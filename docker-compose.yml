@@ -1,0 +1,13 @@
+services:
+  melodarr:
+    image: slimjimserver/melodarr:latest
+    container_name: melodarr
+    ports:
+      - "5056:5056"
+    user: "1000:1000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      MELODARR_DATABASE: /app/data/melodarr.db
+      MELODARR_CACHE_DATABASE: /app/data/cache/metadata.db
+    restart: unless-stopped

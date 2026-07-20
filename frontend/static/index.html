@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Melodarr — Music requests</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <a class="brand" href="/">melodarr<span>.</span></a>
+    <nav>
+      <button class="nav-link active" data-view="discover">Discover</button>
+      <button class="nav-link admin-only" data-view="library">Your library</button>
+      <button class="nav-link admin-only" data-view="settings">Settings</button>
+    </nav>
+    <div id="status" class="status">Checking services…</div>
+    <a id="account-menu" class="account-menu" href="/" aria-label="Open account settings" title="Account settings">●</a>
+    <button id="logout" class="logout" type="button">Sign out</button>
+  </header>
+
+  <section id="auth" class="auth-view">
+    <div class="auth-card">
+      <p class="eyebrow">MELODARR</p>
+      <h1 id="auth-title">Music, for<br><em>your people.</em></h1>
+      <p id="auth-intro" class="intro">Checking account access…</p>
+      <form id="login-form" class="auth-form" hidden>
+        <h2>Sign in</h2>
+        <label>Username<input name="username" autocomplete="username" required></label>
+        <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
+        <label class="checkbox auth-checkbox"><input name="remember" type="checkbox"> Remember me for 30 days</label>
+        <button>Sign in</button>
+        <p class="form-message"></p>
+      </form>
+      <form id="register-form" class="auth-form" hidden>
+        <h2 id="register-title">Create owner account</h2>
+        <label>Username<input name="username" autocomplete="username" minlength="3" maxlength="32" required></label>
+        <label>Password<input name="password" type="password" autocomplete="new-password" minlength="12" required></label>
+        <button>Create account</button>
+        <p class="form-message"></p>
+      </form>
+    </div>
+  </section>
+
+  <main>
+    <section id="discover" class="view active">
+      <p class="eyebrow">YOUR MUSIC, ON REQUEST</p>
+      <h1>What do you want<br>to hear <em>next?</em></h1>
+      <p class="intro">Find an artist and send them straight to your music collection.</p>
+      <form id="search-form" class="search">
+        <select id="search-type" aria-label="Search type">
+          <option value="artist">Artists</option>
+          <option value="album">Albums</option>
+        </select>
+        <input id="search-input" autocomplete="off" placeholder="Search artists…" aria-label="Search">
+        <button>Search</button>
+      </form>
+      <p id="search-message" class="message"></p>
+      <div id="results" class="results"></div>
+      <section class="recommendations" aria-labelledby="recommendations-title">
+        <div class="recommendations-heading">
+          <div><p class="eyebrow">LINKED ACCOUNTS</p><h2 id="recommendations-title">Recommended for you</h2></div>
+          <button id="load-recommendations" class="outline" type="button">Get recommendations</button>
+        </div>
+        <p id="recommendations-message" class="message">Add a ListenBrainz or Last.fm account in Linked accounts to discover recommendations based on your listening history.</p>
+        <div id="recommendation-results"></div>
+      </section>
+    </section>
+
+    <section id="detail" class="view">
+      <div class="detail-heading">
+        <div>
+          <button id="back-to-search" class="outline">← Back to search</button>
+          <p id="detail-eyebrow" class="eyebrow"></p>
+          <h1 id="detail-title"></h1>
+          <p id="detail-subtitle" class="intro"></p>
+        </div>
+        <div id="detail-cover" class="detail-cover" hidden><img id="detail-cover-image" alt=""></div>
+      </div>
+      <p id="detail-message" class="message"></p>
+      <div id="detail-results" class="results"></div>
+    </section>
+
+    <section id="library" class="view">
+      <p class="eyebrow">PLEX MUSIC LIBRARY</p>
+      <h1>Your familiar<br><em>favorites.</em></h1>
+      <div class="library-top">
+        <p id="library-copy" class="intro">Load the artists already available in Plex.</p>
+        <button id="load-library" class="outline">Load library</button>
+      </div>
+      <div id="library-filter" class="library-filter" hidden>
+        <label for="library-search">Search artists</label>
+        <input id="library-search" type="search" placeholder="Search your Plex artists…" autocomplete="off">
+        <span id="library-filter-count" aria-live="polite"></span>
+      </div>
+      <p id="library-message" class="message"></p>
+      <div id="library-results" class="library-results"></div>
+    </section>
+
+    <section id="settings" class="view settings-view">
+      <div class="settings-hero">
+        <div><p class="eyebrow">SETTINGS</p><h1>Your music,<br><em>connected.</em></h1></div>
+        <p>Connect the services Melodarr uses, then choose the defaults for new requests. Credentials are stored in this app’s local settings file.</p>
+      </div>
+
+      <nav class="settings-tabs" aria-label="Settings sections">
+        <button class="active" type="button" data-settings-page="services">Services</button>
+        <button type="button" data-settings-page="jobs">Jobs &amp; Cache</button>
+      </nav>
+
+      <div id="settings-services" class="settings-stack settings-panel">
+        <section class="settings-section">
+          <div class="service-intro"><img class="service-icon" src="/icons/plex.svg" alt="Plex"><div><h2>Plex library</h2><p>Detect artists you already own and open them directly in Plex.</p></div><span id="plex-state" class="service-state">Not connected</span></div>
+          <form id="plex-settings" class="service-card">
+            <div class="settings-fields">
+              <label>Plex address<input name="url" placeholder="http://plex:32400" required></label>
+              <label>Authentication token<input name="token" type="password" placeholder="Plex token (leave blank to keep saved token)"></label>
+            </div>
+            <div class="form-actions"><p class="form-message"></p><button type="button" id="test-plex" class="secondary-action">Test connection</button></div>
+            <fieldset id="plex-libraries" disabled>
+              <hr>
+              <div class="defaults-heading"><div><h3>Music libraries</h3><p class="field-help">Only selected Plex music libraries are scanned and used to filter recommendations.</p></div></div>
+              <div class="option-field">
+                <span class="option-field-label">Select music libraries</span>
+                <div id="plex-library-sections" class="option-picker" role="group" aria-label="Plex music libraries"></div>
+                <small>Select every library Melodarr should use.</small>
+              </div>
+              <div class="form-actions"><span></span><button>Save Plex connection</button></div>
+            </fieldset>
+          </form>
+        </section>
+
+        <section class="settings-section">
+          <div class="service-intro"><img class="service-icon" src="/icons/lidarr.svg" alt="Lidarr"><div><h2>Lidarr</h2><p>Where approved artist requests are added and monitored.</p></div><span id="lidarr-state" class="service-state">Not connected</span></div>
+          <form id="lidarr-settings" class="service-card lidarr-card">
+          <div class="settings-fields">
+            <label>Hostname or IP Address<input name="hostname" placeholder="lidarr" required></label>
+            <label>Port<input name="port" inputmode="numeric" placeholder="8686" required></label>
+            <label class="checkbox">Use SSL<input name="useSsl" type="checkbox"></label>
+            <label>API key<input name="apiKey" type="password" placeholder="Lidarr API key (leave blank to keep saved key)"></label>
+            <label class="wide-field">External URL<small>Used for clickable Lidarr links when the server address is not reachable by browsers outside your network.</small><input name="externalUrl" type="url" placeholder="https://lidarr.example.com"></label>
+          </div>
+          <div class="form-actions"><p class="form-message"></p><button type="button" id="test-lidarr" class="secondary-action">Test connection</button></div>
+          <fieldset id="lidarr-defaults" disabled>
+            <hr>
+            <div class="defaults-heading"><div><h3>Request defaults</h3><p class="field-help">Available after testing the Lidarr connection.</p></div></div>
+            <div class="settings-fields">
+              <label>Root Folder<select name="rootFolderPath" id="default-root-folders" required></select></label>
+              <label>Monitor<select name="monitor"><option value="all">All Albums</option><option value="future">Future Albums</option><option value="missing">Missing Albums</option><option value="none">None</option></select></label>
+              <label>Monitor New Albums<select name="monitorNewItems"><option value="all">All Albums</option><option value="new">New Albums</option><option value="none">None</option></select></label>
+              <label>Quality Profile<select name="qualityProfileId" id="default-quality-profiles" required></select></label>
+              <label>Metadata Profile<select name="metadataProfileId" id="default-metadata-profiles" required></select></label>
+              <div class="option-field">
+                <span class="option-field-label">Default Tags</span>
+                <div id="default-tags" class="option-picker" role="group" aria-label="Default Lidarr tags"></div>
+                <small>Optional tags applied to new requests.</small>
+              </div>
+            </div>
+            <label class="checkbox"><input name="searchForMissingAlbums" type="checkbox" checked> Automatically search for missing albums after adding</label>
+            <div class="form-actions"><span></span><button>Save Lidarr settings</button></div>
+          </fieldset>
+        </form>
+        </section>
+      </div>
+
+      <div id="settings-jobs" class="settings-stack settings-panel" hidden>
+        <section class="settings-section maintenance-section">
+          <div class="maintenance-heading">
+            <div><h2>Jobs</h2><p>Background maintenance runs automatically, and can also be triggered here without changing its schedule.</p></div>
+            <button id="refresh-maintenance" class="outline" type="button">Refresh status</button>
+          </div>
+          <div class="maintenance-table-wrap">
+            <table class="maintenance-table">
+              <thead><tr><th>Job name</th><th>Type</th><th>Schedule</th><th>Status</th><th></th></tr></thead>
+              <tbody id="jobs-table"><tr><td colspan="5" class="table-empty">Loading jobs…</td></tr></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="settings-section maintenance-section">
+          <div class="maintenance-heading">
+            <div><h2>Cache</h2><p>External metadata, recommendation payloads, and artwork are cached to make Melodarr faster and reduce upstream API requests.</p></div>
+            <span id="metadata-cache-size" class="service-state">Metadata DB · 0 B</span>
+          </div>
+          <div class="maintenance-table-wrap">
+            <table class="maintenance-table">
+              <thead><tr><th>Cache name</th><th>Entries</th><th>Expired / misses</th><th>Size</th><th>Latest expiry</th><th></th></tr></thead>
+              <tbody id="cache-table"><tr><td colspan="6" class="table-empty">Loading caches…</td></tr></tbody>
+            </table>
+          </div>
+          <p id="maintenance-message" class="message" aria-live="polite"></p>
+        </section>
+      </div>
+    </section>
+
+    <section id="account" class="view account-view">
+      <div class="account-heading"><p class="eyebrow">YOUR ACCOUNT</p><h1 id="account-title">Profile</h1></div>
+      <div class="account-layout">
+        <nav class="account-nav" aria-label="Account navigation">
+          <a data-account-route="profile" href="#">Profile</a>
+          <p>Settings</p>
+          <a data-account-route="general" href="#">General</a>
+          <a data-account-route="linked-accounts" href="#">Linked accounts</a>
+          <a class="admin-only" data-account-route="invitations" href="#" hidden>Invitations</a>
+          <a data-account-route="notifications" href="#">Notifications</a>
+        </nav>
+        <div id="account-content" class="account-content"></div>
+      </div>
+    </section>
+  </main>
+  <dialog id="request-dialog">
+    <form id="request-form">
+      <div class="dialog-title">
+        <div>
+          <p class="eyebrow">ADD TO LIDARR</p>
+          <h2 id="dialog-artist">Artist</h2>
+        </div>
+        <button type="button" class="close-dialog" aria-label="Close">×</button>
+      </div>
+      <p class="dialog-copy">This artist will be added using your Lidarr request defaults.</p>
+      <details>
+        <summary>Advanced options</summary>
+        <div class="settings-fields">
+          <label>Root Folder<select id="request-root-folder"></select></label>
+          <label>Tags<select id="request-tags" multiple></select></label>
+        </div>
+        <label class="checkbox"><input id="request-search" type="checkbox"> Search automatically (override default)</label>
+      </details>
+      <p id="request-message" class="message"></p>
+      <div class="dialog-actions">
+        <button type="button" class="close-dialog">Cancel</button>
+        <button>Add artist</button>
+      </div>
+    </form>
+  </dialog>
+  <button id="back-to-top" type="button" aria-label="Back to top">↑ <span>Top</span></button>
+  <script src="/static/app.js"></script>
+  <script src="/static/discovery.js"></script>
+</body>
+</html>

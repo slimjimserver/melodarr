@@ -1,0 +1,790 @@
+type JsonObject = Record<string, any>;
+type AppForm = HTMLFormElement & {
+  username: HTMLInputElement;
+  password: HTMLInputElement;
+  remember: HTMLInputElement;
+  listenbrainzUsername: HTMLInputElement;
+  lastfmUsername: HTMLInputElement;
+  lastfmApiKey: HTMLInputElement;
+  invitationLink: HTMLInputElement;
+};
+interface AppElement extends HTMLElement {
+  value: string;
+  placeholder: string;
+  checked: boolean;
+  disabled: boolean;
+  open: boolean;
+  selectedOptions: HTMLCollectionOf<HTMLOptionElement>;
+  hostname: HTMLInputElement;
+  port: HTMLInputElement;
+  useSsl: HTMLInputElement;
+  externalUrl: HTMLInputElement;
+  monitor: HTMLSelectElement;
+  monitorNewItems: HTMLSelectElement;
+  searchForMissingAlbums: HTMLInputElement;
+  remember: HTMLInputElement;
+  reset(): void;
+  close(): void;
+  showModal(): void;
+  src: string;
+  alt: string;
+  fetchPriority: string;
+}
+type AccountPage = "profile" | "general" | "linked-accounts" | "invitations" | "notifications";
+type AppView = "discover" | "detail" | "library" | "settings" | "account";
+type SettingsPage = "services" | "jobs";
+
+interface CurrentUser {
+  username: string;
+  role: "admin" | "user";
+  csrfToken?: string;
+  listenbrainzUsername?: string;
+  lastfmUsername?: string;
+  lastfmConfigured?: boolean;
+}
+
+interface LidarrDefaults extends JsonObject {
+  rootFolderPath?: string;
+  qualityProfileId?: number;
+  metadataProfileId?: number;
+  tags?: number[];
+  monitor?: string;
+  monitorNewItems?: string;
+  searchForMissingAlbums?: boolean;
+}
+
+function $<T extends Element = AppElement>(selector: string): T {
+  const element = document.querySelector<T>(selector);
+  if (!element) throw new Error(`Required element not found: ${selector}`);
+  return element;
+}
+
+function requiredDescendant<T extends Element>(parent: ParentNode, selector: string): T {
+  const element = parent.querySelector<T>(selector);
+  if (!element) throw new Error(`Required descendant not found: ${selector}`);
+  return element;
+}
+
+let lidarrOptions: JsonObject | undefined;
+let lidarrDefaults: LidarrDefaults = {};
+let currentUser: CurrentUser | undefined;
+let showAccountPage: ((page?: AccountPage, updateHistory?: boolean) => void) | undefined;
+let invitationToken = "";
+let maintenanceRefreshTimer: number | undefined;
+
+function setMessage(element: Element, message: string, isError = false) {
+  element.textContent = message;
+  element.className = `message${isError ? " error" : ""}`;
+}
+
+async function api<T = JsonObject>(url: string, options: RequestInit = {}): Promise<T> {
+  const requestOptions = { ...options };
+  const method = (requestOptions.method || "GET").toUpperCase();
+  const headers = new Headers(requestOptions.headers || {});
+  if (["POST", "PUT", "PATCH", "DELETE"].includes(method) && currentUser?.csrfToken) {
+    headers.set("X-CSRF-Token", currentUser.csrfToken);
+  }
+  requestOptions.headers = headers;
+  const response = await fetch(url, requestOptions);
+  const body = await response.json() as T & { error?: string };
+
+  if (!response.ok) {
+    throw new Error(body.error || "Request failed.");
+  }
+  return body;
+}
+
+function addSelectOptions(select: HTMLSelectElement, options: JsonObject[], labelKey: string, valueKey: string, selected: Array<string | number | undefined> = []) {
+  const selectedValues = new Set(selected.map(String));
+  select.replaceChildren();
+
+  options.forEach((option) => {
+    const label = option[labelKey] || option.path;
+    const value = option[valueKey];
+    select.add(new Option(label, value, false, selectedValues.has(String(value))));
+  });
+}
+
+function populateOptionPicker(
+  picker: HTMLElement,
+  options: JsonObject[],
+  labelKey: string,
+  valueKey: string,
+  selected: Array<string | number | undefined> = [],
+) {
+  const selectedValues = new Set(selected.map(String));
+  picker.replaceChildren();
+
+  options.forEach((option) => {
+    const value = String(option[valueKey]);
+    const choice = document.createElement("label");
+    choice.className = "option-choice";
+
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.value = value;
+    input.checked = selectedValues.has(value);
+
+    const label = document.createElement("span");
+    label.textContent = String(option[labelKey] || option.path || value);
+    choice.append(input, label);
+    picker.append(choice);
+  });
+}
+
+function selectedOptionPickerValues(selector: string) {
+  return [...document.querySelectorAll<HTMLInputElement>(`${selector} input:checked`)]
+    .map((input) => input.value);
+}
+
+function populateLidarrOptions(options: JsonObject) {
+  lidarrOptions = options;
+  addSelectOptions($("#default-root-folders"), options.rootFolders, "path", "path", [lidarrDefaults.rootFolderPath]);
+  addSelectOptions($("#default-quality-profiles"), options.qualityProfiles, "name", "id", [lidarrDefaults.qualityProfileId]);
+  addSelectOptions($("#default-metadata-profiles"), options.metadataProfiles, "name", "id", [lidarrDefaults.metadataProfileId]);
+  populateOptionPicker($("#default-tags"), options.tags, "label", "id", lidarrDefaults.tags || []);
+}
+
+function populatePlexLibraries(libraries: JsonObject[], selected: Array<string | number> = []) {
+  populateOptionPicker($("#plex-library-sections"), libraries, "title", "id", selected);
+  $("#plex-libraries").disabled = libraries.length === 0;
+}
+
+function parseLidarrUrl(value: string) {
+  try {
+    const url = new URL(value);
+    return { hostname: url.hostname, port: url.port || "8686", useSsl: url.protocol === "https:" };
+  } catch {
+    return { hostname: "", port: "8686", useSsl: false };
+  }
+}
+
+async function refreshSettings(loadLidarrOptions = true) {
+  const settings = await api("/api/settings");
+  const { lidarr, plex } = settings;
+  lidarrDefaults = lidarr.defaults || {};
+
+  $("#lidarr-state").textContent = lidarr.configured ? `Connected · ${lidarr.url}` : "Not connected";
+  $("#plex-state").textContent = plex.configured ? `Connected · ${plex.url}` : "Not connected";
+  $("#plex-settings [name=url]").value = plex.url || "";
+  populatePlexLibraries(plex.libraries || [], plex.librarySectionIds || []);
+
+  const form = $("#lidarr-settings");
+  if (lidarr.url) {
+    const connection = parseLidarrUrl(lidarr.url);
+    form.hostname.value = connection.hostname;
+    form.port.value = connection.port;
+    form.useSsl.checked = connection.useSsl;
+    form.externalUrl.value = lidarr.externalUrl || "";
+    $("#lidarr-defaults").disabled = false;
+
+    if (loadLidarrOptions) {
+      try {
+        populateLidarrOptions(await api("/api/lidarr/options"));
+      } catch {
+        // A saved configuration may no longer be reachable. The settings form
+        // remains usable so the user can correct it.
+      }
+    }
+  }
+
+  form.monitor.value = lidarrDefaults.monitor || "all";
+  form.monitorNewItems.value = lidarrDefaults.monitorNewItems || "all";
+  form.searchForMissingAlbums.checked = lidarrDefaults.searchForMissingAlbums !== false;
+
+  const status = $("#status");
+  status.textContent = lidarr.configured
+    ? `Lidarr connected${plex.configured ? " · Plex connected" : ""}`
+    : "Connect Lidarr in Settings";
+  status.className = `status ${lidarr.configured ? "ready" : "warn"}`;
+}
+
+function formatBytes(bytes: number) {
+  if (!bytes) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  const unit = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  const value = bytes / (1024 ** unit);
+  return `${value.toFixed(unit === 0 || value >= 10 ? 0 : 1)} ${units[unit]}`;
+}
+
+function tableCell(row: HTMLTableRowElement, value: string) {
+  const cell = document.createElement("td");
+  cell.textContent = value;
+  row.append(cell);
+  return cell;
+}
+
+async function refreshMaintenance() {
+  const jobsTable = $<HTMLTableSectionElement>("#jobs-table");
+  const cacheTable = $<HTMLTableSectionElement>("#cache-table");
+  const message = $("#maintenance-message");
+  try {
+    const data = await api("/api/settings/maintenance");
+    jobsTable.replaceChildren();
+    data.jobs.forEach((job: JsonObject) => {
+      const row = document.createElement("tr");
+      tableCell(row, job.name);
+      const type = tableCell(row, "");
+      const badge = document.createElement("span"); badge.className = "job-type"; badge.textContent = job.type; type.append(badge);
+      tableCell(row, job.schedule);
+      const statusCell = tableCell(row, "");
+      const status = document.createElement("span");
+      status.className = `job-status${job.running ? " running" : ""}`;
+      if (job.running) {
+        const progress = job.total ? ` · ${job.completed}/${job.total}` : "";
+        status.textContent = `${job.phase && job.phase !== "idle" ? job.phase : "Running"}${progress}`;
+      }
+      else if (job.queued) status.textContent = `${job.queued} queued${job.retrying ? ` · ${job.retrying} retrying` : ""}`;
+      else if (job.nextExecutionAt) status.textContent = `Next ${new Date(job.nextExecutionAt * 1000).toLocaleString()}`;
+      else status.textContent = "Idle";
+      statusCell.append(status);
+      const actions = tableCell(row, "");
+      const run = document.createElement("button");
+      run.type = "button"; run.className = "run-job"; run.textContent = job.running ? "Running…" : "Run now"; run.disabled = Boolean(job.running);
+      run.addEventListener("click", async () => {
+        run.disabled = true;
+        try {
+          const result = await api(`/api/settings/jobs/${encodeURIComponent(job.id)}/run`, { method: "POST" });
+          setMessage(message, result.message);
+          await refreshMaintenance();
+        } catch (error) { setMessage(message, error.message, true); }
+        finally { run.disabled = false; }
+      });
+      actions.append(run);
+      jobsTable.append(row);
+    });
+
+    cacheTable.replaceChildren();
+    data.caches.forEach((cache: JsonObject) => {
+      const row = document.createElement("tr");
+      tableCell(row, cache.name);
+      tableCell(row, Number(cache.entries || 0).toLocaleString());
+      tableCell(row, Number(cache.expired || 0).toLocaleString());
+      tableCell(row, formatBytes(Number(cache.valueBytes || 0)));
+      tableCell(row, cache.latestExpiry ? new Date(cache.latestExpiry * 1000).toLocaleString() : "On demand");
+      const actions = tableCell(row, "");
+      const flush = document.createElement("button");
+      flush.type = "button"; flush.textContent = "Flush cache";
+      flush.addEventListener("click", async () => {
+        if (!window.confirm(`Flush ${cache.name}? It will be rebuilt as Melodarr uses it.`)) return;
+        flush.disabled = true;
+        try {
+          const result = await api(`/api/settings/cache/${encodeURIComponent(cache.id)}/flush`, { method: "POST" });
+          setMessage(message, result.message);
+          await refreshMaintenance();
+        } catch (error) { setMessage(message, error.message, true); }
+        finally { flush.disabled = false; }
+      });
+      actions.append(flush);
+      cacheTable.append(row);
+    });
+    $("#metadata-cache-size").textContent = `Metadata DB · ${formatBytes(data.metadataDatabaseBytes)}`;
+  } catch (error) {
+    setMessage(message, error.message, true);
+  }
+}
+
+function showSettingsPage(page: SettingsPage, updateHistory = true) {
+  document.querySelectorAll<HTMLElement>("[data-settings-page]").forEach((button) => button.classList.toggle("active", button.dataset.settingsPage === page));
+  $("#settings-services").hidden = page !== "services";
+  $("#settings-jobs").hidden = page !== "jobs";
+  if (maintenanceRefreshTimer !== undefined) window.clearInterval(maintenanceRefreshTimer);
+  maintenanceRefreshTimer = undefined;
+  if (page === "jobs") {
+    refreshMaintenance();
+    maintenanceRefreshTimer = window.setInterval(refreshMaintenance, 10_000);
+  }
+  if (updateHistory) window.history.pushState({ view: "settings", settings: page }, "", page === "jobs" ? "/settings/jobs" : "/settings");
+}
+
+function setupNavigation() {
+  function showView(view: AppView, updateHistory = true) {
+    if (!currentUser || (currentUser.role !== "admin" && !["discover", "account"].includes(view))) view = "discover";
+    document.querySelectorAll(".nav-link, .view").forEach((element) => element.classList.remove("active"));
+    // Account and detail are application views without a matching top-nav
+    // button. Use an optional native query instead of the strict `$` helper,
+    // which deliberately throws when an element is absent.
+    document.querySelector<HTMLElement>(`[data-view="${view}"]`)?.classList.add("active");
+    $(`#${view}`).classList.add("active");
+    if (view !== "settings" && maintenanceRefreshTimer !== undefined) {
+      window.clearInterval(maintenanceRefreshTimer);
+      maintenanceRefreshTimer = undefined;
+    }
+
+    if (updateHistory) {
+      const path = view === "discover" ? "/" : `/${view}`;
+      window.history.pushState({ view }, "", path);
+    }
+  }
+
+  function accountPath(page: AccountPage) {
+    if (!currentUser) throw new Error("Account navigation requires an authenticated user.");
+    const username = encodeURIComponent(currentUser.username);
+    return page === "profile" ? `/${username}` : `/${username}/settings/${page}`;
+  }
+
+  async function renderAccount(page: AccountPage) {
+    const user = currentUser;
+    if (!user) return;
+    const content = $("#account-content");
+    $("#account-title").textContent = page === "profile" ? "Profile" : page.split("-").map((word) => word[0].toUpperCase() + word.slice(1)).join(" ");
+    document.querySelectorAll<HTMLElement>("[data-account-route]").forEach((link) => link.classList.toggle("active", link.dataset.accountRoute === page));
+    content.replaceChildren();
+    const message = document.createElement("p");
+    message.className = "message";
+    message.textContent = "Loading…";
+    content.append(message);
+    try {
+      if (page === "profile") {
+        const data = await api("/api/account/profile");
+        content.replaceChildren();
+        [["Artists", data.requests.artist, "artists"], ["Release groups", data.requests["release-group"], "albums"]].forEach(([title, requests, route]) => {
+          const section = document.createElement("section");
+          section.className = "account-section";
+          const heading = document.createElement("h2"); heading.textContent = title;
+          const list = document.createElement("div"); list.className = "results";
+          if (!requests.length) { const empty = document.createElement("p"); empty.className = "message"; empty.textContent = "No requests yet."; list.append(empty); }
+          requests.forEach((item: JsonObject) => { const link = document.createElement("a"); link.className = "history-item"; link.href = `/${route}/${encodeURIComponent(item.mbid)}`; link.textContent = item.name; const date = document.createElement("span"); date.textContent = new Date(item.created_at * 1000).toLocaleDateString(); link.append(date); list.append(link); });
+          section.append(heading, list); content.append(section);
+        });
+      } else if (page === "general") {
+        content.replaceChildren();
+        const form = document.createElement("form") as AppForm; form.className = "service-card account-form";
+        form.innerHTML = '<h2>General</h2><label>Username<input name="username" autocomplete="username" required></label><label>New password<small>Leave blank to keep your current password.</small><input name="password" type="password" autocomplete="new-password" minlength="12"></label><div class="form-actions"><p class="form-message"></p><button>Save general settings</button></div>';
+        form.username.value = user.username;
+        form.addEventListener("submit", async (event) => { event.preventDefault(); const formMessage = requiredDescendant<HTMLElement>(form, ".form-message"); try { const result = await api("/api/account/general", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(Object.fromEntries(new FormData(form))) }); user.username = result.username; const accountMenu = $<HTMLAnchorElement>("#account-menu"); accountMenu.textContent = result.username.slice(0, 1).toUpperCase(); accountMenu.href = accountPath("profile"); formMessage.textContent = result.message; window.history.replaceState({ account: "general" }, "", accountPath("general")); } catch (error) { setMessage(formMessage, error.message, true); } });
+        content.append(form);
+      } else if (page === "linked-accounts") {
+        content.replaceChildren();
+        const form = document.createElement("form") as AppForm; form.className = "service-card account-form";
+        form.innerHTML = '<h2>Linked accounts</h2><fieldset><legend>ListenBrainz</legend><label>Username<small>Used to tailor recommendations. Leave blank to disconnect it.</small><input name="listenbrainzUsername" autocomplete="username" placeholder="your-listenbrainz-name"></label></fieldset><fieldset><legend>Last.fm</legend><label>Username<input name="lastfmUsername" autocomplete="username" placeholder="your-lastfm-name"></label><label>API key<small>Create one in your Last.fm API account. Leave blank to keep your saved key.</small><input name="lastfmApiKey" type="password" autocomplete="off" placeholder="Last.fm API key"></label></fieldset><div class="form-actions"><p class="form-message"></p><button>Save linked accounts</button></div>';
+        form.listenbrainzUsername.value = user.listenbrainzUsername || "";
+        form.lastfmUsername.value = user.lastfmUsername || "";
+        form.addEventListener("submit", async (event) => { event.preventDefault(); const formMessage = requiredDescendant<HTMLElement>(form, ".form-message"); setMessage(formMessage, "Saving linked accounts…"); try { const listenbrainz = await api("/api/account/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username: form.listenbrainzUsername.value }) }); const lastfm = await api("/api/account/lastfm", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username: form.lastfmUsername.value, apiKey: form.lastfmApiKey.value }) }); user.listenbrainzUsername = form.listenbrainzUsername.value.trim(); user.lastfmUsername = form.lastfmUsername.value.trim(); user.lastfmConfigured = Boolean(user.lastfmUsername); form.lastfmApiKey.value = ""; setMessage(formMessage, `${listenbrainz.message} ${lastfm.message} Recommendations are being refreshed.`); window.dispatchEvent(new Event("melodarr-recommendations-changed")); } catch (error) { setMessage(formMessage, error.message, true); } });
+        content.append(form);
+      } else if (page === "invitations" && user.role === "admin") {
+        content.replaceChildren();
+        const form = document.createElement("form") as AppForm; form.className = "service-card account-form";
+        form.innerHTML = '<h2>Account invitations</h2><p class="intro">Create a private, one-time signup link. Each link expires after seven days.</p><div class="form-actions"><p class="form-message"></p><button>Create invitation link</button></div><div class="invitation-result" hidden><label>Invitation link<input name="invitationLink" readonly></label><button class="outline" type="button">Copy link</button></div>';
+        const formMessage = requiredDescendant<HTMLElement>(form, ".form-message");
+        const result = requiredDescendant<HTMLElement>(form, ".invitation-result");
+        const linkInput = form.invitationLink;
+        form.addEventListener("submit", async (event) => {
+          event.preventDefault();
+          result.hidden = true;
+          setMessage(formMessage, "Creating invitation…");
+          try {
+            const invitation = await api("/api/account/invitations", { method: "POST" });
+            linkInput.value = new URL(invitation.path, window.location.origin).href;
+            result.hidden = false;
+            setMessage(formMessage, `This one-time link expires ${new Date(invitation.expiresAt * 1000).toLocaleString()}.`);
+          } catch (error) { setMessage(formMessage, error.message, true); }
+        });
+        requiredDescendant<HTMLButtonElement>(result, "button").addEventListener("click", async () => {
+          try {
+            await navigator.clipboard.writeText(linkInput.value);
+            setMessage(formMessage, "Invitation link copied.");
+          } catch {
+            linkInput.select();
+            setMessage(formMessage, "Copy the selected invitation link.");
+          }
+        });
+        content.append(form);
+      } else {
+        content.replaceChildren();
+        const section = document.createElement("section"); section.className = "service-card account-form"; section.innerHTML = "<h2>Notifications</h2><p class=\"intro\">Notification preferences will be available here soon.</p>"; content.append(section);
+      }
+    } catch (error) { setMessage(message, error.message, true); }
+  }
+
+  showAccountPage = (page = "profile", updateHistory = true) => {
+    if (!currentUser) return;
+    showView("account", false);
+    if (updateHistory) window.history.pushState({ account: page }, "", accountPath(page));
+    const allowedPages = ["profile", "general", "linked-accounts", "notifications"];
+    if (currentUser.role === "admin") allowedPages.push("invitations");
+    renderAccount(allowedPages.includes(page) ? page : "profile");
+  };
+
+  document.querySelectorAll<HTMLElement>(".nav-link").forEach((button) => {
+    button.addEventListener("click", () => {
+      showView(button.dataset.view as AppView);
+      if (button.dataset.view === "discover") {
+        window.dispatchEvent(new Event("melodarr-home"));
+      } else if (button.dataset.view === "settings" && currentUser?.role === "admin") {
+        showSettingsPage("services", false);
+        refreshSettings(true).catch(() => {});
+      }
+    });
+  });
+
+  $(".brand").addEventListener("click", (event) => {
+    // Keep the real href as a no-JavaScript fallback, but avoid reloading the
+    // entire application when an authenticated user returns home.
+    if (!currentUser || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    showView("discover");
+    window.dispatchEvent(new Event("melodarr-home"));
+    window.scrollTo({ top: 0, behavior: "auto" });
+  });
+
+  window.addEventListener("popstate", () => {
+    const accountMatch = window.location.pathname.match(/^\/([^/]+)(?:\/settings\/(general|linked-accounts|invitations|notifications))?\/?$/);
+    if (accountMatch && currentUser && decodeURIComponent(accountMatch[1]).toLowerCase() === currentUser.username.toLowerCase()) {
+      showAccountPage?.((accountMatch[2] || "profile") as AccountPage, false);
+      return;
+    }
+    if (window.location.pathname === "/settings" || window.location.pathname === "/settings/jobs") {
+      showView("settings", false);
+      showSettingsPage(window.location.pathname.endsWith("/jobs") ? "jobs" : "services", false);
+      return;
+    }
+    const view = window.location.pathname.slice(1) || "discover";
+    showView((["discover", "library", "settings"].includes(view) ? view : "discover") as AppView, false);
+  });
+
+  const initialView = window.location.pathname.slice(1) || "discover";
+  if (initialView === "settings/jobs") showView("settings", false);
+  else if (["library", "settings"].includes(initialView)) showView(initialView as AppView, false);
+
+  $<HTMLAnchorElement>("#account-menu").addEventListener("click", (event) => {
+    if (!currentUser || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    showAccountPage?.("profile");
+  });
+  document.querySelectorAll<HTMLElement>("[data-account-route]").forEach((link) => link.addEventListener("click", (event) => { event.preventDefault(); showAccountPage?.(link.dataset.accountRoute as AccountPage); }));
+  document.querySelectorAll<HTMLElement>("[data-settings-page]").forEach((button) => button.addEventListener("click", () => showSettingsPage(button.dataset.settingsPage as SettingsPage)));
+  document.querySelector("#refresh-maintenance")?.addEventListener("click", () => refreshMaintenance());
+}
+
+function applyCurrentUser(user: CurrentUser) {
+  currentUser = user;
+  document.body.classList.add("authenticated");
+  const isAdmin = user.role === "admin";
+  document.querySelectorAll<HTMLElement>(".admin-only").forEach((element) => { element.hidden = !isAdmin; });
+  const status = $("#status");
+  status.textContent = `Signed in as ${user.username}${isAdmin ? " · Administrator" : ""}`;
+  status.className = "status ready";
+  const accountMenu = $<HTMLAnchorElement>("#account-menu");
+  accountMenu.textContent = user.username.slice(0, 1).toUpperCase();
+  accountMenu.href = `/${encodeURIComponent(user.username)}`;
+  accountMenu.setAttribute("aria-label", `Open settings for ${user.username}`);
+  window.dispatchEvent(new Event("melodarr-authenticated"));
+  // Re-evaluate a bookmarked view or detail route only after its API calls
+  // have an authenticated session.
+  window.dispatchEvent(new PopStateEvent("popstate"));
+}
+
+async function showAuth({ resetPath = false } = {}) {
+  currentUser = undefined;
+  document.body.classList.remove("authenticated");
+  const loginForm = $("#login-form");
+  const registerForm = $("#register-form");
+  loginForm.hidden = true;
+  registerForm.hidden = true;
+  if (resetPath) window.history.replaceState({}, "", "/");
+
+  const parameters = new URLSearchParams(window.location.search);
+  invitationToken = parameters.get("invite") || "";
+  try {
+    const query = invitationToken ? `?invite=${encodeURIComponent(invitationToken)}` : "";
+    const status = await api(`/api/auth/status${query}`);
+    if (status.firstAccount) {
+      invitationToken = "";
+      window.history.replaceState({ setup: true }, "", "/setup");
+      $("#auth-title").innerHTML = "Create your<br><em>owner account.</em>";
+      $("#auth-intro").textContent = "Set up the first Melodarr administrator account.";
+      $("#register-title").textContent = "Create owner account";
+      registerForm.hidden = false;
+    } else if (invitationToken && status.invitationValid) {
+      $("#auth-title").innerHTML = "You’re<br><em>invited.</em>";
+      $("#auth-intro").textContent = "Create your account using this one-time invitation.";
+      $("#register-title").textContent = "Create invited account";
+      registerForm.hidden = false;
+    } else {
+      if (window.location.pathname === "/setup" || window.location.pathname === "/register") {
+        window.history.replaceState({}, "", "/");
+      }
+      $("#auth-title").innerHTML = "Music, for<br><em>your people.</em>";
+      $("#auth-intro").textContent = invitationToken
+        ? "That invitation is invalid, expired, or already used. Ask an administrator for a new link."
+        : "Sign in to discover and request music.";
+      invitationToken = "";
+      loginForm.hidden = false;
+    }
+  } catch (error) {
+    $("#auth-intro").textContent = error.message;
+    loginForm.hidden = false;
+  }
+}
+
+async function completeAuthentication(endpoint: string, form: HTMLFormElement, message: Element, extra: JsonObject = {}) {
+  const body = { ...Object.fromEntries(new FormData(form)), ...extra };
+  try {
+    const user = await api<CurrentUser>(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (endpoint === "/api/auth/register") {
+      // Remove the one-time invitation bearer token from browser history as
+      // soon as it has been consumed.
+      window.history.replaceState({ view: "discover" }, "", "/");
+    }
+    applyCurrentUser(user);
+    form.reset();
+    if (user.role === "admin") await refreshSettings(window.location.pathname.startsWith("/settings"));
+  } catch (error) {
+    setMessage(message, error.message, true);
+  }
+}
+
+function setupAuth() {
+  const loginForm = $<AppForm>("#login-form");
+  const registerForm = $<AppForm>("#register-form");
+  loginForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    completeAuthentication(
+      "/api/auth/login",
+      loginForm,
+      requiredDescendant(loginForm, ".form-message"),
+      { remember: loginForm.remember.checked },
+    );
+  });
+  registerForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    completeAuthentication(
+      "/api/auth/register",
+      registerForm,
+      requiredDescendant(registerForm, ".form-message"),
+      { invitationToken },
+    );
+  });
+  $("#logout").addEventListener("click", async () => {
+    try {
+      await api("/api/auth/logout", { method: "POST" });
+    } finally {
+      showAuth({ resetPath: true });
+    }
+  });
+}
+
+function setupLidarrSettings() {
+  const form = $<AppForm>("#lidarr-settings");
+  const testButton = $("#test-lidarr");
+  const message = requiredDescendant<HTMLElement>(form, ".form-message");
+
+  testButton.addEventListener("click", async () => {
+    const body: JsonObject = Object.fromEntries(new FormData(form));
+    body.useSsl = form.useSsl.checked;
+    testButton.disabled = true;
+    setMessage(message, "Testing connection…");
+
+    try {
+      const result = await api("/api/settings/lidarr/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      populateLidarrOptions(result.options);
+      $("#lidarr-defaults").disabled = false;
+      setMessage(message, `${result.message} Choose defaults, then save.`);
+    } catch (error) {
+      $("#lidarr-defaults").disabled = true;
+      setMessage(message, error.message, true);
+    } finally {
+      testButton.disabled = false;
+    }
+  });
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const submitButton = requiredDescendant<HTMLButtonElement>(form, "fieldset button");
+    const body: JsonObject = Object.fromEntries(new FormData(form));
+    body.useSsl = form.useSsl.checked;
+    body.tags = selectedOptionPickerValues("#default-tags").map(Number);
+    body.searchForMissingAlbums = form.searchForMissingAlbums.checked;
+    submitButton.disabled = true;
+    setMessage(message, "Saving service…");
+
+    try {
+      await api("/api/settings/lidarr", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      setMessage(message, "Lidarr service saved.");
+      await refreshSettings();
+    } catch (error) {
+      setMessage(message, error.message, true);
+    } finally {
+      submitButton.disabled = false;
+    }
+  });
+}
+
+function setupPlexSettings() {
+  const form = $<AppForm>("#plex-settings");
+  const testButton = $("#test-plex");
+  const message = requiredDescendant<HTMLElement>(form, ".form-message");
+
+  testButton.addEventListener("click", async () => {
+    testButton.disabled = true;
+    setMessage(message, "Testing Plex connection…");
+    try {
+      const result = await api("/api/settings/plex/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(Object.fromEntries(new FormData(form))),
+      });
+      const current = selectedOptionPickerValues("#plex-library-sections");
+      populatePlexLibraries(result.libraries, current.length ? current : result.libraries.map((library: JsonObject) => library.id));
+      setMessage(message, result.message);
+    } catch (error) {
+      $("#plex-libraries").disabled = true;
+      setMessage(message, error.message, true);
+    } finally {
+      testButton.disabled = false;
+    }
+  });
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const submitButton = requiredDescendant<HTMLButtonElement>(form, "fieldset button");
+    const selectedIds = selectedOptionPickerValues("#plex-library-sections");
+    if (!selectedIds.length) {
+      setMessage(message, "Select at least one Plex music library.", true);
+      return;
+    }
+    const body: JsonObject = Object.fromEntries(new FormData(form));
+    body.librarySectionIds = selectedIds;
+    submitButton.disabled = true;
+    setMessage(message, "Saving Plex libraries…");
+
+    try {
+      const result = await api("/api/settings/plex", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      populatePlexLibraries(result.libraries, result.librarySectionIds);
+      requiredDescendant<HTMLInputElement>(form, "[name=token]").value = "";
+      setMessage(message, result.message);
+      await refreshSettings();
+    } catch (error) {
+      setMessage(message, error.message, true);
+    } finally {
+      submitButton.disabled = false;
+    }
+  });
+}
+
+function setupLibrary() {
+  const results = $("#library-results");
+  const search = $("#library-search") as HTMLInputElement;
+  const filter = $("#library-filter");
+  const filterCount = $("#library-filter-count");
+  let artistCards: HTMLElement[] = [];
+
+  const normalizeSearch = (value: string) => value
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLocaleLowerCase()
+    .trim();
+
+  const filterArtists = () => {
+    const query = normalizeSearch(search.value);
+    let visible = 0;
+    artistCards.forEach((card) => {
+      const matches = !query || (card.dataset.search || "").includes(query);
+      card.hidden = !matches;
+      if (matches) visible += 1;
+    });
+    filterCount.textContent = query
+      ? `${visible} of ${artistCards.length} artists`
+      : `${artistCards.length} artists`;
+    setMessage(
+      $("#library-message"),
+      query && !visible ? `No Plex artists match “${search.value.trim()}”.` : "",
+    );
+  };
+
+  search.addEventListener("input", filterArtists);
+
+  $("#load-library").addEventListener("click", async () => {
+    results.replaceChildren();
+    artistCards = [];
+    search.value = "";
+    filter.hidden = true;
+    setMessage($("#library-message"), "Loading Plex library…");
+
+    try {
+      const library = await api("/api/library");
+      $("#library-copy").textContent = `${library.artistCount} artists and ${library.releaseGroupCount} releases available in your Plex music libraries.`;
+      setMessage($("#library-message"), "");
+      library.artists.forEach((artist: JsonObject) => {
+        const card = document.createElement("div");
+        card.className = `library-card${artist.musicbrainzId ? " clickable" : ""}`;
+        card.dataset.search = normalizeSearch(String(artist.name || ""));
+        const artwork = document.createElement("div");
+        artwork.className = "library-artwork";
+        if (artist.artwork) {
+          const image = document.createElement("img");
+          image.alt = "";
+          image.loading = "lazy";
+          image.decoding = "async";
+          image.src = artist.artwork;
+          image.addEventListener("error", () => image.remove());
+          artwork.append(image);
+        }
+        const info = document.createElement("div");
+        info.className = "library-card-info";
+        const name = document.createElement("strong");
+        name.textContent = artist.name;
+        const section = document.createElement("span");
+        section.textContent = artist.musicbrainzId
+          ? `${artist.section} · View discography`
+          : `${artist.section} · MusicBrainz match unavailable`;
+        info.append(name, section);
+        card.append(artwork, info);
+        if (artist.musicbrainzId) {
+          card.tabIndex = 0;
+          card.setAttribute("role", "link");
+          const openArtist = () => window.dispatchEvent(new CustomEvent(
+            "melodarr-open-detail",
+            { detail: { kind: "artist", id: artist.musicbrainzId } },
+          ));
+          card.addEventListener("click", openArtist);
+          card.addEventListener("keydown", (event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              openArtist();
+            }
+          });
+        }
+        artistCards.push(card);
+        results.append(card);
+      });
+      filter.hidden = false;
+      filterArtists();
+    } catch (error) {
+      setMessage($("#library-message"), error.message, true);
+    }
+  });
+}
+
+setupNavigation();
+setupLidarrSettings();
+setupPlexSettings();
+setupLibrary();
+setupAuth();
+
+api<CurrentUser>("/api/auth/me")
+  .then(async (user) => {
+    if (["/setup", "/register"].includes(window.location.pathname)) {
+      window.history.replaceState({ view: "discover" }, "", "/");
+    }
+    applyCurrentUser(user);
+    if (user.role === "admin") await refreshSettings(window.location.pathname === "/settings");
+  })
+  .catch(() => showAuth());

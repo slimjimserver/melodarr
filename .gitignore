@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node
+node_modules/
+.pnpm-store/
+*.tsbuildinfo
+
+# Generated frontend
+frontend/static/*.js
+frontend/static/*.js.map
+
+# Runtime data
+data/**
+!data/**/
+!data/**/.gitkeep
+*.db*
+settings.json
+session-secret.key
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Local tools
+.agents/
+.codex/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

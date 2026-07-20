@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["DOM", "DOM.Iterable", "ES2022"],
+    "module": "none",
+    "strict": true,
+    "useUnknownInCatchVariables": false,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noEmitOnError": true,
+    "rootDir": "src",
+    "outDir": "static",
+    "removeComments": false,
+    "sourceMap": true,
+    "types": []
+  },
+  "include": ["src/**/*.ts"]
+}
