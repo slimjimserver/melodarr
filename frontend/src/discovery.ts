@@ -197,27 +197,6 @@
     element.append(badge);
   }
 
-  function createPlexAvailabilityPanel(releases: JsonObject[], message = "") {
-    const panel = document.createElement("div");
-    panel.className = "plex-availability-panel";
-    addPlexAvailability(panel);
-    const copy = document.createElement("span");
-    copy.textContent = message || (releases.length === 1
-      ? "One edition is in your selected Plex libraries."
-      : `${releases.length} editions are in your selected Plex libraries.`);
-    panel.append(copy);
-    const target = releases.find((release) => release.url)?.url;
-    if (target) {
-      const link = document.createElement("a");
-      link.href = target;
-      link.target = "_blank";
-      link.rel = "noreferrer";
-      link.textContent = "Open in Plex";
-      panel.append(link);
-    }
-    return panel;
-  }
-
   function detailPath(kind: DetailKind, id: string) {
     const route: Record<DetailKind, string> = { artist: "artists", "release-group": "albums", release: "releases" };
     return `/${route[kind]}/${encodeURIComponent(id)}`;
@@ -380,7 +359,12 @@
     const id = document.createElement("strong");
     id.textContent = `MusicBrainz ID: ${data.id}`;
     meta.append(id);
-    const plexUrl = kind === "artist" && data.availableInPlex ? data.plexUrl : "";
+    const plexRelease = kind === "release-group"
+      ? (data.plexReleases || []).find((release: JsonObject) => release.url)
+      : undefined;
+    const plexUrl = data.availableInPlex
+      ? (kind === "artist" ? data.plexUrl : plexRelease?.url || "")
+      : "";
     addExternalLinks(meta, kind, data.id, data.spotify, plexUrl);
     return meta;
   }
@@ -557,8 +541,14 @@
       results.append(meta);
       const requestButton = document.createElement("button");
       requestButton.className = "request-artist";
-      requestButton.textContent = "Add artist to Lidarr";
-      requestButton.addEventListener("click", () => openRequestDialog(data));
+      if (data.availableInLidarr) {
+        requestButton.textContent = "In Lidarr";
+        requestButton.disabled = true;
+        requestButton.title = "This artist is already in Lidarr";
+      } else {
+        requestButton.textContent = "Add artist to Lidarr";
+        requestButton.addEventListener("click", () => openRequestDialog(data));
+      }
       const refreshButton = document.createElement("button");
       refreshButton.className = "secondary-action refresh-discography";
       refreshButton.type = "button";
@@ -617,7 +607,6 @@
             "release-group",
             group.id,
           );
-          if (group.availableInPlex) addPlexAvailability(card);
           const groupRequest = document.createElement("button");
           groupRequest.className = "request release-group-request";
           groupRequest.type = "button";
@@ -684,9 +673,6 @@
       }
       [data.type, data.date].filter(Boolean).forEach((value) => subtitle.append(` · ${value}`));
       results.append(createMeta("release-group", data));
-      if (data.availableInPlex) {
-        results.append(createPlexAvailabilityPanel(data.plexReleases || []));
-      }
       const requestButton = document.createElement("button");
       requestButton.className = "request-artist";
       if (data.fullyAvailableInLidarr) {

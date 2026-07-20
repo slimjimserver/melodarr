@@ -236,9 +236,6 @@ h1 em { font-style: normal; }
 .artist-card > .plex-availability { margin-left: auto; }
 .release-group-request { min-width: 92px; margin-left: 8px; }
 .release-group-request:disabled, .request-artist:disabled { border-color: rgba(92, 190, 126, .3); background: rgba(92, 190, 126, .09); color: #8ed9a7; cursor: default; box-shadow: none; }
-.plex-availability-panel { display: flex; align-items: center; gap: 12px; border: 1px solid rgba(229, 174, 61, .25); border-radius: 11px; background: rgba(229, 174, 61, .055); color: var(--foreground-subtle); padding: 11px 13px; font-size: 12px; }
-.plex-availability-panel a { margin-left: auto; color: #f1c45f; font-weight: 700; text-decoration: none; }
-.plex-availability-panel a:hover { color: #ffe09a; }
 
 .settings-view { max-width: 980px; }
 .settings-hero { display: grid; grid-template-columns: minmax(0, 1fr) 310px; align-items: end; gap: 48px; margin-bottom: 58px; }
