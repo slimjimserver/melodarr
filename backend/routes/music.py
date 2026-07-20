@@ -266,6 +266,7 @@ def _release_group_detail_payload(mbid, priority, *, cache_only=False):
             break
         offset += len(batch)
     plex_releases = _plex_release_group_inventory().get(mbid, [])
+    lidarr_album = lidarr.cached_library_availability().get(mbid)
     owned_release_ids = {
         item.get("musicbrainzReleaseId") for item in plex_releases
         if item.get("musicbrainzReleaseId")
@@ -297,6 +298,10 @@ def _release_group_detail_payload(mbid, priority, *, cache_only=False):
         "coverArt": release_group_cover_art(data["id"]),
         "coverArtLarge": musicbrainz.cover_art_url(data["id"], size=500),
         "availableInPlex": bool(plex_releases),
+        "availableInLidarr": bool(lidarr_album),
+        "fullyAvailableInLidarr": bool(
+            lidarr_album and lidarr_album.get("fullyAvailable")
+        ),
         "plexReleases": [
             _plex_release_summary(item) for item in plex_releases
         ],
@@ -323,6 +328,7 @@ def _lidarr_release_group_detail_payload(mbid):
     )
     if not album:
         return None
+    availability = lidarr.album_availability(album)
     artist = album.get("artist") or {}
     plex_releases = _plex_release_group_inventory().get(mbid, [])
     owned_release_ids = {
@@ -362,6 +368,8 @@ def _lidarr_release_group_detail_payload(mbid):
         "coverArt": release_group_cover_art(mbid),
         "coverArtLarge": musicbrainz.cover_art_url(mbid, size=500),
         "availableInPlex": bool(plex_releases),
+        "availableInLidarr": True,
+        "fullyAvailableInLidarr": availability["fullyAvailable"],
         "plexReleases": [
             _plex_release_summary(item) for item in plex_releases
         ],

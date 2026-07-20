@@ -689,8 +689,16 @@
       }
       const requestButton = document.createElement("button");
       requestButton.className = "request-artist";
-      requestButton.textContent = "Request release group";
-      requestButton.addEventListener("click", () => requestReleaseGroup({ id: data.id, button: requestButton }));
+      if (data.fullyAvailableInLidarr) {
+        requestButton.textContent = "Available";
+        requestButton.disabled = true;
+        requestButton.title = "This release group is fully available in Lidarr";
+      } else {
+        requestButton.textContent = data.availableInLidarr
+          ? "Search missing"
+          : "Request release group";
+        requestButton.addEventListener("click", () => requestReleaseGroup({ id: data.id, button: requestButton }));
+      }
       results.append(requestButton);
       data.releases.forEach((release: JsonObject) => {
         const card = createCard(

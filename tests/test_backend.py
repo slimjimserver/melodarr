@@ -1599,11 +1599,12 @@ class MusicRoutesTests(DatabaseTestCase):
         self.assertTrue(group["availableInPlex"])
         self.assertEqual(group["plexReleases"][0]["releaseId"], "release-id")
 
+    @patch("backend.routes.music.lidarr.cached_library_availability")
     @patch("backend.routes.music.plex.cached_library_snapshot")
     @patch("backend.routes.music.get_service")
     @patch("backend.routes.music.musicbrainz.get")
     def test_release_group_marks_the_exact_plex_edition(
-        self, get, get_service, library_snapshot
+        self, get, get_service, library_snapshot, lidarr_availability
     ):
         get.side_effect = [
             {
@@ -1633,6 +1634,9 @@ class MusicRoutesTests(DatabaseTestCase):
                 "url": "https://app.plex.tv/album",
             }]
         }
+        lidarr_availability.return_value = {
+            "group-id": {"fullyAvailable": True}
+        }
 
         response = self.client.get(
             "/api/music/release-group/group-id",
@@ -1642,6 +1646,8 @@ class MusicRoutesTests(DatabaseTestCase):
         payload = response.get_json()
         self.assertTrue(payload["availableInPlex"])
         self.assertTrue(payload["releases"][0]["availableInPlex"])
+        self.assertTrue(payload["availableInLidarr"])
+        self.assertTrue(payload["fullyAvailableInLidarr"])
 
     @patch("backend.routes.music.musicbrainz.get")
     def test_refresh_artist_force_fetches_complete_discography(self, get):

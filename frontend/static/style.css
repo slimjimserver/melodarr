@@ -194,6 +194,8 @@ h1 em { font-style: normal; }
 
 #detail { max-width: 860px; }
 .detail-heading { display: grid; grid-template-columns: minmax(0, 1fr) 280px; align-items: start; gap: 40px; }
+.detail-heading > div:first-child { min-width: 0; }
+#detail-title { width: 100%; max-width: 100%; overflow-wrap: anywhere; padding: .04em .04em .1em 0; font-size: clamp(44px, 6vw, 68px); line-height: 1.02; }
 #detail .outline { margin-bottom: 30px; }
 .detail-cover { width: 280px; aspect-ratio: 1; border: 1px solid var(--border); border-radius: 16px; overflow: hidden; background: var(--background-elevated); box-shadow: 0 16px 40px rgba(0, 0, 0, .32); }
 .detail-cover img { display: block; width: 100%; height: 100%; object-fit: cover; }
@@ -233,7 +235,7 @@ h1 em { font-style: normal; }
 .plex-availability { display: inline-flex; align-items: center; width: fit-content; border: 1px solid rgba(229, 174, 61, .45); border-radius: 999px; background: rgba(229, 174, 61, .1); color: #f1c45f; padding: 4px 8px; font-size: 10px; font-weight: 750; letter-spacing: .02em; white-space: nowrap; }
 .artist-card > .plex-availability { margin-left: auto; }
 .release-group-request { min-width: 92px; margin-left: 8px; }
-.release-group-request:disabled { border-color: rgba(92, 190, 126, .3); background: rgba(92, 190, 126, .09); color: #8ed9a7; cursor: default; box-shadow: none; }
+.release-group-request:disabled, .request-artist:disabled { border-color: rgba(92, 190, 126, .3); background: rgba(92, 190, 126, .09); color: #8ed9a7; cursor: default; box-shadow: none; }
 .plex-availability-panel { display: flex; align-items: center; gap: 12px; border: 1px solid rgba(229, 174, 61, .25); border-radius: 11px; background: rgba(229, 174, 61, .055); color: var(--foreground-subtle); padding: 11px 13px; font-size: 12px; }
 .plex-availability-panel a { margin-left: auto; color: #f1c45f; font-weight: 700; text-decoration: none; }
 .plex-availability-panel a:hover { color: #ffe09a; }
@@ -348,6 +350,7 @@ details summary { margin-bottom: 17px; color: var(--accent-bright); cursor: poin
   .recommendation-card { flex-basis: 132px; } .recommendation-art { width: 132px; }
   .recommendations { width: 100%; margin-left: 0; transform: none; }
   .detail-cover { width: min(280px, 100%); } .service-intro { grid-template-columns: 42px minmax(0, 1fr); } .service-state { grid-column: 2; justify-self: start; }
+  #detail-title { font-size: clamp(40px, 13vw, 58px); }
   .discography-layout, .account-layout { grid-template-columns: 1fr; } .discography-nav { position: static; grid-template-columns: repeat(2, minmax(0, 1fr)); } .account-nav { grid-template-columns: repeat(2, minmax(0, 1fr)); } .account-nav p { grid-column: 1 / -1; } #back-to-top span { display: none; }
 }
 
