@@ -1429,6 +1429,32 @@ class MusicBrainzClientTests(unittest.TestCase):
 
 
 class MusicRoutesTests(DatabaseTestCase):
+    @patch("backend.routes.music.musicbrainz.get")
+    @patch("backend.routes.music.lidarr.cached_artist_availability")
+    def test_artist_detail_marks_artist_already_tracked_in_lidarr(
+        self, artist_availability, get
+    ):
+        artist_availability.return_value = {
+            "artist-id": {"id": 42, "name": "Tracked Artist"}
+        }
+        get.side_effect = [
+            {
+                "id": "artist-id",
+                "name": "Tracked Artist",
+                "relations": [],
+                "genres": [],
+            },
+            {"release-groups": [], "release-group-count": 0},
+        ]
+
+        response = self.client.get(
+            "/api/music/artist/artist-id",
+            headers={"X-CSRF-Token": self.register()},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["availableInLidarr"])
+
     @patch("backend.routes.music.plex.cached_library_snapshot")
     @patch("backend.routes.music.lidarr.albums_by_artist")
     @patch("backend.routes.music.lidarr.tracked_artist")

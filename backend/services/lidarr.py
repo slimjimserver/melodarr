@@ -136,13 +136,22 @@ def album_availability(album):
 
 
 def scan_library_availability(config=None):
-    """Refresh the cached release-group completion inventory from Lidarr."""
+    """Refresh cached artist tracking and release-group completion from Lidarr."""
+    artists = {}
+    for artist in library_artists(config):
+        artist_id = artist.get("foreignArtistId")
+        if artist_id:
+            artists[artist_id] = {
+                "id": artist.get("id"),
+                "name": artist.get("artistName") or artist.get("name") or "",
+                "monitored": bool(artist.get("monitored")),
+            }
     albums = {}
     for album in library_albums(config):
         release_group_id = album.get("foreignAlbumId")
         if release_group_id:
             albums[release_group_id] = album_availability(album)
-    payload = {"albums": albums}
+    payload = {"artists": artists, "albums": albums}
     set_cache_document("lidarr-library", "albums", payload, LIDARR_LIBRARY_CACHE_TTL)
     return payload
 
@@ -152,6 +161,13 @@ def cached_library_availability():
     return (get_cache_document(
         "lidarr-library", "albums", allow_expired=True
     ) or {}).get("albums", {})
+
+
+def cached_artist_availability():
+    """Read tracked Lidarr artists without making an HTTP request."""
+    return (get_cache_document(
+        "lidarr-library", "albums", allow_expired=True
+    ) or {}).get("artists", {})
 
 
 def tracked_artist(mbid, config=None):

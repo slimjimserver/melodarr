@@ -129,6 +129,7 @@ def _artist_detail_payload(
         if "spotify.com" in relation.get("url", {}).get("resource", "")
     ), "")
     plex_artist = _plex_artist(mbid)
+    lidarr_artist = lidarr.cached_artist_availability().get(mbid)
     return {
         "id": data["id"], "name": data.get("name"), "country": data.get("country", ""),
         "disambiguation": data.get("disambiguation", ""), "type": data.get("type", ""),
@@ -137,6 +138,7 @@ def _artist_detail_payload(
         "genres": [genre.get("name") for genre in data.get("genres", [])],
         "spotify": spotify, "coverArtLarge": artist_large_cover_art(data["id"]),
         "availableInPlex": bool(plex_artist),
+        "availableInLidarr": bool(lidarr_artist),
         "plexUrl": plex_artist.get("url", "") if plex_artist else "",
         "sections": sections, "total": len(groups), "nextOffset": None,
         "provisional": False, "metadataSource": "MusicBrainz",
@@ -197,6 +199,7 @@ def _lidarr_artist_detail_payload(mbid):
         "spotify": "",
         "coverArtLarge": artist_large_cover_art(mbid),
         "availableInPlex": bool(plex_artist),
+        "availableInLidarr": True,
         "plexUrl": plex_artist.get("url", "") if plex_artist else "",
         "sections": sections,
         "total": len(groups),

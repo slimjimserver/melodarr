@@ -65,6 +65,7 @@ def request_artist():
         added = lidarr.add_artist(artist)
         if added.status_code == 400 and "already" in added.text.lower():
             record_request(current_user()["id"], "artist", mbid, artist.get("artistName", "Artist"))
+            lidarr_library_worker.request_scan()
             return jsonify({"message": "This artist is already in Lidarr.", "alreadyExists": True})
         added.raise_for_status()
         created_artist = added.json()
@@ -75,6 +76,7 @@ def request_artist():
         })
         editor_update.raise_for_status()
         record_request(current_user()["id"], "artist", mbid, artist.get("artistName", "Artist"))
+        lidarr_library_worker.request_scan()
         return jsonify({"message": f"{artist.get('artistName', 'Artist')} was sent to Lidarr.", "artist": created_artist}), 201
     except (ValueError, TypeError):
         return api_error("Choose a root folder, quality profile, and metadata profile.")
