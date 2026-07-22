@@ -513,6 +513,32 @@ class DeploymentConfigTests(unittest.TestCase):
             discovery_typescript,
         )
 
+    def test_artist_detail_uses_the_lazy_discography_renderer(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(
+            os.path.join(project_root, "frontend", "src", "discovery.ts"),
+            encoding="utf-8",
+        ) as file:
+            discovery_typescript = file.read()
+
+        self.assertIn(
+            "results.append(renderDiscography(data));",
+            discovery_typescript,
+        )
+        self.assertEqual(
+            discovery_typescript.count('layout.className = "discography-layout"'),
+            1,
+        )
+        self.assertEqual(
+            discovery_typescript.count('filter.className = "discography-filter"'),
+            1,
+        )
+        self.assertIn('filterInput.addEventListener("input"', discovery_typescript)
+        self.assertIn(
+            "[group.date, ...(group.secondaryTypes || []), group.disambiguation]",
+            discovery_typescript,
+        )
+
     def test_account_menu_has_a_profile_link_fallback(self):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with open(

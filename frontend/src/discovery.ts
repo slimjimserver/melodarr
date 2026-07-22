@@ -608,7 +608,9 @@
   function createReleaseGroupCard(group: JsonObject) {
     const card = createCard(
       releaseGroupDisplayTitle(group),
-      [group.date, group.disambiguation].filter(Boolean).join(" · "),
+      [group.date, ...(group.secondaryTypes || []), group.disambiguation]
+        .filter(Boolean)
+        .join(" · "),
       () => showDetail("release-group", group.id),
       group.coverArt,
       "release-group",
@@ -648,11 +650,17 @@
     };
     const byPrimary = new Map<string, JsonObject[]>(primaryOrder.map((name) => [name, []]));
     const secondaryCounts = new Map<string, number>();
+    const searchText = new Map<JsonObject, string>();
+    let releaseQuery = "";
+    let wasSearching = false;
 
     (Object.values(data.sections || {}) as JsonObject[][]).forEach((groups) => {
       groups.forEach((group) => {
         const primary = primaryOrder.includes(group.type) ? group.type : "Other";
         byPrimary.get(primary)!.push(group);
+        searchText.set(group, normalizeSearch(
+          `${String(group.title || "")} ${String(group.romanizedTitle || "")} ${String(group.disambiguation || "")}`,
+        ));
         (group.secondaryTypes || []).forEach((secondary: string) => {
           secondaryCounts.set(secondary, (secondaryCounts.get(secondary) || 0) + 1);
         });
@@ -665,10 +673,31 @@
     ));
 
     const enabledSecondary = new Set<string>();
-    const isVisible = (group: JsonObject) => (group.secondaryTypes || [])
-      .every((secondary: string) => enabledSecondary.has(secondary));
+    const isVisible = (group: JsonObject) => (
+      (!releaseQuery || searchText.get(group)?.includes(releaseQuery))
+      && (Boolean(releaseQuery) || (group.secondaryTypes || [])
+        .every((secondary: string) => enabledSecondary.has(secondary)))
+    );
 
     const container = document.createDocumentFragment();
+    const filter = document.createElement("div");
+    filter.className = "discography-filter";
+    const filterLabel = document.createElement("label");
+    filterLabel.htmlFor = "discography-search";
+    filterLabel.textContent = "Search releases";
+    const filterInput = document.createElement("input");
+    filterInput.id = "discography-search";
+    filterInput.type = "search";
+    filterInput.placeholder = "Search this artist's releases…";
+    filterInput.autocomplete = "off";
+    const filterCount = document.createElement("span");
+    filterCount.setAttribute("aria-live", "polite");
+    filter.append(filterLabel, filterInput, filterCount);
+    const filterMessage = document.createElement("p");
+    filterMessage.className = "message";
+    filterMessage.setAttribute("aria-live", "polite");
+    container.append(filter, filterMessage);
+
     const layout = document.createElement("div");
     layout.className = "discography-layout";
     const index = document.createElement("nav");
@@ -678,14 +707,17 @@
     const sections: Array<{
       element: HTMLDetailsElement;
       summary: HTMLElement;
+      link: HTMLAnchorElement;
       groups: JsonObject[];
       rendered: boolean;
+      openBeforeSearch: boolean;
     }> = [];
 
     function renderSection(section: (typeof sections)[number]) {
       const visible = section.groups.filter(isVisible);
       section.summary.textContent = `${section.element.dataset.label} (${visible.length})`;
-      section.element.hidden = section.groups.length === 0;
+      section.element.hidden = visible.length === 0;
+      section.link.hidden = visible.length === 0;
       if (!section.element.open) {
         // Cards are built when a section is first opened. A large discography
         // would otherwise create hundreds of rows the reader never expands.
@@ -705,7 +737,17 @@
       section.dataset.label = primaryLabels[primary];
       section.open = primary !== "Other";
       const summary = document.createElement("summary");
-      const entry = { element: section, summary, groups, rendered: false };
+      const link = document.createElement("a");
+      link.href = `#${section.id}`;
+      link.textContent = primaryLabels[primary];
+      const entry = {
+        element: section,
+        summary,
+        link,
+        groups,
+        rendered: false,
+        openBeforeSearch: section.open,
+      };
       section.append(summary);
       section.addEventListener("toggle", () => {
         if (section.open && !entry.rendered) renderSection(entry);
@@ -714,9 +756,6 @@
       renderSection(entry);
       content.append(section);
 
-      const link = document.createElement("a");
-      link.href = `#${section.id}`;
-      link.textContent = primaryLabels[primary];
       link.addEventListener("click", (event) => {
         // Keep the discography navigation inside the current rendered view.
         // Native fragment navigation changes the URL and can cause the SPA
@@ -726,6 +765,41 @@
         section.scrollIntoView({ behavior: "smooth", block: "start" });
       });
       index.append(link);
+    });
+
+    function refreshSections() {
+      let visible = 0;
+      sections.forEach((section) => {
+        const matching = section.groups.filter(isVisible).length;
+        visible += matching;
+        if (releaseQuery && matching) section.element.open = true;
+        renderSection(section);
+      });
+      const total = [...byPrimary.values()].reduce((count, groups) => count + groups.length, 0);
+      filterCount.textContent = releaseQuery
+        ? `${visible} of ${total} releases`
+        : `${total} releases`;
+      filterMessage.textContent = releaseQuery && !visible
+        ? `No releases match “${filterInput.value.trim()}”.`
+        : "";
+    }
+
+    filterInput.addEventListener("input", () => {
+      const nextQuery = normalizeSearch(filterInput.value);
+      const isSearching = Boolean(nextQuery);
+      if (!wasSearching && isSearching) {
+        sections.forEach((section) => {
+          section.openBeforeSearch = section.element.open;
+        });
+      }
+      releaseQuery = nextQuery;
+      if (wasSearching && !isSearching) {
+        sections.forEach((section) => {
+          section.element.open = section.openBeforeSearch;
+        });
+      }
+      wasSearching = isSearching;
+      refreshSections();
     });
 
     if (secondaryCounts.size) {
@@ -751,7 +825,7 @@
             if (enabled) enabledSecondary.add(secondary);
             else enabledSecondary.delete(secondary);
             chip.setAttribute("aria-pressed", String(enabled));
-            sections.forEach(renderSection);
+            refreshSections();
           });
           filters.append(chip);
         });
@@ -760,6 +834,7 @@
 
     layout.append(index, content);
     container.append(layout);
+    refreshSections();
     return container;
   }
 
@@ -830,116 +905,7 @@
       actions.append(requestButton, refreshButton);
       results.append(actions);
 
-      const layout = document.createElement("div");
-      layout.className = "discography-layout";
-      const index = document.createElement("nav");
-      index.className = "discography-nav";
-      const content = document.createElement("div");
-      content.className = "discography-content";
-      const releaseCards: HTMLElement[] = [];
-      const discographySections: Array<{ section: HTMLElement; link: HTMLElement; cards: HTMLElement[] }> = [];
-
-      const filter = document.createElement("div");
-      filter.className = "discography-filter";
-      const filterLabel = document.createElement("label");
-      filterLabel.htmlFor = "discography-search";
-      filterLabel.textContent = "Search releases";
-      const filterInput = document.createElement("input");
-      filterInput.id = "discography-search";
-      filterInput.type = "search";
-      filterInput.placeholder = "Search this artist's releases…";
-      filterInput.autocomplete = "off";
-      const filterCount = document.createElement("span");
-      filterCount.setAttribute("aria-live", "polite");
-      filter.append(filterLabel, filterInput, filterCount);
-      const filterMessage = document.createElement("p");
-      filterMessage.className = "message";
-      filterMessage.setAttribute("aria-live", "polite");
-      results.append(filter, filterMessage);
-
-      (Object.entries(data.sections || {}) as Array<[string, JsonObject[]]>).forEach(([name, groups], position) => {
-        const section = document.createElement("details");
-        const sectionId = `release-type-${position}`;
-        section.id = sectionId;
-        section.className = "discography-section";
-        section.open = ["Album", "EP", "Single"].includes(name);
-        const summary = document.createElement("summary");
-        summary.textContent = `${name} (${groups.length})`;
-        section.append(summary);
-        const sectionCards: HTMLElement[] = [];
-        groups.forEach((group) => {
-          const card = createCard(
-            releaseGroupDisplayTitle(group),
-            [group.date, group.disambiguation].filter(Boolean).join(" · "),
-            () => showDetail("release-group", group.id),
-            group.coverArt,
-            "release-group",
-            group.id,
-          );
-          card.dataset.search = normalizeSearch(
-            `${String(group.title || "")} ${String(group.romanizedTitle || "")}`,
-          );
-          releaseCards.push(card);
-          sectionCards.push(card);
-          const groupRequest = document.createElement("button");
-          groupRequest.className = "request release-group-request";
-          groupRequest.type = "button";
-          if (group.fullyAvailableInLidarr) {
-            groupRequest.textContent = "Available";
-            groupRequest.disabled = true;
-            groupRequest.title = "This release group is fully available in Lidarr";
-          } else {
-            groupRequest.textContent = group.availableInLidarr ? "Search missing" : "Request";
-            groupRequest.addEventListener("click", (event) => {
-              event.stopPropagation();
-              requestReleaseGroup({ id: group.id, button: groupRequest });
-            });
-          }
-          card.append(groupRequest);
-          section.append(card);
-        });
-        content.append(section);
-
-        const link = document.createElement("a");
-        link.href = `#${sectionId}`;
-        link.textContent = name;
-        link.addEventListener("click", (event) => {
-          // Keep the discography navigation inside the current rendered view.
-          // Native fragment navigation changes the URL and can cause the SPA
-          // route handler to re-render before the section is expanded.
-          event.preventDefault();
-          section.open = true;
-          section.scrollIntoView({ behavior: "smooth", block: "start" });
-        });
-        index.append(link);
-        discographySections.push({ section, link, cards: sectionCards });
-      });
-      layout.append(index, content);
-      results.append(layout);
-
-      const filterReleases = () => {
-        const query = normalizeSearch(filterInput.value);
-        let visible = 0;
-        releaseCards.forEach((card) => {
-          const matches = !query || (card.dataset.search || "").includes(query);
-          card.hidden = !matches;
-          if (matches) visible += 1;
-        });
-        discographySections.forEach(({ section, link, cards }) => {
-          const hasMatch = !query || cards.some((card) => !card.hidden);
-          section.hidden = !hasMatch;
-          link.hidden = !hasMatch;
-          if (query && hasMatch) (section as HTMLDetailsElement).open = true;
-        });
-        filterCount.textContent = query
-          ? `${visible} of ${releaseCards.length} releases`
-          : `${releaseCards.length} releases`;
-        filterMessage.textContent = query && !visible
-          ? `No releases match “${filterInput.value.trim()}”.`
-          : "";
-      };
-      filterInput.addEventListener("input", filterReleases);
-      filterReleases();
+      results.append(renderDiscography(data));
       return;
     }
 
