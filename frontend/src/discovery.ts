@@ -217,6 +217,12 @@
     return romanizedName ? `${name} (${romanizedName})` : name;
   }
 
+  function releaseGroupDisplayTitle(group: JsonObject) {
+    const title = String(group.title || group.name || "Untitled release");
+    const romanizedTitle = String(group.romanizedTitle || "").trim();
+    return romanizedTitle ? `${title} (${romanizedTitle})` : title;
+  }
+
   function addPlexAvailability(element: HTMLElement, label = "Available in Plex") {
     const badge = document.createElement("span");
     badge.className = "plex-availability";
@@ -586,7 +592,7 @@
 
   function createReleaseGroupCard(group: JsonObject) {
     const card = createCard(
-      group.title,
+      releaseGroupDisplayTitle(group),
       [group.date, group.disambiguation].filter(Boolean).join(" · "),
       () => showDetail("release-group", group.id),
       group.coverArt,
@@ -848,14 +854,16 @@
         const sectionCards: HTMLElement[] = [];
         groups.forEach((group) => {
           const card = createCard(
-            group.title,
+            releaseGroupDisplayTitle(group),
             [group.date, group.disambiguation].filter(Boolean).join(" · "),
             () => showDetail("release-group", group.id),
             group.coverArt,
             "release-group",
             group.id,
           );
-          card.dataset.search = normalizeSearch(String(group.title || ""));
+          card.dataset.search = normalizeSearch(
+            `${String(group.title || "")} ${String(group.romanizedTitle || "")}`,
+          );
           releaseCards.push(card);
           sectionCards.push(card);
           const groupRequest = document.createElement("button");
@@ -922,7 +930,7 @@
 
     if (kind === "release-group") {
       $("#detail-eyebrow").textContent = "ALBUM RELEASES";
-      $("#detail-title").textContent = data.title;
+      $("#detail-title").textContent = releaseGroupDisplayTitle(data);
       const cover = $("#detail-cover");
       const coverImage = $("#detail-cover-image");
       cover.classList.remove("skeleton");
@@ -966,7 +974,7 @@
       results.append(requestButton);
       data.releases.forEach((release: JsonObject) => {
         const card = createCard(
-          release.title,
+          releaseGroupDisplayTitle(release),
           [release.date, release.country, release.format, release.trackCount ? `${release.trackCount} tracks` : "", release.status, release.disambiguation].filter(Boolean).join(" · "),
           () => showDetail("release", release.id),
         );
@@ -1027,7 +1035,7 @@
           || library.get(normalizedArtistName(result.romanizedName || ""));
         results.append(type === "artist"
           ? (plexArtist ? createPlexArtistCard(result, description, plexArtist) : createSearchArtistCard(result, description))
-          : createCard(result.name, description, () => showDetail("release-group", result.id)));
+          : createCard(releaseGroupDisplayTitle(result), description, () => showDetail("release-group", result.id)));
       });
     } catch (error) {
       if (requestVersion !== searchRequestVersion) return;

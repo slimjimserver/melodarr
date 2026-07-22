@@ -8,6 +8,7 @@ from threading import Lock, local
 from urllib.parse import quote
 
 import requests
+from pykakasi import kakasi
 
 
 logger = logging.getLogger(__name__)
@@ -47,6 +48,7 @@ _background_lock = Lock()
 _background_failure_streak = 0
 _background_resume_at = 0.0
 _session_state = local()
+_romanizer = kakasi()
 
 
 def _http_get(*args, **kwargs):
@@ -256,15 +258,11 @@ def _is_latin_name(value):
     )
 
 
-def romanized_artist_name(artist):
-    """Choose a distinct English or Latin-script name for an artist."""
-    canonical = str(artist.get("name") or "").strip()
-    if not canonical or _is_latin_name(canonical):
-        return ""
-
+def _latin_alias(entity, canonical):
+    """Choose the best English or Latin-script alias for an entity."""
     aliases = [
         alias
-        for alias in artist.get("aliases") or []
+        for alias in entity.get("aliases") or []
         if _is_latin_name(alias.get("name"))
         and str(alias.get("name") or "").strip().casefold() != canonical.casefold()
     ]
@@ -278,8 +276,38 @@ def romanized_artist_name(artist):
         alias = next((item for item in aliases if matches(item)), None)
         if alias:
             return str(alias["name"]).strip()
+    return ""
+
+
+def romanized_artist_name(artist):
+    """Choose a distinct English or Latin-script name for an artist."""
+    canonical = str(artist.get("name") or "").strip()
+    if not canonical or _is_latin_name(canonical):
+        return ""
+
+    alias = _latin_alias(artist, canonical)
+    if alias:
+        return alias
 
     sort_name = str(
         artist.get("sort-name") or artist.get("sortName") or ""
     ).strip()
     return sort_name if _is_latin_name(sort_name) else ""
+
+
+def romanized_release_group_title(group):
+    """Return an English alias or locally romanized Japanese release title."""
+    canonical = str(group.get("title") or "").strip()
+    if not canonical or _is_latin_name(canonical):
+        return ""
+
+    alias = _latin_alias(group, canonical)
+    if alias:
+        return alias
+
+    romanized = "".join(
+        item["hepburn"] for item in _romanizer.convert(canonical)
+    ).strip().translate(str.maketrans({"、": ",", "。": "."}))
+    if not _is_latin_name(romanized) or romanized.casefold() == canonical.casefold():
+        return ""
+    return romanized[:1].upper() + romanized[1:]

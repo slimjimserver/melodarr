@@ -211,6 +211,7 @@ def search():
             {
                 "id": album["id"],
                 "name": album.get("title", "Untitled release"),
+                "romanizedTitle": musicbrainz.romanized_release_group_title(album),
                 "artist": " · ".join(
                     credit.get("name", "") for credit in album.get("artist-credit", [])
                 ),

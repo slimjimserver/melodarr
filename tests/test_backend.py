@@ -1594,6 +1594,29 @@ class MusicBrainzClientTests(unittest.TestCase):
 
         self.assertEqual(musicbrainz.romanized_artist_name(artist), "")
 
+    def test_release_title_prefers_english_alias(self):
+        group = {
+            "title": "極彩",
+            "aliases": [{"name": "In Full Color", "locale": "en"}],
+        }
+
+        self.assertEqual(
+            musicbrainz.romanized_release_group_title(group), "In Full Color"
+        )
+
+    def test_release_title_romanizes_japanese_without_alias(self):
+        group = {"title": "雫", "aliases": []}
+
+        self.assertEqual(
+            musicbrainz.romanized_release_group_title(group), "Shizuku"
+        )
+
+    def test_release_title_omits_duplicate_for_latin_title(self):
+        self.assertEqual(
+            musicbrainz.romanized_release_group_title({"title": "BLACKBOX"}),
+            "",
+        )
+
 
 class DiscoveryRoutesTests(DatabaseTestCase):
     @patch("backend.routes.discovery.musicbrainz.search")
@@ -1617,6 +1640,24 @@ class DiscoveryRoutesTests(DatabaseTestCase):
         artist = response.get_json()["results"][0]
         self.assertEqual(artist["name"], "ポルカドットスティングレイ")
         self.assertEqual(artist["romanizedName"], "POLKADOT STINGRAY")
+
+    @patch("backend.routes.discovery.musicbrainz.search")
+    def test_album_search_returns_english_alias_with_canonical_title(self, search):
+        search.return_value = {"release-groups": [{
+            "id": "42ef0ba4-111c-4b2b-86f2-a5831d72244e",
+            "title": "極彩",
+            "aliases": [{"name": "In Full Color", "locale": "en"}],
+            "artist-credit": [],
+        }]}
+
+        response = self.client.get(
+            "/api/search?q=full%20color&type=album",
+            headers={"X-CSRF-Token": self.register()},
+        )
+
+        album = response.get_json()["results"][0]
+        self.assertEqual(album["name"], "極彩")
+        self.assertEqual(album["romanizedTitle"], "In Full Color")
 
 
 class MusicRoutesTests(DatabaseTestCase):
@@ -1644,6 +1685,59 @@ class MusicRoutesTests(DatabaseTestCase):
 
         self.assertEqual(response.get_json()["romanizedName"], "POLKADOT STINGRAY")
         self.assertEqual(get.call_args_list[0].args[1], "aliases+url-rels+genres")
+
+    @patch("backend.routes.music.musicbrainz.get")
+    def test_artist_discography_returns_romanized_release_titles(self, get):
+        get.side_effect = [
+            {
+                "id": "artist-id",
+                "name": "ポルカドットスティングレイ",
+                "relations": [],
+                "genres": [],
+            },
+            {
+                "release-groups": [{
+                    "id": "group-id",
+                    "title": "極彩",
+                    "aliases": [{"name": "In Full Color", "locale": "en"}],
+                    "primary-type": "Album",
+                }],
+                "release-group-count": 1,
+            },
+        ]
+
+        response = self.client.get(
+            "/api/music/artist/artist-id",
+            headers={"X-CSRF-Token": self.register()},
+        )
+
+        group = response.get_json()["sections"]["Album"][0]
+        self.assertEqual(group["title"], "極彩")
+        self.assertEqual(group["romanizedTitle"], "In Full Color")
+        self.assertEqual(get.call_args_list[1].args[1], "aliases")
+
+    @patch("backend.routes.music.musicbrainz.get")
+    def test_release_group_detail_returns_romanized_title(self, get):
+        get.side_effect = [
+            {
+                "id": "group-id",
+                "title": "極彩",
+                "aliases": [{"name": "In Full Color", "locale": "en"}],
+                "artist-credit": [],
+                "relations": [],
+            },
+            {"releases": [], "release-count": 0},
+        ]
+
+        response = self.client.get(
+            "/api/music/release-group/group-id",
+            headers={"X-CSRF-Token": self.register()},
+        )
+
+        self.assertEqual(response.get_json()["romanizedTitle"], "In Full Color")
+        self.assertEqual(
+            get.call_args_list[0].args[1], "aliases+artist-credits+url-rels"
+        )
 
     @patch("backend.routes.music.musicbrainz.get")
     @patch("backend.routes.music.lidarr.cached_artist_availability")
