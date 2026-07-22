@@ -1318,6 +1318,52 @@ class LidarrClientTests(unittest.TestCase):
             params={"artistId": 42},
         )
 
+    @patch("backend.services.lidarr._metadata_artist")
+    @patch("backend.services.lidarr.lookup_artist")
+    def test_artist_image_prefers_configured_lidarr(self, lookup, metadata_artist):
+        lookup.return_value = Response(payload=[{
+            "foreignArtistId": "artist-id",
+            "images": [
+                {"coverType": "Fanart", "remoteUrl": "https://images/fanart.jpg"},
+                {"coverType": "Poster", "remoteUrl": "https://images/poster.jpg"},
+            ],
+        }])
+
+        result = lidarr.artist_image_url("artist-id", {"url": "http://lidarr"})
+
+        self.assertEqual(result, "https://images/poster.jpg")
+        metadata_artist.assert_not_called()
+
+    @patch("backend.services.lidarr.cached_json_get")
+    @patch("backend.services.lidarr.lookup_artist", side_effect=ValueError)
+    def test_artist_image_uses_public_metadata_without_local_lidarr(
+        self, _lookup, cached_get
+    ):
+        cached_get.return_value = {
+            "images": [
+                {"CoverType": "Fanart", "remoteUrl": "https://images/fanart.jpg"},
+                {"CoverType": "Poster", "remoteUrl": "https://images/poster.jpg"},
+            ]
+        }
+
+        result = lidarr.artist_image_url("artist id")
+
+        self.assertEqual(result, "https://images/poster.jpg")
+        self.assertEqual(
+            cached_get.call_args.args[0],
+            "https://api.lidarr.audio/api/v0.4/artist/artist%20id",
+        )
+        self.assertEqual(
+            cached_get.call_args.kwargs["namespace"], "lidarr-artist-metadata"
+        )
+
+    @patch("backend.services.lidarr.cached_json_get")
+    @patch("backend.services.lidarr.lookup_artist", side_effect=ValueError)
+    def test_artist_image_handles_public_metadata_failure(self, _lookup, cached_get):
+        cached_get.side_effect = requests.ConnectionError("metadata unavailable")
+
+        self.assertIsNone(lidarr.artist_image_url("artist-id"))
+
 
 class MusicBrainzClientTests(unittest.TestCase):
     def setUp(self):
