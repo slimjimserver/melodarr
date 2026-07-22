@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Melodarr</title>
+  <desc id="desc">A sideways alto clef with curled lobes shaped like a lowercase M.</desc>
+  <defs>
+    <linearGradient id="background" x1="64" y1="48" x2="448" y2="464" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#171933"/>
+      <stop offset="0.56" stop-color="#090a12"/>
+      <stop offset="1" stop-color="#050506"/>
+    </linearGradient>
+    <linearGradient id="mark" x1="92" y1="158" x2="420" y2="398" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#EDEDF0"/>
+      <stop offset="0.48" stop-color="#B7BDF8"/>
+      <stop offset="1" stop-color="#7681E4"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0" cy="0" r="1" gradientTransform="translate(142 96) rotate(50) scale(340)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7681E4" stop-opacity="0.36"/>
+      <stop offset="1" stop-color="#5E6AD2" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="shadow" x="65" y="132" width="382" height="288" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="12" stdDeviation="10" flood-color="#020203" flood-opacity="0.72"/>
+    </filter>
+  </defs>
+
+  <rect width="512" height="512" rx="112" fill="url(#background)"/>
+  <rect width="512" height="512" rx="112" fill="url(#glow)"/>
+  <rect x="16" y="16" width="480" height="480" rx="98" fill="none" stroke="#FFFFFF" stroke-opacity="0.07" stroke-width="2"/>
+
+  <g fill="none" stroke="url(#mark)" stroke-linecap="round" stroke-linejoin="round" filter="url(#shadow)">
+    <path
+      d="M123 266
+         C99 250 99 217 116 195
+         C135 170 167 162 201 168
+         C235 174 250 197 244 223
+         C239 246 217 256 190 264
+         C220 269 244 285 256 305
+         C268 285 292 269 322 264
+         C295 256 273 246 268 223
+         C262 197 277 174 311 168
+         C345 162 377 170 396 195
+         C413 217 413 250 389 266"
+      stroke-width="38"
+    />
+    <path d="M104 341H408" stroke-width="14"/>
+    <path d="M104 382H408" stroke-width="30"/>
+  </g>
+
+  <circle cx="123" cy="266" r="22" fill="#EDEDF0"/>
+  <circle cx="389" cy="266" r="22" fill="#7C87E7"/>
+</svg>

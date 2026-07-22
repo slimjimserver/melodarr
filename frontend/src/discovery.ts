@@ -24,6 +24,12 @@
   const activeArtworkLoads = new Map<HTMLImageElement, ArtworkJob>();
   const maxArtworkRequests = 3;
 
+  const normalizeSearch = (value: string) => value
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLocaleLowerCase()
+    .trim();
+
   function discardDetachedArtwork() {
     for (let index = artworkQueue.length - 1; index >= 0; index -= 1) {
       if (!artworkQueue[index].image.isConnected) artworkQueue.splice(index, 1);
@@ -159,6 +165,7 @@
     document.querySelectorAll(".view, .nav-link").forEach((element) => element.classList.remove("active"));
     $(`#${id}`).classList.add("active");
     if (id === "discover") $("[data-view=discover]").classList.add("active");
+    resetPageScroll();
   }
 
   function createCard(title: string, description: string, onClick?: EventListener, coverArt = "", detailKind?: DetailKind, detailId = "") {
@@ -313,14 +320,16 @@
       });
   }
 
-  function createServiceIconLink(url: string, icon: string, label: string, className = "") {
+  function createServiceIconLink(url: string, icon: string, label: string, className = "", openInNewTab = true) {
     const link = document.createElement("a");
     link.className = className;
     link.href = url;
     link.title = label;
     link.setAttribute("aria-label", label);
-    link.target = "_blank";
-    link.rel = "noreferrer";
+    if (openInNewTab) {
+      link.target = "_blank";
+      link.rel = "noreferrer";
+    }
     link.addEventListener("click", (event) => event.stopPropagation());
     const image = document.createElement("img");
     image.src = icon;
@@ -329,18 +338,47 @@
     return link;
   }
 
-  function addExternalLinks(container: Element, kind: DetailKind, id: string, spotify?: string, plexUrl = "") {
+  function isMobileDevice() {
+    return /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
+      || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  }
+
+  function mobilePlexDestination(plexUrl: string, plexampUrl: string) {
+    return isMobileDevice() && plexampUrl
+      ? { url: plexampUrl, label: "Open in Plexamp", openInNewTab: false }
+      : { url: plexUrl, label: "Open in Plex", openInNewTab: true };
+  }
+
+  function addExternalLinks(container: Element, kind: DetailKind, id: string, spotify?: string, plexUrl = "", plexampUrl = "") {
     const links = document.createElement("div");
     links.className = "external-icons";
     const destinations = [
       ["/icons/musicbrainz.svg", `https://musicbrainz.org/${kind}/${id}`, "Open on MusicBrainz"],
-      ...(spotify ? [["/icons/spotify.svg", spotify, "Open on Spotify"]] : []),
-      ...(plexUrl ? [["/icons/plex.svg", plexUrl, "Open in Plex"]] : []),
     ];
 
     destinations.forEach(([icon, url, label]) => links.append(
       createServiceIconLink(url, icon, label),
     ));
+    if (spotify) {
+      const mobile = isMobileDevice();
+      links.append(createServiceIconLink(
+        spotify,
+        "/icons/spotify.svg",
+        mobile ? "Open in Spotify" : "Open on Spotify",
+        "",
+        !mobile,
+      ));
+    }
+    if (plexUrl) {
+      const destination = mobilePlexDestination(plexUrl, plexampUrl);
+      links.append(createServiceIconLink(
+        destination.url,
+        "/icons/plex.svg",
+        destination.label,
+        "",
+        destination.openInNewTab,
+      ));
+    }
     container.append(links);
     getLidarrExternalUrl().then((externalUrl) => {
       if (!externalUrl) return;
@@ -365,7 +403,10 @@
     const plexUrl = data.availableInPlex
       ? (kind === "artist" ? data.plexUrl : plexRelease?.url || "")
       : "";
-    addExternalLinks(meta, kind, data.id, data.spotify, plexUrl);
+    const plexampUrl = data.availableInPlex
+      ? (kind === "artist" ? data.plexampUrl : plexRelease?.plexampUrl || "")
+      : "";
+    addExternalLinks(meta, kind, data.id, data.spotify, plexUrl, plexampUrl);
     return meta;
   }
 
@@ -424,11 +465,13 @@
     const card = createCard(artist.name, description, () => showDetail("artist", artist.id), artist.coverArt, "artist", artist.id);
     const services = document.createElement("div");
     services.className = "card-service-icons";
+    const destination = mobilePlexDestination(plexArtist.url, plexArtist.plexampUrl);
     services.append(createServiceIconLink(
-      plexArtist.url,
+      destination.url,
       "/icons/plex.svg",
-      "Open in Plex",
+      destination.label,
       "service-icon-link",
+      destination.openInNewTab,
     ));
     card.append(services);
     getLidarrExternalUrl().then((externalUrl) => {
@@ -588,6 +631,26 @@
       index.className = "discography-nav";
       const content = document.createElement("div");
       content.className = "discography-content";
+      const releaseCards: HTMLElement[] = [];
+      const discographySections: Array<{ section: HTMLElement; link: HTMLElement; cards: HTMLElement[] }> = [];
+
+      const filter = document.createElement("div");
+      filter.className = "discography-filter";
+      const filterLabel = document.createElement("label");
+      filterLabel.htmlFor = "discography-search";
+      filterLabel.textContent = "Search releases";
+      const filterInput = document.createElement("input");
+      filterInput.id = "discography-search";
+      filterInput.type = "search";
+      filterInput.placeholder = "Search this artist's releases…";
+      filterInput.autocomplete = "off";
+      const filterCount = document.createElement("span");
+      filterCount.setAttribute("aria-live", "polite");
+      filter.append(filterLabel, filterInput, filterCount);
+      const filterMessage = document.createElement("p");
+      filterMessage.className = "message";
+      filterMessage.setAttribute("aria-live", "polite");
+      results.append(filter, filterMessage);
 
       (Object.entries(data.sections || {}) as Array<[string, JsonObject[]]>).forEach(([name, groups], position) => {
         const section = document.createElement("details");
@@ -598,6 +661,7 @@
         const summary = document.createElement("summary");
         summary.textContent = `${name} (${groups.length})`;
         section.append(summary);
+        const sectionCards: HTMLElement[] = [];
         groups.forEach((group) => {
           const card = createCard(
             group.title,
@@ -607,6 +671,9 @@
             "release-group",
             group.id,
           );
+          card.dataset.search = normalizeSearch(String(group.title || ""));
+          releaseCards.push(card);
+          sectionCards.push(card);
           const groupRequest = document.createElement("button");
           groupRequest.className = "request release-group-request";
           groupRequest.type = "button";
@@ -638,9 +705,34 @@
           section.scrollIntoView({ behavior: "smooth", block: "start" });
         });
         index.append(link);
+        discographySections.push({ section, link, cards: sectionCards });
       });
       layout.append(index, content);
       results.append(layout);
+
+      const filterReleases = () => {
+        const query = normalizeSearch(filterInput.value);
+        let visible = 0;
+        releaseCards.forEach((card) => {
+          const matches = !query || (card.dataset.search || "").includes(query);
+          card.hidden = !matches;
+          if (matches) visible += 1;
+        });
+        discographySections.forEach(({ section, link, cards }) => {
+          const hasMatch = !query || cards.some((card) => !card.hidden);
+          section.hidden = !hasMatch;
+          link.hidden = !hasMatch;
+          if (query && hasMatch) (section as HTMLDetailsElement).open = true;
+        });
+        filterCount.textContent = query
+          ? `${visible} of ${releaseCards.length} releases`
+          : `${releaseCards.length} releases`;
+        filterMessage.textContent = query && !visible
+          ? `No releases match “${filterInput.value.trim()}”.`
+          : "";
+      };
+      filterInput.addEventListener("input", filterReleases);
+      filterReleases();
       return;
     }
 

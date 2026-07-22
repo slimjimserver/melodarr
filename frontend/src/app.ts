@@ -72,6 +72,14 @@ let showAccountPage: ((page?: AccountPage, updateHistory?: boolean) => void) | u
 let invitationToken = "";
 let maintenanceRefreshTimer: number | undefined;
 
+if ("scrollRestoration" in window.history) {
+  window.history.scrollRestoration = "manual";
+}
+
+function resetPageScroll() {
+  window.scrollTo({ top: 0, left: 0, behavior: "auto" });
+}
+
 function setMessage(element: Element, message: string, isError = false) {
   element.textContent = message;
   element.className = `message${isError ? " error" : ""}`;
@@ -294,7 +302,10 @@ function showSettingsPage(page: SettingsPage, updateHistory = true) {
     refreshMaintenance();
     maintenanceRefreshTimer = window.setInterval(refreshMaintenance, 10_000);
   }
-  if (updateHistory) window.history.pushState({ view: "settings", settings: page }, "", page === "jobs" ? "/settings/jobs" : "/settings");
+  if (updateHistory) {
+    window.history.pushState({ view: "settings", settings: page }, "", page === "jobs" ? "/settings/jobs" : "/settings");
+    resetPageScroll();
+  }
 }
 
 function setupNavigation() {
@@ -315,6 +326,7 @@ function setupNavigation() {
       const path = view === "discover" ? "/" : `/${view}`;
       window.history.pushState({ view }, "", path);
     }
+    resetPageScroll();
   }
 
   function accountPath(page: AccountPage) {
@@ -425,7 +437,6 @@ function setupNavigation() {
     event.preventDefault();
     showView("discover");
     window.dispatchEvent(new Event("melodarr-home"));
-    window.scrollTo({ top: 0, behavior: "auto" });
   });
 
   window.addEventListener("popstate", () => {

@@ -3,7 +3,7 @@
 import time
 import xml.etree.ElementTree as ET
 from threading import RLock
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 from uuid import UUID
 
 import requests
@@ -92,12 +92,37 @@ def _plex_url(config, key):
     return config["url"]
 
 
+def _plexamp_url(config, key, plex_guid):
+    """Build a mobile universal link for a Plex music-library item."""
+    key = str(key or "")
+    if key.endswith("/children"):
+        key = key[:-len("/children")]
+    scheme, separator, value = str(plex_guid or "").partition("://")
+    media_type, path_separator, item_id = value.partition("/")
+    source = str(config.get("machineIdentifier", ""))
+    if (
+        not separator
+        or scheme.casefold() != "plex"
+        or not path_separator
+        or media_type not in {"artist", "album"}
+        or not item_id
+        or not source
+        or not key
+    ):
+        return ""
+    query = urlencode({"source": source, "key": key})
+    return f"https://listen.plex.tv/{media_type}/{quote(item_id, safe='')}?{query}"
+
+
 def _normalize_snapshot_urls(config, payload):
     """Repair navigational URLs in both new and previously cached snapshots."""
     for collection_name in ("artists", "releaseGroups"):
         for item in payload.get(collection_name, []):
             if item.get("key"):
                 item["url"] = _plex_url(config, item["key"])
+                item["plexampUrl"] = _plexamp_url(
+                    config, item["key"], item.get("plexGuid")
+                )
             if collection_name == "artists" and item.get("ratingKey") and item.get("thumb"):
                 item["artwork"] = f"/api/artwork/plex-artist/{item['ratingKey']}"
     return payload
@@ -141,6 +166,7 @@ def _normalize_artist(config, section, item):
         "guids": guids,
         "musicbrainzId": _musicbrainz_id(guids),
         "url": _plex_url(config, item.get("key", "")),
+        "plexampUrl": _plexamp_url(config, item.get("key", ""), item.get("guid", "")),
     }
 
 
@@ -161,6 +187,7 @@ def _normalize_release_group(config, section, item):
         # album entities use release-group IDs. Keep the entity type explicit.
         "musicbrainzReleaseId": _musicbrainz_id(guids),
         "url": _plex_url(config, item.get("key", "")),
+        "plexampUrl": _plexamp_url(config, item.get("key", ""), item.get("guid", "")),
     }
 
 

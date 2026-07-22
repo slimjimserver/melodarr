@@ -1,4 +1,4 @@
-"""Durable refresh-then-search processing for newly added Lidarr albums."""
+"""Durable metadata-refresh-then-search processing for Lidarr albums."""
 
 import logging
 import time
@@ -54,22 +54,22 @@ def _defer_jobs(jobs, error, *, reset_refresh=False):
         defer_lidarr_search(job["id"], error, reset_refresh=reset_refresh)
 
 
-def _start_artist_refresh(jobs):
-    """Start one refresh shared by jobs that were already queued for an artist."""
+def _start_album_refresh(job):
+    """Refresh one release group's metadata before searching it."""
     try:
         response = lidarr.start_command({
-            "name": "RefreshArtist",
-            "artistId": jobs[0]["artist_id"],
+            "name": "RefreshAlbum",
+            "albumId": job["album_id"],
         })
         response.raise_for_status()
         command_id = response.json()["id"]
-        set_lidarr_refresh_command([job["id"] for job in jobs], command_id)
+        set_lidarr_refresh_command([job["id"]], command_id)
         logger.info(
-            "Started one Lidarr artist refresh for %d queued release group(s)",
-            len(jobs),
+            "Started Lidarr album refresh for %s",
+            job["name"],
         )
     except (KeyError, ValueError, requests.RequestException) as exc:
-        _defer_jobs(jobs, exc)
+        _defer_jobs([job], exc)
 
 
 def _start_album_search(job):
@@ -81,15 +81,15 @@ def _start_album_search(job):
         search.raise_for_status()
         set_lidarr_search_command(job["id"], search.json()["id"])
         logger.info(
-            "Queued Lidarr album search for %s after artist refresh completed",
+            "Queued Lidarr album search for %s after metadata refresh completed",
             job["name"],
         )
     except (KeyError, ValueError, requests.RequestException) as exc:
         _defer_jobs([job], exc)
 
 
-def _poll_artist_refresh(jobs):
-    """Poll a shared refresh once, then advance every dependent album job."""
+def _poll_album_refresh(jobs):
+    """Poll one album refresh, then advance every dependent album search."""
     command_id = jobs[0]["refresh_command_id"]
     try:
         response = lidarr.command(command_id)
@@ -109,7 +109,7 @@ def _poll_artist_refresh(jobs):
     elif status in {"failed", "aborted", "cancelled"}:
         _defer_jobs(
             jobs,
-            f"RefreshArtist command {status}",
+            f"RefreshAlbum command {status}",
             reset_refresh=True,
         )
     else:
@@ -118,8 +118,8 @@ def _poll_artist_refresh(jobs):
 
 
 def process_jobs(jobs):
-    """Advance due jobs in batches, sharing work for the same artist."""
-    new_by_artist = defaultdict(list)
+    """Advance every release-group job through RefreshAlbum then AlbumSearch."""
+    new_jobs = []
     active_by_command = defaultdict(list)
 
     for job in jobs:
@@ -128,12 +128,12 @@ def process_jobs(jobs):
         elif job["refresh_command_id"]:
             active_by_command[job["refresh_command_id"]].append(job)
         else:
-            new_by_artist[job["artist_id"]].append(job)
+            new_jobs.append(job)
 
-    for artist_jobs in new_by_artist.values():
-        _start_artist_refresh(artist_jobs)
+    for job in new_jobs:
+        _start_album_refresh(job)
     for refresh_jobs in active_by_command.values():
-        _poll_artist_refresh(refresh_jobs)
+        _poll_album_refresh(refresh_jobs)
 
 
 def process_job(job):

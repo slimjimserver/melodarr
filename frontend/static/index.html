@@ -3,12 +3,19 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#050506">
   <title>Melodarr — Music requests</title>
+  <link rel="icon" href="/icons/melodarr.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/icons/melodarr-180.png">
+  <link rel="manifest" href="/static/site.webmanifest">
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
   <header>
-    <a class="brand" href="/">melodarr<span>.</span></a>
+    <a class="brand" href="/" aria-label="Melodarr home">
+      <img src="/icons/melodarr.svg" alt="">
+      <span>melodarr</span>
+    </a>
     <nav>
       <button class="nav-link active" data-view="discover">Discover</button>
       <button class="nav-link admin-only" data-view="library">Your library</button>

@@ -102,11 +102,11 @@ def enqueue_lidarr_search(user_id, mbid, album_id, artist_id, name):
     with db() as connection:
         cursor = connection.execute(
             "INSERT OR IGNORE INTO pending_lidarr_searches "
-            "(user_id, mbid, album_id, artist_id, name, next_attempt_at, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            # Briefly hold new jobs so near-simultaneous requests for the same
-            # artist can share one RefreshArtist command.
-            (user_id, mbid, album_id, artist_id, name, now + 1, now),
+            "(user_id, mbid, album_id, artist_id, name, refresh_type, "
+            "next_attempt_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            # Briefly hold new jobs so the request transaction is committed
+            # before the background worker begins processing them.
+            (user_id, mbid, album_id, artist_id, name, "album", now + 1, now),
         )
         if cursor.rowcount:
             connection.execute(
@@ -134,7 +134,7 @@ def due_lidarr_searches(limit=20):
 
 
 def set_lidarr_refresh_command(job_ids, command_id):
-    """Attach one shared artist-refresh command to an exact batch of jobs."""
+    """Attach one metadata-refresh command to an exact batch of jobs."""
     job_ids = list(job_ids)
     if not job_ids:
         return
@@ -315,6 +315,8 @@ def init_db():
                 album_id INTEGER NOT NULL,
                 artist_id INTEGER NOT NULL,
                 name TEXT NOT NULL,
+                refresh_type TEXT NOT NULL DEFAULT 'album'
+                    CHECK(refresh_type IN ('artist', 'album')),
                 refresh_command_id INTEGER,
                 search_command_id INTEGER,
                 attempts INTEGER NOT NULL DEFAULT 0,
@@ -323,6 +325,23 @@ def init_db():
                 created_at REAL NOT NULL
             )
         """)
+        search_columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(pending_lidarr_searches)"
+            )
+        }
+        if "refresh_type" not in search_columns:
+            connection.execute(
+                "ALTER TABLE pending_lidarr_searches ADD COLUMN "
+                "refresh_type TEXT NOT NULL DEFAULT 'album'"
+            )
+        # Release-group requests always use RefreshAlbum. Convert work queued
+        # by versions that conditionally selected RefreshArtist as well.
+        connection.execute(
+            "UPDATE pending_lidarr_searches SET refresh_type = 'album' "
+            "WHERE refresh_type != 'album'"
+        )
         has_legacy_settings = connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'settings'"
         ).fetchone()

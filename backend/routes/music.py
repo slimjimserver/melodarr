@@ -64,6 +64,7 @@ def _plex_release_summary(item):
         "releaseType": item.get("releaseType"),
         "releaseId": item.get("musicbrainzReleaseId"),
         "url": item.get("url"),
+        "plexampUrl": item.get("plexampUrl"),
     }
 
 
@@ -140,6 +141,7 @@ def _artist_detail_payload(
         "availableInPlex": bool(plex_artist),
         "availableInLidarr": bool(lidarr_artist),
         "plexUrl": plex_artist.get("url", "") if plex_artist else "",
+        "plexampUrl": plex_artist.get("plexampUrl", "") if plex_artist else "",
         "sections": sections, "total": len(groups), "nextOffset": None,
         "provisional": False, "metadataSource": "MusicBrainz",
     }
@@ -201,6 +203,7 @@ def _lidarr_artist_detail_payload(mbid):
         "availableInPlex": bool(plex_artist),
         "availableInLidarr": True,
         "plexUrl": plex_artist.get("url", "") if plex_artist else "",
+        "plexampUrl": plex_artist.get("plexampUrl", "") if plex_artist else "",
         "sections": sections,
         "total": len(groups),
         "nextOffset": None,

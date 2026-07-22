@@ -99,7 +99,7 @@ def request_release_group():
         return jsonify({
             "message": (
                 f"{pending['name']} is already queued. Its album search will start "
-                "automatically after Lidarr finishes refreshing the artist."
+                "automatically after Lidarr finishes refreshing its metadata."
             ),
             "pending": True,
         }), 202
@@ -128,12 +128,11 @@ def request_release_group():
         album["monitored"] = True
         album["addOptions"] = {
             "addType": "automatic",
-            # Melodarr explicitly queues the search after RefreshArtist. Letting
-            # Lidarr auto-search here can race metadata creation for new artists.
+            # Melodarr explicitly queues the search after its required metadata
+            # refresh. Letting Lidarr auto-search here can race metadata creation.
             "searchForNewAlbum": False,
         }
         added = lidarr.add_album(album)
-        is_new_album = added.status_code != 400
         if added.status_code == 400 and "already" in added.text.lower():
             existing_response = lidarr.albums_by_release_group(mbid)
             existing_response.raise_for_status()
@@ -158,34 +157,34 @@ def request_release_group():
             added.raise_for_status()
             created_album = added.json()
 
-        if is_new_album:
-            artist_id = created_album.get("artistId") or (created_album.get("artist") or {}).get("id")
-            if not artist_id:
-                return api_error("Lidarr added the release group but did not return an artist ID for metadata refresh.", 502)
-
-            title = created_album.get("title", album.get("title", "Release group"))
-            enqueue_lidarr_search(
-                current_user()["id"], mbid, created_album["id"], artist_id, title
+        artist_id = (
+            created_album.get("artistId")
+            or (created_album.get("artist") or {}).get("id")
+        )
+        if not artist_id:
+            return api_error(
+                "Lidarr did not return an artist ID for the metadata refresh.", 502
             )
-            lidarr_search_worker.request_work()
-            lidarr_library_worker.request_scan()
-            return jsonify({
-                "message": (
-                    f"{title} was added to Lidarr. Its album search is queued and will "
-                    "start automatically after the artist refresh completes."
-                ),
-                "album": created_album,
-                "pending": True,
-            }), 202
 
-        search = lidarr.start_command({
-            "name": "AlbumSearch",
-            "albumIds": [created_album["id"]],
-        })
-        search.raise_for_status()
-        record_request(current_user()["id"], "release-group", mbid, created_album.get("title", album.get("title", "Release group")))
+        title = created_album.get("title", album.get("title", "Release group"))
+        enqueue_lidarr_search(
+            current_user()["id"],
+            mbid,
+            created_album["id"],
+            artist_id,
+            title,
+        )
+        lidarr_search_worker.request_work()
         lidarr_library_worker.request_scan()
-        return jsonify({"message": f"{created_album.get('title', album.get('title', 'Release group'))} was sent to Lidarr and queued for search.", "album": created_album}), 201
+        return jsonify({
+            "message": (
+                f"{title} was sent to Lidarr. Its album search is queued and will "
+                "start automatically after the release group refresh completes."
+            ),
+            "album": created_album,
+            "pending": True,
+            "refreshType": "album",
+        }), 202
     except requests.HTTPError as exc:
         detail = exc.response.text[:300] if exc.response is not None else ""
         return api_error(f"Lidarr rejected the release group. {detail}", 502)

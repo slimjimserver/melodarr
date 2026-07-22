@@ -232,7 +232,7 @@ class PlexMetadataWorkerTests(unittest.TestCase):
 class LidarrSearchWorkerTests(unittest.TestCase):
     @patch("backend.workers.lidarr_searches.set_lidarr_refresh_command")
     @patch("backend.workers.lidarr_searches.lidarr.start_command")
-    def test_job_starts_and_persists_artist_refresh(self, start_command, set_refresh):
+    def test_job_starts_and_persists_album_refresh(self, start_command, set_refresh):
         start_command.return_value = Response(201, {"id": 55})
         job = {
             "id": 1,
@@ -246,15 +246,18 @@ class LidarrSearchWorkerTests(unittest.TestCase):
         lidarr_search_worker.process_job(job)
 
         start_command.assert_called_once_with({
-            "name": "RefreshArtist",
-            "artistId": 44,
+            "name": "RefreshAlbum",
+            "albumId": 33,
         })
         set_refresh.assert_called_once_with([1], 55)
 
     @patch("backend.workers.lidarr_searches.set_lidarr_refresh_command")
     @patch("backend.workers.lidarr_searches.lidarr.start_command")
-    def test_same_artist_jobs_share_one_refresh(self, start_command, set_refresh):
-        start_command.return_value = Response(201, {"id": 55})
+    def test_same_artist_jobs_refresh_each_album(self, start_command, set_refresh):
+        start_command.side_effect = [
+            Response(201, {"id": 55}),
+            Response(201, {"id": 56}),
+        ]
         jobs = [
             {
                 "id": job_id,
@@ -269,11 +272,35 @@ class LidarrSearchWorkerTests(unittest.TestCase):
 
         lidarr_search_worker.process_jobs(jobs)
 
+        self.assertEqual(start_command.call_count, 2)
+        start_command.assert_any_call({"name": "RefreshAlbum", "albumId": 33})
+        start_command.assert_any_call({"name": "RefreshAlbum", "albumId": 34})
+        self.assertEqual(set_refresh.call_args_list[0].args, ([1], 55))
+        self.assertEqual(set_refresh.call_args_list[1].args, ([2], 56))
+
+    @patch("backend.workers.lidarr_searches.set_lidarr_refresh_command")
+    @patch("backend.workers.lidarr_searches.lidarr.start_command")
+    def test_legacy_artist_refresh_job_is_forced_to_album(
+        self, start_command, set_refresh
+    ):
+        start_command.return_value = Response(201, {"id": 56})
+        job = {
+            "id": 1,
+            "name": "Existing Artist Album",
+            "album_id": 33,
+            "artist_id": 44,
+            "refresh_type": "artist",
+            "refresh_command_id": None,
+            "search_command_id": None,
+        }
+
+        lidarr_search_worker.process_job(job)
+
         start_command.assert_called_once_with({
-            "name": "RefreshArtist",
-            "artistId": 44,
+            "name": "RefreshAlbum",
+            "albumId": 33,
         })
-        set_refresh.assert_called_once_with([1, 2], 55)
+        set_refresh.assert_called_once_with([1], 56)
 
     @patch("backend.workers.lidarr_searches.set_lidarr_search_command")
     @patch("backend.workers.lidarr_searches.lidarr.start_command")
@@ -382,6 +409,7 @@ class LidarrSearchQueueTests(DatabaseTestCase):
                 ("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",),
             ).fetchone()
         self.assertEqual(job["artist_id"], 44)
+        self.assertEqual(job["refresh_type"], "album")
         self.assertEqual(history["name"], "Queued Album")
 
     def test_one_refresh_command_is_persisted_for_an_exact_job_batch(self):
@@ -440,6 +468,11 @@ class DeploymentConfigTests(unittest.TestCase):
     def test_brand_navigation_stays_inside_the_loaded_application(self):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with open(
+            os.path.join(project_root, "frontend", "static", "index.html"),
+            encoding="utf-8",
+        ) as file:
+            frontend = file.read()
+        with open(
             os.path.join(project_root, "frontend", "src", "app.ts"),
             encoding="utf-8",
         ) as file:
@@ -450,6 +483,11 @@ class DeploymentConfigTests(unittest.TestCase):
         ) as file:
             discovery_typescript = file.read()
 
+        self.assertIn('<link rel="icon" href="/icons/melodarr.svg"', frontend)
+        self.assertIn('<link rel="apple-touch-icon" href="/icons/melodarr-180.png">', frontend)
+        self.assertIn('<link rel="manifest" href="/static/site.webmanifest">', frontend)
+        self.assertIn('<a class="brand" href="/" aria-label="Melodarr home">', frontend)
+        self.assertIn('<img src="/icons/melodarr.svg" alt="">', frontend)
         self.assertIn('$(".brand").addEventListener("click"', app_typescript)
         self.assertIn('showView("discover")', app_typescript)
         self.assertIn('new Event("melodarr-home")', app_typescript)
@@ -1127,16 +1165,19 @@ class LidarrRequestTests(DatabaseTestCase):
         self.assertEqual((mbid, album_id, artist_id, title), (
             self.album_mbid, 33, 44, "Test Album",
         ))
+        self.assertEqual(response.get_json()["refreshType"], "album")
         request_work.assert_called_once_with()
         start_command.assert_not_called()
 
-    @patch("backend.routes.requests.lidarr.start_command")
+    @patch("backend.routes.requests.lidarr_search_worker.request_work")
+    @patch("backend.routes.requests.enqueue_lidarr_search")
     @patch("backend.routes.requests.lidarr.albums_by_release_group")
     @patch("backend.routes.requests.lidarr.add_album")
     @patch("backend.routes.requests.lidarr.lookup_album")
     @patch("backend.routes.requests.get_service")
-    def test_existing_incomplete_album_is_searched_again(
-        self, get_service, lookup_album, add_album, albums_by_release_group, start_command
+    def test_existing_incomplete_album_refreshes_before_search(
+        self, get_service, lookup_album, add_album, albums_by_release_group,
+        enqueue_search, request_work
     ):
         get_service.return_value = self.lidarr_config()
         lookup_album.return_value = Response(payload=[{
@@ -1147,11 +1188,12 @@ class LidarrRequestTests(DatabaseTestCase):
         add_album.return_value = Response(400, text="Album already exists")
         albums_by_release_group.return_value = Response(payload=[{
             "id": 77,
+            "artistId": 44,
             "foreignAlbumId": self.album_mbid,
             "title": "Existing Album",
             "statistics": {"totalTrackCount": 10, "trackFileCount": 2},
         }])
-        start_command.return_value = Response(201, {"id": 88})
+        enqueue_search.return_value = True
 
         response = self.client.post(
             "/api/request/release-group",
@@ -1159,11 +1201,59 @@ class LidarrRequestTests(DatabaseTestCase):
             headers={"X-CSRF-Token": self.register()},
         )
 
-        self.assertEqual(response.status_code, 201)
-        start_command.assert_called_once_with({
-            "name": "AlbumSearch",
-            "albumIds": [77],
+        self.assertEqual(response.status_code, 202)
+        self.assertTrue(response.get_json()["pending"])
+        enqueue_search.assert_called_once()
+        self.assertEqual(
+            enqueue_search.call_args.args[1:],
+            (self.album_mbid, 77, 44, "Existing Album"),
+        )
+        request_work.assert_called_once_with()
+
+    @patch("backend.routes.requests.lidarr_search_worker.request_work")
+    @patch("backend.routes.requests.enqueue_lidarr_search")
+    @patch("backend.routes.requests.lidarr.add_album")
+    @patch("backend.routes.requests.lidarr.lookup_album")
+    @patch("backend.routes.requests.get_service")
+    def test_new_album_uses_album_refresh_regardless_of_artist_state(
+        self, get_service, lookup_album, add_album, enqueue_search, request_work
+    ):
+        get_service.return_value = self.lidarr_config()
+        lookup_album.return_value = Response(payload=[{
+            "title": "New Album",
+            "foreignAlbumId": self.album_mbid,
+            "artist": {
+                "id": 44,
+                "artistName": "Existing Artist",
+            },
+        }])
+        add_album.return_value = Response(201, {
+            "id": 33,
+            "artistId": 44,
+            "title": "New Album",
         })
+        enqueue_search.return_value = True
+
+        response = self.client.post(
+            "/api/request/release-group",
+            json={
+                "mbid": self.album_mbid,
+                "artistMbid": self.artist_mbid,
+                "artistInLidarr": False,
+            },
+            headers={
+                "X-CSRF-Token": self.register(),
+                "Referer": f"http://melodarr.test/artists/{self.artist_mbid}",
+            },
+        )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.get_json()["refreshType"], "album")
+        self.assertEqual(
+            enqueue_search.call_args.args[1:],
+            (self.album_mbid, 33, 44, "New Album"),
+        )
+        request_work.assert_called_once_with()
 
 
 class LidarrClientTests(unittest.TestCase):
@@ -2259,7 +2349,12 @@ class PlexClientTests(unittest.TestCase):
                 "MediaContainer": {
                     "Metadata": [
                         {"title": "Zulu", "key": "/library/metadata/2", "thumb": "/z"},
-                        {"title": "alpha", "key": "/library/metadata/1/children", "thumb": "/a"},
+                        {
+                            "title": "alpha",
+                            "key": "/library/metadata/1/children",
+                            "thumb": "/a",
+                            "guid": "plex://artist/artist-1",
+                        },
                     ]
                 }
             }),
@@ -2288,8 +2383,18 @@ class PlexClientTests(unittest.TestCase):
         self.assertEqual([artist["name"] for artist in artists], ["alpha", "Zulu"])
         self.assertIn("key=%2Flibrary%2Fmetadata%2F1", artists[0]["url"])
         self.assertNotIn("%2Fchildren", artists[0]["url"])
+        self.assertEqual(
+            artists[0]["plexampUrl"],
+            "https://listen.plex.tv/artist/artist-1?"
+            "source=server-1&key=%2Flibrary%2Fmetadata%2F1",
+        )
         self.assertEqual([release["name"] for release in releases], ["An EP"])
         self.assertEqual(releases[0]["releaseType"], "ep")
+        self.assertEqual(
+            releases[0]["plexampUrl"],
+            "https://listen.plex.tv/album/album-3?"
+            "source=server-1&key=%2Flibrary%2Fmetadata%2F3",
+        )
         self.assertEqual(
             releases[0]["musicbrainzReleaseId"],
             "11111111-1111-1111-1111-111111111111",
@@ -2314,7 +2419,7 @@ class PlexClientTests(unittest.TestCase):
                 "SELECT COUNT(*) AS count FROM api_cache "
                 "WHERE cache_key LIKE 'plex-guid:%'"
             ).fetchone()["count"]
-        self.assertEqual(guid_rows, 1)
+        self.assertEqual(guid_rows, 2)
 
     def test_cached_plex_urls_are_repaired_without_rescanning(self):
         payload = plex._normalize_snapshot_urls(
