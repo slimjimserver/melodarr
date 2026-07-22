@@ -17,12 +17,17 @@
   let plexArtists: Map<string, JsonObject> | undefined;
   let recommendationPoll: ReturnType<typeof setTimeout> | undefined;
   let searchRequestVersion = 0;
+  let searchDebounce: ReturnType<typeof setTimeout>;
+  let searchAbort: AbortController | undefined;
   const detailRequests = new Map<string, DetailRequest>();
   const detailUpgrades = new Map<string, Promise<JsonObject>>();
   const artworkQueue: ArtworkItem[] = [];
   const deferredArtwork = new WeakMap<Element, Omit<ArtworkItem, "image">>();
   const activeArtworkLoads = new Map<HTMLImageElement, ArtworkJob>();
-  const maxArtworkRequests = 3;
+  // Melodarr now serves downscaled variants rather than the provider's
+  // full-size originals, so more covers can be in flight without a single view
+  // occupying every web-request thread.
+  const maxArtworkRequests = 6;
 
   const normalizeSearch = (value: string) => value
     .normalize("NFKD")
@@ -112,13 +117,20 @@
     pumpArtworkQueue();
   }).observe(document.body, { childList: true, subtree: true });
 
-  async function getJson(url: string, timeoutMilliseconds = 30_000): Promise<JsonObject> {
+  async function getJson(
+    url: string,
+    timeoutMilliseconds = 30_000,
+    signal?: AbortSignal,
+  ): Promise<JsonObject> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMilliseconds);
+    // A superseded typeahead query aborts through the caller's signal, while
+    // the timeout above still bounds every request.
+    signal?.addEventListener("abort", () => controller.abort(), { once: true });
 
     try {
       const response = await fetch(url, { signal: controller.signal });
-    const body = await response.json() as JsonObject;
+      const body = await response.json() as JsonObject;
       if (!response.ok) throw new Error(body.error || "MusicBrainz request failed.");
       return body;
     } finally {
@@ -181,6 +193,8 @@
       image.loading = "lazy";
       image.decoding = "async";
       image.fetchPriority = "low";
+      image.width = 44;
+      image.height = 44;
       loadArtworkWhenNear(image, coverArt, fallbackAvatar);
       artwork = image;
     }
@@ -195,6 +209,18 @@
     if (onClick) card.addEventListener("click", onClick);
     if (detailKind && detailId) addDetailPrefetch(card, detailKind, detailId);
     return card;
+  }
+
+  function artistDisplayName(artist: JsonObject) {
+    const name = String(artist.name || "Unknown artist");
+    const romanizedName = String(artist.romanizedName || "").trim();
+    return romanizedName ? `${name} (${romanizedName})` : name;
+  }
+
+  function releaseGroupDisplayTitle(group: JsonObject) {
+    const title = String(group.title || group.name || "Untitled release");
+    const romanizedTitle = String(group.romanizedTitle || "").trim();
+    return romanizedTitle ? `${title} (${romanizedTitle})` : title;
   }
 
   function addPlexAvailability(element: HTMLElement, label = "Available in Plex") {
@@ -285,11 +311,12 @@
       ? `← Back to ${previous.kind === "artist" ? "artist" : previous.kind === "release-group" ? "album" : "release"}`
       : "← Back to search";
     showView("detail");
-    $("#detail-results").replaceChildren();
+    $("#detail-results").replaceChildren(skeletonBlock("skeleton-card", kind === "release" ? 6 : 4));
     $("#detail-title").textContent = "";
     $("#detail-eyebrow").textContent = "";
     $("#detail-subtitle").textContent = "";
-    $("#detail-cover").hidden = true;
+    $("#detail-cover").hidden = kind === "release";
+    $("#detail-cover").classList.toggle("skeleton", kind !== "release");
     $("#detail-cover-image").removeAttribute("src");
     $("#detail-message").textContent = kind === "artist"
       ? "Loading artist and discography…"
@@ -436,19 +463,19 @@
     button.textContent = "Sending to Lidarr…";
     try {
       const result = await postJson("/api/request/release-group", { mbid: releaseGroup.id });
-      $("#detail-message").textContent = result.message;
+      showToast(result.message);
       button.textContent = result.alreadyExists
         ? "Available"
         : (result.pending ? "Queued" : "Requested");
     } catch (error) {
-      $("#detail-message").textContent = error.message;
+      showToast(error.message, true);
       button.textContent = "Request release group";
       button.disabled = false;
     }
   }
 
   function createSearchArtistCard(artist: JsonObject, description: string) {
-    const card = createCard(artist.name, description, () => showDetail("artist", artist.id), artist.coverArt, "artist", artist.id);
+    const card = createCard(artistDisplayName(artist), description, () => showDetail("artist", artist.id), artist.coverArt, "artist", artist.id);
     const requestButton = document.createElement("button");
     requestButton.className = "request";
     requestButton.type = "button";
@@ -462,7 +489,7 @@
   }
 
   function createPlexArtistCard(artist: JsonObject, description: string, plexArtist: JsonObject) {
-    const card = createCard(artist.name, description, () => showDetail("artist", artist.id), artist.coverArt, "artist", artist.id);
+    const card = createCard(artistDisplayName(artist), description, () => showDetail("artist", artist.id), artist.coverArt, "artist", artist.id);
     const services = document.createElement("div");
     services.className = "card-service-icons";
     const destination = mobilePlexDestination(plexArtist.url, plexArtist.plexampUrl);
@@ -499,7 +526,10 @@
       image.className = "recommendation-art";
       image.alt = "";
       image.loading = "lazy";
+      image.decoding = "async";
       image.fetchPriority = "low";
+      image.width = 154;
+      image.height = 154;
       loadArtworkWhenNear(image, item.coverArt, fallback);
       artwork = image;
     }
@@ -560,6 +590,164 @@
     return group;
   }
 
+  function createReleaseGroupCard(group: JsonObject) {
+    const card = createCard(
+      releaseGroupDisplayTitle(group),
+      [group.date, group.disambiguation].filter(Boolean).join(" · "),
+      () => showDetail("release-group", group.id),
+      group.coverArt,
+      "release-group",
+      group.id,
+    );
+    const groupRequest = document.createElement("button");
+    groupRequest.className = "request release-group-request";
+    groupRequest.type = "button";
+    if (group.fullyAvailableInLidarr) {
+      groupRequest.textContent = "Available";
+      groupRequest.disabled = true;
+      groupRequest.title = "This release group is fully available in Lidarr";
+    } else {
+      groupRequest.textContent = group.availableInLidarr ? "Search missing" : "Request";
+      groupRequest.addEventListener("click", (event) => {
+        event.stopPropagation();
+        requestReleaseGroup({ id: group.id, button: groupRequest });
+      });
+    }
+    card.append(groupRequest);
+    return card;
+  }
+
+  /**
+   * Group a discography by primary release type, with secondary types opt-in.
+   *
+   * MusicBrainz reports a separate section per combination of primary and
+   * secondary types, which for a well-documented artist means dozens of
+   * headings — 28 for Radiohead, where 308 live recordings bury 10 albums.
+   * Melodarr instead keeps four primary sections and exposes the secondary
+   * types as filters that start switched off.
+   */
+  function renderDiscography(data: JsonObject) {
+    const primaryOrder = ["Album", "EP", "Single", "Other"];
+    const primaryLabels: Record<string, string> = {
+      Album: "Albums", EP: "EPs", Single: "Singles", Other: "Other releases",
+    };
+    const byPrimary = new Map<string, JsonObject[]>(primaryOrder.map((name) => [name, []]));
+    const secondaryCounts = new Map<string, number>();
+
+    (Object.values(data.sections || {}) as JsonObject[][]).forEach((groups) => {
+      groups.forEach((group) => {
+        const primary = primaryOrder.includes(group.type) ? group.type : "Other";
+        byPrimary.get(primary)!.push(group);
+        (group.secondaryTypes || []).forEach((secondary: string) => {
+          secondaryCounts.set(secondary, (secondaryCounts.get(secondary) || 0) + 1);
+        });
+      });
+    });
+    // Newest first: an artist's recent work is what a requester looks for, and
+    // undated entries stay at the end rather than leading the list.
+    byPrimary.forEach((groups) => groups.sort(
+      (first, second) => (second.date || "").localeCompare(first.date || ""),
+    ));
+
+    const enabledSecondary = new Set<string>();
+    const isVisible = (group: JsonObject) => (group.secondaryTypes || [])
+      .every((secondary: string) => enabledSecondary.has(secondary));
+
+    const container = document.createDocumentFragment();
+    const layout = document.createElement("div");
+    layout.className = "discography-layout";
+    const index = document.createElement("nav");
+    index.className = "discography-nav";
+    const content = document.createElement("div");
+    content.className = "discography-content";
+    const sections: Array<{
+      element: HTMLDetailsElement;
+      summary: HTMLElement;
+      groups: JsonObject[];
+      rendered: boolean;
+    }> = [];
+
+    function renderSection(section: (typeof sections)[number]) {
+      const visible = section.groups.filter(isVisible);
+      section.summary.textContent = `${section.element.dataset.label} (${visible.length})`;
+      section.element.hidden = section.groups.length === 0;
+      if (!section.element.open) {
+        // Cards are built when a section is first opened. A large discography
+        // would otherwise create hundreds of rows the reader never expands.
+        section.rendered = false;
+        section.element.replaceChildren(section.summary);
+        return;
+      }
+      section.element.replaceChildren(section.summary, ...visible.map(createReleaseGroupCard));
+      section.rendered = true;
+    }
+
+    primaryOrder.forEach((primary, position) => {
+      const groups = byPrimary.get(primary)!;
+      const section = document.createElement("details");
+      section.id = `release-type-${position}`;
+      section.className = "discography-section";
+      section.dataset.label = primaryLabels[primary];
+      section.open = primary !== "Other";
+      const summary = document.createElement("summary");
+      const entry = { element: section, summary, groups, rendered: false };
+      section.append(summary);
+      section.addEventListener("toggle", () => {
+        if (section.open && !entry.rendered) renderSection(entry);
+      });
+      sections.push(entry);
+      renderSection(entry);
+      content.append(section);
+
+      const link = document.createElement("a");
+      link.href = `#${section.id}`;
+      link.textContent = primaryLabels[primary];
+      link.addEventListener("click", (event) => {
+        // Keep the discography navigation inside the current rendered view.
+        // Native fragment navigation changes the URL and can cause the SPA
+        // route handler to re-render before the section is expanded.
+        event.preventDefault();
+        section.open = true;
+        section.scrollIntoView({ behavior: "smooth", block: "start" });
+      });
+      index.append(link);
+    });
+
+    if (secondaryCounts.size) {
+      const filters = document.createElement("div");
+      filters.className = "type-filters";
+      const label = document.createElement("p");
+      label.className = "type-filters-label";
+      label.textContent = "Also show";
+      filters.append(label);
+      [...secondaryCounts.entries()]
+        .sort((first, second) => second[1] - first[1])
+        .forEach(([secondary, count]) => {
+          const chip = document.createElement("button");
+          chip.className = "type-filter";
+          chip.type = "button";
+          chip.setAttribute("aria-pressed", "false");
+          chip.textContent = secondary;
+          const total = document.createElement("span");
+          total.textContent = String(count);
+          chip.append(total);
+          chip.addEventListener("click", () => {
+            const enabled = !enabledSecondary.has(secondary);
+            if (enabled) enabledSecondary.add(secondary);
+            else enabledSecondary.delete(secondary);
+            chip.setAttribute("aria-pressed", String(enabled));
+            sections.forEach(renderSection);
+          });
+          filters.append(chip);
+        });
+      container.append(filters);
+    }
+
+    layout.append(index, content);
+    container.append(layout);
+    return container;
+  }
+
   function renderDetail(kind: DetailKind, data: JsonObject) {
     const results = $("#detail-results");
     results.replaceChildren();
@@ -567,9 +755,11 @@
 
     if (kind === "artist") {
       $("#detail-eyebrow").textContent = "ARTIST DISCOGRAPHY";
-      $("#detail-title").textContent = data.name;
+      $("#detail-title").textContent = artistDisplayName(data);
       const cover = $("#detail-cover");
       const coverImage = $("#detail-cover-image");
+      cover.classList.remove("skeleton");
+      cover.hidden = true;
       if (data.coverArtLarge) {
         cover.hidden = false;
         coverImage.fetchPriority = "high";
@@ -664,14 +854,16 @@
         const sectionCards: HTMLElement[] = [];
         groups.forEach((group) => {
           const card = createCard(
-            group.title,
+            releaseGroupDisplayTitle(group),
             [group.date, group.disambiguation].filter(Boolean).join(" · "),
             () => showDetail("release-group", group.id),
             group.coverArt,
             "release-group",
             group.id,
           );
-          card.dataset.search = normalizeSearch(String(group.title || ""));
+          card.dataset.search = normalizeSearch(
+            `${String(group.title || "")} ${String(group.romanizedTitle || "")}`,
+          );
           releaseCards.push(card);
           sectionCards.push(card);
           const groupRequest = document.createElement("button");
@@ -738,9 +930,11 @@
 
     if (kind === "release-group") {
       $("#detail-eyebrow").textContent = "ALBUM RELEASES";
-      $("#detail-title").textContent = data.title;
+      $("#detail-title").textContent = releaseGroupDisplayTitle(data);
       const cover = $("#detail-cover");
       const coverImage = $("#detail-cover-image");
+      cover.classList.remove("skeleton");
+      cover.hidden = true;
       if (data.coverArtLarge) {
         cover.hidden = false;
         coverImage.fetchPriority = "high";
@@ -780,7 +974,7 @@
       results.append(requestButton);
       data.releases.forEach((release: JsonObject) => {
         const card = createCard(
-          release.title,
+          releaseGroupDisplayTitle(release),
           [release.date, release.country, release.format, release.trackCount ? `${release.trackCount} tracks` : "", release.status, release.disambiguation].filter(Boolean).join(" · "),
           () => showDetail("release", release.id),
         );
@@ -798,25 +992,38 @@
 
   $("#search-type").addEventListener("change", (event) => {
     $("#search-input").placeholder = (event.target as HTMLSelectElement).value === "artist" ? "Search artists…" : "Search albums…";
+    if ($("#search-input").value.trim().length >= 2) runSearch();
   });
 
-  $("#search-form").addEventListener("submit", async (event) => {
-    event.preventDefault();
+  async function runSearch() {
     const requestVersion = ++searchRequestVersion;
+    searchAbort?.abort();
     const query = $("#search-input").value.trim();
     const type = $("#search-type").value;
     const results = $("#results");
-    results.replaceChildren();
 
     if (query.length < 2) {
-      $("#search-message").textContent = "Enter at least two characters.";
+      results.replaceChildren();
+      $("#search-message").textContent = query ? "Enter at least two characters." : "";
       return;
     }
 
+    const controller = new AbortController();
+    searchAbort = controller;
     $("#search-message").textContent = "Searching MusicBrainz…";
+    $("#search-form").classList.add("searching");
+    results.replaceChildren(skeletonBlock("skeleton-card", 5));
     try {
-      const [data, library] = await Promise.all([getJson(`/api/search?q=${encodeURIComponent(query)}&type=${type}`), getPlexArtists()]);
+      const [data, library] = await Promise.all([
+        getJson(
+          `/api/search?q=${encodeURIComponent(query)}&type=${type}`,
+          30_000,
+          controller.signal,
+        ),
+        getPlexArtists(),
+      ]);
       if (requestVersion !== searchRequestVersion) return;
+      results.replaceChildren();
       $("#search-message").textContent = data.results.length
         ? `${data.results.length} ${type === "artist" ? "artists" : "albums"} found`
         : "No results found.";
@@ -824,15 +1031,37 @@
         const description = type === "artist"
           ? [result.type, result.country, result.disambiguation].filter(Boolean).join(" · ")
           : [result.artist, result.type, result.date, result.disambiguation].filter(Boolean).join(" · ");
-        const plexArtist = library.get(normalizedArtistName(result.name));
+        const plexArtist = library.get(normalizedArtistName(result.name))
+          || library.get(normalizedArtistName(result.romanizedName || ""));
         results.append(type === "artist"
           ? (plexArtist ? createPlexArtistCard(result, description, plexArtist) : createSearchArtistCard(result, description))
-          : createCard(result.name, description, () => showDetail("release-group", result.id)));
+          : createCard(releaseGroupDisplayTitle(result), description, () => showDetail("release-group", result.id)));
       });
     } catch (error) {
       if (requestVersion !== searchRequestVersion) return;
-      $("#search-message").textContent = error.message;
+      results.replaceChildren();
+      $("#search-message").textContent = error.name === "AbortError"
+        ? "MusicBrainz took too long to respond."
+        : error.message;
+    } finally {
+      if (requestVersion === searchRequestVersion) {
+        $("#search-form").classList.remove("searching");
+      }
     }
+  }
+
+  // MusicBrainz requests are serialized at roughly one per second upstream, so
+  // this waits for a genuine pause in typing rather than firing per keystroke.
+  const searchDebounceMilliseconds = 450;
+  $("#search-input").addEventListener("input", () => {
+    clearTimeout(searchDebounce);
+    searchDebounce = setTimeout(runSearch, searchDebounceMilliseconds);
+  });
+
+  $("#search-form").addEventListener("submit", (event) => {
+    event.preventDefault();
+    clearTimeout(searchDebounce);
+    runSearch();
   });
 
   function combineRecommendations(results: Array<{ source: string; data: JsonObject }>, key: string) {
@@ -853,10 +1082,14 @@
     const message = $("#recommendations-message");
     const results = $("#recommendation-results");
     button.disabled = true;
-    results.replaceChildren();
+    const placeholder = document.createElement("div");
+    placeholder.className = "recommendation-carousel";
+    placeholder.append(skeletonBlock("skeleton-art", 8));
+    results.replaceChildren(placeholder);
     message.textContent = "Loading cached recommendations…";
     try {
       const data = await getJson("/api/discover");
+      results.replaceChildren();
       if (data.pending) {
         message.textContent = "Your recommendation cache is being prepared. This page will populate automatically after the background scan finishes.";
         recommendationPoll = setTimeout(() => loadRecommendations(button), 15_000);
@@ -881,6 +1114,7 @@
       (data.tagRows || []).forEach((row: JsonObject) => results.append(recommendationRow(`More for your ${row.tag} taste`, row.albums, "release-group")));
       if (!artists.length && !albums.length && !data.chartArtists?.length && !(data.tagRows || []).length && !unavailableProviders.length) message.textContent = "No MusicBrainz-linked recommendations were found in the latest scan.";
     } catch (error) {
+      results.replaceChildren();
       message.textContent = error.message;
     } finally {
       button.disabled = false;
@@ -912,7 +1146,10 @@
     currentDetail = null;
     detailHistory.length = 0;
     searchRequestVersion += 1;
+    clearTimeout(searchDebounce);
+    searchAbort?.abort();
     requestedArtist = undefined;
+    $("#search-form").classList.remove("searching");
     $("#search-form").reset();
     $("#search-input").placeholder = "Search artists…";
     $("#search-message").textContent = "";
@@ -961,7 +1198,7 @@
     try {
       const result = await postJson("/api/request", body);
       $("#request-dialog").close();
-      $("#detail-message").textContent = result.message;
+      showToast(result.message);
     } catch (error) {
       $("#request-message").textContent = error.message;
     }

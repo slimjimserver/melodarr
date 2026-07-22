@@ -197,6 +197,7 @@ def search():
             {
                 "id": artist["id"],
                 "name": artist.get("name", "Unknown artist"),
+                "romanizedName": musicbrainz.romanized_artist_name(artist),
                 "disambiguation": artist.get("disambiguation", ""),
                 "country": artist.get("country", ""),
                 "type": artist.get("type", ""),
@@ -210,6 +211,7 @@ def search():
             {
                 "id": album["id"],
                 "name": album.get("title", "Untitled release"),
+                "romanizedTitle": musicbrainz.romanized_release_group_title(album),
                 "artist": " · ".join(
                     credit.get("name", "") for credit in album.get("artist-credit", [])
                 ),

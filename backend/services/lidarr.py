@@ -1,15 +1,34 @@
 """Lidarr configuration and HTTP client operations."""
 
+from urllib.parse import quote
+
 import requests
 
 if __package__ == "backend.services":
     from ..api_cache import cached_json_get, get_cache_document, set_cache_document
-    from ..config import LIDARR_LIBRARY_CACHE_TTL, LIDARR_OPTIONS_CACHE_TTL
+    from ..cache_memo import invalidate_document, memoized_document
+    from ..config import (
+        LIDARR_LIBRARY_CACHE_TTL,
+        LIDARR_METADATA_CACHE_TTL,
+        LIDARR_METADATA_URL,
+        LIDARR_OPTIONS_CACHE_TTL,
+        USER_AGENT,
+    )
     from ..storage import get_service
 else:  # Support the existing `python backend/app.py` entry point.
     from api_cache import cached_json_get, get_cache_document, set_cache_document
-    from config import LIDARR_LIBRARY_CACHE_TTL, LIDARR_OPTIONS_CACHE_TTL
+    from cache_memo import invalidate_document, memoized_document
+    from config import (
+        LIDARR_LIBRARY_CACHE_TTL,
+        LIDARR_METADATA_CACHE_TTL,
+        LIDARR_METADATA_URL,
+        LIDARR_OPTIONS_CACHE_TTL,
+        USER_AGENT,
+    )
     from storage import get_service
+
+
+LIBRARY_INDEX_KEY = "lidarr-library-index"
 
 
 def connection(values, old=None):
@@ -153,21 +172,26 @@ def scan_library_availability(config=None):
             albums[release_group_id] = album_availability(album)
     payload = {"artists": artists, "albums": albums}
     set_cache_document("lidarr-library", "albums", payload, LIDARR_LIBRARY_CACHE_TTL)
+    invalidate_document(LIBRARY_INDEX_KEY)
     return payload
+
+
+def cached_library_index():
+    """Return the cached Lidarr library document, parsed at most once."""
+    return memoized_document(
+        LIBRARY_INDEX_KEY,
+        lambda: get_cache_document("lidarr-library", "albums", allow_expired=True) or {},
+    )
 
 
 def cached_library_availability():
     """Read Lidarr status without making an HTTP request on an artist page."""
-    return (get_cache_document(
-        "lidarr-library", "albums", allow_expired=True
-    ) or {}).get("albums", {})
+    return cached_library_index().get("albums", {})
 
 
 def cached_artist_availability():
     """Read tracked Lidarr artists without making an HTTP request."""
-    return (get_cache_document(
-        "lidarr-library", "albums", allow_expired=True
-    ) or {}).get("artists", {})
+    return cached_library_index().get("artists", {})
 
 
 def tracked_artist(mbid, config=None):
@@ -203,23 +227,51 @@ def command(command_id, config=None):
     return _request("GET", f"/command/{command_id}", config=config, timeout=12)
 
 
+def _artist_image(images):
+    """Select the best portrait-like image across Lidarr response formats."""
+    for cover_type in ("poster", "headshot", "fanart"):
+        image = next((
+            item
+            for item in images or []
+            if str(item.get("coverType") or item.get("CoverType") or "").lower()
+            == cover_type
+        ), None)
+        if image:
+            return (
+                image.get("remoteUrl")
+                or image.get("RemoteUrl")
+                or image.get("url")
+                or image.get("Url")
+            )
+    return None
+
+
+def _metadata_artist(mbid):
+    """Load public Lidarr metadata without requiring a user's Lidarr server."""
+    return cached_json_get(
+        f"{LIDARR_METADATA_URL.rstrip('/')}/artist/{quote(mbid)}",
+        headers={"User-Agent": USER_AGENT},
+        namespace="lidarr-artist-metadata",
+        ttl=LIDARR_METADATA_CACHE_TTL,
+        request_timeout=15,
+    )
+
+
 def artist_image_url(mbid, config=None):
-    """Ask Lidarr's metadata lookup for the best available artist image."""
+    """Return artist art even when a local Lidarr server is not configured."""
     try:
         response = lookup_artist(mbid, config)
         response.raise_for_status()
         artists = response.json()
         artist = next((item for item in artists if item.get("foreignArtistId") == mbid), None)
-        if not artist:
-            return None
-        images = artist.get("images") or []
-        for cover_type in ("poster", "headshot", "fanart"):
-            image = next(
-                (item for item in images if item.get("coverType", "").lower() == cover_type),
-                None,
-            )
-            if image:
-                return image.get("remoteUrl") or image.get("url")
+        image_url = _artist_image((artist or {}).get("images"))
+        if image_url:
+            return image_url
     except (ValueError, requests.RequestException):
+        pass
+
+    try:
+        metadata = _metadata_artist(mbid)
+        return _artist_image((metadata or {}).get("images"))
+    except requests.RequestException:
         return None
-    return None

@@ -9,6 +9,7 @@ FRONTEND_ROOT = os.path.join(PROJECT_ROOT, "frontend")
 
 MUSICBRAINZ_URL = "https://musicbrainz.org/ws/2"
 COVER_ART_ARCHIVE_URL = "https://coverartarchive.org"
+LIDARR_METADATA_URL = "https://api.lidarr.audio/api/v0.4"
 LISTENBRAINZ_URL = "https://api.listenbrainz.org/1"
 LASTFM_URL = "https://ws.audioscrobbler.com/2.0/"
 USER_AGENT = "Melodarr/0.1 (https://github.com/slimjimserver/melodarr)"
@@ -16,6 +17,7 @@ USER_AGENT = "Melodarr/0.1 (https://github.com/slimjimserver/melodarr)"
 MUSICBRAINZ_SEARCH_CACHE_TTL = 10 * 60
 MUSICBRAINZ_METADATA_CACHE_TTL = 90 * 24 * 60 * 60
 LIDARR_OPTIONS_CACHE_TTL = 5 * 60
+LIDARR_METADATA_CACHE_TTL = 30 * 24 * 60 * 60
 LIDARR_LIBRARY_SCAN_INTERVAL = 5 * 60
 LIDARR_LIBRARY_CACHE_TTL = 30 * 24 * 60 * 60
 LISTENBRAINZ_METADATA_CACHE_TTL = 6 * 60 * 60
@@ -34,6 +36,11 @@ ARTWORK_CACHE_LIMIT_BYTES = 500 * 1024 * 1024
 ARTWORK_MISS_TTL = 24 * 60 * 60
 ARTWORK_BROWSER_CACHE_TTL = 7 * 24 * 60 * 60
 ARTWORK_MAX_DOWNLOAD_BYTES = 5 * 1024 * 1024
+# Longest-edge pixel budgets for the resized variants Melodarr serves. Providers
+# return images far larger than any Melodarr layout: artist art arrives at
+# 1000x1000 (~690 KB) for cards that render it at 44 CSS pixels.
+ARTWORK_SIZES = {"thumb": 128, "card": 384, "large": 640}
+ARTWORK_WEBP_QUALITY = 80
 
 DATABASE = os.getenv("MELODARR_DATABASE", os.path.join(PROJECT_ROOT, "melodarr.db"))
 CACHE_DATABASE = os.getenv(

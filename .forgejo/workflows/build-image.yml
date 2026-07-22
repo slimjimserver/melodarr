@@ -1,0 +1,25 @@
+name: Build and publish image
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  image:
+    runs-on: docker
+    steps:
+      - name: Checkout
+        run: |
+          git -c http.extraHeader="Authorization: token ${FORGEJO_TOKEN}" clone "https://forgejo.ram-home.org/${GITHUB_REPOSITORY}.git" .
+          git checkout "${GITHUB_SHA}"
+
+      - name: Build and push
+        run: |
+          IMAGE="forgejo.ram-home.org/${GITHUB_REPOSITORY}"
+          SHORT_SHA="$(printf '%s' "${GITHUB_SHA}" | cut -c1-12)"
+          echo "${{ secrets.REGISTRY_TOKEN }}" | docker login forgejo.ram-home.org -u "${GITHUB_ACTOR}" --password-stdin
+          docker build -t "${IMAGE}:latest" -t "${IMAGE}:${SHORT_SHA}" .
+          docker push "${IMAGE}:latest"
+          docker push "${IMAGE}:${SHORT_SHA}"

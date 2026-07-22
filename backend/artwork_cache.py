@@ -1,12 +1,14 @@
-"""Disk-backed artwork caching and eviction."""
+"""Disk-backed artwork caching, resizing, and eviction."""
 
 import os
 import time
 from hashlib import sha256
+from io import BytesIO
 from tempfile import NamedTemporaryFile
 
 import requests
 from flask import current_app, redirect, send_file
+from PIL import Image, UnidentifiedImageError
 
 if __package__:
     from .config import (
@@ -15,6 +17,8 @@ if __package__:
         ARTWORK_CACHE_LIMIT_BYTES,
         ARTWORK_MAX_DOWNLOAD_BYTES,
         ARTWORK_MISS_TTL,
+        ARTWORK_SIZES,
+        ARTWORK_WEBP_QUALITY,
     )
 else:
     from config import (
@@ -23,15 +27,74 @@ else:
         ARTWORK_CACHE_LIMIT_BYTES,
         ARTWORK_MAX_DOWNLOAD_BYTES,
         ARTWORK_MISS_TTL,
+        ARTWORK_SIZES,
+        ARTWORK_WEBP_QUALITY,
     )
 
 
-def artwork_cache_file(cache_key):
+def normalized_size(size):
+    """Return a supported variant name, or None for the original image."""
+    return size if size in ARTWORK_SIZES else None
+
+
+def base_cache_key(filename):
+    """Return the owning cache key for an original or resized cache file."""
+    return filename.rsplit(".", 1)[0].split("@", 1)[0]
+
+
+def variant_cache_file(cache_key, size):
+    return os.path.join(ARTWORK_CACHE_DIRECTORY, f"{cache_key}@{size}.webp")
+
+
+def artwork_cache_file(cache_key, size=None):
+    """Return the cached file for a variant, or for the original image."""
+    if size:
+        path = variant_cache_file(cache_key, size)
+        return path if os.path.isfile(path) else None
     for extension in ("jpg", "png", "webp", "gif"):
         path = os.path.join(ARTWORK_CACHE_DIRECTORY, f"{cache_key}.{extension}")
         if os.path.isfile(path):
             return path
     return None
+
+
+def build_artwork_variant(original_path, cache_key, size):
+    """Downscale a cached original into a WebP variant, returning its path.
+
+    Returns None when the original cannot be decoded, so the caller can serve
+    the untouched original rather than failing the request.
+    """
+    edge = ARTWORK_SIZES[size]
+    try:
+        with Image.open(original_path) as image:
+            image = image.convert("RGB")
+            # `thumbnail` never upscales, so an already-small source is only
+            # re-encoded to WebP rather than stretched.
+            image.thumbnail((edge, edge), Image.LANCZOS)
+            buffer = BytesIO()
+            image.save(buffer, format="WEBP", quality=ARTWORK_WEBP_QUALITY, method=4)
+    except (OSError, ValueError, UnidentifiedImageError) as exc:
+        current_app.logger.warning(
+            "Could not resize artwork %s to %s: %s", cache_key, size, exc
+        )
+        return None
+
+    final_path = variant_cache_file(cache_key, size)
+    temporary_path = None
+    try:
+        os.makedirs(ARTWORK_CACHE_DIRECTORY, exist_ok=True)
+        with NamedTemporaryFile("wb", dir=ARTWORK_CACHE_DIRECTORY, delete=False) as file:
+            temporary_path = file.name
+            file.write(buffer.getvalue())
+        os.replace(temporary_path, final_path)
+        temporary_path = None
+        return final_path
+    except OSError as exc:
+        current_app.logger.warning("Could not store artwork variant %s: %s", cache_key, exc)
+        return None
+    finally:
+        if temporary_path and os.path.exists(temporary_path):
+            os.unlink(temporary_path)
 
 
 def plex_artist_artwork_key(server_id, rating_key):
@@ -49,7 +112,9 @@ def remove_stale_plex_artist_artwork(valid_keys):
             for entry in entries:
                 if not entry.is_file(follow_symlinks=False):
                     continue
-                cache_key = entry.name.rsplit(".", 1)[0]
+                # Resized variants share the owning artist's cache key, so the
+                # `@size` suffix has to be removed before the retention check.
+                cache_key = base_cache_key(entry.name)
                 if cache_key.startswith("plex-artist-") and cache_key not in valid_keys:
                     os.unlink(entry.path)
                     removed += 1
@@ -112,15 +177,38 @@ def clear_artwork_cache():
     return removed
 
 
-def cached_artwork(cache_key, source_url, *, headers=None):
-    """Serve a cached image, downloading a safe provider URL on a miss."""
+def _serve(path):
+    try:
+        os.utime(path, None)
+    except OSError:
+        pass
+    return send_file(path, max_age=ARTWORK_BROWSER_CACHE_TTL)
+
+
+def _serve_at_size(original_path, cache_key, size):
+    """Serve the requested variant, falling back to the original image."""
+    if not size:
+        return _serve(original_path)
+    variant = artwork_cache_file(cache_key, size)
+    if not variant:
+        variant = build_artwork_variant(original_path, cache_key, size)
+    return _serve(variant or original_path)
+
+
+def cached_artwork(cache_key, source_url, *, headers=None, size=None):
+    """Serve a cached image, downloading a safe provider URL on a miss.
+
+    The full-size download is always retained as the regeneration source, so
+    adding or changing a variant size never re-requests the upstream provider.
+    """
+    size = normalized_size(size)
+    variant_file = artwork_cache_file(cache_key, size) if size else None
+    if variant_file:
+        return _serve(variant_file)
+
     cached_file = artwork_cache_file(cache_key)
     if cached_file:
-        try:
-            os.utime(cached_file, None)
-        except OSError:
-            pass
-        return send_file(cached_file, max_age=ARTWORK_BROWSER_CACHE_TTL)
+        return _serve_at_size(cached_file, cache_key, size)
 
     miss_file = os.path.join(ARTWORK_CACHE_DIRECTORY, f"{cache_key}.miss")
     try:
@@ -162,8 +250,9 @@ def cached_artwork(cache_key, source_url, *, headers=None):
                 file.write(chunk)
         os.replace(temporary_path, final_path)
         temporary_path = None
+        response = _serve_at_size(final_path, cache_key, size)
         trim_artwork_cache()
-        return send_file(final_path, max_age=ARTWORK_BROWSER_CACHE_TTL)
+        return response
     except (OSError, ValueError, requests.RequestException) as exc:
         current_app.logger.warning("Could not cache artwork %s: %s", cache_key, exc)
         return redirect(source_url, code=302)

@@ -3,13 +3,17 @@
 from urllib.parse import quote
 
 
-def release_group_cover_art(mbid):
-    return f"/api/artwork/release-group/{quote(mbid)}"
+def _sized(path, size):
+    return f"{path}?size={size}" if size else path
 
 
-def artist_cover_art(mbid):
-    return f"/api/artwork/artist/{quote(mbid)}"
+def release_group_cover_art(mbid, size="thumb"):
+    return _sized(f"/api/artwork/release-group/{quote(mbid)}", size)
 
 
-def artist_large_cover_art(mbid):
-    return f"/api/artwork/artist/{quote(mbid)}/large"
+def artist_cover_art(mbid, size="thumb"):
+    return _sized(f"/api/artwork/artist/{quote(mbid)}", size)
+
+
+def artist_large_cover_art(mbid, size="large"):
+    return _sized(f"/api/artwork/artist/{quote(mbid)}", size)

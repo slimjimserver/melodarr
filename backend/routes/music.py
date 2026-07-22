@@ -28,34 +28,23 @@ def _musicbrainz_priority():
     return "prefetch" if request.args.get("prefetch") == "1" else "interactive"
 
 
-def _plex_release_group_inventory():
+def _plex_index():
+    """Return the memoized Plex lookup tables, or empty ones when unavailable."""
     config = get_service("plex")
     if not config:
-        return {}
+        return {"artistsByMbid": {}, "releaseGroupsByMbid": {}}
     try:
-        inventory = plex.cached_library_snapshot(config)
+        return plex.cached_library_index(config)
     except (ValueError, requests.RequestException):
-        return {}
-    groups = {}
-    for item in inventory.get("releaseGroups", []):
-        release_group_id = item.get("musicbrainzReleaseGroupId")
-        if release_group_id:
-            groups.setdefault(release_group_id, []).append(item)
-    return groups
+        return {"artistsByMbid": {}, "releaseGroupsByMbid": {}}
+
+
+def _plex_release_group_inventory():
+    return _plex_index()["releaseGroupsByMbid"]
 
 
 def _plex_artist(mbid):
-    config = get_service("plex")
-    if not config:
-        return None
-    try:
-        return next((
-            artist
-            for artist in plex.cached_library_snapshot(config).get("artists", [])
-            if artist.get("musicbrainzId") == mbid
-        ), None)
-    except (ValueError, requests.RequestException):
-        return None
+    return _plex_index()["artistsByMbid"].get(mbid)
 
 
 def _plex_release_summary(item):
@@ -77,7 +66,7 @@ def _artist_detail_payload(
     operation = musicbrainz.critical_operation() if priority == "critical" else None
     with operation or nullcontext():
         data = musicbrainz.get(
-            f"/artist/{quote(mbid)}", "url-rels+genres", priority=priority,
+            f"/artist/{quote(mbid)}", "aliases+url-rels+genres", priority=priority,
             force_refresh=force_refresh,
             cache_only=cache_only,
         )
@@ -86,7 +75,7 @@ def _artist_detail_payload(
         raw_groups, offset = [], 0
         while True:
             page = musicbrainz.get(
-                "/release-group", "", priority=priority,
+                "/release-group", "aliases", priority=priority,
                 force_refresh=force_refresh,
                 cache_only=cache_only,
                 artist=mbid, limit=100, offset=offset,
@@ -104,6 +93,7 @@ def _artist_detail_payload(
     groups = [
         {
             "id": group["id"], "title": group.get("title", "Untitled"),
+            "romanizedTitle": musicbrainz.romanized_release_group_title(group),
             "date": group.get("first-release-date", ""),
             "type": group.get("primary-type") or "Other",
             "secondaryTypes": [name for name in group.get("secondary-types") or [] if name],
@@ -132,7 +122,9 @@ def _artist_detail_payload(
     plex_artist = _plex_artist(mbid)
     lidarr_artist = lidarr.cached_artist_availability().get(mbid)
     return {
-        "id": data["id"], "name": data.get("name"), "country": data.get("country", ""),
+        "id": data["id"], "name": data.get("name"),
+        "romanizedName": musicbrainz.romanized_artist_name(data),
+        "country": data.get("country", ""),
         "disambiguation": data.get("disambiguation", ""), "type": data.get("type", ""),
         "gender": data.get("gender", ""), "area": (data.get("area") or {}).get("name", ""),
         "lifeSpan": data.get("life-span", {}),
@@ -169,6 +161,9 @@ def _lidarr_artist_detail_payload(mbid):
         groups.append({
             "id": group_id,
             "title": album.get("title") or "Untitled",
+            "romanizedTitle": musicbrainz.romanized_release_group_title({
+                "title": album.get("title"),
+            }),
             "date": str(album.get("releaseDate") or "")[:10],
             "type": album.get("albumType") or "Other",
             "secondaryTypes": secondary_types,
@@ -191,6 +186,10 @@ def _lidarr_artist_detail_payload(mbid):
     return {
         "id": mbid,
         "name": artist.get("artistName") or artist.get("name") or "Unknown artist",
+        "romanizedName": musicbrainz.romanized_artist_name({
+            "name": artist.get("artistName") or artist.get("name"),
+            "sortName": artist.get("sortName"),
+        }),
         "country": artist.get("country") or "",
         "disambiguation": artist.get("disambiguation") or "",
         "type": artist.get("artistType") or "",
@@ -251,7 +250,7 @@ def refresh_artist_detail(mbid):
 def _release_group_detail_payload(mbid, priority, *, cache_only=False):
     data = musicbrainz.get(
         f"/release-group/{quote(mbid)}",
-        "artist-credits+url-rels",
+        "aliases+artist-credits+url-rels",
         priority=priority,
         cache_only=cache_only,
     )
@@ -280,6 +279,9 @@ def _release_group_detail_payload(mbid, priority, *, cache_only=False):
     releases = [
         {
             "id": release["id"], "title": release.get("title", data.get("title", "Untitled")),
+            "romanizedTitle": musicbrainz.romanized_release_group_title({
+                "title": release.get("title", data.get("title")),
+            }),
             "date": release.get("date", ""), "country": release.get("country", ""),
             "status": release.get("status", ""), "disambiguation": release.get("disambiguation", ""),
             "format": ", ".join(media.get("format", "") for media in release.get("media", []) if media.get("format")),
@@ -298,6 +300,7 @@ def _release_group_detail_payload(mbid, priority, *, cache_only=False):
     primary_artist = artist_credit[0].get("artist", {}) if artist_credit else {}
     return {
         "id": data["id"], "title": data.get("title"),
+        "romanizedTitle": musicbrainz.romanized_release_group_title(data),
         "artist": " · ".join(credit.get("name", "") for credit in artist_credit),
         "artistId": primary_artist.get("id", ""), "date": data.get("first-release-date", ""),
         "type": data.get("primary-type", "Album"), "spotify": spotify,
@@ -349,6 +352,9 @@ def _lidarr_release_group_detail_payload(mbid):
         releases.append({
             "id": release_id,
             "title": release.get("title") or album.get("title") or "Untitled",
+            "romanizedTitle": musicbrainz.romanized_release_group_title({
+                "title": release.get("title") or album.get("title"),
+            }),
             "date": str(release.get("releaseDate") or "")[:10],
             "country": release.get("country") or "",
             "status": release.get("status") or "",
@@ -361,6 +367,9 @@ def _lidarr_release_group_detail_payload(mbid):
     return {
         "id": mbid,
         "title": album.get("title") or "Untitled",
+        "romanizedTitle": musicbrainz.romanized_release_group_title({
+            "title": album.get("title"),
+        }),
         "artist": (
             artist.get("artistName")
             or album.get("artistTitle")
