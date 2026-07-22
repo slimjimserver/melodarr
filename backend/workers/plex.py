@@ -58,17 +58,21 @@ def _run_scan(kind):
         if not config:
             return
         if kind == "full":
-            artists = plex.full_library_scan(config)
+            result = plex.full_library_scan(config)
             server_id = config.get("machineIdentifier") or config.get("url", "")
             valid_artwork = {
                 plex_artist_artwork_key(server_id, artist.get("ratingKey"))
-                for artist in artists
+                for artist in result["artists"]
                 if artist.get("ratingKey") and artist.get("thumb")
             }
             remove_stale_plex_artist_artwork(valid_artwork)
         else:
-            plex.recently_added_scan(config)
-        plex_metadata.request_enrichment()
+            result = plex.recently_added_scan(config)
+        if result["artistMbids"] or result["releaseMbids"]:
+            plex_metadata.request_enrichment(
+                artist_ids=result["artistMbids"],
+                release_ids=result["releaseMbids"],
+            )
     except (ValueError, requests.RequestException) as exc:
         logger.warning("Plex %s music-library scan failed: %s", kind, exc)
     except Exception:

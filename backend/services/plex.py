@@ -287,16 +287,41 @@ def _guid_documents(config, inventory):
     return documents
 
 
-def _save_snapshot(config, payload, *, replace_guids=False):
+def _save_snapshot(
+    config,
+    payload,
+    *,
+    replace_guids=False,
+    guid_inventory=None,
+):
     set_cache_document(
         "plex-library", _snapshot_id(config), payload, PLEX_LIBRARY_CACHE_TTL
     )
     invalidate_document(_index_key(_snapshot_id(config)))
-    documents = _guid_documents(config, payload)
+    documents = _guid_documents(config, guid_inventory or payload)
     if replace_guids:
         replace_cache_documents("plex-guid", documents, PLEX_LIBRARY_CACHE_TTL)
     else:
         upsert_cache_documents("plex-guid", documents, PLEX_LIBRARY_CACHE_TTL)
+
+
+def _scan_result(inventory, *, artist_items=(), release_items=(), changed):
+    """Return the inventory plus the exact MusicBrainz work caused by a scan."""
+    return {
+        "artists": inventory.get("artists", []),
+        "artistMbids": sorted({
+            item["musicbrainzId"]
+            for item in artist_items
+            if item.get("musicbrainzId")
+        }),
+        "releaseMbids": sorted({
+            item["musicbrainzReleaseId"]
+            for item in release_items
+            if item.get("musicbrainzReleaseId")
+            and not item.get("releaseGroupResolved")
+        }),
+        "changed": changed,
+    }
 
 
 def full_library_scan(config):
@@ -329,8 +354,26 @@ def full_library_scan(config):
             "sectionIds": [section["id"] for section in sections],
             "scannedAt": time.time(),
         }
+        previous_artists = {
+            _item_identity(item): item for item in previous.get("artists", [])
+        }
+        changed_artists = [
+            item for item in inventory["artists"]
+            if previous_artists.get(_item_identity(item)) != item
+        ]
+        changed = bool(
+            previous.get("snapshotVersion") != SNAPSHOT_VERSION
+            or previous.get("sectionIds") != payload["sectionIds"]
+            or previous.get("artists") != inventory["artists"]
+            or previous.get("releaseGroups") != inventory["releaseGroups"]
+        )
         _save_snapshot(config, payload, replace_guids=True)
-        return payload["artists"]
+        return _scan_result(
+            inventory,
+            artist_items=changed_artists,
+            release_items=inventory["releaseGroups"],
+            changed=changed,
+        )
 
 
 def recently_added_scan(config):
@@ -349,6 +392,8 @@ def recently_added_scan(config):
             return full_library_scan(config)
         recent = _scan_sections(config, sections, recently_added=True)
         merged_inventory = {}
+        changed_inventory = {"artists": [], "releaseGroups": []}
+        recent_inventory = {"artists": [], "releaseGroups": []}
         for collection_name in ("artists", "releaseGroups"):
             merged = {
                 _item_identity(item): item
@@ -359,16 +404,27 @@ def recently_added_scan(config):
                 if item.get("name"):
                     identity = _item_identity(item)
                     previous_item = merged.get(identity, {})
-                    merged[identity] = {**previous_item, **item}
+                    updated_item = {**previous_item, **item}
                     if previous_item.get("releaseGroupResolved"):
-                        merged[identity].update({
+                        updated_item.update({
                             "musicbrainzReleaseGroupId": previous_item.get(
                                 "musicbrainzReleaseGroupId", ""
                             ),
                             "releaseGroupResolved": True,
                         })
+                    recent_inventory[collection_name].append(updated_item)
+                    if updated_item != previous_item:
+                        changed_inventory[collection_name].append(updated_item)
+                        merged[identity] = updated_item
             merged_inventory[collection_name] = sorted(
                 merged.values(), key=lambda item: (item.get("name") or "").casefold()
+            )
+        changed = any(changed_inventory.values())
+        if not changed:
+            return _scan_result(
+                cached,
+                release_items=recent_inventory["releaseGroups"],
+                changed=False,
             )
         payload = {
             "snapshotVersion": SNAPSHOT_VERSION,
@@ -376,8 +432,13 @@ def recently_added_scan(config):
             "sectionIds": section_ids,
             "scannedAt": time.time(),
         }
-        _save_snapshot(config, payload)
-        return payload["artists"]
+        _save_snapshot(config, payload, guid_inventory=changed_inventory)
+        return _scan_result(
+            merged_inventory,
+            artist_items=changed_inventory["artists"],
+            release_items=recent_inventory["releaseGroups"],
+            changed=True,
+        )
 
 
 def library_snapshot(config):

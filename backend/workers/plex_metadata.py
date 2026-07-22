@@ -2,7 +2,7 @@
 
 import logging
 import time
-from threading import Event
+from threading import Event, Lock
 
 import requests
 
@@ -16,6 +16,10 @@ else:
 
 logger = logging.getLogger(__name__)
 wake_requested = Event()
+queue_lock = Lock()
+queued_artist_ids = set()
+queued_release_ids = set()
+full_enrichment_requested = False
 job_state = {
     "running": False,
     "lastCompletedAt": None,
@@ -27,8 +31,24 @@ job_state = {
 }
 
 
-def request_enrichment():
-    job_state["queued"] = 1
+def request_enrichment(*, artist_ids=None, release_ids=None):
+    """Queue targeted scan deltas, or a full pass when called without targets."""
+    global full_enrichment_requested
+    full_request = artist_ids is None and release_ids is None
+    artist_ids = set(artist_ids or ())
+    release_ids = set(release_ids or ())
+    with queue_lock:
+        if full_request:
+            full_enrichment_requested = True
+        elif artist_ids or release_ids:
+            queued_artist_ids.update(artist_ids)
+            queued_release_ids.update(release_ids)
+        else:
+            return
+        job_state["queued"] = (
+            1 if full_enrichment_requested
+            else len(queued_artist_ids) + len(queued_release_ids)
+        )
     wake_requested.set()
 
 
@@ -41,12 +61,17 @@ def _confirmed_missing(exc):
     return getattr(response, "status_code", None) == 404
 
 
-def _resolve_release_groups(config):
-    releases = plex.unresolved_musicbrainz_releases(config)
-    job_state.update(phase="release groups", completed=0, total=len(releases))
+def _resolve_release_groups(config, release_ids=None):
+    if release_ids is None:
+        release_ids = {
+            item["musicbrainzReleaseId"]
+            for item in plex.unresolved_musicbrainz_releases(config)
+        }
+    else:
+        release_ids = set(release_ids)
+    job_state.update(phase="release groups", completed=0, total=len(release_ids))
     mappings = {}
-    for index, item in enumerate(releases, start=1):
-        release_id = item["musicbrainzReleaseId"]
+    for index, release_id in enumerate(sorted(release_ids), start=1):
         try:
             metadata = musicbrainz.get(
                 f"/release/{release_id}",
@@ -70,14 +95,17 @@ def _resolve_release_groups(config):
     plex.apply_release_group_mappings(config, mappings)
 
 
-def _warm_artist_discographies(config):
-    artists = [
-        artist for artist in plex.music_library(config)
-        if artist.get("musicbrainzId")
-    ]
-    job_state.update(phase="artist discographies", completed=0, total=len(artists))
-    for index, artist in enumerate(artists, start=1):
-        artist_id = artist["musicbrainzId"]
+def _warm_artist_discographies(config, artist_ids=None):
+    if artist_ids is None:
+        artist_ids = {
+            artist["musicbrainzId"]
+            for artist in plex.music_library(config)
+            if artist.get("musicbrainzId")
+        }
+    else:
+        artist_ids = set(artist_ids)
+    job_state.update(phase="artist discographies", completed=0, total=len(artist_ids))
+    for index, artist_id in enumerate(sorted(artist_ids), start=1):
         try:
             musicbrainz.get(
                 f"/artist/{artist_id}",
@@ -108,16 +136,16 @@ def _warm_artist_discographies(config):
         job_state["completed"] = index
 
 
-def _run_enrichment():
+def _run_enrichment(artist_ids=None, release_ids=None):
     config = get_service("plex")
     if not config:
         return
-    job_state.update(running=True, queued=0)
+    job_state["running"] = True
     try:
         # Make Plex artist clicks fast first; exact edition-to-group mapping can
         # then continue behind the already-warmed discographies.
-        _warm_artist_discographies(config)
-        _resolve_release_groups(config)
+        _warm_artist_discographies(config, artist_ids)
+        _resolve_release_groups(config, release_ids)
     except (ValueError, requests.RequestException) as exc:
         logger.warning("Plex MusicBrainz enrichment failed: %s", exc)
     except Exception:
@@ -134,7 +162,16 @@ def _run_enrichment():
 
 def run():
     """Enrich after scans or manual requests, yielding to interactive MB work."""
+    global full_enrichment_requested
     while True:
         wake_requested.wait()
         wake_requested.clear()
-        _run_enrichment()
+        with queue_lock:
+            full = full_enrichment_requested
+            artist_ids = None if full else set(queued_artist_ids)
+            release_ids = None if full else set(queued_release_ids)
+            full_enrichment_requested = False
+            queued_artist_ids.clear()
+            queued_release_ids.clear()
+            job_state["queued"] = 0
+        _run_enrichment(artist_ids, release_ids)

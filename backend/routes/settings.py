@@ -143,7 +143,7 @@ def maintenance():
                 "id": "lidarr-library",
                 "name": "Lidarr Library Scan",
                 "type": "process",
-                "schedule": "Every 5 minutes",
+                "schedule": "Every 4 minutes",
                 **lidarr_library_status,
             },
             {
@@ -164,7 +164,7 @@ def maintenance():
                 "id": "plex-metadata",
                 "name": "Plex MusicBrainz enrichment",
                 "type": "process",
-                "schedule": "After Plex library scans",
+                "schedule": "After Plex library changes",
                 **plex_metadata_status,
             },
         ],
