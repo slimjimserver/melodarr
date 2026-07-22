@@ -183,6 +183,14 @@ class WorkerEntrypointTests(unittest.TestCase):
 
 
 class PlexMetadataWorkerTests(unittest.TestCase):
+    def setUp(self):
+        with plex_metadata_worker.queue_lock:
+            plex_metadata_worker.queued_artist_ids.clear()
+            plex_metadata_worker.queued_release_ids.clear()
+            plex_metadata_worker.full_enrichment_requested = False
+            plex_metadata_worker.job_state["queued"] = 0
+        plex_metadata_worker.wake_requested.clear()
+
     @patch("backend.workers.plex_metadata.plex.apply_release_group_mappings")
     @patch("backend.workers.plex_metadata.plex.unresolved_musicbrainz_releases")
     @patch("backend.workers.plex_metadata.musicbrainz.get")
@@ -230,6 +238,108 @@ class PlexMetadataWorkerTests(unittest.TestCase):
             artist="artist-1",
             limit=100,
             offset=0,
+        )
+
+    @patch("backend.workers.plex_metadata.plex.music_library")
+    @patch("backend.workers.plex_metadata.musicbrainz.get")
+    def test_targeted_artist_enrichment_does_not_walk_the_plex_library(
+        self, musicbrainz_get, music_library
+    ):
+        musicbrainz_get.side_effect = [
+            {"id": "artist-2"},
+            {"release-groups": [], "release-group-count": 0},
+        ]
+
+        plex_metadata_worker._warm_artist_discographies(
+            {"url": "http://plex"}, {"artist-2"}
+        )
+
+        music_library.assert_not_called()
+        musicbrainz_get.assert_any_call(
+            "/artist/artist-2", "url-rels+genres", priority="background"
+        )
+
+    @patch("backend.workers.plex_metadata.plex.unresolved_musicbrainz_releases")
+    @patch("backend.workers.plex_metadata.plex.apply_release_group_mappings")
+    @patch("backend.workers.plex_metadata.musicbrainz.get")
+    def test_targeted_release_enrichment_does_not_walk_unresolved_inventory(
+        self, musicbrainz_get, apply_mappings, unresolved
+    ):
+        musicbrainz_get.return_value = {
+            "release-group": {"id": "release-group-2"}
+        }
+
+        plex_metadata_worker._resolve_release_groups(
+            {"url": "http://plex"}, {"release-2"}
+        )
+
+        unresolved.assert_not_called()
+        apply_mappings.assert_called_once_with(
+            {"url": "http://plex"}, {"release-2": "release-group-2"}
+        )
+
+    @patch("backend.workers.plex_metadata.wake_requested.set")
+    def test_enrichment_queue_deduplicates_targets_and_keeps_manual_full_pass(
+        self, wake
+    ):
+        plex_metadata_worker.request_enrichment(
+            artist_ids=["artist-1", "artist-1"],
+            release_ids=["release-1"],
+        )
+        plex_metadata_worker.request_enrichment(
+            artist_ids=["artist-1"],
+            release_ids=["release-1"],
+        )
+
+        self.assertEqual(plex_metadata_worker.queued_artist_ids, {"artist-1"})
+        self.assertEqual(plex_metadata_worker.queued_release_ids, {"release-1"})
+        self.assertEqual(plex_metadata_worker.job_state["queued"], 2)
+
+        plex_metadata_worker.request_enrichment()
+
+        self.assertTrue(plex_metadata_worker.full_enrichment_requested)
+        self.assertEqual(plex_metadata_worker.job_state["queued"], 1)
+        self.assertEqual(wake.call_count, 3)
+
+
+class PlexScanWorkerTests(unittest.TestCase):
+    @patch("backend.workers.plex.plex_metadata.request_enrichment")
+    @patch("backend.workers.plex.plex.recently_added_scan")
+    @patch("backend.workers.plex.get_service")
+    def test_unchanged_recent_scan_does_not_queue_enrichment(
+        self, get_service, recently_added_scan, request_enrichment
+    ):
+        get_service.return_value = {"url": "http://plex"}
+        recently_added_scan.return_value = {
+            "artists": [],
+            "artistMbids": [],
+            "releaseMbids": [],
+            "changed": False,
+        }
+
+        plex_worker._run_scan("recent")
+
+        request_enrichment.assert_not_called()
+
+    @patch("backend.workers.plex.plex_metadata.request_enrichment")
+    @patch("backend.workers.plex.plex.recently_added_scan")
+    @patch("backend.workers.plex.get_service")
+    def test_recent_scan_queues_only_returned_enrichment_targets(
+        self, get_service, recently_added_scan, request_enrichment
+    ):
+        get_service.return_value = {"url": "http://plex"}
+        recently_added_scan.return_value = {
+            "artists": [],
+            "artistMbids": ["artist-2"],
+            "releaseMbids": ["release-2"],
+            "changed": True,
+        }
+
+        plex_worker._run_scan("recent")
+
+        request_enrichment.assert_called_once_with(
+            artist_ids=["artist-2"],
+            release_ids=["release-2"],
         )
 
 
@@ -737,6 +847,8 @@ class SettingsMaintenanceTests(DatabaseTestCase):
                 "plex-metadata",
             ],
         )
+        jobs = {job["id"]: job for job in response.get_json()["jobs"]}
+        self.assertEqual(jobs["lidarr-library"]["schedule"], "Every 4 minutes")
 
         recommendation = self.client.post(
             "/api/settings/jobs/recommendations/run",
@@ -3040,19 +3152,138 @@ class PlexClientTests(unittest.TestCase):
             Response(payload={"MediaContainer": {"Metadata": []}}),
         ]
 
-        artists = plex.full_library_scan({
+        result = plex.full_library_scan({
             "url": "http://plex:32400",
             "token": "token",
             "machineIdentifier": "server-2",
             "librarySectionIds": ["2"],
         })
 
-        self.assertEqual([artist["name"] for artist in artists], ["Selected Artist"])
+        self.assertEqual(
+            [artist["name"] for artist in result["artists"]],
+            ["Selected Artist"],
+        )
         self.assertIn("/library/sections/2/all", get.call_args_list[1].args[0])
         self.assertIn("/library/sections/2/all", get.call_args_list[2].args[0])
         self.assertEqual(get.call_args_list[1].kwargs["params"]["type"], 8)
         self.assertEqual(get.call_args_list[2].kwargs["params"]["type"], 9)
         self.assertEqual(get.call_count, 3)
+
+    def test_unchanged_recent_scan_skips_snapshot_and_guid_writes(self):
+        artist = {
+            "name": "Cached Artist",
+            "ratingKey": "1",
+            "musicbrainzId": "artist-1",
+        }
+        release = {
+            "name": "Cached Album",
+            "ratingKey": "2",
+            "musicbrainzReleaseId": "release-1",
+            "releaseGroupResolved": False,
+        }
+        cached = {
+            "snapshotVersion": plex.SNAPSHOT_VERSION,
+            "artists": [artist],
+            "releaseGroups": [release],
+            "sectionIds": ["music"],
+            "scannedAt": 1,
+        }
+        with (
+            patch("backend.services.plex.get_cache_document", return_value=cached),
+            patch(
+                "backend.services.plex.selected_music_sections",
+                return_value=[{"id": "music", "title": "Music"}],
+            ),
+            patch(
+                "backend.services.plex._scan_sections",
+                return_value={"artists": [dict(artist)], "releaseGroups": [dict(release)]},
+            ),
+            patch("backend.services.plex._save_snapshot") as save_snapshot,
+        ):
+            result = plex.recently_added_scan({
+                "url": "http://plex",
+                "machineIdentifier": "server-1",
+            })
+
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["artistMbids"], [])
+        self.assertEqual(result["releaseMbids"], ["release-1"])
+        save_snapshot.assert_not_called()
+
+    def test_recent_scan_writes_only_changed_guid_documents(self):
+        cached_artist = {
+            "name": "Cached Artist",
+            "ratingKey": "1",
+            "musicbrainzId": "artist-1",
+            "thumb": "/old",
+        }
+        updated_artist = {**cached_artist, "thumb": "/new"}
+        cached = {
+            "snapshotVersion": plex.SNAPSHOT_VERSION,
+            "artists": [cached_artist],
+            "releaseGroups": [],
+            "sectionIds": ["music"],
+            "scannedAt": 1,
+        }
+        with (
+            patch("backend.services.plex.get_cache_document", return_value=cached),
+            patch(
+                "backend.services.plex.selected_music_sections",
+                return_value=[{"id": "music", "title": "Music"}],
+            ),
+            patch(
+                "backend.services.plex._scan_sections",
+                return_value={"artists": [updated_artist], "releaseGroups": []},
+            ),
+            patch("backend.services.plex._save_snapshot") as save_snapshot,
+        ):
+            result = plex.recently_added_scan({
+                "url": "http://plex",
+                "machineIdentifier": "server-1",
+            })
+
+        self.assertTrue(result["changed"])
+        self.assertEqual(result["artistMbids"], ["artist-1"])
+        self.assertEqual(result["releaseMbids"], [])
+        self.assertEqual(
+            save_snapshot.call_args.kwargs["guid_inventory"],
+            {"artists": [updated_artist], "releaseGroups": []},
+        )
+
+    def test_unchanged_full_scan_returns_no_artist_enrichment_targets(self):
+        artist = {
+            "name": "Cached Artist",
+            "ratingKey": "1",
+            "musicbrainzId": "artist-1",
+        }
+        cached = {
+            "snapshotVersion": plex.SNAPSHOT_VERSION,
+            "artists": [artist],
+            "releaseGroups": [],
+            "sectionIds": ["music"],
+            "scannedAt": 1,
+        }
+        with (
+            patch("backend.services.plex.get_cache_document", return_value=cached),
+            patch(
+                "backend.services.plex.selected_music_sections",
+                return_value=[{"id": "music", "title": "Music"}],
+            ),
+            patch(
+                "backend.services.plex._scan_sections",
+                return_value={"artists": [dict(artist)], "releaseGroups": []},
+            ),
+            patch("backend.services.plex._save_snapshot") as save_snapshot,
+        ):
+            result = plex.full_library_scan({
+                "url": "http://plex",
+                "machineIdentifier": "server-1",
+            })
+
+        self.assertFalse(result["changed"])
+        self.assertEqual(result["artistMbids"], [])
+        self.assertEqual(result["releaseMbids"], [])
+        save_snapshot.assert_called_once()
 
 
 if __name__ == "__main__":

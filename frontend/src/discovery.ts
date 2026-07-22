@@ -3,7 +3,13 @@
   type DetailReference = { kind: DetailKind; id: string };
   type ArtworkItem = { image: HTMLImageElement; source: string; fallback: HTMLElement };
   type ArtworkJob = { guard: ReturnType<typeof setTimeout> };
-  type DetailRequest = { prefetch: boolean; settled: boolean; promise: Promise<JsonObject> | null };
+  type DetailRequest = {
+    prefetch: boolean;
+    settled: boolean;
+    promise: Promise<JsonObject>;
+    expiresAt: number;
+    lastAccessedAt: number;
+  };
 
   const $ = <T extends Element = AppElement>(selector: string): T => {
     const element = document.querySelector<T>(selector);
@@ -20,6 +26,9 @@
   let searchAbort: AbortController | undefined;
   const detailRequests = new Map<string, DetailRequest>();
   const detailUpgrades = new Map<string, Promise<JsonObject>>();
+  const detailCacheMaxEntries = 32;
+  const detailPrefetchTtl = 2 * 60 * 1000;
+  const detailOpenedTtl = 15 * 60 * 1000;
   const artworkQueue: ArtworkItem[] = [];
   const deferredArtwork = new WeakMap<Element, Omit<ArtworkItem, "image">>();
   const activeArtworkLoads = new Map<HTMLImageElement, ArtworkJob>();
@@ -219,14 +228,51 @@
     return `/${route[kind]}/${encodeURIComponent(id)}`;
   }
 
+  function pruneDetailRequests(now = Date.now()) {
+    detailRequests.forEach((entry, key) => {
+      if (entry.settled && entry.expiresAt <= now) detailRequests.delete(key);
+    });
+
+    const settledEntries = [...detailRequests.entries()]
+      .filter(([, entry]) => entry.settled)
+      .sort((left, right) => left[1].lastAccessedAt - right[1].lastAccessedAt);
+    settledEntries
+      .slice(0, Math.max(0, settledEntries.length - detailCacheMaxEntries))
+      .forEach(([key]) => detailRequests.delete(key));
+  }
+
+  function storeSettledDetail(key: string, data: JsonObject, prefetch = false) {
+    const now = Date.now();
+    detailRequests.set(key, {
+      prefetch,
+      settled: true,
+      promise: Promise.resolve(data),
+      expiresAt: now + (prefetch ? detailPrefetchTtl : detailOpenedTtl),
+      lastAccessedAt: now,
+    });
+    pruneDetailRequests(now);
+  }
+
   function loadDetail(kind: DetailKind, id: string, prefetch = false): Promise<JsonObject> {
     const key = `${kind}:${id}`;
+    const now = Date.now();
+    pruneDetailRequests(now);
     const existing = detailRequests.get(key);
     if (existing && (prefetch || !existing.prefetch || existing.settled)) {
-      return existing.promise!;
+      existing.lastAccessedAt = now;
+      if (!prefetch) {
+        existing.prefetch = false;
+        if (existing.settled) existing.expiresAt = now + detailOpenedTtl;
+      }
+      return existing.promise;
     }
 
-    const entry: DetailRequest = { prefetch, settled: false, promise: null };
+    const entry = {
+      prefetch,
+      settled: false,
+      expiresAt: Number.POSITIVE_INFINITY,
+      lastAccessedAt: now,
+    } as DetailRequest;
     const query = prefetch ? "?prefetch=1" : "";
     const timeout = prefetch ? 30_000 : kind === "artist" ? 120_000 : 60_000;
     entry.promise = getJson(
@@ -235,6 +281,10 @@
     )
       .then((data) => {
         entry.settled = true;
+        const settledAt = Date.now();
+        entry.expiresAt = settledAt + (entry.prefetch ? detailPrefetchTtl : detailOpenedTtl);
+        entry.lastAccessedAt = settledAt;
+        pruneDetailRequests(settledAt);
         return data;
       })
         .catch((error) => {
@@ -256,21 +306,15 @@
 
   function upgradeProvisionalDetail(kind: "artist" | "release-group", id: string) {
     const key = `${kind}:${id}`;
-    let upgrade = detailUpgrades.get(key);
-    if (!upgrade) {
-      upgrade = getJson(
-        `/api/music/${kind}/${encodeURIComponent(id)}?complete=1`,
-        120_000,
-      );
-      detailUpgrades.set(key, upgrade);
-    }
+    if (detailUpgrades.has(key)) return;
+    const upgrade = getJson(
+      `/api/music/${kind}/${encodeURIComponent(id)}?complete=1`,
+      120_000,
+    );
+    detailUpgrades.set(key, upgrade);
     upgrade
       .then((data) => {
-        detailRequests.set(key, {
-          prefetch: false,
-          settled: true,
-          promise: Promise.resolve(data),
-        });
+        storeSettledDetail(key, data);
         if (currentDetail?.kind !== kind || currentDetail.id !== id) return;
         renderDetail(kind, data);
         $("#detail-message").textContent = kind === "artist"
@@ -278,12 +322,12 @@
           : "Complete release information loaded from MusicBrainz.";
       })
       .catch((error) => {
-        detailUpgrades.delete(key);
         if (currentDetail?.kind !== kind || currentDetail.id !== id) return;
         $("#detail-message").textContent = error.name === "AbortError"
           ? "The Lidarr metadata is shown. MusicBrainz is still taking too long to complete this page."
           : `The Lidarr metadata is shown. MusicBrainz enrichment failed: ${error.message}`;
-      });
+      })
+      .finally(() => detailUpgrades.delete(key));
   }
 
   function showDetail(kind: DetailKind, id: string, addToHistory = true, updateHistory = true) {
@@ -869,11 +913,7 @@
             `/api/music/artist/${encodeURIComponent(data.id)}/refresh`,
             {},
           );
-          detailRequests.set(`artist:${data.id}`, {
-            prefetch: false,
-            settled: true,
-            promise: Promise.resolve(refreshed),
-          });
+          storeSettledDetail(`artist:${data.id}`, refreshed);
           if (currentDetail?.kind === "artist" && currentDetail?.id === data.id) {
             renderDetail("artist", refreshed);
             $("#detail-message").textContent = "Discography refreshed from MusicBrainz.";
