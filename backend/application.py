@@ -1,9 +1,10 @@
 """Flask application factory and extension registration."""
 
+import gzip
 import os
 from datetime import timedelta
 
-from flask import Flask
+from flask import Flask, request
 
 if __package__:
     from .api_cache import init_cache_db, migrate_legacy_cache
@@ -35,6 +36,54 @@ else:  # Support the existing `python backend/app.py` entry point.
     from storage import init_db
 
 
+STATIC_CACHE_TTL = 365 * 24 * 60 * 60
+COMPRESSIBLE_MIMETYPES = frozenset({
+    "application/javascript",
+    "application/json",
+    "application/manifest+json",
+    "image/svg+xml",
+    "text/css",
+    "text/html",
+    "text/javascript",
+    "text/plain",
+})
+COMPRESSION_MINIMUM_BYTES = 1024
+
+
+def compress_response(response):
+    """Gzip large text responses so mobile clients transfer far fewer bytes.
+
+    Artwork is already stored in compressed image formats and is streamed
+    straight from disk, so `direct_passthrough` responses are left untouched.
+    """
+    response.headers.add("Vary", "Accept-Encoding")
+    if (
+        response.direct_passthrough
+        or response.status_code < 200
+        or response.status_code >= 300
+        or "Content-Encoding" in response.headers
+        or response.mimetype not in COMPRESSIBLE_MIMETYPES
+        or "gzip" not in request.headers.get("Accept-Encoding", "")
+    ):
+        return response
+    body = response.get_data()
+    if len(body) < COMPRESSION_MINIMUM_BYTES:
+        return response
+    response.set_data(gzip.compress(body, compresslevel=6))
+    response.headers["Content-Encoding"] = "gzip"
+    response.headers["Content-Length"] = response.content_length
+    return response
+
+
+def cache_static_assets(response):
+    """Let browsers keep fingerprinted assets without revalidating them."""
+    if request.path.startswith("/static/") and response.status_code == 200:
+        response.headers["Cache-Control"] = (
+            f"public, max-age={STATIC_CACHE_TTL}, immutable"
+        )
+    return response
+
+
 BLUEPRINTS = (
     account_blueprint,
     artwork_blueprint,
@@ -61,6 +110,7 @@ def create_app(config=None):
         SESSION_COOKIE_SAMESITE="Lax",
         SESSION_COOKIE_SECURE=os.getenv("MELODARR_COOKIE_SECURE", "false").lower() == "true",
         PERMANENT_SESSION_LIFETIME=timedelta(days=30),
+        SEND_FILE_MAX_AGE_DEFAULT=STATIC_CACHE_TTL,
     )
     if config:
         app.config.update(config)
@@ -69,6 +119,8 @@ def create_app(config=None):
     migrate_legacy_cache()
     init_db()
     app.before_request(verify_csrf_token)
+    app.after_request(cache_static_assets)
+    app.after_request(compress_response)
     for blueprint in BLUEPRINTS:
         app.register_blueprint(blueprint)
     return app

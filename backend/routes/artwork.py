@@ -2,7 +2,7 @@
 
 from uuid import UUID
 
-from flask import Blueprint
+from flask import Blueprint, request
 
 if __package__ == "backend.routes":
     from ..artwork_cache import cached_artwork, plex_artist_artwork_key
@@ -21,6 +21,11 @@ else:
 blueprint = Blueprint("artwork", __name__)
 
 
+def _requested_size():
+    """Read the variant requested by the browser, defaulting to the original."""
+    return request.args.get("size") or None
+
+
 @blueprint.get("/api/artwork/release-group/<mbid>")
 @login_required
 def release_group_artwork(mbid):
@@ -28,7 +33,13 @@ def release_group_artwork(mbid):
         mbid = str(UUID(mbid))
     except ValueError:
         return api_error("Invalid MusicBrainz release-group ID.")
-    return cached_artwork(f"release-group-{mbid}", musicbrainz.cover_art_url(mbid))
+    return cached_artwork(
+        f"release-group-{mbid}",
+        # Cache the larger Cover Art Archive rendition once and derive every
+        # smaller variant from it, instead of sending browsers to the archive.
+        musicbrainz.cover_art_url(mbid, size=500),
+        size=_requested_size(),
+    )
 
 
 @blueprint.get("/api/artwork/artist/<mbid>")
@@ -41,12 +52,14 @@ def artist_artwork(mbid):
     return cached_artwork(
         f"artist-{mbid}",
         lambda: lidarr.artist_image_url(mbid),
+        size=_requested_size(),
     )
 
 
 @blueprint.get("/api/artwork/artist/<mbid>/large")
 @login_required
 def artist_large_artwork(mbid):
+    """Serve the detail-page rendition, kept for previously issued URLs."""
     try:
         mbid = str(UUID(mbid))
     except ValueError:
@@ -54,6 +67,7 @@ def artist_large_artwork(mbid):
     return cached_artwork(
         f"artist-{mbid}",
         lambda: lidarr.artist_image_url(mbid),
+        size="large",
     )
 
 
@@ -64,10 +78,7 @@ def plex_artist_artwork(rating_key):
     config = get_service("plex")
     if not config:
         return "", 404
-    artist = next((
-        item for item in plex.cached_library_snapshot(config).get("artists", [])
-        if item.get("ratingKey") == rating_key
-    ), None)
+    artist = plex.cached_library_index(config)["artistsByRatingKey"].get(rating_key)
     if not artist or not artist.get("thumb"):
         return "", 404
     server_id = config.get("machineIdentifier") or config.get("url", "")
@@ -76,4 +87,5 @@ def plex_artist_artwork(rating_key):
         plex_artist_artwork_key(server_id, rating_key),
         source_url,
         headers={"X-Plex-Token": config.get("token", "")},
+        size=_requested_size(),
     )

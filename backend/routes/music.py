@@ -28,34 +28,23 @@ def _musicbrainz_priority():
     return "prefetch" if request.args.get("prefetch") == "1" else "interactive"
 
 
-def _plex_release_group_inventory():
+def _plex_index():
+    """Return the memoized Plex lookup tables, or empty ones when unavailable."""
     config = get_service("plex")
     if not config:
-        return {}
+        return {"artistsByMbid": {}, "releaseGroupsByMbid": {}}
     try:
-        inventory = plex.cached_library_snapshot(config)
+        return plex.cached_library_index(config)
     except (ValueError, requests.RequestException):
-        return {}
-    groups = {}
-    for item in inventory.get("releaseGroups", []):
-        release_group_id = item.get("musicbrainzReleaseGroupId")
-        if release_group_id:
-            groups.setdefault(release_group_id, []).append(item)
-    return groups
+        return {"artistsByMbid": {}, "releaseGroupsByMbid": {}}
+
+
+def _plex_release_group_inventory():
+    return _plex_index()["releaseGroupsByMbid"]
 
 
 def _plex_artist(mbid):
-    config = get_service("plex")
-    if not config:
-        return None
-    try:
-        return next((
-            artist
-            for artist in plex.cached_library_snapshot(config).get("artists", [])
-            if artist.get("musicbrainzId") == mbid
-        ), None)
-    except (ValueError, requests.RequestException):
-        return None
+    return _plex_index()["artistsByMbid"].get(mbid)
 
 
 def _plex_release_summary(item):

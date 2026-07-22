@@ -34,6 +34,11 @@ ARTWORK_CACHE_LIMIT_BYTES = 500 * 1024 * 1024
 ARTWORK_MISS_TTL = 24 * 60 * 60
 ARTWORK_BROWSER_CACHE_TTL = 7 * 24 * 60 * 60
 ARTWORK_MAX_DOWNLOAD_BYTES = 5 * 1024 * 1024
+# Longest-edge pixel budgets for the resized variants Melodarr serves. Providers
+# return images far larger than any Melodarr layout: artist art arrives at
+# 1000x1000 (~690 KB) for cards that render it at 44 CSS pixels.
+ARTWORK_SIZES = {"thumb": 128, "card": 384, "large": 640}
+ARTWORK_WEBP_QUALITY = 80
 
 DATABASE = os.getenv("MELODARR_DATABASE", os.path.join(PROJECT_ROOT, "melodarr.db"))
 CACHE_DATABASE = os.getenv(

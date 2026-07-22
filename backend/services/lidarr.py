@@ -4,12 +4,17 @@ import requests
 
 if __package__ == "backend.services":
     from ..api_cache import cached_json_get, get_cache_document, set_cache_document
+    from ..cache_memo import invalidate_document, memoized_document
     from ..config import LIDARR_LIBRARY_CACHE_TTL, LIDARR_OPTIONS_CACHE_TTL
     from ..storage import get_service
 else:  # Support the existing `python backend/app.py` entry point.
     from api_cache import cached_json_get, get_cache_document, set_cache_document
+    from cache_memo import invalidate_document, memoized_document
     from config import LIDARR_LIBRARY_CACHE_TTL, LIDARR_OPTIONS_CACHE_TTL
     from storage import get_service
+
+
+LIBRARY_INDEX_KEY = "lidarr-library-index"
 
 
 def connection(values, old=None):
@@ -153,21 +158,26 @@ def scan_library_availability(config=None):
             albums[release_group_id] = album_availability(album)
     payload = {"artists": artists, "albums": albums}
     set_cache_document("lidarr-library", "albums", payload, LIDARR_LIBRARY_CACHE_TTL)
+    invalidate_document(LIBRARY_INDEX_KEY)
     return payload
+
+
+def cached_library_index():
+    """Return the cached Lidarr library document, parsed at most once."""
+    return memoized_document(
+        LIBRARY_INDEX_KEY,
+        lambda: get_cache_document("lidarr-library", "albums", allow_expired=True) or {},
+    )
 
 
 def cached_library_availability():
     """Read Lidarr status without making an HTTP request on an artist page."""
-    return (get_cache_document(
-        "lidarr-library", "albums", allow_expired=True
-    ) or {}).get("albums", {})
+    return cached_library_index().get("albums", {})
 
 
 def cached_artist_availability():
     """Read tracked Lidarr artists without making an HTTP request."""
-    return (get_cache_document(
-        "lidarr-library", "albums", allow_expired=True
-    ) or {}).get("artists", {})
+    return cached_library_index().get("artists", {})
 
 
 def tracked_artist(mbid, config=None):

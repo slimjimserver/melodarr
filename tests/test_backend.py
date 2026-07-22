@@ -1,5 +1,7 @@
 """High-value backend regression tests using Flask's built-in test client."""
 
+import gzip
+import io
 import json
 import os
 import runpy
@@ -24,8 +26,10 @@ os.environ.update({
 })
 
 import requests
+from PIL import Image
 
 from backend import api_cache
+from backend import artwork_cache
 from backend import recommendations as recommendation_engine
 from backend.api_cache import (
     cache_db,
@@ -113,8 +117,8 @@ class ApplicationFactoryTests(DatabaseTestCase):
             for method in rule.methods
             if method not in {"HEAD", "OPTIONS"}
         }
-        self.assertEqual(len(rules), 49)
-        self.assertEqual(len(route_methods), 49)
+        self.assertEqual(len(rules), 52)
+        self.assertEqual(len(route_methods), 52)
 
     def test_factory_applies_test_configuration(self):
         self.assertTrue(self.app.config["TESTING"])
@@ -1826,8 +1830,10 @@ class RecommendationAssemblyTests(unittest.TestCase):
         self.assertEqual(len(albums), 1)
         self.assertEqual(artists[0]["score"], 0.9)
         self.assertEqual(albums[0]["score"], 0.9)
-        self.assertEqual(artists[0]["coverArt"], "/api/artwork/artist/artist-1")
-        self.assertEqual(albums[0]["coverArt"], "/api/artwork/release-group/group-1")
+        self.assertEqual(artists[0]["coverArt"], "/api/artwork/artist/artist-1?size=thumb")
+        self.assertEqual(
+            albums[0]["coverArt"], "/api/artwork/release-group/group-1?size=thumb"
+        )
 
     @patch("backend.recommendations.listenbrainz.recording_metadata")
     @patch("backend.recommendations.listenbrainz.recording_recommendations")
@@ -2313,7 +2319,7 @@ class ArtworkCacheTests(DatabaseTestCase):
 
         self.assertEqual(response.status_code, 302)
         self.assertIn(
-            f"/release-group/{mbid}/front-250",
+            f"/release-group/{mbid}/front-500",
             response.headers["Location"],
         )
         self.assertFalse(os.path.exists(os.path.join(
@@ -2321,6 +2327,284 @@ class ArtworkCacheTests(DatabaseTestCase):
             f"release-group-{mbid}.jpg",
         )))
         self.assertIn("too large to cache", logs.output[0])
+
+
+def encoded_image(size, colour=(90, 30, 160)):
+    """Return JPEG bytes for a square test image."""
+    buffer = io.BytesIO()
+    Image.new("RGB", (size, size), colour).save(buffer, format="JPEG")
+    return buffer.getvalue()
+
+
+class ArtworkVariantTests(DatabaseTestCase):
+    def artwork_url(self, mbid, size=None):
+        url = f"/api/artwork/release-group/{mbid}"
+        return f"{url}?size={size}" if size else url
+
+    @patch("backend.artwork_cache.requests.get")
+    def test_requested_size_is_downscaled_to_webp_once(self, get):
+        mbid = "77777777-7777-7777-7777-777777777777"
+        original = encoded_image(1000)
+        get.return_value = Response(
+            headers={"Content-Type": "image/jpeg"},
+            chunks=(original,),
+        )
+        self.register()
+
+        first = self.client.get(self.artwork_url(mbid, "thumb"))
+        second = self.client.get(self.artwork_url(mbid, "thumb"))
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.data, second.data)
+        # One upstream download serves every variant of the same artwork.
+        get.assert_called_once()
+        self.assertLess(len(first.data), len(original))
+        with Image.open(io.BytesIO(first.data)) as image:
+            self.assertEqual(image.format, "WEBP")
+            self.assertEqual(max(image.size), 128)
+        first.close()
+        second.close()
+
+    @patch("backend.artwork_cache.requests.get")
+    def test_variants_and_original_use_separate_cache_files(self, get):
+        mbid = "88888888-8888-8888-8888-888888888888"
+        get.return_value = Response(
+            headers={"Content-Type": "image/jpeg"},
+            chunks=(encoded_image(1000),),
+        )
+        self.register()
+
+        thumb = self.client.get(self.artwork_url(mbid, "thumb"))
+        large = self.client.get(self.artwork_url(mbid, "large"))
+        original = self.client.get(self.artwork_url(mbid))
+
+        get.assert_called_once()
+        for name in (
+            f"release-group-{mbid}.jpg",
+            f"release-group-{mbid}@thumb.webp",
+            f"release-group-{mbid}@large.webp",
+        ):
+            self.assertTrue(
+                os.path.isfile(os.path.join(ARTWORK_CACHE_DIRECTORY, name)), name
+            )
+        self.assertNotEqual(thumb.data, large.data)
+        self.assertNotEqual(thumb.data, original.data)
+        thumb.close()
+        large.close()
+        original.close()
+
+    @patch("backend.artwork_cache.requests.get")
+    def test_unsupported_size_serves_the_original_image(self, get):
+        mbid = "99999999-9999-9999-9999-999999999999"
+        original = encoded_image(300)
+        get.return_value = Response(
+            headers={"Content-Type": "image/jpeg"},
+            chunks=(original,),
+        )
+        self.register()
+
+        response = self.client.get(self.artwork_url(mbid, "enormous"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, original)
+        response.close()
+
+    def test_stale_cleanup_keeps_variants_of_current_plex_artists(self):
+        os.makedirs(ARTWORK_CACHE_DIRECTORY, exist_ok=True)
+        kept = artwork_cache.plex_artist_artwork_key("server-1", "100")
+        removed = artwork_cache.plex_artist_artwork_key("server-1", "200")
+        names = [
+            f"{kept}.jpg",
+            f"{kept}@thumb.webp",
+            f"{kept}@card.webp",
+            f"{removed}.jpg",
+            f"{removed}@thumb.webp",
+        ]
+        for name in names:
+            with open(os.path.join(ARTWORK_CACHE_DIRECTORY, name), "wb") as file:
+                file.write(b"image")
+
+        deleted = artwork_cache.remove_stale_plex_artist_artwork({kept})
+
+        self.assertEqual(deleted, 2)
+        for name in names[:3]:
+            self.assertTrue(
+                os.path.isfile(os.path.join(ARTWORK_CACHE_DIRECTORY, name)), name
+            )
+        for name in names[3:]:
+            self.assertFalse(
+                os.path.exists(os.path.join(ARTWORK_CACHE_DIRECTORY, name)), name
+            )
+
+
+class CompressionTests(DatabaseTestCase):
+    @patch("backend.routes.library.plex.cached_library_snapshot")
+    @patch("backend.routes.library.get_service")
+    def test_large_json_is_gzipped_only_when_the_client_accepts_it(
+        self, get_service_mock, cached_snapshot
+    ):
+        get_service_mock.return_value = {"url": "http://plex:32400", "token": "token"}
+        cached_snapshot.return_value = {
+            "artists": [
+                {"name": f"Artist {index}", "section": "Music", "url": "u"}
+                for index in range(400)
+            ],
+            "releaseGroups": [],
+            "scannedAt": 1,
+        }
+        self.register()
+
+        compressed = self.client.get(
+            "/api/library", headers={"Accept-Encoding": "gzip"}
+        )
+        plain = self.client.get("/api/library", headers={"Accept-Encoding": ""})
+
+        self.assertEqual(compressed.headers.get("Content-Encoding"), "gzip")
+        self.assertIsNone(plain.headers.get("Content-Encoding"))
+        self.assertIn("Accept-Encoding", compressed.headers.get("Vary", ""))
+        self.assertIn("Accept-Encoding", plain.headers.get("Vary", ""))
+        self.assertEqual(
+            gzip.decompress(compressed.data),
+            plain.data,
+        )
+        self.assertLess(len(compressed.data), len(plain.data))
+
+    def test_small_responses_are_not_compressed(self):
+        response = self.client.get(
+            "/api/auth/status", headers={"Accept-Encoding": "gzip"}
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.headers.get("Content-Encoding"))
+
+    @patch("backend.artwork_cache.requests.get")
+    def test_streamed_artwork_is_never_recompressed(self, get):
+        mbid = "12121212-1212-1212-1212-121212121212"
+        get.return_value = Response(
+            headers={"Content-Type": "image/jpeg"},
+            chunks=(encoded_image(600),),
+        )
+        self.register()
+
+        response = self.client.get(
+            f"/api/artwork/release-group/{mbid}?size=card",
+            headers={"Accept-Encoding": "gzip"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.headers.get("Content-Encoding"))
+        response.close()
+
+
+class LibraryRouteTests(DatabaseTestCase):
+    def sign_in_as_invited_user(self):
+        """Register the owner, then join and sign in as a non-admin account."""
+        csrf = self.register()
+        invitation = self.client.post(
+            "/api/account/invitations", headers={"X-CSRF-Token": csrf}
+        )
+        token = parse_qs(urlparse(invitation.get_json()["path"]).query)["invite"][0]
+        self.client.post("/api/auth/logout", headers={"X-CSRF-Token": csrf})
+        response = self.client.post(
+            "/api/auth/register",
+            json={
+                "username": "invited-user",
+                "password": "another-secure-password",
+                "invitationToken": token,
+            },
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.get_json()["role"], "user")
+
+    @patch("backend.routes.library.plex.library_snapshot")
+    @patch("backend.routes.library.plex.cached_library_snapshot")
+    @patch("backend.routes.library.get_service")
+    def test_invited_users_read_the_cached_library_without_a_scan(
+        self, get_service_mock, cached_snapshot, live_snapshot
+    ):
+        get_service_mock.return_value = {"url": "http://plex:32400", "token": "token"}
+        cached_snapshot.return_value = {
+            "artists": [{
+                "name": "alpha",
+                "section": "Music",
+                "musicbrainzId": "11111111-1111-1111-1111-111111111111",
+                "artwork": "/api/artwork/plex-artist/1",
+                "url": "https://app.plex.tv/",
+                "thumb": "/library/metadata/1/thumb",
+                "guids": ["plex://artist/1"],
+                "plexGuid": "plex://artist/1",
+                "key": "/library/metadata/1/children",
+            }],
+            "releaseGroups": [{"name": "An album"}],
+            "scannedAt": 1234,
+        }
+        self.sign_in_as_invited_user()
+
+        response = self.client.get("/api/library")
+
+        self.assertEqual(response.status_code, 200)
+        live_snapshot.assert_not_called()
+        payload = response.get_json()
+        self.assertEqual(payload["artistCount"], 1)
+        self.assertEqual(payload["releaseGroupCount"], 1)
+        # Plex GUIDs and internal keys stay on the server.
+        self.assertEqual(
+            set(payload["artists"][0]),
+            {"name", "section", "musicbrainzId", "artwork", "url"},
+        )
+        self.assertTrue(response.headers.get("ETag"))
+
+    @patch("backend.routes.library.plex.library_snapshot")
+    @patch("backend.routes.library.plex.cached_library_snapshot")
+    @patch("backend.routes.library.get_service")
+    def test_empty_cache_falls_back_to_a_live_scan(
+        self, get_service_mock, cached_snapshot, live_snapshot
+    ):
+        get_service_mock.return_value = {"url": "http://plex:32400", "token": "token"}
+        cached_snapshot.return_value = {"artists": [], "releaseGroups": []}
+        live_snapshot.return_value = {
+            "artists": [{"name": "alpha"}],
+            "releaseGroups": [],
+        }
+        self.register()
+
+        response = self.client.get("/api/library")
+
+        self.assertEqual(response.status_code, 200)
+        live_snapshot.assert_called_once()
+        self.assertEqual(response.get_json()["artistCount"], 1)
+
+
+class LibraryIndexMemoizationTests(DatabaseTestCase):
+    def test_snapshot_is_parsed_once_per_request(self):
+        config = {"url": "http://plex:32400", "token": "token"}
+        snapshot = {
+            "artists": [{
+                "name": "alpha",
+                "musicbrainzId": "11111111-1111-1111-1111-111111111111",
+                "ratingKey": "10",
+            }],
+            "releaseGroups": [{
+                "name": "An album",
+                "musicbrainzReleaseGroupId": "22222222-2222-2222-2222-222222222222",
+            }],
+        }
+        with patch(
+            "backend.services.plex.get_cache_document", return_value=snapshot
+        ) as read:
+            with self.app.test_request_context("/"):
+                first = plex.cached_library_index(config)
+                second = plex.cached_library_index(config)
+
+        self.assertIs(first, second)
+        read.assert_called_once()
+        self.assertEqual(
+            set(first["artistsByMbid"]), {"11111111-1111-1111-1111-111111111111"}
+        )
+        self.assertEqual(
+            set(first["releaseGroupsByMbid"]),
+            {"22222222-2222-2222-2222-222222222222"},
+        )
+        self.assertEqual(set(first["artistsByRatingKey"]), {"10"})
 
 
 class PlexClientTests(unittest.TestCase):

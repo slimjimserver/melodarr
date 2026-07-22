@@ -15,6 +15,7 @@ if __package__ == "backend.services":
         set_cache_document,
         upsert_cache_documents,
     )
+    from ..cache_memo import invalidate_document, memoized_document
     from ..config import PLEX_LIBRARY_CACHE_TTL
 else:  # Support the existing `python backend/app.py` entry point.
     from api_cache import (
@@ -23,11 +24,16 @@ else:  # Support the existing `python backend/app.py` entry point.
         set_cache_document,
         upsert_cache_documents,
     )
+    from cache_memo import invalidate_document, memoized_document
     from config import PLEX_LIBRARY_CACHE_TTL
 
 
 scan_lock = RLock()
 SNAPSHOT_VERSION = 2
+
+
+def _index_key(snapshot_id):
+    return f"plex-library-index:{snapshot_id}"
 
 
 def _headers(config, accept_json=False):
@@ -270,6 +276,7 @@ def _save_snapshot(config, payload, *, replace_guids=False):
     set_cache_document(
         "plex-library", _snapshot_id(config), payload, PLEX_LIBRARY_CACHE_TTL
     )
+    invalidate_document(_index_key(_snapshot_id(config)))
     documents = _guid_documents(config, payload)
     if replace_guids:
         replace_cache_documents("plex-guid", documents, PLEX_LIBRARY_CACHE_TTL)
@@ -383,6 +390,42 @@ def cached_library_snapshot(config, *, allow_expired=True):
     return _normalize_snapshot_urls(config, payload)
 
 
+def _build_library_index(config):
+    snapshot = cached_library_snapshot(config)
+    release_groups = {}
+    for item in snapshot.get("releaseGroups", []):
+        release_group_id = item.get("musicbrainzReleaseGroupId")
+        if release_group_id:
+            release_groups.setdefault(release_group_id, []).append(item)
+    return {
+        "snapshot": snapshot,
+        "artistsByMbid": {
+            artist["musicbrainzId"]: artist
+            for artist in snapshot.get("artists", [])
+            if artist.get("musicbrainzId")
+        },
+        "artistsByRatingKey": {
+            artist["ratingKey"]: artist
+            for artist in snapshot.get("artists", [])
+            if artist.get("ratingKey")
+        },
+        "releaseGroupsByMbid": release_groups,
+    }
+
+
+def cached_library_index(config):
+    """Return lookup tables over the Plex snapshot, parsed at most once.
+
+    Detail pages previously deserialized the whole snapshot several times per
+    request and then scanned it linearly. The index is memoized per request and
+    otherwise behind a short TTL, so background workers share it too.
+    """
+    return memoized_document(
+        _index_key(_snapshot_id(config)),
+        lambda: _build_library_index(config),
+    )
+
+
 def music_library(config):
     """Return cached artists from the selected Plex music libraries."""
     return library_snapshot(config).get("artists", [])
@@ -426,6 +469,7 @@ def apply_release_group_mappings(config, mappings):
         set_cache_document(
             "plex-library", _snapshot_id(config), payload, PLEX_LIBRARY_CACHE_TTL
         )
+        invalidate_document(_index_key(_snapshot_id(config)))
         documents = _guid_documents(config, {
             "artists": [],
             "releaseGroups": changed,
