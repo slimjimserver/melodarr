@@ -83,6 +83,51 @@ function resetPageScroll() {
   window.scrollTo({ top: 0, left: 0, behavior: "auto" });
 }
 
+/**
+ * Restore pull-to-refresh for installed PWAs, where the browser's own gesture
+ * is not consistently exposed. It only activates from the document top so it
+ * cannot interfere with normal scrolling or horizontal carousels.
+ */
+function setupStandalonePullToRefresh() {
+  const isStandalone = window.matchMedia("(display-mode: standalone)").matches
+    || (navigator as Navigator & { standalone?: boolean }).standalone === true;
+  if (!isStandalone) return;
+
+  const indicator = document.querySelector<HTMLElement>("#pull-to-refresh");
+  if (!indicator) return;
+  let startY = 0;
+  let tracking = false;
+  const threshold = 84;
+
+  document.addEventListener("touchstart", (event) => {
+    if (event.touches.length !== 1 || window.scrollY > 0) return;
+    const target = event.target as Element | null;
+    if (target?.closest("input, textarea, select, button, a, [contenteditable=true]")) return;
+    startY = event.touches[0].clientY;
+    tracking = true;
+  }, { passive: true });
+
+  document.addEventListener("touchmove", (event) => {
+    if (!tracking) return;
+    const distance = Math.max(0, event.touches[0].clientY - startY);
+    if (!distance) return;
+    if (distance > 8) event.preventDefault();
+    const progress = Math.min(distance / threshold, 1);
+    indicator.style.setProperty("--pull-progress", String(progress));
+    indicator.classList.toggle("ready", distance >= threshold);
+    indicator.classList.add("visible");
+  }, { passive: false });
+
+  document.addEventListener("touchend", () => {
+    if (!tracking) return;
+    const shouldRefresh = indicator.classList.contains("ready");
+    tracking = false;
+    indicator.classList.remove("ready", "visible");
+    indicator.style.removeProperty("--pull-progress");
+    if (shouldRefresh) window.location.reload();
+  }, { passive: true });
+}
+
 function setMessage(element: Element, message: string, isError = false) {
   element.textContent = message;
   element.className = `message${isError ? " error" : ""}`;
@@ -833,6 +878,7 @@ function setupLibrary() {
 }
 
 setupNavigation();
+setupStandalonePullToRefresh();
 setupLidarrSettings();
 setupPlexSettings();
 setupLibrary();

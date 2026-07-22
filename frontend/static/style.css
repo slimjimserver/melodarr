@@ -71,6 +71,9 @@ body::after {
 [hidden] { display: none !important; }
 body:not(.authenticated) header, body:not(.authenticated) main, body:not(.authenticated) .tab-bar { display: none; }
 body.authenticated #auth { display: none; }
+.pull-to-refresh { position: fixed; top: calc(-44px + env(safe-area-inset-top, 0px)); left: 50%; z-index: 50; display: grid; width: 36px; height: 36px; place-items: center; border: 1px solid var(--border-hover); border-radius: 50%; background: rgba(16, 16, 20, .94); color: var(--foreground-muted); opacity: 0; pointer-events: none; transform: translate(-50%, calc(var(--pull-progress, 0) * 62px)) rotate(calc(var(--pull-progress, 0) * 180deg)); transition: opacity .15s var(--ease-out), color .15s var(--ease-out); }
+.pull-to-refresh.visible { opacity: 1; }
+.pull-to-refresh.ready { color: var(--accent-bright); }
 
 header {
   display: flex;
