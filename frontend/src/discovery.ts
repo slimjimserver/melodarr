@@ -376,6 +376,21 @@
       : { url: plexUrl, label: "Open in Plex", openInNewTab: true };
   }
 
+  function plexampArtistUrl(plexArtist: JsonObject) {
+    if (plexArtist.plexampUrl) return plexArtist.plexampUrl;
+    const plexGuid = [plexArtist.plexGuid, ...(plexArtist.guids || [])]
+      .find((guid) => /^plex:\/\/artist\//i.test(String(guid || "")));
+    const guidMatch = String(plexGuid || "").match(/^plex:\/\/artist\/(.+)$/i);
+    const webMatch = String(plexArtist.url || "").match(/#!\/server\/([^/]+)\/details\?(.+)$/);
+    if (!guidMatch || !webMatch) return "";
+    const key = new URLSearchParams(webMatch[2]).get("key") || plexArtist.key;
+    if (!key) return "";
+    const url = new URL(`https://listen.plex.tv/artist/${encodeURIComponent(guidMatch[1])}`);
+    url.searchParams.set("source", webMatch[1]);
+    url.searchParams.set("key", key);
+    return url.href;
+  }
+
   function addExternalLinks(container: Element, kind: DetailKind, id: string, spotify?: string, plexUrl = "", plexampUrl = "") {
     const links = document.createElement("div");
     links.className = "external-icons";
@@ -492,7 +507,7 @@
     const card = createCard(artistDisplayName(artist), description, () => showDetail("artist", artist.id), artist.coverArt, "artist", artist.id);
     const services = document.createElement("div");
     services.className = "card-service-icons";
-    const destination = mobilePlexDestination(plexArtist.url, plexArtist.plexampUrl);
+    const destination = mobilePlexDestination(plexArtist.url, plexampArtistUrl(plexArtist));
     services.append(createServiceIconLink(
       destination.url,
       "/icons/plex.svg",
@@ -1031,7 +1046,8 @@
         const description = type === "artist"
           ? [result.type, result.country, result.disambiguation].filter(Boolean).join(" · ")
           : [result.artist, result.type, result.date, result.disambiguation].filter(Boolean).join(" · ");
-        const plexArtist = library.get(normalizedArtistName(result.name))
+        const plexArtist = result.plex
+          || library.get(normalizedArtistName(result.name))
           || library.get(normalizedArtistName(result.romanizedName || ""));
         results.append(type === "artist"
           ? (plexArtist ? createPlexArtistCard(result, description, plexArtist) : createSearchArtistCard(result, description))

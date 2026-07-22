@@ -1619,6 +1619,37 @@ class MusicBrainzClientTests(unittest.TestCase):
 
 
 class DiscoveryRoutesTests(DatabaseTestCase):
+    @patch("backend.routes.discovery.plex.cached_library_index")
+    @patch("backend.routes.discovery.get_service")
+    @patch("backend.routes.discovery.musicbrainz.search")
+    def test_artist_search_uses_the_detail_page_plexamp_link(
+        self, search, get_service, plex_index
+    ):
+        artist_id = "b16c0872-31a7-4db9-8569-0e3146fcecfc"
+        plexamp_url = (
+            "https://listen.plex.tv/artist/635398caff6cd5445df237ef?"
+            "source=server-1&key=%2Flibrary%2Fmetadata%2F214575"
+        )
+        search.return_value = {"artists": [{"id": artist_id, "name": "Ella Langley"}]}
+        get_service.return_value = {"url": "http://plex", "token": "token"}
+        plex_index.return_value = {"artistsByMbid": {
+            artist_id: {
+                "url": "https://app.plex.tv/artist",
+                "plexampUrl": plexamp_url,
+                "plexGuid": "plex://artist/635398caff6cd5445df237ef",
+                "guids": [f"mbid://{artist_id}"],
+                "key": "/library/metadata/214575",
+            }
+        }}
+
+        response = self.client.get(
+            "/api/search?q=ella%20langley&type=artist",
+            headers={"X-CSRF-Token": self.register()},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["results"][0]["plex"]["plexampUrl"], plexamp_url)
+
     @patch("backend.routes.discovery.musicbrainz.search")
     def test_artist_search_returns_english_alias_with_canonical_name(self, search):
         search.return_value = {"artists": [{
@@ -2928,6 +2959,8 @@ class PlexClientTests(unittest.TestCase):
                 "artists": [{
                     "key": "/library/metadata/65537/children",
                     "url": "https://app.plex.tv/old-link",
+                    "plexGuid": "",
+                    "guids": ["plex://artist/artist-65537"],
                 }],
                 "releaseGroups": [],
             },
@@ -2936,6 +2969,11 @@ class PlexClientTests(unittest.TestCase):
         url = payload["artists"][0]["url"]
         self.assertIn("key=%2Flibrary%2Fmetadata%2F65537", url)
         self.assertNotIn("%2Fchildren", url)
+        self.assertEqual(
+            payload["artists"][0]["plexampUrl"],
+            "https://listen.plex.tv/artist/artist-65537?"
+            "source=server-1&key=%2Flibrary%2Fmetadata%2F65537",
+        )
 
     @patch("backend.services.plex.requests.get")
     def test_full_scan_only_reads_selected_music_sections(self, get):

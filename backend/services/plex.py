@@ -123,11 +123,16 @@ def _plexamp_url(config, key, plex_guid):
 def _normalize_snapshot_urls(config, payload):
     """Repair navigational URLs in both new and previously cached snapshots."""
     for collection_name in ("artists", "releaseGroups"):
+        media_type = "artist" if collection_name == "artists" else "album"
         for item in payload.get(collection_name, []):
             if item.get("key"):
+                plex_guid = _plex_metadata_guid(
+                    [item.get("plexGuid"), *(item.get("guids") or [])], media_type
+                )
+                item["plexGuid"] = plex_guid
                 item["url"] = _plex_url(config, item["key"])
                 item["plexampUrl"] = _plexamp_url(
-                    config, item["key"], item.get("plexGuid")
+                    config, item["key"], plex_guid
                 )
             if collection_name == "artists" and item.get("ratingKey") and item.get("thumb"):
                 item["artwork"] = f"/api/artwork/plex-artist/{item['ratingKey']}"
@@ -158,9 +163,18 @@ def _musicbrainz_id(guids):
     return ""
 
 
+def _plex_metadata_guid(guids, media_type):
+    prefix = f"plex://{media_type}/"
+    return next((
+        str(guid) for guid in guids
+        if str(guid).casefold().startswith(prefix)
+    ), "")
+
+
 def _normalize_artist(config, section, item):
     guids = _guids(item)
     rating_key = str(item.get("ratingKey", ""))
+    plex_guid = _plex_metadata_guid(guids, "artist")
     return {
         "name": item.get("title"),
         "thumb": item.get("thumb"),
@@ -168,16 +182,17 @@ def _normalize_artist(config, section, item):
         "key": item.get("key", ""),
         "ratingKey": rating_key,
         "artwork": f"/api/artwork/plex-artist/{rating_key}" if rating_key and item.get("thumb") else "",
-        "plexGuid": str(item.get("guid", "")),
+        "plexGuid": plex_guid,
         "guids": guids,
         "musicbrainzId": _musicbrainz_id(guids),
         "url": _plex_url(config, item.get("key", "")),
-        "plexampUrl": _plexamp_url(config, item.get("key", ""), item.get("guid", "")),
+        "plexampUrl": _plexamp_url(config, item.get("key", ""), plex_guid),
     }
 
 
 def _normalize_release_group(config, section, item):
     guids = _guids(item)
+    plex_guid = _plex_metadata_guid(guids, "album")
     return {
         "name": item.get("title"),
         "artistName": item.get("parentTitle") or item.get("grandparentTitle"),
@@ -187,13 +202,13 @@ def _normalize_release_group(config, section, item):
         "section": section.get("title"),
         "key": item.get("key", ""),
         "ratingKey": str(item.get("ratingKey", "")),
-        "plexGuid": str(item.get("guid", "")),
+        "plexGuid": plex_guid,
         "guids": guids,
         # Plex album matches use MusicBrainz release IDs, while Melodarr's
         # album entities use release-group IDs. Keep the entity type explicit.
         "musicbrainzReleaseId": _musicbrainz_id(guids),
         "url": _plex_url(config, item.get("key", "")),
-        "plexampUrl": _plexamp_url(config, item.get("key", ""), item.get("guid", "")),
+        "plexampUrl": _plexamp_url(config, item.get("key", ""), plex_guid),
     }
 
 

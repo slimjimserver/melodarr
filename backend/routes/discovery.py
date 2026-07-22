@@ -10,18 +10,41 @@ if __package__ == "backend.routes":
     from ..media_urls import artist_cover_art, release_group_cover_art
     from ..responses import api_error
     from ..security import current_user, login_required
-    from ..services import lastfm, musicbrainz
-    from ..storage import get_recommendation_cache
+    from ..services import lastfm, musicbrainz, plex
+    from ..storage import get_recommendation_cache, get_service
 else:  # Support the existing `python backend/app.py` entry point.
     import recommendations as recommendation_engine
     from media_urls import artist_cover_art, release_group_cover_art
     from responses import api_error
     from security import current_user, login_required
-    from services import lastfm, musicbrainz
-    from storage import get_recommendation_cache
+    from services import lastfm, musicbrainz, plex
+    from storage import get_recommendation_cache, get_service
 
 
 blueprint = Blueprint("discovery", __name__)
+
+
+def _plex_search_artists():
+    """Use the same MBID-indexed Plex records as artist detail pages."""
+    config = get_service("plex")
+    if not config:
+        return {}
+    try:
+        return plex.cached_library_index(config)["artistsByMbid"]
+    except (ValueError, requests.RequestException):
+        return {}
+
+
+def _plex_search_link(artist):
+    if not artist:
+        return None
+    return {
+        "url": artist.get("url", ""),
+        "plexampUrl": artist.get("plexampUrl", ""),
+        "plexGuid": artist.get("plexGuid", ""),
+        "guids": artist.get("guids", []),
+        "key": artist.get("key", ""),
+    }
 
 
 @blueprint.get("/api/recommendations")
@@ -193,6 +216,7 @@ def search():
         return api_error("MusicBrainz could not be reached. Try again shortly.", 502)
 
     if search_type == "artist":
+        plex_artists = _plex_search_artists()
         results = [
             {
                 "id": artist["id"],
@@ -203,6 +227,7 @@ def search():
                 "type": artist.get("type", ""),
                 "score": artist.get("score", 0),
                 "coverArt": artist_cover_art(artist["id"]),
+                "plex": _plex_search_link(plex_artists.get(artist["id"])),
             }
             for artist in response.get("artists", [])
         ]
