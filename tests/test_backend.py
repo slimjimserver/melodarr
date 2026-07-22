@@ -1570,8 +1570,81 @@ class MusicBrainzClientTests(unittest.TestCase):
         musicbrainz.get("/artist/artist-id", "genres", cache_only=True)
         self.assertTrue(cached_get.call_args.kwargs["cache_only"])
 
+    def test_artist_name_prefers_primary_english_alias(self):
+        artist = {
+            "name": "ポルカドットスティングレイ",
+            "sort-name": "POLKADOT STINGRAY",
+            "aliases": [
+                {"name": "Porukadotto Sutingurei", "locale": "ja-Latn"},
+                {"name": "POLKADOT STINGRAY", "locale": "en", "primary": True},
+            ],
+        }
+
+        self.assertEqual(
+            musicbrainz.romanized_artist_name(artist), "POLKADOT STINGRAY"
+        )
+
+    def test_artist_name_falls_back_to_latin_sort_name(self):
+        artist = {"name": "雫", "sort-name": "Shizuku", "aliases": []}
+
+        self.assertEqual(musicbrainz.romanized_artist_name(artist), "Shizuku")
+
+    def test_artist_name_omits_duplicate_for_latin_canonical_name(self):
+        artist = {"name": "BAND-MAID", "sort-name": "BAND-MAID"}
+
+        self.assertEqual(musicbrainz.romanized_artist_name(artist), "")
+
+
+class DiscoveryRoutesTests(DatabaseTestCase):
+    @patch("backend.routes.discovery.musicbrainz.search")
+    def test_artist_search_returns_english_alias_with_canonical_name(self, search):
+        search.return_value = {"artists": [{
+            "id": "0f0caf6e-e815-4ad3-93db-fb37be9adcc8",
+            "name": "ポルカドットスティングレイ",
+            "sort-name": "POLKADOT STINGRAY",
+            "aliases": [{
+                "name": "POLKADOT STINGRAY",
+                "locale": "en",
+                "primary": True,
+            }],
+        }]}
+
+        response = self.client.get(
+            "/api/search?q=polkadot%20stingray&type=artist",
+            headers={"X-CSRF-Token": self.register()},
+        )
+
+        artist = response.get_json()["results"][0]
+        self.assertEqual(artist["name"], "ポルカドットスティングレイ")
+        self.assertEqual(artist["romanizedName"], "POLKADOT STINGRAY")
+
 
 class MusicRoutesTests(DatabaseTestCase):
+    @patch("backend.routes.music.musicbrainz.get")
+    def test_artist_detail_returns_english_alias(self, get):
+        get.side_effect = [
+            {
+                "id": "artist-id",
+                "name": "ポルカドットスティングレイ",
+                "aliases": [{
+                    "name": "POLKADOT STINGRAY",
+                    "locale": "en",
+                    "primary": True,
+                }],
+                "relations": [],
+                "genres": [],
+            },
+            {"release-groups": [], "release-group-count": 0},
+        ]
+
+        response = self.client.get(
+            "/api/music/artist/artist-id",
+            headers={"X-CSRF-Token": self.register()},
+        )
+
+        self.assertEqual(response.get_json()["romanizedName"], "POLKADOT STINGRAY")
+        self.assertEqual(get.call_args_list[0].args[1], "aliases+url-rels+genres")
+
     @patch("backend.routes.music.musicbrainz.get")
     @patch("backend.routes.music.lidarr.cached_artist_availability")
     def test_artist_detail_marks_artist_already_tracked_in_lidarr(

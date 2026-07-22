@@ -211,6 +211,12 @@
     return card;
   }
 
+  function artistDisplayName(artist: JsonObject) {
+    const name = String(artist.name || "Unknown artist");
+    const romanizedName = String(artist.romanizedName || "").trim();
+    return romanizedName ? `${name} (${romanizedName})` : name;
+  }
+
   function addPlexAvailability(element: HTMLElement, label = "Available in Plex") {
     const badge = document.createElement("span");
     badge.className = "plex-availability";
@@ -463,7 +469,7 @@
   }
 
   function createSearchArtistCard(artist: JsonObject, description: string) {
-    const card = createCard(artist.name, description, () => showDetail("artist", artist.id), artist.coverArt, "artist", artist.id);
+    const card = createCard(artistDisplayName(artist), description, () => showDetail("artist", artist.id), artist.coverArt, "artist", artist.id);
     const requestButton = document.createElement("button");
     requestButton.className = "request";
     requestButton.type = "button";
@@ -477,7 +483,7 @@
   }
 
   function createPlexArtistCard(artist: JsonObject, description: string, plexArtist: JsonObject) {
-    const card = createCard(artist.name, description, () => showDetail("artist", artist.id), artist.coverArt, "artist", artist.id);
+    const card = createCard(artistDisplayName(artist), description, () => showDetail("artist", artist.id), artist.coverArt, "artist", artist.id);
     const services = document.createElement("div");
     services.className = "card-service-icons";
     const destination = mobilePlexDestination(plexArtist.url, plexArtist.plexampUrl);
@@ -743,7 +749,7 @@
 
     if (kind === "artist") {
       $("#detail-eyebrow").textContent = "ARTIST DISCOGRAPHY";
-      $("#detail-title").textContent = data.name;
+      $("#detail-title").textContent = artistDisplayName(data);
       const cover = $("#detail-cover");
       const coverImage = $("#detail-cover-image");
       cover.classList.remove("skeleton");
@@ -1017,7 +1023,8 @@
         const description = type === "artist"
           ? [result.type, result.country, result.disambiguation].filter(Boolean).join(" · ")
           : [result.artist, result.type, result.date, result.disambiguation].filter(Boolean).join(" · ");
-        const plexArtist = library.get(normalizedArtistName(result.name));
+        const plexArtist = library.get(normalizedArtistName(result.name))
+          || library.get(normalizedArtistName(result.romanizedName || ""));
         results.append(type === "artist"
           ? (plexArtist ? createPlexArtistCard(result, description, plexArtist) : createSearchArtistCard(result, description))
           : createCard(result.name, description, () => showDetail("release-group", result.id)));

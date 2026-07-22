@@ -197,6 +197,7 @@ def search():
             {
                 "id": artist["id"],
                 "name": artist.get("name", "Unknown artist"),
+                "romanizedName": musicbrainz.romanized_artist_name(artist),
                 "disambiguation": artist.get("disambiguation", ""),
                 "country": artist.get("country", ""),
                 "type": artist.get("type", ""),

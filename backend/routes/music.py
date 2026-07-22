@@ -66,7 +66,7 @@ def _artist_detail_payload(
     operation = musicbrainz.critical_operation() if priority == "critical" else None
     with operation or nullcontext():
         data = musicbrainz.get(
-            f"/artist/{quote(mbid)}", "url-rels+genres", priority=priority,
+            f"/artist/{quote(mbid)}", "aliases+url-rels+genres", priority=priority,
             force_refresh=force_refresh,
             cache_only=cache_only,
         )
@@ -121,7 +121,9 @@ def _artist_detail_payload(
     plex_artist = _plex_artist(mbid)
     lidarr_artist = lidarr.cached_artist_availability().get(mbid)
     return {
-        "id": data["id"], "name": data.get("name"), "country": data.get("country", ""),
+        "id": data["id"], "name": data.get("name"),
+        "romanizedName": musicbrainz.romanized_artist_name(data),
+        "country": data.get("country", ""),
         "disambiguation": data.get("disambiguation", ""), "type": data.get("type", ""),
         "gender": data.get("gender", ""), "area": (data.get("area") or {}).get("name", ""),
         "lifeSpan": data.get("life-span", {}),
@@ -180,6 +182,10 @@ def _lidarr_artist_detail_payload(mbid):
     return {
         "id": mbid,
         "name": artist.get("artistName") or artist.get("name") or "Unknown artist",
+        "romanizedName": musicbrainz.romanized_artist_name({
+            "name": artist.get("artistName") or artist.get("name"),
+            "sortName": artist.get("sortName"),
+        }),
         "country": artist.get("country") or "",
         "disambiguation": artist.get("disambiguation") or "",
         "type": artist.get("artistType") or "",
