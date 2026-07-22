@@ -539,6 +539,22 @@ class DeploymentConfigTests(unittest.TestCase):
             discovery_typescript,
         )
 
+    def test_discovery_search_uses_only_the_search_response_for_plex_matches(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(
+            os.path.join(project_root, "frontend", "src", "discovery.ts"),
+            encoding="utf-8",
+        ) as file:
+            discovery_typescript = file.read()
+
+        self.assertNotIn('getJson("/api/library")', discovery_typescript)
+        self.assertNotIn("getPlexArtists", discovery_typescript)
+        self.assertNotIn("normalizedArtistName", discovery_typescript)
+        self.assertIn(
+            "result.plex ? createPlexArtistCard",
+            discovery_typescript,
+        )
+
     def test_account_menu_has_a_profile_link_fallback(self):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with open(

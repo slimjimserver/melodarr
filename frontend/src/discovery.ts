@@ -14,7 +14,6 @@
   const detailHistory: DetailReference[] = [];
   let requestedArtist: JsonObject | undefined;
   let lidarrExternalUrl: string | undefined;
-  let plexArtists: Map<string, JsonObject> | undefined;
   let recommendationPoll: ReturnType<typeof setTimeout> | undefined;
   let searchRequestVersion = 0;
   let searchDebounce: ReturnType<typeof setTimeout>;
@@ -138,26 +137,11 @@
     }
   }
 
-  function normalizedArtistName(name: string) {
-    return (name || "").normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]/g, "");
-  }
-
   async function getLidarrExternalUrl() {
     if (lidarrExternalUrl !== undefined) return lidarrExternalUrl;
     const settings = await getJson("/api/settings");
     lidarrExternalUrl = settings.lidarr.externalUrl || "";
     return lidarrExternalUrl;
-  }
-
-  async function getPlexArtists() {
-    if (plexArtists !== undefined) return plexArtists;
-    try {
-      const library = await getJson("/api/library");
-      plexArtists = new Map(library.artists.map((artist: JsonObject) => [normalizedArtistName(artist.name), artist]));
-    } catch {
-      plexArtists = new Map();
-    }
-    return plexArtists;
   }
 
   async function postJson(url: string, body: JsonObject): Promise<JsonObject> {
@@ -995,14 +979,11 @@
     $("#search-form").classList.add("searching");
     results.replaceChildren(skeletonBlock("skeleton-card", 5));
     try {
-      const [data, library] = await Promise.all([
-        getJson(
-          `/api/search?q=${encodeURIComponent(query)}&type=${type}`,
-          30_000,
-          controller.signal,
-        ),
-        getPlexArtists(),
-      ]);
+      const data = await getJson(
+        `/api/search?q=${encodeURIComponent(query)}&type=${type}`,
+        30_000,
+        controller.signal,
+      );
       if (requestVersion !== searchRequestVersion) return;
       results.replaceChildren();
       $("#search-message").textContent = data.results.length
@@ -1012,11 +993,8 @@
         const description = type === "artist"
           ? [result.type, result.country, result.disambiguation].filter(Boolean).join(" · ")
           : [result.artist, result.type, result.date, result.disambiguation].filter(Boolean).join(" · ");
-        const plexArtist = result.plex
-          || library.get(normalizedArtistName(result.name))
-          || library.get(normalizedArtistName(result.romanizedName || ""));
         results.append(type === "artist"
-          ? (plexArtist ? createPlexArtistCard(result, description, plexArtist) : createSearchArtistCard(result, description))
+          ? (result.plex ? createPlexArtistCard(result, description, result.plex) : createSearchArtistCard(result, description))
           : createCard(releaseGroupDisplayTitle(result), description, () => showDetail("release-group", result.id)));
       });
     } catch (error) {
