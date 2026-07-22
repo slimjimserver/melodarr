@@ -53,19 +53,21 @@ COMPRESSION_MINIMUM_BYTES = 1024
 def compress_response(response):
     """Gzip large text responses so mobile clients transfer far fewer bytes.
 
-    Artwork is already stored in compressed image formats and is streamed
-    straight from disk, so `direct_passthrough` responses are left untouched.
+    Artwork is already stored in compressed image formats, and its mimetype
+    keeps it out of this path so it stays streamed straight from disk. Static
+    scripts and stylesheets are streamed too, so passthrough is turned off for
+    them specifically in order to read and compress the body.
     """
     response.headers.add("Vary", "Accept-Encoding")
     if (
-        response.direct_passthrough
-        or response.status_code < 200
-        or response.status_code >= 300
+        response.status_code != 200
         or "Content-Encoding" in response.headers
+        or "Content-Range" in response.headers
         or response.mimetype not in COMPRESSIBLE_MIMETYPES
         or "gzip" not in request.headers.get("Accept-Encoding", "")
     ):
         return response
+    response.direct_passthrough = False
     body = response.get_data()
     if len(body) < COMPRESSION_MINIMUM_BYTES:
         return response

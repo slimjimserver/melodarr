@@ -71,6 +71,9 @@ let currentUser: CurrentUser | undefined;
 let showAccountPage: ((page?: AccountPage, updateHistory?: boolean) => void) | undefined;
 let invitationToken = "";
 let maintenanceRefreshTimer: number | undefined;
+// Plex holdings tell a requester what is already available, so the library is
+// readable by every account. Settings remains administrator-only.
+const VIEWS_FOR_EVERY_USER = ["discover", "detail", "library", "account"];
 
 if ("scrollRestoration" in window.history) {
   window.history.scrollRestoration = "manual";
@@ -83,6 +86,38 @@ function resetPageScroll() {
 function setMessage(element: Element, message: string, isError = false) {
   element.textContent = message;
   element.className = `message${isError ? " error" : ""}`;
+}
+
+/**
+ * Announce the result of an action next to the reader's thumb.
+ *
+ * Request buttons can sit hundreds of rows down a discography, where a message
+ * written into the page heading is never seen.
+ */
+function showToast(message: string, isError = false) {
+  if (!message) return;
+  const container = document.querySelector("#toasts");
+  if (!container) return;
+  const toast = document.createElement("div");
+  toast.className = `toast${isError ? " error" : ""}`;
+  toast.setAttribute("role", isError ? "alert" : "status");
+  toast.textContent = message;
+  container.append(toast);
+  window.setTimeout(() => {
+    toast.classList.add("leaving");
+    toast.addEventListener("animationend", () => toast.remove(), { once: true });
+  }, isError ? 7_000 : 4_500);
+}
+
+/** Build a shimmering stand-in with the same shape as the pending content. */
+function skeletonBlock(className: string, count = 1) {
+  const fragment = document.createDocumentFragment();
+  for (let index = 0; index < count; index += 1) {
+    const block = document.createElement("div");
+    block.className = `skeleton ${className}`;
+    fragment.append(block);
+  }
+  return fragment;
 }
 
 async function api<T = JsonObject>(url: string, options: RequestInit = {}): Promise<T> {
@@ -310,12 +345,12 @@ function showSettingsPage(page: SettingsPage, updateHistory = true) {
 
 function setupNavigation() {
   function showView(view: AppView, updateHistory = true) {
-    if (!currentUser || (currentUser.role !== "admin" && !["discover", "account"].includes(view))) view = "discover";
+    if (!currentUser || (currentUser.role !== "admin" && !VIEWS_FOR_EVERY_USER.includes(view))) view = "discover";
     document.querySelectorAll(".nav-link, .view").forEach((element) => element.classList.remove("active"));
-    // Account and detail are application views without a matching top-nav
-    // button. Use an optional native query instead of the strict `$` helper,
-    // which deliberately throws when an element is absent.
-    document.querySelector<HTMLElement>(`[data-view="${view}"]`)?.classList.add("active");
+    // Account and detail are application views without a matching nav button,
+    // and the header and bottom tab bar both carry a button per view, so this
+    // marks every match rather than using the strict single-element helper.
+    document.querySelectorAll<HTMLElement>(`[data-view="${view}"]`).forEach((button) => button.classList.add("active"));
     $(`#${view}`).classList.add("active");
     if (view !== "settings" && maintenanceRefreshTimer !== undefined) {
       window.clearInterval(maintenanceRefreshTimer);
@@ -458,12 +493,17 @@ function setupNavigation() {
   if (initialView === "settings/jobs") showView("settings", false);
   else if (["library", "settings"].includes(initialView)) showView(initialView as AppView, false);
 
+  document.querySelectorAll<HTMLElement>(".tab-bar .nav-link").forEach((button) => button.addEventListener("click", () => {
+    window.scrollTo({ top: 0, behavior: "auto" });
+  }));
+
   $<HTMLAnchorElement>("#account-menu").addEventListener("click", (event) => {
     if (!currentUser || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
     event.preventDefault();
     showAccountPage?.("profile");
   });
   document.querySelectorAll<HTMLElement>("[data-account-route]").forEach((link) => link.addEventListener("click", (event) => { event.preventDefault(); showAccountPage?.(link.dataset.accountRoute as AccountPage); }));
+  document.querySelector("#account-logout")?.addEventListener("click", () => signOut());
   document.querySelectorAll<HTMLElement>("[data-settings-page]").forEach((button) => button.addEventListener("click", () => showSettingsPage(button.dataset.settingsPage as SettingsPage)));
   document.querySelector("#refresh-maintenance")?.addEventListener("click", () => refreshMaintenance());
 }
@@ -571,13 +611,16 @@ function setupAuth() {
       { invitationToken },
     );
   });
-  $("#logout").addEventListener("click", async () => {
-    try {
-      await api("/api/auth/logout", { method: "POST" });
-    } finally {
-      showAuth({ resetPath: true });
-    }
-  });
+  $("#logout").addEventListener("click", () => signOut());
+}
+
+/** End the session from either the header button or the account menu. */
+async function signOut() {
+  try {
+    await api("/api/auth/logout", { method: "POST" });
+  } finally {
+    showAuth({ resetPath: true });
+  }
 }
 
 function setupLidarrSettings() {
@@ -723,7 +766,7 @@ function setupLibrary() {
   search.addEventListener("input", filterArtists);
 
   $("#load-library").addEventListener("click", async () => {
-    results.replaceChildren();
+    results.replaceChildren(skeletonBlock("library-card", 12));
     artistCards = [];
     search.value = "";
     filter.hidden = true;
@@ -731,6 +774,7 @@ function setupLibrary() {
 
     try {
       const library = await api("/api/library");
+      results.replaceChildren();
       $("#library-copy").textContent = `${library.artistCount} artists and ${library.releaseGroupCount} releases available in your Plex music libraries.`;
       setMessage($("#library-message"), "");
       library.artists.forEach((artist: JsonObject) => {
@@ -744,7 +788,10 @@ function setupLibrary() {
           image.alt = "";
           image.loading = "lazy";
           image.decoding = "async";
-          image.src = artist.artwork;
+          image.width = 384;
+          image.height = 384;
+          // Plex serves 600px originals; the grid renders them at 175 CSS px.
+          image.src = `${artist.artwork}?size=card`;
           image.addEventListener("error", () => image.remove());
           artwork.append(image);
         }
@@ -779,6 +826,7 @@ function setupLibrary() {
       filter.hidden = false;
       filterArtists();
     } catch (error) {
+      results.replaceChildren();
       setMessage($("#library-message"), error.message, true);
     }
   });

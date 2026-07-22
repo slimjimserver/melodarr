@@ -501,7 +501,7 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn('$("#search-form").reset()', discovery_typescript)
         self.assertIn('$("#results").replaceChildren()', discovery_typescript)
         self.assertIn("searchRequestVersion += 1", discovery_typescript)
-        self.assertIn("const maxArtworkRequests = 3", discovery_typescript)
+        self.assertIn("const maxArtworkRequests = 6", discovery_typescript)
         self.assertIn('kind === "artist" ? 120_000', discovery_typescript)
         self.assertIn("loadArtworkWhenNear", discovery_typescript)
         self.assertIn('"/icons/listenbrainz.svg"', discovery_typescript)
@@ -529,8 +529,11 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn('<a id="account-menu"', frontend)
         self.assertIn("accountMenu.href = `/${encodeURIComponent(user.username)}`", typescript)
         self.assertIn('showAccountPage?.("profile")', typescript)
+        # The header and the mobile tab bar both carry a button per view, and
+        # detail/account views have none, so this must not use the strict
+        # single-element helper that throws when a selector matches nothing.
         self.assertIn(
-            'document.querySelector<HTMLElement>(`[data-view="${view}"]`)',
+            'document.querySelectorAll<HTMLElement>(`[data-view="${view}"]`)',
             typescript,
         )
         self.assertNotIn('$(`[data-view=${view}]`)', typescript)

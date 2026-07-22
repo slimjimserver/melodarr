@@ -16,7 +16,7 @@
       <img src="/icons/melodarr.svg" alt="">
       <span>melodarr</span>
     </a>
-    <nav>
+    <nav class="header-nav">
       <button class="nav-link active" data-view="discover">Discover</button>
       <button class="nav-link admin-only" data-view="library">Your library</button>
       <button class="nav-link admin-only" data-view="settings">Settings</button>
@@ -240,6 +240,12 @@
       </div>
     </form>
   </dialog>
+  <nav class="tab-bar" aria-label="Primary">
+    <button class="nav-link active" data-view="discover"><span class="tab-icon" aria-hidden="true">◎</span>Discover</button>
+    <button class="nav-link" data-view="library"><span class="tab-icon" aria-hidden="true">▤</span>Library</button>
+    <button class="nav-link admin-only" data-view="settings"><span class="tab-icon" aria-hidden="true">⚙</span>Settings</button>
+  </nav>
+  <div id="toasts" class="toasts" aria-live="polite" aria-atomic="false"></div>
   <button id="back-to-top" type="button" aria-label="Back to top">↑ <span>Top</span></button>
   <script src="/static/app.js"></script>
   <script src="/static/discovery.js"></script>
