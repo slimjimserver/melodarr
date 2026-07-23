@@ -64,6 +64,7 @@ def url(path, config=None):
 
 
 def _request(method, path, *, config=None, timeout=15, **kwargs):
+    config = config or get_service("lidarr")
     return requests.request(
         method,
         url(path, config),
@@ -79,6 +80,7 @@ def system_status(config=None):
 
 def options(config=None):
     """Load the selectable root folders, profiles, and tags from Lidarr."""
+    config = config or get_service("lidarr")
     request_headers = headers(config)
 
     def get(path):

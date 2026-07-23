@@ -13,12 +13,20 @@ else:  # Support the existing `python backend/app.py` entry point.
     from config import DATABASE, SETTINGS_FILE
 
 
+DATABASE_BUSY_TIMEOUT_MS = 5000
+
+
 @contextmanager
 def db():
     """Yield a transactional SQLite connection and always close it."""
     os.makedirs(os.path.dirname(os.path.abspath(DATABASE)), exist_ok=True)
-    connection = sqlite3.connect(DATABASE)
+    connection = sqlite3.connect(
+        DATABASE,
+        timeout=DATABASE_BUSY_TIMEOUT_MS / 1000,
+    )
     connection.row_factory = sqlite3.Row
+    connection.execute(f"PRAGMA busy_timeout = {DATABASE_BUSY_TIMEOUT_MS}")
+    connection.execute("PRAGMA synchronous = NORMAL")
     try:
         yield connection
         connection.commit()
@@ -201,16 +209,15 @@ def defer_lidarr_search(job_id, error, reset_refresh=False):
     """Retry transient Lidarr work with bounded exponential backoff."""
     with db() as connection:
         row = connection.execute(
-            "SELECT attempts FROM pending_lidarr_searches WHERE id = ?", (job_id,)
+            "SELECT attempts, refresh_command_id "
+            "FROM pending_lidarr_searches WHERE id = ?",
+            (job_id,),
         ).fetchone()
         if not row:
             return
         attempts = row["attempts"] + 1
         delay = min(5 * (2 ** min(attempts - 1, 6)), 300)
-        refresh_command_id = None if reset_refresh else connection.execute(
-            "SELECT refresh_command_id FROM pending_lidarr_searches WHERE id = ?",
-            (job_id,),
-        ).fetchone()["refresh_command_id"]
+        refresh_command_id = None if reset_refresh else row["refresh_command_id"]
         connection.execute(
             "UPDATE pending_lidarr_searches SET refresh_command_id = ?, attempts = ?, "
             "last_error = ?, next_attempt_at = ? WHERE id = ?",
@@ -254,7 +261,11 @@ def save_recommendation_cache(user_id, value):
         connection.execute(
             "INSERT OR REPLACE INTO recommendation_cache (user_id, value, refreshed_at) "
             "VALUES (?, ?, ?)",
-            (user_id, json.dumps(value), time.time()),
+            (
+                user_id,
+                json.dumps(value, ensure_ascii=False, separators=(",", ":")),
+                time.time(),
+            ),
         )
 
 
@@ -301,6 +312,9 @@ def init_db():
     """Create current tables and migrate legacy service settings to JSON."""
     legacy_settings = {}
     with db() as connection:
+        # WAL lets request threads read account and queue state while a
+        # background worker commits unrelated updates.
+        connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

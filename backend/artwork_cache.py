@@ -364,18 +364,21 @@ def cached_artwork(cache_key, source_url, *, headers=None, size=None):
             return "", 404
 
         temporary_path = None
+        provider_response = None
         try:
-            response = requests.get(
+            provider_response = requests.get(
                 resolved_source_url, headers=headers, stream=True, timeout=20
             )
-            if response.status_code == 404:
+            if provider_response.status_code == 404:
                 os.makedirs(ARTWORK_CACHE_DIRECTORY, exist_ok=True)
                 with open(miss_file, "a", encoding="utf-8"):
                     pass
                 return "", 404
-            response.raise_for_status()
+            provider_response.raise_for_status()
             content_type = (
-                response.headers.get("Content-Type", "").split(";", 1)[0].lower()
+                provider_response.headers.get("Content-Type", "")
+                .split(";", 1)[0]
+                .lower()
             )
             extension = {
                 "image/jpeg": "jpg",
@@ -397,7 +400,7 @@ def cached_artwork(cache_key, source_url, *, headers=None, size=None):
             ) as file:
                 temporary_path = file.name
                 downloaded = 0
-                for chunk in response.iter_content(chunk_size=64 * 1024):
+                for chunk in provider_response.iter_content(chunk_size=64 * 1024):
                     downloaded += len(chunk)
                     if downloaded > ARTWORK_MAX_DOWNLOAD_BYTES:
                         raise ValueError("Cover Art Archive image is too large to cache")
@@ -413,5 +416,15 @@ def cached_artwork(cache_key, source_url, *, headers=None, size=None):
             )
             return redirect(resolved_source_url, code=302)
         finally:
+            close_response = getattr(provider_response, "close", None)
+            if close_response is not None:
+                try:
+                    close_response()
+                except OSError:
+                    current_app.logger.debug(
+                        "Could not close artwork response for %s",
+                        cache_key,
+                        exc_info=True,
+                    )
             if temporary_path and os.path.exists(temporary_path):
                 os.unlink(temporary_path)

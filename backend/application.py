@@ -66,7 +66,7 @@ def compress_response(response):
         or "Content-Encoding" in response.headers
         or "Content-Range" in response.headers
         or response.mimetype not in COMPRESSIBLE_MIMETYPES
-        or "gzip" not in request.headers.get("Accept-Encoding", "")
+        or request.accept_encodings["gzip"] <= 0
     ):
         return response
     response.direct_passthrough = False

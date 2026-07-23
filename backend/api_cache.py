@@ -25,6 +25,11 @@ _cleanup_lock = Lock()
 _last_cleanup_at = None
 
 
+def _serialize_json(value):
+    """Encode cache values compactly without escaping non-ASCII metadata."""
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
 @contextmanager
 def cache_db():
     """Yield a transactional connection to the disposable metadata cache."""
@@ -71,6 +76,36 @@ def _cache_operation(operation, *, locked_default=_RAISE_ON_LOCK, description="a
                 )
                 return locked_default
             time.sleep(delay)
+
+
+def _cached_value(key, row):
+    """Decode one row, discarding corruption from the disposable cache."""
+    if row is None:
+        return None
+    try:
+        return json.loads(row["value"])
+    except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        logger.warning("Discarding invalid metadata cache entry %s: %s", key, exc)
+
+        def delete_invalid(connection):
+            connection.execute(
+                "DELETE FROM api_cache WHERE cache_key = ?",
+                (key,),
+            )
+
+        try:
+            _cache_operation(
+                delete_invalid,
+                locked_default=None,
+                description="discard an invalid HTTP response",
+            )
+        except sqlite3.Error as delete_exc:
+            logger.warning(
+                "Could not discard invalid metadata cache entry %s: %s",
+                key,
+                delete_exc,
+            )
+        return None
 
 
 def init_cache_db():
@@ -143,7 +178,7 @@ def _fresh_cache_value(key):
         locked_default=None,
         description="read an HTTP response",
     )
-    return json.loads(row["value"]) if row else None
+    return _cached_value(key, row)
 
 
 def get_cache_expiry(key):
@@ -199,7 +234,7 @@ def get_cache_document(namespace, document_id, *, allow_expired=False):
         locked_default=None,
         description=f"read the {namespace} document",
     )
-    return json.loads(row["value"]) if row else None
+    return _cached_value(key, row)
 
 
 def set_cache_document(namespace, document_id, value, ttl):
@@ -213,7 +248,11 @@ def upsert_cache_documents(namespace, documents, ttl):
         return
     expires_at = time.time() + ttl
     rows = [
-        (document_cache_key(namespace, document_id), json.dumps(value), expires_at)
+        (
+            document_cache_key(namespace, document_id),
+            _serialize_json(value),
+            expires_at,
+        )
         for document_id, value in documents.items()
     ]
 
@@ -237,7 +276,7 @@ def replace_cache_documents(namespace, documents, ttl):
     rows = [
         (
             document_cache_key(namespace, document_id),
-            json.dumps(value),
+            _serialize_json(value),
             expires_at,
         )
         for document_id, value in documents.items()
@@ -269,7 +308,7 @@ def commit_json_responses(responses, *, delete_keys=()):
                 response["url"],
                 response.get("params"),
             ),
-            json.dumps(response["value"]),
+            _serialize_json(response["value"]),
             now + response["ttl"],
         )
         for response in responses
@@ -427,7 +466,7 @@ def cached_json_get(
             connection.execute(
                 "INSERT OR REPLACE INTO api_cache "
                 "(cache_key, value, expires_at) VALUES (?, ?, ?)",
-                (key, json.dumps(value), now + ttl),
+                (key, _serialize_json(value), now + ttl),
             )
 
         try:

@@ -4,7 +4,7 @@ import os
 import re
 from hashlib import sha256
 
-from flask import Blueprint, Response, current_app, redirect, request, send_from_directory
+from flask import Blueprint, Response, redirect, request, send_from_directory
 
 if __package__ == "backend.routes":
     from ..config import FRONTEND_ROOT

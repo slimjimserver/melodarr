@@ -4,7 +4,7 @@ import os
 from functools import wraps
 from hmac import compare_digest
 
-from flask import jsonify, request, session
+from flask import g, has_request_context, jsonify, request, session
 
 if __package__:
     from .responses import api_error
@@ -23,13 +23,24 @@ def get_user(user_id):
         ).fetchone()
 
 
+_MISSING = object()
+_REQUEST_USER_KEY = "_melodarr_current_user"
+
+
 def current_user():
+    """Return the signed-in user, querying SQLite at most once per request."""
     user_id = session.get("user_id")
     if not user_id:
         return None
+    if has_request_context():
+        cached = getattr(g, _REQUEST_USER_KEY, _MISSING)
+        if cached is not _MISSING and cached[0] == user_id:
+            return cached[1]
     user = get_user(user_id)
     if not user:
         session.clear()
+    if has_request_context():
+        setattr(g, _REQUEST_USER_KEY, (user_id, user))
     return user
 
 

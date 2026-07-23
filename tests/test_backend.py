@@ -34,6 +34,7 @@ from backend import artwork_cache
 from backend import cache_memo
 from backend import detail_cache
 from backend import recommendations as recommendation_engine
+from backend import security
 from backend.api_cache import (
     cache_db,
     cache_key,
@@ -1287,6 +1288,15 @@ class AuthenticationTests(DatabaseTestCase):
         )
         self.assertEqual(accepted.status_code, 200)
 
+    def test_authenticated_route_loads_the_user_once(self):
+        self.register()
+        original_get_user = security.get_user
+        with patch("backend.security.get_user", wraps=original_get_user) as get_user:
+            response = self.client.get("/api/account/settings")
+
+        self.assertEqual(response.status_code, 200)
+        get_user.assert_called_once()
+
 
 class SettingsMaintenanceTests(DatabaseTestCase):
     @patch("backend.routes.settings.lidarr_library_worker.request_scan")
@@ -1639,6 +1649,26 @@ class ApiCacheTests(DatabaseTestCase):
         self.assertEqual(
             get_cache_document("batch-test", "second"), {"value": 2}
         )
+
+    def test_invalid_cache_document_is_discarded(self):
+        key = api_cache.document_cache_key("corrupt-test", "document")
+        with cache_db() as connection:
+            connection.execute(
+                "INSERT INTO api_cache (cache_key, value, expires_at) "
+                "VALUES (?, ?, ?)",
+                (key, "{invalid", time.time() + 60),
+            )
+
+        with self.assertLogs("backend.api_cache", level="WARNING"):
+            value = get_cache_document("corrupt-test", "document")
+
+        self.assertIsNone(value)
+        with cache_db() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM api_cache WHERE cache_key = ?",
+                (key,),
+            ).fetchone()
+        self.assertIsNone(row)
 
     def test_legacy_cache_is_moved_out_of_the_application_database(self):
         with db() as connection:
@@ -3669,6 +3699,48 @@ class RecommendationAssemblyTests(unittest.TestCase):
 
     @patch("backend.recommendations.save_recommendation_cache")
     @patch("backend.recommendations.build_recommendation_cache")
+    @patch("backend.recommendations._service_recommendation_exclusions")
+    @patch("backend.recommendations.recommendation_users")
+    def test_refresh_collects_service_exclusions_once_for_all_users(
+        self,
+        recommendation_users,
+        service_exclusions,
+        build_cache,
+        save_cache,
+    ):
+        recommendation_users.return_value = [
+            {
+                "id": 1,
+                "username": "first",
+                "listenbrainz_username": "first-listener",
+                "lastfm_username": None,
+                "lastfm_api_key": None,
+            },
+            {
+                "id": 2,
+                "username": "second",
+                "listenbrainz_username": "second-listener",
+                "lastfm_username": None,
+                "lastfm_api_key": None,
+            },
+        ]
+        shared = recommendation_engine._empty_exclusions()
+        service_exclusions.return_value = shared
+        build_cache.return_value = {"providerStatus": {}}
+
+        retry_required = recommendation_engine.refresh_recommendation_cache()
+
+        self.assertFalse(retry_required)
+        service_exclusions.assert_called_once_with()
+        self.assertEqual(build_cache.call_count, 2)
+        self.assertTrue(all(
+            call.kwargs["shared_exclusions"] is shared
+            for call in build_cache.call_args_list
+        ))
+        self.assertEqual(save_cache.call_count, 2)
+
+    @patch("backend.recommendations.save_recommendation_cache")
+    @patch("backend.recommendations.build_recommendation_cache")
     @patch("backend.recommendations.recommendation_users")
     def test_partial_provider_cache_is_saved_and_requests_retry(
         self, recommendation_users, build_cache, save_cache
@@ -4147,6 +4219,28 @@ class CompressionTests(DatabaseTestCase):
             "/api/auth/status", headers={"Accept-Encoding": "gzip"}
         )
         self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.headers.get("Content-Encoding"))
+
+    @patch("backend.routes.library.plex.cached_library_snapshot")
+    @patch("backend.routes.library.get_service")
+    def test_gzip_with_zero_quality_is_not_used(
+        self, get_service_mock, cached_snapshot
+    ):
+        get_service_mock.return_value = {
+            "url": "http://plex:32400",
+            "token": "token",
+        }
+        cached_snapshot.return_value = {
+            "artists": [{"name": "Artist"} for _ in range(400)],
+            "releaseGroups": [],
+        }
+        self.register()
+
+        response = self.client.get(
+            "/api/library",
+            headers={"Accept-Encoding": "gzip;q=0"},
+        )
+
         self.assertIsNone(response.headers.get("Content-Encoding"))
 
     @patch("backend.artwork_cache.requests.get")

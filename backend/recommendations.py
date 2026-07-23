@@ -460,6 +460,7 @@ def lastfm_tag_recommendations(
     excluded_album_names=None,
     excluded_artist_names=None,
     existing_album_ids=None,
+    listened_album_names=None,
     limit=LASTFM_TAG_ROW_LIMIT,
 ):
     """Backfill a sparse taste row and re-rank it for recency and novelty."""
@@ -474,7 +475,11 @@ def lastfm_tag_recommendations(
     excluded_artist_names = {
         str(name).casefold() for name in (excluded_artist_names or ()) if name
     }
-    listened_albums = _lastfm_listened_albums(username, api_key)
+    listened_albums = (
+        _lastfm_listened_albums(username, api_key)
+        if listened_album_names is None
+        else set(listened_album_names)
+    )
     candidates = lastfm.get(
         "tag.gettopalbums",
         username,
@@ -561,25 +566,18 @@ def _user_value(user, key, default=None):
         return default
 
 
-def _recommendation_exclusions(user):
-    """Collect already-known artists and albums without making them hard dependencies."""
-    excluded = {
+def _empty_exclusions():
+    return {
         "artist_ids": set(),
         "artist_names": set(),
         "album_ids": set(),
         "album_names": set(),
     }
-    user_id = _user_value(user, "id")
-    if user_id is None:
-        return excluded
 
-    for row in get_request_history(user_id, limit=500):
-        if row["kind"] == "artist":
-            excluded["artist_ids"].add(row["mbid"])
-            excluded["artist_names"].add(row["name"])
-        elif row["kind"] == "release-group":
-            excluded["album_ids"].add(row["mbid"])
 
+def _service_recommendation_exclusions():
+    """Collect shared Lidarr and Plex exclusions once per refresh pass."""
+    excluded = _empty_exclusions()
     lidarr_config = get_service("lidarr")
     if lidarr_config:
         try:
@@ -621,7 +619,33 @@ def _recommendation_exclusions(user):
     return excluded
 
 
-def build_recommendation_cache(user):
+def _recommendation_exclusions(user, shared_exclusions=None):
+    """Combine one user's requests with shared Lidarr and Plex inventory."""
+    excluded = _empty_exclusions()
+    user_id = _user_value(user, "id")
+    if user_id is None:
+        return excluded
+
+    shared = (
+        _service_recommendation_exclusions()
+        if shared_exclusions is None
+        else shared_exclusions
+    )
+    excluded = {
+        name: set(values)
+        for name, values in shared.items()
+    }
+
+    for row in get_request_history(user_id, limit=500):
+        if row["kind"] == "artist":
+            excluded["artist_ids"].add(row["mbid"])
+            excluded["artist_names"].add(row["name"])
+        elif row["kind"] == "release-group":
+            excluded["album_ids"].add(row["mbid"])
+    return excluded
+
+
+def build_recommendation_cache(user, *, shared_exclusions=None):
     payload = {
         "artists": [],
         "albums": [],
@@ -632,7 +656,15 @@ def build_recommendation_cache(user):
             "lastfm": "disabled",
         },
     }
-    exclusions = _recommendation_exclusions(user)
+    has_listenbrainz = bool(_user_value(user, "listenbrainz_username"))
+    has_lastfm = bool(
+        _user_value(user, "lastfm_username")
+        and _user_value(user, "lastfm_api_key")
+    )
+    if not has_listenbrainz and not has_lastfm:
+        return payload
+
+    exclusions = _recommendation_exclusions(user, shared_exclusions)
     if user["listenbrainz_username"]:
         try:
             artists, albums = listenbrainz_recommendations(
@@ -727,13 +759,14 @@ def build_recommendation_cache(user):
             tag_name.casefold(): rank for rank, tag_name in enumerate(tag_names)
         }
         for album in remaining_albums:
+            album_tags = {
+                candidate_tag.casefold()
+                for candidate_tag in album.get("tasteTags", [])
+            }
             matches = [
                 tag_name
                 for tag_name in albums_by_tag
-                if tag_name.casefold() in {
-                    candidate_tag.casefold()
-                    for candidate_tag in album.get("tasteTags", [])
-                }
+                if tag_name.casefold() in album_tags
                 and len(albums_by_tag[tag_name]) < LASTFM_TAG_ROW_LIMIT
             ]
             if not matches:
@@ -746,24 +779,32 @@ def build_recommendation_cache(user):
                 ),
             )
             albums_by_tag[selected_tag].append(album)
+        allocated_album_ids = main_album_ids | {
+            album["id"]
+            for albums in albums_by_tag.values()
+            for album in albums
+        }
+        listened_albums = None
         for tag_name, tag_albums in albums_by_tag.items():
             if len(tag_albums) < LASTFM_TAG_ROW_LIMIT:
-                existing_album_ids = main_album_ids | {
-                    album["id"]
-                    for albums in albums_by_tag.values()
-                    for album in albums
-                }
+                if listened_albums is None:
+                    listened_albums = _lastfm_listened_albums(username, api_key)
                 try:
-                    tag_albums.extend(lastfm_tag_recommendations(
+                    backfill = lastfm_tag_recommendations(
                         tag_name,
                         username,
                         api_key,
                         excluded_album_ids=exclusions["album_ids"],
                         excluded_album_names=exclusions["album_names"],
                         excluded_artist_names=exclusions["artist_names"],
-                        existing_album_ids=existing_album_ids,
+                        existing_album_ids=allocated_album_ids,
+                        listened_album_names=listened_albums,
                         limit=LASTFM_TAG_ROW_LIMIT - len(tag_albums),
-                    ))
+                    )
+                    tag_albums.extend(backfill)
+                    allocated_album_ids.update(
+                        album["id"] for album in backfill
+                    )
                 except (ValueError, requests.RequestException) as exc:
                     lastfm_failed = True
                     logger.warning(
@@ -792,9 +833,22 @@ def build_recommendation_cache(user):
 
 def refresh_recommendation_cache():
     retry_required = False
+    shared_exclusions = None
     for user in recommendation_users():
         try:
-            payload = build_recommendation_cache(user)
+            has_provider = bool(
+                _user_value(user, "listenbrainz_username")
+                or (
+                    _user_value(user, "lastfm_username")
+                    and _user_value(user, "lastfm_api_key")
+                )
+            )
+            if has_provider and shared_exclusions is None:
+                shared_exclusions = _service_recommendation_exclusions()
+            payload = build_recommendation_cache(
+                user,
+                shared_exclusions=shared_exclusions,
+            )
             save_recommendation_cache(user["id"], payload)
             if any(
                 status in {"partial", "unavailable"}
