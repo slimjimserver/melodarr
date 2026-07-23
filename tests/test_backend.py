@@ -913,6 +913,29 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn("status.firstAccount", typescript)
         self.assertIn("status.invitationValid", typescript)
 
+    def test_discovery_search_offers_track_to_release_group_results(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(
+            os.path.join(project_root, "frontend", "static", "index.html"),
+            encoding="utf-8",
+        ) as file:
+            frontend = file.read()
+        with open(
+            os.path.join(project_root, "frontend", "src", "discovery.ts"),
+            encoding="utf-8",
+        ) as file:
+            discovery_typescript = file.read()
+
+        self.assertIn('<option value="track">Tracks</option>', frontend)
+        self.assertIn('track: { placeholder: "Search tracks…"', discovery_typescript)
+        self.assertIn('"release group"', discovery_typescript)
+        self.assertIn("for matching tracks", discovery_typescript)
+        self.assertIn("Matched track:", discovery_typescript)
+        self.assertIn(
+            'showDetail("release-group", result.id)',
+            discovery_typescript,
+        )
+
     def test_brand_navigation_stays_inside_the_loaded_application(self):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with open(
@@ -2216,6 +2239,23 @@ class MusicBrainzClientTests(unittest.TestCase):
         self.assertEqual(kwargs["params"]["limit"], 25)
 
     @patch("backend.services.musicbrainz.cached_json_get")
+    def test_track_search_uses_recording_resource(self, cached_get):
+        cached_get.return_value = {"recordings": []}
+
+        result = musicbrainz.search("Song title", "track", plain_search=True)
+
+        self.assertEqual(result, {"recordings": []})
+        self.assertTrue(cached_get.call_args.args[0].endswith("/recording/"))
+        self.assertEqual(
+            cached_get.call_args.kwargs["namespace"],
+            "musicbrainz-search",
+        )
+        self.assertEqual(
+            cached_get.call_args.kwargs["params"]["dismax"],
+            "true",
+        )
+
+    @patch("backend.services.musicbrainz.cached_json_get")
     def test_metadata_lookup_forwards_includes_and_paging(self, cached_get):
         cached_get.return_value = {"release-groups": []}
         musicbrainz.get(
@@ -2366,6 +2406,177 @@ class DiscoveryRoutesTests(DatabaseTestCase):
         album = response.get_json()["results"][0]
         self.assertEqual(album["name"], "極彩")
         self.assertEqual(album["romanizedTitle"], "In Full Color")
+
+    @patch("backend.routes.discovery.musicbrainz.search")
+    def test_track_search_ranks_and_deduplicates_release_groups(self, search):
+        artist_credit = [{"name": "Example Artist"}]
+        search.side_effect = [
+            {
+                "recordings": [
+                    {
+                        "id": "recording-studio",
+                        "score": "100",
+                        "title": "Example Song",
+                        "artist-credit": artist_credit,
+                        "first-release-date": "2020-01-01",
+                        "releases": [
+                            {
+                                "id": "release-compilation",
+                                "title": "Big Compilation",
+                                "status": "Official",
+                                "date": "2020-06-01",
+                                "artist-credit": [{"name": "Various Artists"}],
+                                "release-group": {
+                                    "id": "group-compilation",
+                                    "primary-type": "Album",
+                                    "secondary-types": ["Compilation"],
+                                },
+                            },
+                            {
+                                "id": "release-promo",
+                                "title": "Example Song (Promo)",
+                                "status": "Promotion",
+                                "date": "2019-12-01",
+                                "release-group": {
+                                    "id": "group-single",
+                                    "primary-type": "Single",
+                                },
+                            },
+                            {
+                                "id": "release-official",
+                                "title": "Example Song (Digital Edition)",
+                                "status": "Official",
+                                "date": "2020-01-01",
+                                "release-group": {
+                                    "id": "group-single",
+                                    "primary-type": "Single",
+                                },
+                            },
+                            {
+                                "id": "release-without-group",
+                                "title": "Incomplete metadata",
+                            },
+                        ],
+                    },
+                    {
+                        "id": "recording-live",
+                        "score": 90,
+                        "title": "Example Song (Live)",
+                        "artist-credit": artist_credit,
+                        "releases": [{
+                            "id": "release-live",
+                            "title": "Example Song Live",
+                            "status": "Official",
+                            "date": "2021-01-01",
+                            "release-group": {
+                                "id": "group-live",
+                                "primary-type": "Album",
+                                "secondary-types": ["Live"],
+                            },
+                        }],
+                    },
+                ],
+            },
+            {
+                "release-groups": [
+                    {
+                        "id": "group-compilation",
+                        "title": "Canonical Compilation",
+                        "artist-credit": [{"name": "Various Artists"}],
+                        "first-release-date": "2020-06-01",
+                        "primary-type": "Album",
+                        "secondary-types": ["Compilation"],
+                    },
+                    {
+                        "id": "group-single",
+                        "title": "Canonical Example Song",
+                        "artist-credit": artist_credit,
+                        "first-release-date": "2020-01-01",
+                        "primary-type": "Single",
+                    },
+                    {
+                        "id": "group-live",
+                        "title": "Canonical Live Album",
+                        "artist-credit": artist_credit,
+                        "first-release-date": "2021-01-01",
+                        "primary-type": "Album",
+                        "secondary-types": ["Live"],
+                    },
+                ],
+            },
+        ]
+
+        response = self.client.get(
+            "/api/search?q=example%20song&type=track",
+            headers={"X-CSRF-Token": self.register()},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["type"], "track")
+        self.assertEqual(
+            [result["id"] for result in payload["results"]],
+            ["group-single", "group-compilation", "group-live"],
+        )
+        self.assertEqual(
+            payload["results"][0]["name"],
+            "Canonical Example Song",
+        )
+        self.assertEqual(
+            payload["results"][0]["matchedTrack"],
+            "Example Song",
+        )
+        self.assertEqual(
+            payload["results"][1]["secondaryTypes"],
+            ["Compilation"],
+        )
+        self.assertEqual(search.call_args_list[0].args, ("example song", "track"))
+        self.assertEqual(
+            search.call_args_list[0].kwargs,
+            {"plain_search": True},
+        )
+        enrichment_query, enrichment_type = search.call_args_list[1].args
+        self.assertEqual(enrichment_type, "album")
+        self.assertEqual(search.call_args_list[1].kwargs, {})
+        self.assertEqual(enrichment_query.count("rgid:group-single"), 1)
+        self.assertEqual(enrichment_query.count("rgid:group-compilation"), 1)
+        self.assertEqual(enrichment_query.count("rgid:group-live"), 1)
+
+    @patch("backend.routes.discovery.musicbrainz.search")
+    def test_track_search_caps_unique_release_groups(self, search):
+        releases = [
+            {
+                "id": f"release-{index}",
+                "title": f"Release {index}",
+                "status": "Official",
+                "date": f"2020-{(index % 12) + 1:02d}-01",
+                "release-group": {
+                    "id": f"group-{index}",
+                    "primary-type": "Album",
+                },
+            }
+            for index in range(30)
+        ]
+        search.side_effect = [
+            {
+                "recordings": [{
+                    "id": "recording",
+                    "score": 100,
+                    "title": "Song",
+                    "artist-credit": [{"name": "Artist"}],
+                    "releases": releases,
+                }],
+            },
+            {"release-groups": []},
+        ]
+
+        response = self.client.get(
+            "/api/search?q=song&type=track",
+            headers={"X-CSRF-Token": self.register()},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.get_json()["results"]), 25)
 
 
 class MusicRoutesTests(DatabaseTestCase):

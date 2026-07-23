@@ -1,6 +1,7 @@
 """Discovery, recommendations, charts, and search routes."""
 
 import json
+import logging
 
 import requests
 from flask import Blueprint, jsonify, request
@@ -22,6 +23,16 @@ else:  # Support the existing `python backend/app.py` entry point.
 
 
 blueprint = Blueprint("discovery", __name__)
+logger = logging.getLogger(__name__)
+
+_SEARCH_RESULT_LIMIT = 25
+_PRIMARY_RELEASE_TYPE_RANK = {
+    "single": 0,
+    "album": 1,
+    "ep": 2,
+    "broadcast": 3,
+    "other": 4,
+}
 
 
 def _plex_search_artists():
@@ -45,6 +56,157 @@ def _plex_search_link(artist):
         "guids": artist.get("guids", []),
         "key": artist.get("key", ""),
     }
+
+
+def _artist_credit_name(entity):
+    """Return a readable MusicBrainz artist credit from a search entity."""
+    names = [
+        str(
+            credit.get("name")
+            or (credit.get("artist") or {}).get("name")
+            or ""
+        ).strip()
+        for credit in entity.get("artist-credit") or []
+    ]
+    return " · ".join(name for name in names if name)
+
+
+def _recording_score(recording):
+    try:
+        return int(recording.get("score") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _track_release_rank(recording, release, recording_position, release_position):
+    """Prefer strong recording matches, then original official editions."""
+    group = release.get("release-group") or {}
+    secondary_types = [
+        str(name).casefold() for name in group.get("secondary-types") or []
+    ]
+    if "compilation" in secondary_types:
+        secondary_type_rank = 2
+    elif secondary_types:
+        secondary_type_rank = 1
+    else:
+        secondary_type_rank = 0
+
+    status = str(release.get("status") or "").casefold()
+    status_rank = 0 if status == "official" else (1 if not status else 2)
+    primary_type = str(group.get("primary-type") or "other").casefold()
+    return (
+        -_recording_score(recording),
+        status_rank,
+        secondary_type_rank,
+        _PRIMARY_RELEASE_TYPE_RANK.get(primary_type, 5),
+        release.get("date") or recording.get("first-release-date") or "9999",
+        recording_position,
+        release_position,
+    )
+
+
+def _recording_release_group_candidates(response):
+    """Flatten recording releases and retain the best edition per release group."""
+    candidates = {}
+    for recording_position, recording in enumerate(response.get("recordings") or []):
+        for release_position, release in enumerate(recording.get("releases") or []):
+            group = release.get("release-group") or {}
+            group_id = str(group.get("id") or "").strip()
+            if not group_id:
+                continue
+
+            rank = _track_release_rank(
+                recording, release, recording_position, release_position
+            )
+            existing = candidates.get(group_id)
+            if existing and existing["rank"] <= rank:
+                continue
+
+            title = str(
+                group.get("title")
+                or release.get("title")
+                or recording.get("title")
+                or "Untitled release"
+            ).strip()
+            candidates[group_id] = {
+                "id": group_id,
+                "name": title,
+                "artist": (
+                    _artist_credit_name(group)
+                    or _artist_credit_name(release)
+                    or _artist_credit_name(recording)
+                ),
+                "date": (
+                    release.get("date")
+                    or recording.get("first-release-date")
+                    or ""
+                ),
+                "type": group.get("primary-type") or "Other",
+                "secondaryTypes": [
+                    name for name in group.get("secondary-types") or [] if name
+                ],
+                "disambiguation": "",
+                "score": _recording_score(recording),
+                "matchedTrack": recording.get("title") or "Untitled track",
+                "matchedTrackArtist": _artist_credit_name(recording),
+                "rank": rank,
+            }
+
+    return sorted(candidates.values(), key=lambda item: item["rank"])[
+        :_SEARCH_RESULT_LIMIT
+    ]
+
+
+def _recording_release_group_results(response):
+    """Return canonical, ranked release groups reached through recording matches."""
+    candidates = _recording_release_group_candidates(response)
+    canonical_groups = {}
+    if candidates:
+        query = " OR ".join(f"rgid:{candidate['id']}" for candidate in candidates)
+        try:
+            group_response = musicbrainz.search(query, "album")
+            canonical_groups = {
+                group["id"]: group
+                for group in group_response.get("release-groups") or []
+                if group.get("id")
+            }
+        except requests.RequestException as exc:
+            # The recording response still contains enough release metadata to
+            # offer a useful result if canonical enrichment is temporarily down.
+            logger.warning(
+                "Could not enrich track search release groups: %s", exc
+            )
+
+    results = []
+    for candidate in candidates:
+        group = canonical_groups.get(candidate["id"], {})
+        title = group.get("title") or candidate["name"]
+        results.append({
+            "id": candidate["id"],
+            "name": title,
+            "romanizedTitle": musicbrainz.romanized_release_group_title(
+                group or {"title": title}
+            ),
+            "artist": _artist_credit_name(group) or candidate["artist"],
+            "date": group.get("first-release-date") or candidate["date"],
+            "type": group.get("primary-type") or candidate["type"],
+            "secondaryTypes": [
+                name
+                for name in (
+                    group.get("secondary-types")
+                    if group.get("secondary-types") is not None
+                    else candidate["secondaryTypes"]
+                )
+                if name
+            ],
+            "disambiguation": (
+                group.get("disambiguation") or candidate["disambiguation"]
+            ),
+            "score": candidate["score"],
+            "matchedTrack": candidate["matchedTrack"],
+            "matchedTrackArtist": candidate["matchedTrackArtist"],
+        })
+    return results
 
 
 @blueprint.get("/api/recommendations")
@@ -208,10 +370,10 @@ def search():
     search_type = request.args.get("type", "artist")
     if len(query) < 2:
         return api_error("Enter at least two characters.")
-    if search_type not in {"artist", "album"}:
-        return api_error("Search type must be artist or album.")
+    if search_type not in {"artist", "album", "track"}:
+        return api_error("Search type must be artist, album, or track.")
     try:
-        response = musicbrainz.search(query, search_type)
+        response = musicbrainz.search(query, search_type, plain_search=True)
     except requests.RequestException:
         return api_error("MusicBrainz could not be reached. Try again shortly.", 502)
 
@@ -231,7 +393,7 @@ def search():
             }
             for artist in response.get("artists", [])
         ]
-    else:
+    elif search_type == "album":
         results = [
             {
                 "id": album["id"],
@@ -247,4 +409,6 @@ def search():
             }
             for album in response.get("release-groups", [])
         ]
+    else:
+        results = _recording_release_group_results(response)
     return jsonify({"results": results, "type": search_type})

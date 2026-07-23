@@ -1151,8 +1151,25 @@
     data.tracks.forEach((track: JsonObject) => results.append(createCard(`${track.number}. ${track.title}`, track.artist || "")));
   }
 
+  const searchTypeCopy = {
+    artist: { placeholder: "Search artists…", noun: "artist" },
+    album: { placeholder: "Search albums…", noun: "album" },
+    track: { placeholder: "Search tracks…", noun: "release group" },
+  } as const;
+
+  function copyForSearchType(type: string) {
+    return searchTypeCopy[type as keyof typeof searchTypeCopy] || searchTypeCopy.artist;
+  }
+
+  function searchResultMessage(type: string, count: number) {
+    const noun = copyForSearchType(type).noun;
+    const summary = `${count} ${noun}${count === 1 ? "" : "s"} found`;
+    return type === "track" ? `${summary} for matching tracks` : summary;
+  }
+
   $("#search-type").addEventListener("change", (event) => {
-    $("#search-input").placeholder = (event.target as HTMLSelectElement).value === "artist" ? "Search artists…" : "Search albums…";
+    const type = (event.target as HTMLSelectElement).value;
+    $("#search-input").placeholder = copyForSearchType(type).placeholder;
     if ($("#search-input").value.trim().length >= 2) runSearch();
   });
 
@@ -1183,12 +1200,21 @@
       if (requestVersion !== searchRequestVersion) return;
       results.replaceChildren();
       $("#search-message").textContent = data.results.length
-        ? `${data.results.length} ${type === "artist" ? "artists" : "albums"} found`
+        ? searchResultMessage(type, data.results.length)
         : "No results found.";
       data.results.forEach((result: JsonObject) => {
         const description = type === "artist"
           ? [result.type, result.country, result.disambiguation].filter(Boolean).join(" · ")
-          : [result.artist, result.type, result.date, result.disambiguation].filter(Boolean).join(" · ");
+          : [
+            result.artist,
+            result.type,
+            ...(result.secondaryTypes || []),
+            result.date,
+            result.disambiguation,
+            type === "track" && result.matchedTrack
+              ? `Matched track: ${result.matchedTrack}`
+              : "",
+          ].filter(Boolean).join(" · ");
         results.append(type === "artist"
           ? (result.plex ? createPlexArtistCard(result, description, result.plex) : createSearchArtistCard(result, description))
           : createCard(releaseGroupDisplayTitle(result), description, () => showDetail("release-group", result.id)));

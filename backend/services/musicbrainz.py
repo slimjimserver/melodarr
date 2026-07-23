@@ -205,12 +205,30 @@ def _cached_get(url, priority="interactive", **kwargs):
         raise
 
 
-def search(query, search_type, include_cache_status=False, priority="interactive"):
-    """Search MusicBrainz for artists or release groups."""
-    resource = "artist" if search_type == "artist" else "release-group"
+def search(
+    query,
+    search_type,
+    include_cache_status=False,
+    priority="interactive",
+    plain_search=False,
+):
+    """Search a supported MusicBrainz entity using Melodarr's search names."""
+    resources = {
+        "artist": "artist",
+        "album": "release-group",
+        "release-group": "release-group",
+        "track": "recording",
+        "recording": "recording",
+    }
+    resource = resources.get(search_type)
+    if resource is None:
+        raise ValueError(f"Unsupported MusicBrainz search type: {search_type}")
+    params = {"query": query, "fmt": "json", "limit": 25}
+    if plain_search:
+        params["dismax"] = "true"
     return _cached_get(
         f"{MUSICBRAINZ_URL}/{resource}/",
-        params={"query": query, "fmt": "json", "limit": 25},
+        params=params,
         headers={"User-Agent": USER_AGENT},
         namespace="musicbrainz-search",
         ttl=MUSICBRAINZ_SEARCH_CACHE_TTL,
