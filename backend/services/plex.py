@@ -33,7 +33,7 @@ else:  # Support the existing `python backend/app.py` entry point.
 
 
 scan_lock = RLock()
-SNAPSHOT_VERSION = 2
+SNAPSHOT_VERSION = 3
 
 
 def _index_key(snapshot_id):
@@ -183,6 +183,7 @@ def _normalize_artist(config, section, item):
     plex_guid = _plex_metadata_guid(guids, "artist")
     return {
         "name": item.get("title"),
+        "sortName": item.get("titleSort") or "",
         "thumb": item.get("thumb"),
         "section": section.get("title"),
         "key": item.get("key", ""),

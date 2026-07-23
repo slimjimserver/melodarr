@@ -17,7 +17,7 @@ else:  # Support the existing `python backend/app.py` entry point.
 
 blueprint = Blueprint("library", __name__)
 
-ARTIST_FIELDS = ("name", "section", "musicbrainzId", "artwork", "url")
+ARTIST_FIELDS = ("name", "sortName", "section", "musicbrainzId", "artwork", "url")
 
 
 def _artist_summary(artist):

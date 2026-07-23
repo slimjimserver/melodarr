@@ -1117,7 +1117,9 @@ function setupLibrary() {
       results.replaceChildren();
       libraryArtists = library.artists.map((artist: JsonObject) => ({
         ...artist,
-        search: normalizeSearch(String(artist.name || "")),
+        search: normalizeSearch(
+          [artist.name, artist.sortName].filter(Boolean).join(" "),
+        ),
       }));
       $("#library-copy").textContent = `${library.artistCount} artists and ${library.releaseGroupCount} releases available in your Plex music libraries.`;
       setMessage($("#library-message"), "");

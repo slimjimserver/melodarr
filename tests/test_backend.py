@@ -1033,6 +1033,7 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn("const maxArtworkRequests = 6", app_typescript)
         self.assertIn("new IntersectionObserver", app_typescript)
         self.assertIn('includes("?") ? "&" : "?"', app_typescript)
+        self.assertIn("[artist.name, artist.sortName]", app_typescript)
         self.assertIn(">Reload</button>", frontend)
 
     def test_artist_detail_returns_to_its_originating_view(self):
@@ -4197,6 +4198,7 @@ class LibraryRouteTests(DatabaseTestCase):
         cached_snapshot.return_value = {
             "artists": [{
                 "name": "alpha",
+                "sortName": "The Alpha",
                 "section": "Music",
                 "musicbrainzId": "11111111-1111-1111-1111-111111111111",
                 "artwork": "/api/artwork/plex-artist/1",
@@ -4221,8 +4223,9 @@ class LibraryRouteTests(DatabaseTestCase):
         # Plex GUIDs and internal keys stay on the server.
         self.assertEqual(
             set(payload["artists"][0]),
-            {"name", "section", "musicbrainzId", "artwork", "url"},
+            {"name", "sortName", "section", "musicbrainzId", "artwork", "url"},
         )
+        self.assertEqual(payload["artists"][0]["sortName"], "The Alpha")
         self.assertTrue(response.headers.get("ETag"))
 
     @patch("backend.routes.library.plex.library_snapshot")
@@ -4307,6 +4310,7 @@ class PlexClientTests(unittest.TestCase):
                         {"title": "Zulu", "key": "/library/metadata/2", "thumb": "/z"},
                         {
                             "title": "alpha",
+                            "titleSort": "The Alpha",
                             "key": "/library/metadata/1/children",
                             "thumb": "/a",
                             "guid": "plex://artist/artist-1",
@@ -4337,6 +4341,7 @@ class PlexClientTests(unittest.TestCase):
         artists = plex.music_library(config)
         releases = plex.library_release_groups(config)
         self.assertEqual([artist["name"] for artist in artists], ["alpha", "Zulu"])
+        self.assertEqual(artists[0]["sortName"], "The Alpha")
         self.assertIn("key=%2Flibrary%2Fmetadata%2F1", artists[0]["url"])
         self.assertNotIn("%2Fchildren", artists[0]["url"])
         self.assertEqual(
