@@ -5,6 +5,7 @@ import time
 from hashlib import sha256
 from io import BytesIO
 from tempfile import NamedTemporaryFile
+from threading import Lock
 
 import requests
 from flask import current_app, redirect, send_file
@@ -15,6 +16,7 @@ if __package__:
         ARTWORK_BROWSER_CACHE_TTL,
         ARTWORK_CACHE_DIRECTORY,
         ARTWORK_CACHE_LIMIT_BYTES,
+        ARTWORK_CACHE_TRIM_INTERVAL,
         ARTWORK_MAX_DOWNLOAD_BYTES,
         ARTWORK_MISS_TTL,
         ARTWORK_SIZES,
@@ -25,11 +27,16 @@ else:
         ARTWORK_BROWSER_CACHE_TTL,
         ARTWORK_CACHE_DIRECTORY,
         ARTWORK_CACHE_LIMIT_BYTES,
+        ARTWORK_CACHE_TRIM_INTERVAL,
         ARTWORK_MAX_DOWNLOAD_BYTES,
         ARTWORK_MISS_TTL,
         ARTWORK_SIZES,
         ARTWORK_WEBP_QUALITY,
     )
+
+
+_trim_lock = Lock()
+_last_trim_at = None
 
 
 def normalized_size(size):
@@ -145,6 +152,31 @@ def trim_artwork_cache():
         current_app.logger.warning("Could not trim artwork cache in %s", ARTWORK_CACHE_DIRECTORY)
 
 
+def maybe_trim_artwork_cache():
+    """Trim at most once per interval while allowing downloads to proceed."""
+    global _last_trim_at
+    checked_at = time.monotonic()
+    if (
+        _last_trim_at is not None
+        and checked_at - _last_trim_at < ARTWORK_CACHE_TRIM_INTERVAL
+    ):
+        return False
+    if not _trim_lock.acquire(blocking=False):
+        return False
+    try:
+        checked_at = time.monotonic()
+        if (
+            _last_trim_at is not None
+            and checked_at - _last_trim_at < ARTWORK_CACHE_TRIM_INTERVAL
+        ):
+            return False
+        trim_artwork_cache()
+        _last_trim_at = checked_at
+        return True
+    finally:
+        _trim_lock.release()
+
+
 def artwork_cache_stats():
     """Return counts and sizes for cached covers and negative-cache markers."""
     images = misses = size = 0
@@ -251,7 +283,7 @@ def cached_artwork(cache_key, source_url, *, headers=None, size=None):
         os.replace(temporary_path, final_path)
         temporary_path = None
         response = _serve_at_size(final_path, cache_key, size)
-        trim_artwork_cache()
+        maybe_trim_artwork_cache()
         return response
     except (OSError, ValueError, requests.RequestException) as exc:
         current_app.logger.warning("Could not cache artwork %s: %s", cache_key, exc)

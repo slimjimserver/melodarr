@@ -138,6 +138,11 @@
 
     try {
       const response = await fetch(url, { signal: controller.signal });
+      if (response.status === 204) {
+        const error = new Error("Requested detail is not cached.");
+        error.name = "CacheMissError";
+        throw error;
+      }
       const body = await response.json() as JsonObject;
       if (!response.ok) throw new Error(body.error || "MusicBrainz request failed.");
       return body;
@@ -226,6 +231,32 @@
   function detailPath(kind: DetailKind, id: string) {
     const route: Record<DetailKind, string> = { artist: "artists", "release-group": "albums", release: "releases" };
     return `/${route[kind]}/${encodeURIComponent(id)}`;
+  }
+
+  function resetDetailCover(showSkeleton = false) {
+    const cover = $("#detail-cover");
+    const image = $("#detail-cover-image");
+    image.onload = null;
+    image.onerror = null;
+    image.hidden = true;
+    image.removeAttribute("src");
+    image.alt = "";
+    cover.hidden = !showSkeleton;
+    cover.classList.toggle("skeleton", showSkeleton);
+  }
+
+  function loadDetailCover(source: string, alt: string) {
+    const cover = $("#detail-cover");
+    const image = $("#detail-cover-image");
+    resetDetailCover(true);
+    image.fetchPriority = "high";
+    image.onload = () => {
+      image.hidden = false;
+      cover.classList.remove("skeleton");
+    };
+    image.onerror = () => resetDetailCover();
+    image.alt = alt;
+    image.src = source;
   }
 
   function pruneDetailRequests(now = Date.now()) {
@@ -343,9 +374,7 @@
     $("#detail-title").textContent = "";
     $("#detail-eyebrow").textContent = "";
     $("#detail-subtitle").textContent = "";
-    $("#detail-cover").hidden = kind === "release";
-    $("#detail-cover").classList.toggle("skeleton", kind !== "release");
-    $("#detail-cover-image").removeAttribute("src");
+    resetDetailCover(kind !== "release");
     $("#detail-message").textContent = kind === "artist"
       ? "Loading artist and discography…"
       : kind === "release-group" ? "Loading album and release information…" : "Loading release…";
@@ -874,16 +903,10 @@
     if (kind === "artist") {
       $("#detail-eyebrow").textContent = "ARTIST DISCOGRAPHY";
       $("#detail-title").textContent = artistDisplayName(data);
-      const cover = $("#detail-cover");
-      const coverImage = $("#detail-cover-image");
-      cover.classList.remove("skeleton");
-      cover.hidden = true;
       if (data.coverArtLarge) {
-        cover.hidden = false;
-        coverImage.fetchPriority = "high";
-        coverImage.src = data.coverArtLarge;
-        coverImage.alt = `Artist image for ${data.name}`;
-        coverImage.onerror = () => { cover.hidden = true; };
+        loadDetailCover(data.coverArtLarge, `Artist image for ${data.name}`);
+      } else {
+        resetDetailCover();
       }
       $("#detail-subtitle").textContent = [data.country, data.disambiguation].filter(Boolean).join(" · ");
       const meta = createMeta("artist", data);
@@ -936,16 +959,10 @@
     if (kind === "release-group") {
       $("#detail-eyebrow").textContent = "ALBUM RELEASES";
       $("#detail-title").textContent = releaseGroupDisplayTitle(data);
-      const cover = $("#detail-cover");
-      const coverImage = $("#detail-cover-image");
-      cover.classList.remove("skeleton");
-      cover.hidden = true;
       if (data.coverArtLarge) {
-        cover.hidden = false;
-        coverImage.fetchPriority = "high";
-        coverImage.src = data.coverArtLarge;
-        coverImage.alt = `Cover art for ${data.title}`;
-        coverImage.onerror = () => { cover.hidden = true; };
+        loadDetailCover(data.coverArtLarge, `Cover art for ${data.title}`);
+      } else {
+        resetDetailCover();
       }
       const subtitle = $("#detail-subtitle");
       subtitle.replaceChildren();

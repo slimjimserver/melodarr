@@ -7,19 +7,22 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from hashlib import sha256
+from threading import Lock
 
 import requests
 
 if __package__:
-    from .config import CACHE_DATABASE, DATABASE
+    from .config import API_CACHE_CLEANUP_INTERVAL, CACHE_DATABASE, DATABASE
 else:  # Support the existing `python backend/app.py` entry point.
-    from config import CACHE_DATABASE, DATABASE
+    from config import API_CACHE_CLEANUP_INTERVAL, CACHE_DATABASE, DATABASE
 
 
 logger = logging.getLogger(__name__)
 CACHE_BUSY_TIMEOUT_MS = 5000
 CACHE_LOCK_RETRY_DELAYS = (0.05, 0.15)
 _RAISE_ON_LOCK = object()
+_cleanup_lock = Lock()
+_last_cleanup_at = None
 
 
 @contextmanager
@@ -84,6 +87,10 @@ def init_cache_db():
                 expires_at REAL NOT NULL
             )
         """)
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_api_cache_expires_at "
+            "ON api_cache(expires_at)"
+        )
 
     _cache_operation(initialize, description="initialize it")
 
@@ -233,6 +240,53 @@ def replace_cache_documents(namespace, documents, ttl):
     )
 
 
+def cleanup_expired_cache():
+    """Remove expired rows no more than once per configured interval."""
+    global _last_cleanup_at
+    checked_at = time.monotonic()
+    if (
+        _last_cleanup_at is not None
+        and checked_at - _last_cleanup_at < API_CACHE_CLEANUP_INTERVAL
+    ):
+        return 0
+    if not _cleanup_lock.acquire(blocking=False):
+        return 0
+    try:
+        checked_at = time.monotonic()
+        if (
+            _last_cleanup_at is not None
+            and checked_at - _last_cleanup_at < API_CACHE_CLEANUP_INTERVAL
+        ):
+            return 0
+        now = time.time()
+
+        def cleanup(connection):
+            cursor = connection.execute(
+                "DELETE FROM api_cache WHERE expires_at <= ?", (now,)
+            )
+            return cursor.rowcount
+
+        try:
+            removed = _cache_operation(
+                cleanup,
+                locked_default=-1,
+                description="remove expired metadata cache entries",
+            )
+        except sqlite3.OperationalError as exc:
+            logger.warning(
+                "Could not clean expired metadata cache entries at %s: %s",
+                CACHE_DATABASE,
+                exc,
+            )
+            return 0
+        if removed < 0:
+            return 0
+        _last_cleanup_at = checked_at
+        return removed
+    finally:
+        _cleanup_lock.release()
+
+
 def cached_json_get(
     url,
     *,
@@ -314,7 +368,6 @@ def cached_json_get(
     now = time.time()
 
     def write_response(connection):
-        connection.execute("DELETE FROM api_cache WHERE expires_at <= ?", (now,))
         connection.execute(
             "INSERT OR REPLACE INTO api_cache (cache_key, value, expires_at) VALUES (?, ?, ?)",
             (key, json.dumps(value), now + ttl),
@@ -330,6 +383,7 @@ def cached_json_get(
         # A non-locking filesystem error should remain visible, but caching
         # must never turn a successful upstream request into an API failure.
         logger.warning("Could not write metadata cache at %s: %s", CACHE_DATABASE, exc)
+    cleanup_expired_cache()
     return (value, False) if include_cache_status else value
 
 

@@ -1046,6 +1046,43 @@ class ListenBrainzLinkingTests(DatabaseTestCase):
 
 
 class ApiCacheTests(DatabaseTestCase):
+    def test_expiry_cleanup_has_an_index(self):
+        with cache_db() as connection:
+            indexes = {
+                row["name"] for row in connection.execute("PRAGMA index_list(api_cache)")
+            }
+
+        self.assertIn("idx_api_cache_expires_at", indexes)
+
+    @patch("backend.api_cache.time.monotonic", return_value=100.0)
+    def test_expired_rows_are_cleaned_at_most_once_per_interval(self, monotonic):
+        original_last_cleanup = api_cache._last_cleanup_at
+        api_cache._last_cleanup_at = None
+        try:
+            with cache_db() as connection:
+                connection.execute(
+                    "INSERT INTO api_cache (cache_key, value, expires_at) VALUES (?, ?, ?)",
+                    ("expired:first", "{}", time.time() - 1),
+                )
+            self.assertEqual(api_cache.cleanup_expired_cache(), 1)
+
+            with cache_db() as connection:
+                connection.execute(
+                    "INSERT INTO api_cache (cache_key, value, expires_at) VALUES (?, ?, ?)",
+                    ("expired:second", "{}", time.time() - 1),
+                )
+            self.assertEqual(api_cache.cleanup_expired_cache(), 0)
+            with cache_db() as connection:
+                remaining = connection.execute(
+                    "SELECT COUNT(*) FROM api_cache WHERE cache_key = 'expired:second'"
+                ).fetchone()[0]
+            self.assertEqual(remaining, 1)
+
+            monotonic.return_value += api_cache.API_CACHE_CLEANUP_INTERVAL + 1
+            self.assertEqual(api_cache.cleanup_expired_cache(), 1)
+        finally:
+            api_cache._last_cleanup_at = original_last_cleanup
+
     def test_cache_database_is_configured_for_concurrent_access(self):
         with cache_db() as connection:
             journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
@@ -1846,6 +1883,54 @@ class DiscoveryRoutesTests(DatabaseTestCase):
 
 
 class MusicRoutesTests(DatabaseTestCase):
+    @patch("backend.routes.music.lidarr.tracked_artist")
+    @patch("backend.routes.music.musicbrainz.get")
+    def test_artist_prefetch_miss_does_not_call_providers(self, get, tracked_artist):
+        get.return_value = None
+
+        response = self.client.get(
+            "/api/music/artist/artist-id?prefetch=1",
+            headers={"X-CSRF-Token": self.register()},
+        )
+
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        get.assert_called_once()
+        self.assertTrue(get.call_args.kwargs["cache_only"])
+        tracked_artist.assert_not_called()
+
+    @patch("backend.routes.music.lidarr.albums_by_release_group")
+    @patch("backend.routes.music.musicbrainz.get")
+    def test_release_group_prefetch_miss_does_not_call_providers(
+        self, get, albums_by_release_group
+    ):
+        get.return_value = None
+
+        response = self.client.get(
+            "/api/music/release-group/group-id?prefetch=1",
+            headers={"X-CSRF-Token": self.register()},
+        )
+
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        get.assert_called_once()
+        self.assertTrue(get.call_args.kwargs["cache_only"])
+        albums_by_release_group.assert_not_called()
+
+    @patch("backend.routes.music.musicbrainz.get")
+    def test_release_prefetch_miss_does_not_call_musicbrainz(self, get):
+        get.return_value = None
+
+        response = self.client.get(
+            "/api/music/release/release-id?prefetch=1",
+            headers={"X-CSRF-Token": self.register()},
+        )
+
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        get.assert_called_once()
+        self.assertTrue(get.call_args.kwargs["cache_only"])
+
     @patch("backend.routes.music.musicbrainz.get")
     def test_artist_detail_returns_english_alias(self, get):
         get.side_effect = [
@@ -2640,6 +2725,22 @@ class RecommendationAssemblyTests(unittest.TestCase):
 class ArtworkCacheTests(DatabaseTestCase):
     def artwork_url(self, mbid):
         return f"/api/artwork/release-group/{mbid}"
+
+    @patch("backend.artwork_cache.trim_artwork_cache")
+    @patch("backend.artwork_cache.time.monotonic", return_value=100.0)
+    def test_artwork_trim_runs_at_most_once_per_interval(self, monotonic, trim):
+        original_last_trim = artwork_cache._last_trim_at
+        artwork_cache._last_trim_at = None
+        try:
+            self.assertTrue(artwork_cache.maybe_trim_artwork_cache())
+            self.assertFalse(artwork_cache.maybe_trim_artwork_cache())
+            trim.assert_called_once_with()
+
+            monotonic.return_value += artwork_cache.ARTWORK_CACHE_TRIM_INTERVAL + 1
+            self.assertTrue(artwork_cache.maybe_trim_artwork_cache())
+            self.assertEqual(trim.call_count, 2)
+        finally:
+            artwork_cache._last_trim_at = original_last_trim
 
     @patch("backend.artwork_cache.requests.get")
     def test_downloaded_artwork_is_served_from_disk_on_next_request(self, get):

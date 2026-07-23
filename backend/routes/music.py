@@ -24,6 +24,11 @@ else:
 blueprint = Blueprint("music", __name__)
 
 
+def _prefetch_cache_miss():
+    """Return an intentionally uncacheable empty response for speculative misses."""
+    return "", 204, {"Cache-Control": "no-store"}
+
+
 def _musicbrainz_priority():
     return "prefetch" if request.args.get("prefetch") == "1" else "interactive"
 
@@ -215,10 +220,13 @@ def _lidarr_artist_detail_payload(mbid):
 @login_required
 def artist_detail(mbid):
     try:
-        priority = "prefetch" if request.args.get("prefetch") == "1" else "critical"
+        prefetch = request.args.get("prefetch") == "1"
+        priority = "prefetch" if prefetch else "critical"
         cached = _artist_detail_payload(mbid, priority, cache_only=True)
         if cached is not None:
             return jsonify(cached)
+        if prefetch:
+            return _prefetch_cache_miss()
         if request.args.get("complete") != "1":
             try:
                 provisional = _lidarr_artist_detail_payload(mbid)
@@ -400,10 +408,13 @@ def _lidarr_release_group_detail_payload(mbid):
 @login_required
 def release_group_detail(mbid):
     try:
+        prefetch = request.args.get("prefetch") == "1"
         priority = _musicbrainz_priority()
         cached = _release_group_detail_payload(mbid, priority, cache_only=True)
         if cached is not None:
             return jsonify(cached)
+        if prefetch:
+            return _prefetch_cache_miss()
         if request.args.get("complete") != "1":
             try:
                 provisional = _lidarr_release_group_detail_payload(mbid)
@@ -416,27 +427,42 @@ def release_group_detail(mbid):
         return api_error("MusicBrainz could not load this album.", 502)
 
 
+def _release_detail_payload(mbid, priority, *, cache_only=False):
+    data = musicbrainz.get(
+        f"/release/{quote(mbid)}",
+        "recordings+artist-credits",
+        priority=priority,
+        cache_only=cache_only,
+    )
+    if data is None:
+        return None
+    tracks = [
+        {
+            "number": track.get("number", ""), "title": track.get("title", "Untitled"),
+            "length": track.get("length"),
+            "artist": " · ".join(credit.get("name", "") for credit in track.get("artist-credit", [])),
+        }
+        for medium in data.get("media", []) for track in medium.get("tracks", [])
+    ]
+    return {
+        "id": data["id"], "title": data.get("title"),
+        "artist": " · ".join(credit.get("name", "") for credit in data.get("artist-credit", [])),
+        "date": data.get("date", ""), "country": data.get("country", ""), "tracks": tracks,
+    }
+
+
 @blueprint.get("/api/music/release/<mbid>")
 @login_required
 def release_detail(mbid):
     try:
-        data = musicbrainz.get(
-            f"/release/{quote(mbid)}",
-            "recordings+artist-credits",
-            priority=_musicbrainz_priority(),
+        prefetch = request.args.get("prefetch") == "1"
+        payload = _release_detail_payload(
+            mbid,
+            _musicbrainz_priority(),
+            cache_only=prefetch,
         )
-        tracks = [
-            {
-                "number": track.get("number", ""), "title": track.get("title", "Untitled"),
-                "length": track.get("length"),
-                "artist": " · ".join(credit.get("name", "") for credit in track.get("artist-credit", [])),
-            }
-            for medium in data.get("media", []) for track in medium.get("tracks", [])
-        ]
-        return jsonify({
-            "id": data["id"], "title": data.get("title"),
-            "artist": " · ".join(credit.get("name", "") for credit in data.get("artist-credit", [])),
-            "date": data.get("date", ""), "country": data.get("country", ""), "tracks": tracks,
-        })
+        if payload is None:
+            return _prefetch_cache_miss()
+        return jsonify(payload)
     except requests.RequestException:
         return api_error("MusicBrainz could not load this release.", 502)
