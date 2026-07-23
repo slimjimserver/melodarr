@@ -2,6 +2,7 @@
 
 import os
 import time
+from contextlib import contextmanager
 from hashlib import sha256
 from io import BytesIO
 from tempfile import NamedTemporaryFile
@@ -15,6 +16,7 @@ if __package__:
     from .config import (
         ARTWORK_BROWSER_CACHE_TTL,
         ARTWORK_CACHE_DIRECTORY,
+        ARTWORK_CACHE_HIGH_WATER_BYTES,
         ARTWORK_CACHE_LIMIT_BYTES,
         ARTWORK_CACHE_TRIM_INTERVAL,
         ARTWORK_MAX_DOWNLOAD_BYTES,
@@ -26,6 +28,7 @@ else:
     from config import (
         ARTWORK_BROWSER_CACHE_TTL,
         ARTWORK_CACHE_DIRECTORY,
+        ARTWORK_CACHE_HIGH_WATER_BYTES,
         ARTWORK_CACHE_LIMIT_BYTES,
         ARTWORK_CACHE_TRIM_INTERVAL,
         ARTWORK_MAX_DOWNLOAD_BYTES,
@@ -36,7 +39,88 @@ else:
 
 
 _trim_lock = Lock()
+_size_lock = Lock()
+_key_locks_lock = Lock()
+_key_locks = {}
 _last_trim_at = None
+_cached_size_bytes = None
+
+
+@contextmanager
+def _artwork_key_lock(cache_key):
+    """Serialize cache misses for one image without retaining locks forever."""
+    with _key_locks_lock:
+        entry = _key_locks.get(cache_key)
+        if entry is None:
+            entry = {"lock": Lock(), "users": 0}
+            _key_locks[cache_key] = entry
+        entry["users"] += 1
+        lock = entry["lock"]
+
+    lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
+        with _key_locks_lock:
+            entry["users"] -= 1
+            if entry["users"] == 0 and _key_locks.get(cache_key) is entry:
+                del _key_locks[cache_key]
+
+
+def _evictable_filename(filename):
+    """Return whether a file counts toward the bounded provider-art cache."""
+    lowered = filename.lower()
+    return (
+        not lowered.endswith(".miss")
+        and not filename.startswith("plex-artist-")
+        and lowered.endswith((".jpg", ".png", ".webp", ".gif"))
+    )
+
+
+def _scan_evictable_entries():
+    entries = []
+    try:
+        with os.scandir(ARTWORK_CACHE_DIRECTORY) as directory:
+            for entry in directory:
+                if (
+                    not entry.is_file(follow_symlinks=False)
+                    or not _evictable_filename(entry.name)
+                ):
+                    continue
+                stat = entry.stat(follow_symlinks=False)
+                entries.append((stat.st_mtime, stat.st_size, entry.path))
+    except FileNotFoundError:
+        pass
+    return entries
+
+
+def _estimated_artwork_cache_size():
+    """Return a process-local size estimate, scanning only on first use."""
+    global _cached_size_bytes
+    with _size_lock:
+        if _cached_size_bytes is None:
+            _cached_size_bytes = sum(size for _, size, _ in _scan_evictable_entries())
+        return _cached_size_bytes
+
+
+def _replace_cache_file(temporary_path, final_path):
+    """Atomically publish a cache file and update the size estimate."""
+    global _cached_size_bytes
+    with _size_lock:
+        evictable = _evictable_filename(os.path.basename(final_path))
+        previous_size = 0
+        if evictable:
+            try:
+                previous_size = os.path.getsize(final_path)
+            except FileNotFoundError:
+                pass
+        replacement_size = os.path.getsize(temporary_path)
+        os.replace(temporary_path, final_path)
+        if evictable and _cached_size_bytes is not None:
+            _cached_size_bytes = max(
+                0, _cached_size_bytes - previous_size + replacement_size
+            )
 
 
 def normalized_size(size):
@@ -93,7 +177,7 @@ def build_artwork_variant(original_path, cache_key, size):
         with NamedTemporaryFile("wb", dir=ARTWORK_CACHE_DIRECTORY, delete=False) as file:
             temporary_path = file.name
             file.write(buffer.getvalue())
-        os.replace(temporary_path, final_path)
+        _replace_cache_file(temporary_path, final_path)
         temporary_path = None
         return final_path
     except OSError as exc:
@@ -132,29 +216,31 @@ def remove_stale_plex_artist_artwork(valid_keys):
 
 def trim_artwork_cache():
     """Evict least-recently-served covers until the cache is within its cap."""
+    global _cached_size_bytes
     try:
-        entries = []
-        for filename in os.listdir(ARTWORK_CACHE_DIRECTORY):
-            path = os.path.join(ARTWORK_CACHE_DIRECTORY, filename)
-            if (
-                os.path.isfile(path)
-                and not filename.endswith(".miss")
-                and not filename.startswith("plex-artist-")
-            ):
-                entries.append((os.path.getmtime(path), os.path.getsize(path), path))
-        total = sum(size for _, size, _ in entries)
-        for _, size, path in sorted(entries):
-            if total <= ARTWORK_CACHE_LIMIT_BYTES:
-                break
-            os.unlink(path)
-            total -= size
+        with _size_lock:
+            entries = _scan_evictable_entries()
+            total = sum(size for _, size, _ in entries)
+            for _, size, path in sorted(entries):
+                if total <= ARTWORK_CACHE_LIMIT_BYTES:
+                    break
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    continue
+                total -= size
+            _cached_size_bytes = max(0, total)
     except OSError:
+        with _size_lock:
+            _cached_size_bytes = None
         current_app.logger.warning("Could not trim artwork cache in %s", ARTWORK_CACHE_DIRECTORY)
 
 
 def maybe_trim_artwork_cache():
-    """Trim at most once per interval while allowing downloads to proceed."""
+    """Trim above the high-water mark, at most once per interval."""
     global _last_trim_at
+    if _estimated_artwork_cache_size() <= ARTWORK_CACHE_HIGH_WATER_BYTES:
+        return False
     checked_at = time.monotonic()
     if (
         _last_trim_at is not None
@@ -164,6 +250,8 @@ def maybe_trim_artwork_cache():
     if not _trim_lock.acquire(blocking=False):
         return False
     try:
+        if _estimated_artwork_cache_size() <= ARTWORK_CACHE_HIGH_WATER_BYTES:
+            return False
         checked_at = time.monotonic()
         if (
             _last_trim_at is not None
@@ -197,15 +285,23 @@ def artwork_cache_stats():
 
 def clear_artwork_cache():
     """Remove only files owned by the artwork cache."""
+    global _cached_size_bytes
     removed = 0
     try:
-        with os.scandir(ARTWORK_CACHE_DIRECTORY) as entries:
-            for entry in entries:
-                if entry.is_file(follow_symlinks=False):
-                    os.unlink(entry.path)
-                    removed += 1
+        with _size_lock:
+            with os.scandir(ARTWORK_CACHE_DIRECTORY) as entries:
+                for entry in entries:
+                    if entry.is_file(follow_symlinks=False):
+                        os.unlink(entry.path)
+                        removed += 1
+            _cached_size_bytes = 0
     except FileNotFoundError:
-        pass
+        with _size_lock:
+            _cached_size_bytes = 0
+    except OSError:
+        with _size_lock:
+            _cached_size_bytes = None
+        raise
     return removed
 
 
@@ -239,55 +335,83 @@ def cached_artwork(cache_key, source_url, *, headers=None, size=None):
         return _serve(variant_file)
 
     cached_file = artwork_cache_file(cache_key)
-    if cached_file:
-        return _serve_at_size(cached_file, cache_key, size)
+    if cached_file and not size:
+        return _serve(cached_file)
 
-    miss_file = os.path.join(ARTWORK_CACHE_DIRECTORY, f"{cache_key}.miss")
-    try:
-        if os.path.isfile(miss_file) and time.time() - os.path.getmtime(miss_file) < ARTWORK_MISS_TTL:
+    with _artwork_key_lock(cache_key):
+        # A request ahead of this one may have populated the original, the
+        # requested variant, or the negative-cache marker while we waited.
+        variant_file = artwork_cache_file(cache_key, size) if size else None
+        if variant_file:
+            return _serve(variant_file)
+
+        cached_file = artwork_cache_file(cache_key)
+        if cached_file:
+            return _serve_at_size(cached_file, cache_key, size)
+
+        miss_file = os.path.join(ARTWORK_CACHE_DIRECTORY, f"{cache_key}.miss")
+        try:
+            if (
+                os.path.isfile(miss_file)
+                and time.time() - os.path.getmtime(miss_file) < ARTWORK_MISS_TTL
+            ):
+                return "", 404
+        except OSError:
+            pass
+
+        resolved_source_url = source_url() if callable(source_url) else source_url
+        if not resolved_source_url:
             return "", 404
-    except OSError:
-        pass
 
-    if callable(source_url):
-        source_url = source_url()
-    if not source_url:
-        return "", 404
-
-    temporary_path = None
-    try:
-        response = requests.get(source_url, headers=headers, stream=True, timeout=20)
-        if response.status_code == 404:
-            os.makedirs(ARTWORK_CACHE_DIRECTORY, exist_ok=True)
-            with open(miss_file, "a", encoding="utf-8"):
-                pass
-            return "", 404
-        response.raise_for_status()
-        content_type = response.headers.get("Content-Type", "").split(";", 1)[0].lower()
-        extension = {
-            "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif"
-        }.get(content_type)
-        if not extension:
-            raise ValueError(f"Artwork provider returned unsupported content type {content_type!r}")
-
-        os.makedirs(ARTWORK_CACHE_DIRECTORY, exist_ok=True)
-        final_path = os.path.join(ARTWORK_CACHE_DIRECTORY, f"{cache_key}.{extension}")
-        with NamedTemporaryFile("wb", dir=ARTWORK_CACHE_DIRECTORY, delete=False) as file:
-            temporary_path = file.name
-            downloaded = 0
-            for chunk in response.iter_content(chunk_size=64 * 1024):
-                downloaded += len(chunk)
-                if downloaded > ARTWORK_MAX_DOWNLOAD_BYTES:
-                    raise ValueError("Cover Art Archive image is too large to cache")
-                file.write(chunk)
-        os.replace(temporary_path, final_path)
         temporary_path = None
-        response = _serve_at_size(final_path, cache_key, size)
-        maybe_trim_artwork_cache()
-        return response
-    except (OSError, ValueError, requests.RequestException) as exc:
-        current_app.logger.warning("Could not cache artwork %s: %s", cache_key, exc)
-        return redirect(source_url, code=302)
-    finally:
-        if temporary_path and os.path.exists(temporary_path):
-            os.unlink(temporary_path)
+        try:
+            response = requests.get(
+                resolved_source_url, headers=headers, stream=True, timeout=20
+            )
+            if response.status_code == 404:
+                os.makedirs(ARTWORK_CACHE_DIRECTORY, exist_ok=True)
+                with open(miss_file, "a", encoding="utf-8"):
+                    pass
+                return "", 404
+            response.raise_for_status()
+            content_type = (
+                response.headers.get("Content-Type", "").split(";", 1)[0].lower()
+            )
+            extension = {
+                "image/jpeg": "jpg",
+                "image/png": "png",
+                "image/webp": "webp",
+                "image/gif": "gif",
+            }.get(content_type)
+            if not extension:
+                raise ValueError(
+                    f"Artwork provider returned unsupported content type {content_type!r}"
+                )
+
+            os.makedirs(ARTWORK_CACHE_DIRECTORY, exist_ok=True)
+            final_path = os.path.join(
+                ARTWORK_CACHE_DIRECTORY, f"{cache_key}.{extension}"
+            )
+            with NamedTemporaryFile(
+                "wb", dir=ARTWORK_CACHE_DIRECTORY, delete=False
+            ) as file:
+                temporary_path = file.name
+                downloaded = 0
+                for chunk in response.iter_content(chunk_size=64 * 1024):
+                    downloaded += len(chunk)
+                    if downloaded > ARTWORK_MAX_DOWNLOAD_BYTES:
+                        raise ValueError("Cover Art Archive image is too large to cache")
+                    file.write(chunk)
+            _replace_cache_file(temporary_path, final_path)
+            temporary_path = None
+            served_response = _serve_at_size(final_path, cache_key, size)
+            maybe_trim_artwork_cache()
+            return served_response
+        except (OSError, ValueError, requests.RequestException) as exc:
+            current_app.logger.warning(
+                "Could not cache artwork %s: %s", cache_key, exc
+            )
+            return redirect(resolved_source_url, code=302)
+        finally:
+            if temporary_path and os.path.exists(temporary_path):
+                os.unlink(temporary_path)

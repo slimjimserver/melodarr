@@ -493,8 +493,8 @@ def cached_library_index(config):
     """Return lookup tables over the Plex snapshot, parsed at most once.
 
     Detail pages previously deserialized the whole snapshot several times per
-    request and then scanned it linearly. The index is memoized per request and
-    otherwise behind a short TTL, so background workers share it too.
+    request and then scanned it linearly. The request-local memo is backed by a
+    short process TTL, so nearby HTTP requests and background work share it.
     """
     return memoized_document(
         _index_key(_snapshot_id(config)),

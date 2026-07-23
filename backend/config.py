@@ -34,6 +34,9 @@ ARTWORK_CACHE_DIRECTORY = os.getenv(
     os.path.join(PROJECT_ROOT, "data", "cache", "artwork"),
 )
 ARTWORK_CACHE_LIMIT_BYTES = 500 * 1024 * 1024
+# Let writes briefly exceed the target before paying for a directory-wide LRU
+# pass. A trim still evicts back to ARTWORK_CACHE_LIMIT_BYTES.
+ARTWORK_CACHE_HIGH_WATER_BYTES = int(ARTWORK_CACHE_LIMIT_BYTES * 1.05)
 ARTWORK_CACHE_TRIM_INTERVAL = 5 * 60
 ARTWORK_MISS_TTL = 24 * 60 * 60
 ARTWORK_BROWSER_CACHE_TTL = 7 * 24 * 60 * 60

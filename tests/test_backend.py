@@ -9,6 +9,7 @@ import sqlite3
 import tempfile
 import time
 import unittest
+from threading import Event, Thread
 from urllib.parse import parse_qs, urlparse
 from unittest.mock import Mock, patch
 
@@ -30,6 +31,7 @@ from PIL import Image
 
 from backend import api_cache
 from backend import artwork_cache
+from backend import cache_memo
 from backend import recommendations as recommendation_engine
 from backend.api_cache import (
     cache_db,
@@ -90,6 +92,14 @@ class DatabaseTestCase(unittest.TestCase):
     def setUp(self):
         self.app = create_app({"TESTING": True, "SECRET_KEY": "test-secret"})
         self.client = self.app.test_client()
+        with cache_memo._lock:
+            cache_memo._entries.clear()
+            cache_memo._generations.clear()
+        with artwork_cache._size_lock:
+            artwork_cache._cached_size_bytes = None
+        with artwork_cache._key_locks_lock:
+            artwork_cache._key_locks.clear()
+        artwork_cache._last_trim_at = None
         with db() as connection:
             connection.execute("DELETE FROM pending_lidarr_searches")
             connection.execute("DELETE FROM recommendation_cache")
@@ -1268,6 +1278,68 @@ class ApiCacheTests(DatabaseTestCase):
         self.assertEqual(refreshed, {"result": "refreshed"})
         self.assertEqual(cached, {"result": "refreshed"})
         self.assertEqual(get.call_count, 2)
+
+
+class CacheMemoTests(DatabaseTestCase):
+    @patch("backend.cache_memo.time.monotonic", return_value=100.0)
+    def test_parsed_document_is_shared_across_requests(self, monotonic):
+        build = Mock(return_value={"artists": [1, 2, 3]})
+
+        with self.app.test_request_context():
+            first = cache_memo.memoized_document("library", build)
+            self.assertIs(first, cache_memo.memoized_document("library", build))
+        with self.app.test_request_context():
+            second = cache_memo.memoized_document("library", build)
+
+        self.assertIs(first, second)
+        build.assert_called_once_with()
+
+    @patch("backend.cache_memo.time.monotonic", return_value=100.0)
+    def test_expired_shared_document_is_rebuilt(self, monotonic):
+        build = Mock(side_effect=[{"version": 1}, {"version": 2}])
+
+        with self.app.test_request_context():
+            first = cache_memo.memoized_document("library", build)
+        monotonic.return_value = 131.0
+        with self.app.test_request_context():
+            second = cache_memo.memoized_document("library", build)
+
+        self.assertEqual(first["version"], 1)
+        self.assertEqual(second["version"], 2)
+        self.assertEqual(build.call_count, 2)
+
+    @patch("backend.cache_memo.time.monotonic", return_value=100.0)
+    def test_invalidation_rebuilds_the_next_request(self, monotonic):
+        build = Mock(side_effect=[{"version": 1}, {"version": 2}])
+
+        with self.app.test_request_context():
+            cache_memo.memoized_document("library", build)
+        cache_memo.invalidate_document("library")
+        with self.app.test_request_context():
+            refreshed = cache_memo.memoized_document("library", build)
+
+        self.assertEqual(refreshed["version"], 2)
+        self.assertEqual(build.call_count, 2)
+
+    @patch("backend.cache_memo.time.monotonic", return_value=100.0)
+    def test_invalidation_during_build_does_not_republish_stale_value(self, monotonic):
+        calls = 0
+
+        def build():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                cache_memo.invalidate_document("library")
+            return {"version": calls}
+
+        with self.app.test_request_context():
+            first = cache_memo.memoized_document("library", build)
+        with self.app.test_request_context():
+            second = cache_memo.memoized_document("library", build)
+
+        self.assertEqual(first["version"], 1)
+        self.assertEqual(second["version"], 2)
+        self.assertEqual(calls, 2)
 
 
 class LidarrRequestTests(DatabaseTestCase):
@@ -2727,8 +2799,14 @@ class ArtworkCacheTests(DatabaseTestCase):
         return f"/api/artwork/release-group/{mbid}"
 
     @patch("backend.artwork_cache.trim_artwork_cache")
+    @patch(
+        "backend.artwork_cache._estimated_artwork_cache_size",
+        return_value=artwork_cache.ARTWORK_CACHE_HIGH_WATER_BYTES + 1,
+    )
     @patch("backend.artwork_cache.time.monotonic", return_value=100.0)
-    def test_artwork_trim_runs_at_most_once_per_interval(self, monotonic, trim):
+    def test_artwork_trim_runs_at_most_once_per_interval(
+        self, monotonic, estimated_size, trim
+    ):
         original_last_trim = artwork_cache._last_trim_at
         artwork_cache._last_trim_at = None
         try:
@@ -2741,6 +2819,139 @@ class ArtworkCacheTests(DatabaseTestCase):
             self.assertEqual(trim.call_count, 2)
         finally:
             artwork_cache._last_trim_at = original_last_trim
+
+    @patch("backend.artwork_cache.trim_artwork_cache")
+    @patch("backend.artwork_cache._estimated_artwork_cache_size")
+    def test_artwork_trim_skips_directory_scan_below_high_water(
+        self, estimated_size, trim
+    ):
+        estimated_size.return_value = artwork_cache.ARTWORK_CACHE_HIGH_WATER_BYTES
+
+        self.assertFalse(artwork_cache.maybe_trim_artwork_cache())
+
+        trim.assert_not_called()
+
+    def test_artwork_size_estimate_updates_without_repeated_scans(self):
+        cache_key = "release-group-size-accounting"
+        os.makedirs(ARTWORK_CACHE_DIRECTORY, exist_ok=True)
+        final_path = os.path.join(ARTWORK_CACHE_DIRECTORY, f"{cache_key}.jpg")
+
+        with patch(
+            "backend.artwork_cache._scan_evictable_entries",
+            return_value=[(0, 100, "existing.jpg")],
+        ) as scan:
+            self.assertEqual(artwork_cache._estimated_artwork_cache_size(), 100)
+
+            with tempfile.NamedTemporaryFile(
+                "wb", dir=ARTWORK_CACHE_DIRECTORY, delete=False
+            ) as file:
+                first_temporary = file.name
+                file.write(b"12345")
+            artwork_cache._replace_cache_file(first_temporary, final_path)
+            self.assertEqual(artwork_cache._estimated_artwork_cache_size(), 105)
+
+            with tempfile.NamedTemporaryFile(
+                "wb", dir=ARTWORK_CACHE_DIRECTORY, delete=False
+            ) as file:
+                second_temporary = file.name
+                file.write(b"12")
+            artwork_cache._replace_cache_file(second_temporary, final_path)
+            self.assertEqual(artwork_cache._estimated_artwork_cache_size(), 102)
+
+        scan.assert_called_once_with()
+
+    @patch("backend.artwork_cache.requests.get")
+    def test_concurrent_cache_misses_share_one_download(self, get):
+        cache_key = "release-group-concurrent-download"
+        download_started = Event()
+        release_download = Event()
+
+        def fetch(*args, **kwargs):
+            download_started.set()
+            self.assertTrue(release_download.wait(2))
+            return Response(
+                headers={"Content-Type": "image/jpeg"},
+                chunks=(b"shared-image",),
+            )
+
+        get.side_effect = fetch
+        responses = []
+
+        def request_artwork():
+            with self.app.test_request_context():
+                response = artwork_cache.cached_artwork(
+                    cache_key, "https://images.example/shared.jpg"
+                )
+                response.direct_passthrough = False
+                responses.append((response.status_code, response.get_data()))
+                response.close()
+
+        first = Thread(target=request_artwork)
+        second = Thread(target=request_artwork)
+        first.start()
+        self.assertTrue(download_started.wait(2))
+        second.start()
+        time.sleep(0.05)
+        self.assertEqual(get.call_count, 1)
+        release_download.set()
+        first.join(2)
+        second.join(2)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(get.call_count, 1)
+        self.assertEqual(responses, [(200, b"shared-image"), (200, b"shared-image")])
+        self.assertNotIn(cache_key, artwork_cache._key_locks)
+
+    def test_concurrent_variant_misses_share_one_resize(self):
+        cache_key = "release-group-concurrent-resize"
+        os.makedirs(ARTWORK_CACHE_DIRECTORY, exist_ok=True)
+        original_path = os.path.join(ARTWORK_CACHE_DIRECTORY, f"{cache_key}.jpg")
+        with open(original_path, "wb") as file:
+            file.write(encoded_image(1000))
+
+        resize_started = Event()
+        release_resize = Event()
+        actual_build = artwork_cache.build_artwork_variant
+
+        def build_variant(*args, **kwargs):
+            resize_started.set()
+            self.assertTrue(release_resize.wait(2))
+            return actual_build(*args, **kwargs)
+
+        responses = []
+
+        def request_artwork():
+            with self.app.test_request_context():
+                response = artwork_cache.cached_artwork(
+                    cache_key, None, size="thumb"
+                )
+                response.direct_passthrough = False
+                responses.append((response.status_code, response.get_data()))
+                response.close()
+
+        with patch(
+            "backend.artwork_cache.build_artwork_variant",
+            side_effect=build_variant,
+        ) as build:
+            first = Thread(target=request_artwork)
+            second = Thread(target=request_artwork)
+            first.start()
+            self.assertTrue(resize_started.wait(2))
+            second.start()
+            time.sleep(0.05)
+            self.assertEqual(build.call_count, 1)
+            release_resize.set()
+            first.join(2)
+            second.join(2)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(build.call_count, 1)
+        self.assertEqual(len(responses), 2)
+        self.assertEqual(responses[0][0], 200)
+        self.assertEqual(responses[0], responses[1])
+        self.assertNotIn(cache_key, artwork_cache._key_locks)
 
     @patch("backend.artwork_cache.requests.get")
     def test_downloaded_artwork_is_served_from_disk_on_next_request(self, get):
