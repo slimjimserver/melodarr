@@ -46,14 +46,16 @@ else:  # Support the existing `python backend/app.py` entry point.
 blueprint = Blueprint("settings", __name__)
 
 CACHE_NAMES = {
-    "musicbrainz-search": "MusicBrainz search",
-    "musicbrainz-metadata": "MusicBrainz metadata",
-    "listenbrainz-metadata": "ListenBrainz metadata",
+    "musicbrainz-search": "MusicBrainz Search",
+    "musicbrainz-metadata": "MusicBrainz Metadata",
+    "musicbrainz-artist-revalidation": "MusicBrainz Artist Revalidation",
+    "listenbrainz-metadata": "ListenBrainz Metadata",
     "lastfm": "Last.fm",
-    "lidarr-options": "Lidarr options",
-    "lidarr-library": "Lidarr library availability",
-    "plex-library": "Plex library inventory",
-    "plex-guid": "Plex GUID mappings",
+    "lidarr-options": "Lidarr Options",
+    "lidarr-library": "Lidarr Library Availability",
+    "lidarr-artist-metadata": "Lidarr Artist Metadata",
+    "plex-library": "Plex Library Inventory",
+    "plex-guid": "Plex GUID Mappings",
 }
 
 
@@ -127,14 +129,14 @@ def maintenance():
         "jobs": [
             {
                 "id": "recommendations",
-                "name": "Recommendation refresh",
+                "name": "Recommendation Refresh",
                 "type": "process",
                 "schedule": "Every 12 hours",
                 **recommendation_status,
             },
             {
                 "id": "lidarr-followups",
-                "name": "Lidarr search follow-ups",
+                "name": "Lidarr Search Follow-Ups",
                 "type": "process",
                 "schedule": "Every 2 seconds when queued",
                 "queued": lidarr_queue["queued"],
@@ -164,7 +166,7 @@ def maintenance():
             },
             {
                 "id": "plex-metadata",
-                "name": "Plex MusicBrainz enrichment",
+                "name": "Plex MusicBrainz Enrichment",
                 "type": "process",
                 "schedule": "After Plex library changes",
                 **plex_metadata_status,
@@ -174,7 +176,7 @@ def maintenance():
             *api_caches,
             {
                 "id": "recommendations",
-                "name": "Assembled recommendations",
+                "name": "Assembled Recommendations",
                 "entries": recommendations["entries"],
                 "expired": 0,
                 "valueBytes": recommendations["value_bytes"],
@@ -182,7 +184,7 @@ def maintenance():
             },
             {
                 "id": "artwork",
-                "name": "Artwork files",
+                "name": "Artwork Files",
                 "entries": artwork["entries"],
                 "expired": artwork["misses"],
                 "valueBytes": artwork["valueBytes"],

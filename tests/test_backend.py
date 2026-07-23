@@ -1278,7 +1278,19 @@ class SettingsMaintenanceTests(DatabaseTestCase):
                 "plex-metadata",
             ],
         )
-        jobs = {job["id"]: job for job in response.get_json()["jobs"]}
+        job_rows = response.get_json()["jobs"]
+        self.assertEqual(
+            [job["name"] for job in job_rows],
+            [
+                "Recommendation Refresh",
+                "Lidarr Search Follow-Ups",
+                "Lidarr Library Scan",
+                "Plex Recently Added Scan",
+                "Plex Full Library Scan",
+                "Plex MusicBrainz Enrichment",
+            ],
+        )
+        jobs = {job["id"]: job for job in job_rows}
         self.assertEqual(jobs["lidarr-library"]["schedule"], "Every 4 minutes")
 
         recommendation = self.client.post(
@@ -1389,6 +1401,40 @@ class SettingsMaintenanceTests(DatabaseTestCase):
             file.write(b"artwork")
 
         caches = self.client.get("/api/settings/maintenance").get_json()["caches"]
+        self.assertEqual(
+            [cache["id"] for cache in caches],
+            [
+                "musicbrainz-search",
+                "musicbrainz-metadata",
+                "musicbrainz-artist-revalidation",
+                "listenbrainz-metadata",
+                "lastfm",
+                "lidarr-options",
+                "lidarr-library",
+                "lidarr-artist-metadata",
+                "plex-library",
+                "plex-guid",
+                "recommendations",
+                "artwork",
+            ],
+        )
+        self.assertEqual(
+            [cache["name"] for cache in caches],
+            [
+                "MusicBrainz Search",
+                "MusicBrainz Metadata",
+                "MusicBrainz Artist Revalidation",
+                "ListenBrainz Metadata",
+                "Last.fm",
+                "Lidarr Options",
+                "Lidarr Library Availability",
+                "Lidarr Artist Metadata",
+                "Plex Library Inventory",
+                "Plex GUID Mappings",
+                "Assembled Recommendations",
+                "Artwork Files",
+            ],
+        )
         by_id = {cache["id"]: cache for cache in caches}
         self.assertEqual(by_id["musicbrainz-metadata"]["entries"], 1)
         self.assertEqual(by_id["recommendations"]["entries"], 1)
