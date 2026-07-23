@@ -418,6 +418,82 @@ function setupNavigation() {
     return page === "profile" ? `/${username}` : `/${username}/settings/${page}`;
   }
 
+  function isMobileDevice() {
+    return /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
+      || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  }
+
+  function mobilePlexDestination(plexUrl: string, plexampUrl: string) {
+    return isMobileDevice() && plexampUrl
+      ? { url: plexampUrl, label: "Open in Plexamp", openInNewTab: false }
+      : { url: plexUrl, label: "Open in Plex", openInNewTab: true };
+  }
+
+  function createHistoryItem(item: JsonObject, route: string) {
+    const row = document.createElement("article");
+    row.className = "history-item";
+
+    const detailLink = document.createElement("a");
+    detailLink.className = "history-detail";
+    detailLink.href = `/${route}/${encodeURIComponent(item.mbid)}`;
+
+    const copy = document.createElement("span");
+    copy.className = "history-copy";
+    const title = document.createElement("strong");
+    title.className = "history-title";
+    title.textContent = item.name;
+    copy.append(title);
+
+    if (route === "albums") {
+      const releaseType = String(item.release_type || "");
+      const metadata = [
+        item.artist_name,
+        releaseType ? releaseType[0].toUpperCase() + releaseType.slice(1) : "",
+        item.release_date,
+      ].filter(Boolean);
+      if (metadata.length) {
+        const secondary = document.createElement("span");
+        secondary.className = "history-meta";
+        secondary.textContent = metadata.join(" · ");
+        copy.append(secondary);
+      }
+    }
+
+    const requestedAtDate = new Date(Number(item.created_at) * 1000);
+    const requestedAt = document.createElement("time");
+    requestedAt.className = "history-request-date";
+    requestedAt.dateTime = requestedAtDate.toISOString();
+    requestedAt.textContent = requestedAtDate.toLocaleDateString();
+    detailLink.append(copy, requestedAt);
+    row.append(detailLink);
+
+    if (item.availableInPlex) {
+      const destination = mobilePlexDestination(
+        String(item.plexUrl || ""),
+        String(item.plexampUrl || ""),
+      );
+      const plexBadge: HTMLElement = destination.url
+        ? document.createElement("a")
+        : document.createElement("span");
+      plexBadge.className = "history-plex";
+      plexBadge.title = destination.url ? destination.label : "Available in Plex";
+      plexBadge.setAttribute("aria-label", plexBadge.title);
+      if (plexBadge instanceof HTMLAnchorElement) {
+        plexBadge.href = destination.url;
+        if (destination.openInNewTab) {
+          plexBadge.target = "_blank";
+          plexBadge.rel = "noreferrer";
+        }
+      }
+      const icon = document.createElement("img");
+      icon.src = "/icons/plex.svg";
+      icon.alt = "";
+      plexBadge.append(icon);
+      row.append(plexBadge);
+    }
+    return row;
+  }
+
   async function renderAccount(page: AccountPage) {
     const user = currentUser;
     if (!user) return;
@@ -439,7 +515,7 @@ function setupNavigation() {
           const heading = document.createElement("h2"); heading.textContent = title;
           const list = document.createElement("div"); list.className = "results";
           if (!requests.length) { const empty = document.createElement("p"); empty.className = "message"; empty.textContent = "No requests yet."; list.append(empty); }
-          requests.forEach((item: JsonObject) => { const link = document.createElement("a"); link.className = "history-item"; link.href = `/${route}/${encodeURIComponent(item.mbid)}`; link.textContent = item.name; const date = document.createElement("span"); date.textContent = new Date(item.created_at * 1000).toLocaleDateString(); link.append(date); list.append(link); });
+          requests.forEach((item: JsonObject) => list.append(createHistoryItem(item, route)));
           section.append(heading, list); content.append(section);
         });
       } else if (page === "general") {

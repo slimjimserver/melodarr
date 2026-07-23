@@ -825,6 +825,9 @@ class LidarrSearchQueueTests(DatabaseTestCase):
             33,
             44,
             "Queued Album",
+            artist_name="Queue Artist",
+            release_type="Album",
+            release_date="2026-07-23",
         )
 
         self.assertTrue(inserted)
@@ -839,6 +842,9 @@ class LidarrSearchQueueTests(DatabaseTestCase):
         self.assertEqual(job["artist_id"], 44)
         self.assertEqual(job["refresh_type"], "album")
         self.assertEqual(history["name"], "Queued Album")
+        self.assertEqual(history["artist_name"], "Queue Artist")
+        self.assertEqual(history["release_type"], "Album")
+        self.assertEqual(history["release_date"], "2026-07-23")
 
     def test_one_refresh_command_is_persisted_for_an_exact_job_batch(self):
         self.register()
@@ -1850,6 +1856,8 @@ class LidarrRequestTests(DatabaseTestCase):
             "title": "Test Album",
             "foreignAlbumId": self.album_mbid,
             "artist": {"artistName": "Test Artist"},
+            "albumType": "Album",
+            "releaseDate": "2020-03-18T00:00:00Z",
         }])
         add_album.return_value = Response(201, {
             "id": 33,
@@ -1872,6 +1880,11 @@ class LidarrRequestTests(DatabaseTestCase):
         self.assertEqual((mbid, album_id, artist_id, title), (
             self.album_mbid, 33, 44, "Test Album",
         ))
+        self.assertEqual(enqueue_search.call_args.kwargs, {
+            "artist_name": "Test Artist",
+            "release_type": "Album",
+            "release_date": "2020-03-18",
+        })
         self.assertEqual(response.get_json()["refreshType"], "album")
         request_work.assert_called_once_with()
         start_command.assert_not_called()
@@ -1961,6 +1974,99 @@ class LidarrRequestTests(DatabaseTestCase):
             (self.album_mbid, 33, 44, "New Album"),
         )
         request_work.assert_called_once_with()
+
+
+class AccountProfileTests(DatabaseTestCase):
+    release_group_mbid = "33333333-3333-3333-3333-333333333333"
+
+    @patch("backend.routes.account.musicbrainz.get")
+    @patch("backend.routes.account.plex.cached_library_index")
+    @patch("backend.routes.account.get_service")
+    def test_profile_returns_stored_release_metadata_and_plex_availability(
+        self, get_service, cached_library_index, musicbrainz_get
+    ):
+        self.register()
+        with db() as connection:
+            user_id = connection.execute(
+                "SELECT id FROM users WHERE username = 'test-user'"
+            ).fetchone()["id"]
+            connection.execute(
+                "INSERT INTO request_history "
+                "(user_id, kind, mbid, name, artist_name, release_type, "
+                "release_date, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    user_id,
+                    "release-group",
+                    self.release_group_mbid,
+                    "SKZ2020",
+                    "Stray Kids",
+                    "Album",
+                    "2020-03-18",
+                    1000,
+                ),
+            )
+        get_service.return_value = {"url": "http://plex", "token": "token"}
+        cached_library_index.return_value = {
+            "artistsByMbid": {},
+            "releaseGroupsByMbid": {
+                self.release_group_mbid: [{
+                    "url": "https://app.plex.tv/album",
+                    "plexampUrl": "https://listen.plex.tv/album/example",
+                }],
+            },
+        }
+
+        response = self.client.get("/api/account/profile")
+
+        self.assertEqual(response.status_code, 200)
+        item = response.get_json()["requests"]["release-group"][0]
+        self.assertEqual(item["artist_name"], "Stray Kids")
+        self.assertEqual(item["release_type"], "Album")
+        self.assertEqual(item["release_date"], "2020-03-18")
+        self.assertTrue(item["availableInPlex"])
+        self.assertEqual(item["plexUrl"], "https://app.plex.tv/album")
+        self.assertEqual(
+            item["plexampUrl"],
+            "https://listen.plex.tv/album/example",
+        )
+        musicbrainz_get.assert_not_called()
+
+    @patch("backend.routes.account.musicbrainz.get")
+    @patch("backend.routes.account.get_service", return_value=None)
+    def test_profile_backfills_legacy_rows_from_cached_musicbrainz_only(
+        self, get_service, musicbrainz_get
+    ):
+        self.register()
+        with db() as connection:
+            user_id = connection.execute(
+                "SELECT id FROM users WHERE username = 'test-user'"
+            ).fetchone()["id"]
+            connection.execute(
+                "INSERT INTO request_history "
+                "(user_id, kind, mbid, name, created_at) VALUES (?, ?, ?, ?, ?)",
+                (
+                    user_id,
+                    "release-group",
+                    self.release_group_mbid,
+                    "Legacy Album",
+                    1000,
+                ),
+            )
+        musicbrainz_get.return_value = {
+            "artist-credit": [{"name": "Legacy Artist"}],
+            "primary-type": "EP",
+            "first-release-date": "2019-04-05",
+        }
+
+        response = self.client.get("/api/account/profile")
+
+        self.assertEqual(response.status_code, 200)
+        item = response.get_json()["requests"]["release-group"][0]
+        self.assertEqual(item["artist_name"], "Legacy Artist")
+        self.assertEqual(item["release_type"], "EP")
+        self.assertEqual(item["release_date"], "2019-04-05")
+        self.assertFalse(item["availableInPlex"])
+        self.assertTrue(musicbrainz_get.call_args.kwargs["cache_only"])
 
 
 class LidarrClientTests(unittest.TestCase):

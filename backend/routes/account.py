@@ -5,6 +5,7 @@ import re
 import secrets
 import sqlite3
 import time
+from urllib.parse import quote
 
 import requests
 from flask import Blueprint, current_app, jsonify, request
@@ -13,14 +14,24 @@ from werkzeug.security import generate_password_hash
 if __package__ == "backend.routes":
     from ..responses import api_error
     from ..security import admin_required, current_user, login_required
-    from ..services import lastfm, listenbrainz
-    from ..storage import db, delete_recommendation_cache, get_request_history
+    from ..services import lastfm, listenbrainz, musicbrainz, plex
+    from ..storage import (
+        db,
+        delete_recommendation_cache,
+        get_request_history,
+        get_service,
+    )
     from ..workers import recommendations as recommendation_worker
 else:  # Support the existing `python backend/app.py` entry point.
     from responses import api_error
     from security import admin_required, current_user, login_required
-    from services import lastfm, listenbrainz
-    from storage import db, delete_recommendation_cache, get_request_history
+    from services import lastfm, listenbrainz, musicbrainz, plex
+    from storage import (
+        db,
+        delete_recommendation_cache,
+        get_request_history,
+        get_service,
+    )
     from workers import recommendations as recommendation_worker
 
 
@@ -30,6 +41,85 @@ blueprint = Blueprint("account", __name__)
 def _recommendation_inputs_changed(user_id):
     delete_recommendation_cache(user_id)
     recommendation_worker.request_refresh()
+
+
+def _profile_plex_index():
+    """Read current Plex availability without triggering a library scan."""
+    config = get_service("plex")
+    if not config:
+        return {"artistsByMbid": {}, "releaseGroupsByMbid": {}}
+    try:
+        return plex.cached_library_index(config)
+    except (KeyError, TypeError, ValueError, requests.RequestException):
+        return {"artistsByMbid": {}, "releaseGroupsByMbid": {}}
+
+
+def _cached_release_group_metadata(mbid):
+    """Backfill legacy history rows only when detail metadata is already cached."""
+    try:
+        data = musicbrainz.get(
+            f"/release-group/{quote(mbid)}",
+            "aliases+artist-credits+url-rels",
+            priority="prefetch",
+            cache_only=True,
+        )
+    except (KeyError, TypeError, ValueError, requests.RequestException):
+        return {}
+    if not data:
+        return {}
+    artist_credit = data.get("artist-credit") or []
+    return {
+        "artist_name": " · ".join(
+            str(credit.get("name") or "").strip()
+            for credit in artist_credit
+            if isinstance(credit, dict) and credit.get("name")
+        ),
+        "release_type": data.get("primary-type") or "",
+        "release_date": data.get("first-release-date") or "",
+    }
+
+
+def _profile_history_item(row, plex_index):
+    item = dict(row)
+    plex_item = None
+    if item["kind"] == "artist":
+        plex_item = plex_index.get("artistsByMbid", {}).get(item["mbid"])
+    else:
+        plex_items = plex_index.get("releaseGroupsByMbid", {}).get(
+            item["mbid"], []
+        )
+        plex_item = next(
+            (entry for entry in plex_items if entry.get("url")),
+            plex_items[0] if plex_items else None,
+        )
+        if not all(
+            item.get(field)
+            for field in ("artist_name", "release_type", "release_date")
+        ):
+            cached = _cached_release_group_metadata(item["mbid"])
+            item["artist_name"] = (
+                item.get("artist_name")
+                or cached.get("artist_name")
+                or (plex_item or {}).get("artistName")
+                or ""
+            )
+            item["release_type"] = (
+                item.get("release_type")
+                or cached.get("release_type")
+                or (plex_item or {}).get("releaseType")
+                or ""
+            )
+            item["release_date"] = (
+                item.get("release_date")
+                or cached.get("release_date")
+                or str((plex_item or {}).get("year") or "")
+            )
+    item.update({
+        "availableInPlex": bool(plex_item),
+        "plexUrl": (plex_item or {}).get("url") or "",
+        "plexampUrl": (plex_item or {}).get("plexampUrl") or "",
+    })
+    return item
 
 
 @blueprint.post("/api/account/invitations")
@@ -72,8 +162,9 @@ def account_settings():
 def account_profile():
     user = current_user()
     history = {"artist": [], "release-group": []}
+    plex_index = _profile_plex_index()
     for row in get_request_history(user["id"]):
-        history[row["kind"]].append(dict(row))
+        history[row["kind"]].append(_profile_history_item(row, plex_index))
     return jsonify({"username": user["username"], "requests": history})
 
 

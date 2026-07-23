@@ -32,6 +32,41 @@ else:  # Support the existing `python backend/app.py` entry point.
 blueprint = Blueprint("requests", __name__)
 
 
+def _release_history_metadata(*albums):
+    """Extract display metadata from Lidarr's lookup and created-album shapes."""
+    artist_name = ""
+    release_type = ""
+    release_date = ""
+    for album in albums:
+        if not isinstance(album, dict):
+            continue
+        artist = album.get("artist") or {}
+        if not isinstance(artist, dict):
+            artist = {}
+        artist_name = artist_name or str(
+            album.get("artistName")
+            or artist.get("artistName")
+            or artist.get("name")
+            or ""
+        ).strip()
+        release_type = release_type or str(
+            album.get("albumType")
+            or album.get("releaseType")
+            or album.get("type")
+            or ""
+        ).strip()
+        release_date = release_date or str(
+            album.get("releaseDate")
+            or album.get("firstReleaseDate")
+            or ""
+        ).strip()[:10]
+    return {
+        "artist_name": artist_name,
+        "release_type": release_type,
+        "release_date": release_date,
+    }
+
+
 @blueprint.post("/api/request")
 @login_required
 def request_artist():
@@ -150,7 +185,13 @@ def request_release_group():
             total_tracks = statistics.get("totalTrackCount", created_album.get("trackCount", 0))
             downloaded_tracks = statistics.get("trackFileCount", 0)
             if total_tracks and downloaded_tracks >= total_tracks:
-                record_request(current_user()["id"], "release-group", mbid, created_album.get("title", album.get("title", "Release group")))
+                record_request(
+                    current_user()["id"],
+                    "release-group",
+                    mbid,
+                    created_album.get("title", album.get("title", "Release group")),
+                    **_release_history_metadata(created_album, album),
+                )
                 lidarr_library_worker.request_scan()
                 return jsonify({"message": "This release group is already fully available in Lidarr.", "alreadyExists": True})
         else:
@@ -173,6 +214,7 @@ def request_release_group():
             created_album["id"],
             artist_id,
             title,
+            **_release_history_metadata(created_album, album),
         )
         lidarr_search_worker.request_work()
         lidarr_library_worker.request_scan()

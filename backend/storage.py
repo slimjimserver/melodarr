@@ -80,23 +80,53 @@ def get_request_history(user_id, limit=100):
     """Return the most recent private request-history rows for one user."""
     with db() as connection:
         return connection.execute(
-            "SELECT kind, mbid, name, created_at FROM request_history "
+            "SELECT kind, mbid, name, artist_name, release_type, release_date, "
+            "created_at FROM request_history "
             "WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
             (user_id, limit),
         ).fetchall()
 
 
-def record_request(user_id, kind, mbid, name):
+def record_request(
+    user_id,
+    kind,
+    mbid,
+    name,
+    *,
+    artist_name="",
+    release_type="",
+    release_date="",
+):
     """Record an artist or release-group request for one user."""
     with db() as connection:
         connection.execute(
-            "INSERT INTO request_history (user_id, kind, mbid, name, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (user_id, kind, mbid, name, time.time()),
+            "INSERT INTO request_history "
+            "(user_id, kind, mbid, name, artist_name, release_type, "
+            "release_date, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                user_id,
+                kind,
+                mbid,
+                name,
+                artist_name or None,
+                release_type or None,
+                release_date or None,
+                time.time(),
+            ),
         )
 
 
-def enqueue_lidarr_search(user_id, mbid, album_id, artist_id, name):
+def enqueue_lidarr_search(
+    user_id,
+    mbid,
+    album_id,
+    artist_id,
+    name,
+    *,
+    artist_name="",
+    release_type="",
+    release_date="",
+):
     """Persist a refresh-then-search job and its user-visible request atomically."""
     now = time.time()
     with db() as connection:
@@ -110,9 +140,19 @@ def enqueue_lidarr_search(user_id, mbid, album_id, artist_id, name):
         )
         if cursor.rowcount:
             connection.execute(
-                "INSERT INTO request_history (user_id, kind, mbid, name, created_at) "
-                "VALUES (?, 'release-group', ?, ?, ?)",
-                (user_id, mbid, name, now),
+                "INSERT INTO request_history "
+                "(user_id, kind, mbid, name, artist_name, release_type, "
+                "release_date, created_at) "
+                "VALUES (?, 'release-group', ?, ?, ?, ?, ?, ?)",
+                (
+                    user_id,
+                    mbid,
+                    name,
+                    artist_name or None,
+                    release_type or None,
+                    release_date or None,
+                    now,
+                ),
             )
         return bool(cursor.rowcount)
 
@@ -287,9 +327,21 @@ def init_db():
                 kind TEXT NOT NULL CHECK(kind IN ('artist', 'release-group')),
                 mbid TEXT NOT NULL,
                 name TEXT NOT NULL,
+                artist_name TEXT,
+                release_type TEXT,
+                release_date TEXT,
                 created_at REAL NOT NULL
             )
         """)
+        request_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(request_history)")
+        }
+        for column in ("artist_name", "release_type", "release_date"):
+            if column not in request_columns:
+                connection.execute(
+                    f"ALTER TABLE request_history ADD COLUMN {column} TEXT"
+                )
         connection.execute("""
             CREATE TABLE IF NOT EXISTS recommendation_cache (
                 user_id INTEGER PRIMARY KEY REFERENCES users(id),

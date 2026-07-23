@@ -353,8 +353,14 @@ dialog::backdrop { background: rgba(2, 2, 3, .75); backdrop-filter: blur(6px); }
 .account-content { min-width: 0; }
 .account-section + .account-section { margin-top: 34px; }
 .account-section h2, .account-form h2 { margin: 0 0 14px; font-size: 20px; letter-spacing: -.03em; }
-.history-item { display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid var(--border); border-radius: 11px; background: var(--surface); color: var(--foreground); padding: 13px 15px; text-decoration: none; transition: border-color .2s var(--ease-out), background .2s var(--ease-out); }
-.history-item span { color: var(--foreground-muted); font-size: 12px; white-space: nowrap; }
+.history-item { display: flex; align-items: center; border: 1px solid var(--border); border-radius: 11px; background: var(--surface); color: var(--foreground); overflow: hidden; transition: border-color .2s var(--ease-out), background .2s var(--ease-out); }
+.history-detail { display: flex; flex: 1; align-items: center; justify-content: space-between; min-width: 0; gap: 16px; color: var(--foreground); padding: 11px 15px; text-decoration: none; }
+.history-copy { display: grid; min-width: 0; gap: 4px; }
+.history-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
+.history-meta { overflow: hidden; color: var(--foreground-muted); text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.history-request-date { flex: 0 0 auto; color: var(--foreground-muted); white-space: nowrap; font-size: 12px; }
+.history-plex { display: inline-flex; flex: 0 0 auto; align-items: center; justify-content: center; width: 32px; height: 32px; margin-right: 11px; border: 1px solid rgba(229, 160, 13, .3); border-radius: 8px; background: rgba(229, 160, 13, .06); padding: 7px; }
+.history-plex img { display: block; width: 100%; height: 100%; object-fit: contain; }
 .account-form { max-width: 580px; }
 .dialog-title { display: flex; justify-content: space-between; }
 .dialog-title h2 { margin: 0; font-size: 30px; letter-spacing: -.04em; }
@@ -419,6 +425,7 @@ details summary { margin-bottom: 17px; color: var(--accent-bright); cursor: poin
   .option-choice:hover span { border-color: var(--border-hover); background: var(--surface-hover); color: var(--foreground); transform: translateY(-1px); }
   .account-nav a:hover { background: rgba(94, 106, 210, .2); color: var(--foreground); }
   .history-item:hover { border-color: var(--border-hover); background: var(--surface-hover); }
+  .history-plex:hover { background: rgba(229, 160, 13, .15); }
   .maintenance-table button:disabled:hover { transform: none; }
 }
 
@@ -475,6 +482,7 @@ details summary { margin-bottom: 17px; color: var(--accent-bright); cursor: poin
   .account-nav { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .account-nav p { grid-column: 1 / -1; }
   .account-nav-action { grid-column: 1 / -1; }
+  .history-detail { align-items: flex-start; }
   #back-to-top { right: 16px; padding: 11px 13px; }
   #back-to-top span { display: none; }
   .dialog-actions { position: sticky; bottom: 0; background: #101014; padding-bottom: calc(17px + var(--safe-bottom)); }
