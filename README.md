@@ -93,6 +93,8 @@ PUID=99
 PGID=100
 ```
 
+Do not map a host directory to `/app`; doing so hides Melodarr's application files. Only `/app/data` should be used for persistent storage.
+
 Do not also set Docker's `--user` option. The container starts as root only long enough to ensure `/app/data` exists with the requested ownership, then runs Melodarr as `PUID:PGID`. If the container is deliberately started with `--user`, Melodarr will honor that Docker-level identity but cannot change bind-mount ownership.
 
 For an HTTPS deployment, add this to the service's `environment` block in `docker-compose.yml`:

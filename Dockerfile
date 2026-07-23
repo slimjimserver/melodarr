@@ -28,4 +28,4 @@ ENV PUID=1000 \
     MELODARR_CACHE_DATABASE=/app/data/cache/metadata.db
 EXPOSE 5056
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
-CMD ["gunicorn", "--config=backend/gunicorn.conf.py", "backend.app:app"]
+CMD ["gunicorn", "--chdir=/app", "--config=/app/backend/gunicorn.conf.py", "backend.app:app"]

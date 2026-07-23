@@ -46,8 +46,24 @@ jobs:
           docker run --rm \
             --env PUID=99 \
             --env PGID=100 \
+            --workdir /tmp \
             "$IMAGE_NAME:$GITHUB_SHA" \
-            sh -ec 'test "$(id -u)" = 99 && test "$(id -g)" = 100 && python -c "from backend.storage import init_db; from backend.api_cache import init_cache_db; from backend.config import load_session_secret; init_db(); init_cache_db(); load_session_secret()" && test -f /app/data/melodarr.db && test -f /app/data/cache/metadata.db && test -f /app/data/session-secret.key'
+            sh -ec 'test "$PWD" = /app && test "$(id -u)" = 99 && test "$(id -g)" = 100 && python -c "from backend.storage import init_db; from backend.api_cache import init_cache_db; from backend.config import load_session_secret; init_db(); init_cache_db(); load_session_secret()" && test -f /app/data/melodarr.db && test -f /app/data/cache/metadata.db && test -f /app/data/session-secret.key'
+
+      - name: Test Unraid container startup
+        run: |
+          container_id="$(docker run --detach --env PUID=99 --env PGID=100 --workdir /tmp "$IMAGE_NAME:$GITHUB_SHA")"
+          trap 'docker logs "$container_id"; docker rm --force "$container_id" >/dev/null' EXIT
+          for attempt in $(seq 1 30); do
+            if docker exec "$container_id" python -c 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:5056/api/auth/status", timeout=1).read()'; then
+              exit 0
+            fi
+            if [ "$(docker inspect --format '{{.State.Running}}' "$container_id")" != true ]; then
+              exit 1
+            fi
+            sleep 1
+          done
+          exit 1
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v4

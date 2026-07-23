@@ -737,7 +737,8 @@ class DeploymentConfigTests(unittest.TestCase):
         with open(os.path.join(project_root, "Dockerfile"), encoding="utf-8") as file:
             dockerfile = file.read()
         self.assertIn('"gunicorn"', dockerfile)
-        self.assertIn('"--config=backend/gunicorn.conf.py"', dockerfile)
+        self.assertIn('"--chdir=/app"', dockerfile)
+        self.assertIn('"--config=/app/backend/gunicorn.conf.py"', dockerfile)
 
         with open(
             os.path.join(project_root, "frontend", "static", "index.html"),
