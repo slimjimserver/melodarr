@@ -52,7 +52,13 @@ Melodarr is designed to run with Docker Compose. The included [`docker-compose.y
    mkdir -p data
    ```
 
-   On Linux, the included Compose configuration runs Melodarr as UID/GID `1000:1000` by default. To use a different identity, set `PUID` and `PGID` in your shell or Compose `.env` file. The container prepares the data directory before dropping root privileges.
+   On Linux, give Melodarr's fixed container user ownership of the directory:
+
+   ```bash
+   chown -R 1000:1000 data
+   ```
+
+   The image runs directly as UID/GID `1000:1000`. It does not start as root or change bind-mount ownership during startup.
 
 3. Start Melodarr:
 
@@ -72,8 +78,6 @@ No additional environment variables are required for the included Docker Compose
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `PUID` | `1000` | Numeric user ID used to run Melodarr and own files beneath `/app/data`. Unraid commonly uses `99`. |
-| `PGID` | `1000` | Numeric group ID used to run Melodarr and own files beneath `/app/data`. Unraid commonly uses `100`. |
 | `MELODARR_DATABASE` | `<project>/melodarr.db` | Main SQLite database containing accounts, invitations, request history, and queued work. The image and Compose set this to `/app/data/melodarr.db`. |
 | `MELODARR_CACHE_DATABASE` | `cache/metadata.db` beside the main database | Disposable external API-response cache. The image and Compose set this to `/app/data/cache/metadata.db`. |
 | `MELODARR_SETTINGS` | `settings.json` beside the main database | Service configuration and credentials saved through the web UI. |
@@ -86,16 +90,29 @@ No additional environment variables are required for the included Docker Compose
 
 ### Unraid Community Applications
 
-Use `/app/data` as the container path for the persistent appdata mapping and configure:
+Use this volume mapping:
 
 ```text
-PUID=99
-PGID=100
+Host:      /mnt/user/appdata/melodarr
+Container: /app/data
 ```
 
 Do not map a host directory to `/app`; doing so hides Melodarr's application files. Only `/app/data` should be used for persistent storage.
 
-Do not also set Docker's `--user` option. The container starts as root only long enough to ensure `/app/data` exists with the requested ownership, then runs Melodarr as `PUID:PGID`. If the container is deliberately started with `--user`, Melodarr will honor that Docker-level identity but cannot change bind-mount ownership.
+To use Unraid's native `nobody:users` identity, prepare the directory once from the Unraid terminal:
+
+```bash
+mkdir -p /mnt/user/appdata/melodarr
+chown -R 99:100 /mnt/user/appdata/melodarr
+```
+
+Then add this in the container's **Extra Parameters** field:
+
+```text
+--user 99:100
+```
+
+Remove any `PUID` or `PGID` variables from an older template; Melodarr no longer uses them. Docker's `--user` override starts Melodarr directly as `99:100`, without a root entrypoint.
 
 For an HTTPS deployment, add this to the service's `environment` block in `docker-compose.yml`:
 

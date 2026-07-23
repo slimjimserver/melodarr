@@ -14,18 +14,25 @@ FROM python:3.13-slim
 WORKDIR /app
 COPY backend/requirements.txt .
 RUN apt-get update \
-    && apt-get install --no-install-recommends --yes gosu passwd \
+    && apt-get install --no-install-recommends --yes passwd \
     && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir -r requirements.txt
+    && pip install --no-cache-dir -r requirements.txt \
+    && groupadd --gid 1000 melodarr \
+    && useradd \
+        --no-create-home \
+        --no-log-init \
+        --uid 1000 \
+        --gid 1000 \
+        --home-dir /app/data \
+        --shell /usr/sbin/nologin \
+        melodarr \
+    && mkdir -p /app/data \
+    && chown 1000:1000 /app/data
 COPY . .
 COPY --from=frontend-build /app/frontend/static /app/frontend/static
-COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
-ENV PUID=1000 \
-    PGID=1000 \
-    HOME=/app/data \
+ENV HOME=/app/data \
     MELODARR_DATABASE=/app/data/melodarr.db \
     MELODARR_CACHE_DATABASE=/app/data/cache/metadata.db
 EXPOSE 5056
-ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+USER melodarr:melodarr
 CMD ["gunicorn", "--chdir=/app", "--config=/app/backend/gunicorn.conf.py", "backend.app:app"]

@@ -9,7 +9,6 @@ on:
       - 'frontend/**'
       - 'tests/**'
       - 'Dockerfile'
-      - 'docker-entrypoint.sh'
       - '.dockerignore'
       - '.github/workflows/publish-image.yml'
   release:
@@ -41,18 +40,27 @@ jobs:
       - name: Test image
         run: docker run --rm "$IMAGE_NAME:$GITHUB_SHA" python -m unittest discover -s tests -v
 
-      - name: Test Unraid runtime identity
+      - name: Test default rootless runtime
         run: |
           docker run --rm \
-            --env PUID=99 \
-            --env PGID=100 \
-            --workdir /tmp \
             "$IMAGE_NAME:$GITHUB_SHA" \
-            sh -ec 'test "$PWD" = /app && test "$(id -u)" = 99 && test "$(id -g)" = 100 && python -c "from backend.storage import init_db; from backend.api_cache import init_cache_db; from backend.config import load_session_secret; init_db(); init_cache_db(); load_session_secret()" && test -f /app/data/melodarr.db && test -f /app/data/cache/metadata.db && test -f /app/data/session-secret.key'
+            sh -ec 'test "$(id -u)" = 1000 && test "$(id -g)" = 1000 && python -c "from backend.storage import init_db; from backend.api_cache import init_cache_db; from backend.config import load_session_secret; init_db(); init_cache_db(); load_session_secret()" && test -f /app/data/melodarr.db && test -f /app/data/cache/metadata.db && test -f /app/data/session-secret.key'
+
+      - name: Test Unraid user override
+        run: |
+          data_dir="$(mktemp -d)"
+          docker run --rm --user 0:0 --volume "$data_dir:/app/data" "$IMAGE_NAME:$GITHUB_SHA" chown 99:100 /app/data
+          docker run --rm \
+            --user 99:100 \
+            --volume "$data_dir:/app/data" \
+            "$IMAGE_NAME:$GITHUB_SHA" \
+            sh -ec 'test "$(id -u)" = 99 && test "$(id -g)" = 100 && python -c "from backend.storage import init_db; from backend.api_cache import init_cache_db; from backend.config import load_session_secret; init_db(); init_cache_db(); load_session_secret()"'
 
       - name: Test Unraid container startup
         run: |
-          container_id="$(docker run --detach --env PUID=99 --env PGID=100 --workdir /tmp "$IMAGE_NAME:$GITHUB_SHA")"
+          data_dir="$(mktemp -d)"
+          docker run --rm --user 0:0 --volume "$data_dir:/app/data" "$IMAGE_NAME:$GITHUB_SHA" chown 99:100 /app/data
+          container_id="$(docker run --detach --user 99:100 --volume "$data_dir:/app/data" --workdir /tmp "$IMAGE_NAME:$GITHUB_SHA")"
           trap 'docker logs "$container_id"; docker rm --force "$container_id" >/dev/null' EXIT
           for attempt in $(seq 1 30); do
             if docker exec "$container_id" python -c 'import urllib.request; urllib.request.urlopen("http://127.0.0.1:5056/api/auth/status", timeout=1).read()'; then

@@ -21,6 +21,9 @@ jobs:
           SHORT_SHA="$(printf '%s' "${GITHUB_SHA}" | cut -c1-12)"
           echo "${{ secrets.REGISTRY_TOKEN }}" | docker login forgejo.ram-home.org -u "${GITHUB_ACTOR}" --password-stdin
           docker build -t "${IMAGE}:latest" -t "${IMAGE}:${SHORT_SHA}" .
-          docker run --rm -e PUID=99 -e PGID=100 --workdir /tmp "${IMAGE}:${SHORT_SHA}" sh -ec 'test "$PWD" = /app && test "$(id -u)" = 99 && test "$(id -g)" = 100 && python -c "from backend.storage import init_db; from backend.api_cache import init_cache_db; from backend.config import load_session_secret; init_db(); init_cache_db(); load_session_secret()" && test -f /app/data/melodarr.db && test -f /app/data/cache/metadata.db && test -f /app/data/session-secret.key'
+          docker run --rm "${IMAGE}:${SHORT_SHA}" sh -ec 'test "$(id -u)" = 1000 && test "$(id -g)" = 1000'
+          DATA_DIR="$(mktemp -d)"
+          docker run --rm --user 0:0 --volume "${DATA_DIR}:/app/data" "${IMAGE}:${SHORT_SHA}" chown 99:100 /app/data
+          docker run --rm --user 99:100 --volume "${DATA_DIR}:/app/data" "${IMAGE}:${SHORT_SHA}" sh -ec 'test "$(id -u)" = 99 && test "$(id -g)" = 100 && python -c "from backend.storage import init_db; from backend.api_cache import init_cache_db; from backend.config import load_session_secret; init_db(); init_cache_db(); load_session_secret()"'
           docker push "${IMAGE}:latest"
           docker push "${IMAGE}:${SHORT_SHA}"

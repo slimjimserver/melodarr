@@ -739,6 +739,20 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn('"gunicorn"', dockerfile)
         self.assertIn('"--chdir=/app"', dockerfile)
         self.assertIn('"--config=/app/backend/gunicorn.conf.py"', dockerfile)
+        self.assertIn("USER melodarr:melodarr", dockerfile)
+        self.assertNotIn("ENTRYPOINT", dockerfile)
+        self.assertNotIn("gosu", dockerfile)
+        self.assertNotIn("PUID", dockerfile)
+        self.assertNotIn("PGID", dockerfile)
+
+        with open(
+            os.path.join(project_root, "docker-compose.yml"),
+            encoding="utf-8",
+        ) as file:
+            compose = file.read()
+        self.assertIn('user: "1000:1000"', compose)
+        self.assertNotIn("PUID", compose)
+        self.assertNotIn("PGID", compose)
 
         with open(
             os.path.join(project_root, "frontend", "static", "index.html"),
