@@ -1118,6 +1118,28 @@ class DeploymentConfigTests(unittest.TestCase):
         )
         self.assertNotIn('$(`[data-view=${view}]`)', typescript)
 
+    def test_library_navigation_is_available_to_every_authenticated_user(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(
+            os.path.join(project_root, "frontend", "static", "index.html"),
+            encoding="utf-8",
+        ) as file:
+            frontend = file.read()
+
+        self.assertIn(
+            '<button class="nav-link" data-view="library">Your library</button>',
+            frontend,
+        )
+        self.assertIn(
+            '<button class="nav-link" data-view="library">'
+            '<span class="tab-icon" aria-hidden="true">▤</span>Library</button>',
+            frontend,
+        )
+        self.assertNotIn(
+            'class="nav-link admin-only" data-view="library"',
+            frontend,
+        )
+
     def test_gunicorn_runs_one_process_with_threaded_concurrency(self):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         config_path = os.path.join(project_root, "backend", "gunicorn.conf.py")
