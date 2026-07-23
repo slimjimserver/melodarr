@@ -133,6 +133,24 @@ function setMessage(element: Element, message: string, isError = false) {
   element.className = `message${isError ? " error" : ""}`;
 }
 
+async function copyInputValue(input: HTMLInputElement) {
+  if (window.isSecureContext && navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(input.value);
+      return true;
+    } catch {
+      // Fall through to the synchronous copy path for denied permissions.
+    }
+  }
+  try {
+    input.select();
+    input.setSelectionRange(0, input.value.length);
+    return document.execCommand("copy");
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Announce the result of an action next to the reader's thumb.
  *
@@ -552,13 +570,11 @@ function setupNavigation() {
           } catch (error) { setMessage(formMessage, error.message, true); }
         });
         requiredDescendant<HTMLButtonElement>(result, "button").addEventListener("click", async () => {
-          try {
-            await navigator.clipboard.writeText(linkInput.value);
-            setMessage(formMessage, "Invitation link copied.");
-          } catch {
-            linkInput.select();
-            setMessage(formMessage, "Copy the selected invitation link.");
-          }
+          const copied = await copyInputValue(linkInput);
+          setMessage(
+            formMessage,
+            copied ? "Invitation link copied." : "Copy the selected invitation link.",
+          );
         });
         content.append(form);
       } else {

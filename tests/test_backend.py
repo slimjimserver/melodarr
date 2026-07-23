@@ -919,6 +919,18 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn("status.firstAccount", typescript)
         self.assertIn("status.invitationValid", typescript)
 
+    def test_invitation_copy_supports_http_lan_hosts(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(
+            os.path.join(project_root, "frontend", "src", "app.ts"),
+            encoding="utf-8",
+        ) as file:
+            typescript = file.read()
+
+        self.assertIn("window.isSecureContext", typescript)
+        self.assertIn('document.execCommand("copy")', typescript)
+        self.assertIn("copied ? \"Invitation link copied.\"", typescript)
+
     def test_discovery_search_offers_track_to_release_group_results(self):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with open(
