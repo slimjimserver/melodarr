@@ -11,6 +11,12 @@
     expiresAt: number;
     lastAccessedAt: number;
   };
+  type ArtistRevalidation = {
+    artistId: string;
+    baselineRefreshAt: number;
+    expiresAt: number;
+    timer?: ReturnType<typeof setTimeout>;
+  };
 
   const $ = <T extends Element = AppElement>(selector: string): T => {
     const element = document.querySelector<T>(selector);
@@ -28,6 +34,7 @@
   let searchAbort: AbortController | undefined;
   const detailRequests = new Map<string, DetailRequest>();
   const detailUpgrades = new Map<string, Promise<JsonObject>>();
+  let artistRevalidation: ArtistRevalidation | undefined;
   const detailCacheMaxEntries = 32;
   const detailPrefetchTtl = 2 * 60 * 1000;
   const detailOpenedTtl = 15 * 60 * 1000;
@@ -174,6 +181,7 @@
   }
 
   function showView(id: AppView) {
+    if (id !== "detail") stopArtistRevalidation();
     document.querySelectorAll(".view, .nav-link").forEach((element) => element.classList.remove("active"));
     $(`#${id}`).classList.add("active");
     if (id !== "detail") {
@@ -375,7 +383,108 @@
       .finally(() => detailUpgrades.delete(key));
   }
 
+  function stopArtistRevalidation() {
+    if (artistRevalidation?.timer) clearTimeout(artistRevalidation.timer);
+    artistRevalidation = undefined;
+  }
+
+  function scheduleArtistRevalidationPoll(watcher: ArtistRevalidation) {
+    if (Date.now() >= watcher.expiresAt) {
+      if (artistRevalidation === watcher) artistRevalidation = undefined;
+      if (currentDetail?.kind === "artist" && currentDetail.id === watcher.artistId) {
+        $("#detail-message").textContent = "The cached discography remains available while its background update continues.";
+      }
+      return;
+    }
+    watcher.timer = setTimeout(() => pollArtistRevalidation(watcher), 1_500);
+  }
+
+  async function reloadRevalidatedArtist(watcher: ArtistRevalidation, refreshedAt: number) {
+    const key = `artist:${watcher.artistId}`;
+    detailRequests.delete(key);
+    try {
+      const data = await getJson(
+        `/api/music/artist/${encodeURIComponent(watcher.artistId)}`
+          + `?complete=1&revision=${encodeURIComponent(refreshedAt)}`,
+        120_000,
+      );
+      storeSettledDetail(key, data);
+      if (currentDetail?.kind !== "artist" || currentDetail.id !== watcher.artistId) return;
+      renderDetail("artist", data);
+      $("#detail-message").textContent = "Discography and artist metadata updated from MusicBrainz.";
+    } catch (error) {
+      if (currentDetail?.kind === "artist" && currentDetail.id === watcher.artistId) {
+        $("#detail-message").textContent = `The cached discography is still shown: ${error.message}`;
+      }
+    }
+  }
+
+  async function pollArtistRevalidation(watcher: ArtistRevalidation) {
+    if (
+      artistRevalidation !== watcher
+      || currentDetail?.kind !== "artist"
+      || currentDetail.id !== watcher.artistId
+    ) return;
+    try {
+      const state = await getJson(
+        `/api/music/artist/${encodeURIComponent(watcher.artistId)}/revalidation`,
+      );
+      if (artistRevalidation !== watcher) return;
+      if (state.status === "refreshing") {
+        $("#detail-message").textContent = "MusicBrainz found a discography change; updating metadata…";
+      }
+      if (state.polling) {
+        scheduleArtistRevalidationPoll(watcher);
+        return;
+      }
+      artistRevalidation = undefined;
+      const refreshedAt = Number(state.lastRefreshAt || 0);
+      if (state.status === "refreshed" && refreshedAt > watcher.baselineRefreshAt) {
+        await reloadRevalidatedArtist(watcher, refreshedAt);
+      } else if (
+        state.status === "failed"
+        && currentDetail?.kind === "artist"
+        && currentDetail.id === watcher.artistId
+      ) {
+        $("#detail-message").textContent = "The cached discography is shown; its background update will retry later.";
+      }
+    } catch {
+      if (artistRevalidation === watcher) artistRevalidation = undefined;
+    }
+  }
+
+  async function startArtistRevalidation(data: JsonObject) {
+    if (
+      data.provisional
+      || data.metadataSource !== "MusicBrainz"
+      || currentDetail?.kind !== "artist"
+      || currentDetail.id !== data.id
+      || artistRevalidation?.artistId === data.id
+    ) return;
+    try {
+      const state = await postJson(
+        `/api/music/artist/${encodeURIComponent(data.id)}/revalidate`,
+        {},
+      );
+      if (
+        !state.polling
+        || currentDetail?.kind !== "artist"
+        || currentDetail.id !== data.id
+      ) return;
+      const watcher: ArtistRevalidation = {
+        artistId: data.id,
+        baselineRefreshAt: Number(state.lastRefreshAt || 0),
+        expiresAt: Date.now() + 5 * 60 * 1000,
+      };
+      artistRevalidation = watcher;
+      scheduleArtistRevalidationPoll(watcher);
+    } catch {
+      // Opportunistic freshness checks must never disrupt a cached page.
+    }
+  }
+
   function showDetail(kind: DetailKind, id: string, addToHistory = true, updateHistory = true) {
+    stopArtistRevalidation();
     const activeView = document.querySelector<HTMLElement>(".view.active")?.id;
     if (addToHistory && currentDetail && activeView === "detail") {
       detailHistory.push(currentDetail);
@@ -982,6 +1091,7 @@
       results.append(actions);
 
       results.append(renderDiscography(data));
+      startArtistRevalidation(data);
       return;
     }
 

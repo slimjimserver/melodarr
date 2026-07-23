@@ -787,10 +787,11 @@ function setupLibrary() {
   const filter = $("#library-filter");
   const filterCount = $("#library-filter-count");
   const loadButton = $<HTMLButtonElement>("#load-library");
-  const renderBatchSize = 40;
+  const renderBatchSize = 24;
   const maxArtworkRequests = 6;
-  let artistCards: HTMLElement[] = [];
   let libraryArtists: JsonObject[] = [];
+  let visibleArtists: JsonObject[] = [];
+  let renderedArtistCount = 0;
   let loadState: "idle" | "loading" | "loaded" | "error" = "idle";
   let renderVersion = 0;
   let filterFrame: number | undefined;
@@ -803,32 +804,6 @@ function setupLibrary() {
     .replace(/[\u0300-\u036f]/g, "")
     .toLocaleLowerCase()
     .trim();
-
-  const filterArtists = () => {
-    const query = normalizeSearch(search.value);
-    const visible = query
-      ? libraryArtists.filter((artist) => artist.search.includes(query)).length
-      : libraryArtists.length;
-    artistCards.forEach((card) => {
-      const matches = !query || (card.dataset.search || "").includes(query);
-      card.hidden = !matches;
-    });
-    filterCount.textContent = query
-      ? `${visible} of ${libraryArtists.length} artists`
-      : `${libraryArtists.length} artists`;
-    setMessage(
-      $("#library-message"),
-      query && !visible ? `No Plex artists match “${search.value.trim()}”.` : "",
-    );
-  };
-
-  search.addEventListener("input", () => {
-    if (filterFrame !== undefined) return;
-    filterFrame = window.requestAnimationFrame(() => {
-      filterFrame = undefined;
-      filterArtists();
-    });
-  });
 
   const pumpArtworkQueue = () => {
     while (activeArtworkLoads < maxArtworkRequests && artworkQueue.length) {
@@ -930,35 +905,117 @@ function setupLibrary() {
     return card;
   };
 
-  const renderArtists = (version: number, offset = 0) => {
-    if (version !== renderVersion) return;
+  const createRenderSentinel = () => {
+    const sentinel = document.createElement("div");
+    sentinel.className = "library-render-sentinel";
+    sentinel.setAttribute("aria-hidden", "true");
+    return sentinel;
+  };
+  let renderSentinel = createRenderSentinel();
+
+  let paginationObserver: IntersectionObserver | null = null;
+
+  const renderArtists = (version: number) => {
+    if (
+      version !== renderVersion
+      || !renderSentinel.isConnected
+      || renderSentinel.parentElement !== results
+    ) return;
+    paginationObserver?.unobserve(renderSentinel);
     const fragment = document.createDocumentFragment();
-    const end = Math.min(offset + renderBatchSize, libraryArtists.length);
-    const query = normalizeSearch(search.value);
-    for (let index = offset; index < end; index += 1) {
-      const card = createArtistCard(libraryArtists[index]);
-      card.hidden = !!query && !libraryArtists[index].search.includes(query);
-      artistCards.push(card);
-      fragment.append(card);
+    const end = Math.min(renderedArtistCount + renderBatchSize, visibleArtists.length);
+    for (let index = renderedArtistCount; index < end; index += 1) {
+      fragment.append(createArtistCard(visibleArtists[index]));
     }
-    results.append(fragment);
-    if (end < libraryArtists.length) {
-      window.requestAnimationFrame(() => renderArtists(version, end));
+    results.insertBefore(fragment, renderSentinel);
+    renderedArtistCount = end;
+    if (end < visibleArtists.length) {
+      paginationObserver?.observe(renderSentinel);
+    } else {
+      renderSentinel.remove();
     }
   };
+
+  const maybeRenderMore = () => {
+    if (
+      !paginationObserver
+      && renderSentinel.isConnected
+      && renderSentinel.getBoundingClientRect().top < window.innerHeight + 800
+    ) {
+      renderArtists(renderVersion);
+      window.requestAnimationFrame(maybeRenderMore);
+    }
+  };
+
+  if ("IntersectionObserver" in window) {
+    paginationObserver = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting && entry.target === renderSentinel)) {
+        renderArtists(renderVersion);
+      }
+    }, { rootMargin: "800px 0px" });
+  }
+  if (!paginationObserver) {
+    window.addEventListener("scroll", maybeRenderMore, { passive: true });
+    window.addEventListener("resize", maybeRenderMore);
+  }
+
+  const filterArtists = () => {
+    const query = normalizeSearch(search.value);
+    visibleArtists = query
+      ? libraryArtists.filter((artist) => artist.search.includes(query))
+      : libraryArtists;
+    filterCount.textContent = query
+      ? `${visibleArtists.length} of ${libraryArtists.length} artists`
+      : `${libraryArtists.length} artists`;
+    setMessage(
+      $("#library-message"),
+      query && !visibleArtists.length ? `No Plex artists match “${search.value.trim()}”.` : "",
+    );
+
+    // Filtering starts a new viewport-sized result set instead of walking or
+    // retaining every card in a large Plex library.
+    renderVersion += 1;
+    renderedArtistCount = 0;
+    paginationObserver?.disconnect();
+    renderSentinel = createRenderSentinel();
+    artworkObserver?.disconnect();
+    deferredArtwork.clear();
+    artworkQueue.length = 0;
+    if (!visibleArtists.length) {
+      results.replaceChildren();
+      return;
+    }
+    results.replaceChildren(renderSentinel);
+    renderArtists(renderVersion);
+    window.requestAnimationFrame(maybeRenderMore);
+  };
+
+  search.addEventListener("input", () => {
+    if (filterFrame !== undefined) return;
+    filterFrame = window.requestAnimationFrame(() => {
+      filterFrame = undefined;
+      filterArtists();
+    });
+  });
 
   const loadLibrary = async (force = false) => {
     if (loadState === "loading" || (!force && loadState !== "idle")) return;
     loadState = "loading";
+    if (filterFrame !== undefined) {
+      window.cancelAnimationFrame(filterFrame);
+      filterFrame = undefined;
+    }
     loadButton.disabled = true;
     loadButton.textContent = "Loading…";
     artworkObserver?.disconnect();
     deferredArtwork.clear();
     artworkQueue.length = 0;
+    paginationObserver?.disconnect();
     results.replaceChildren(skeletonBlock("library-card", 12));
     renderVersion += 1;
-    artistCards = [];
     libraryArtists = [];
+    visibleArtists = [];
+    renderedArtistCount = 0;
     search.value = "";
     filter.hidden = true;
     setMessage($("#library-message"), "Loading Plex library…");
@@ -975,7 +1032,6 @@ function setupLibrary() {
       filter.hidden = false;
       filterArtists();
       loadState = "loaded";
-      renderArtists(renderVersion);
     } catch (error) {
       results.replaceChildren();
       loadState = "error";

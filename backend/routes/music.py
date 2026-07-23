@@ -14,6 +14,7 @@ if __package__ == "backend.routes":
     from ..security import login_required
     from ..services import lidarr, musicbrainz, plex
     from ..storage import get_service
+    from ..workers import artist_metadata as artist_metadata_worker
 else:
     import detail_cache
     from media_urls import artist_large_cover_art, release_group_cover_art
@@ -21,6 +22,7 @@ else:
     from security import login_required
     from services import lidarr, musicbrainz, plex
     from storage import get_service
+    from workers import artist_metadata as artist_metadata_worker
 
 
 blueprint = Blueprint("music", __name__)
@@ -261,14 +263,51 @@ def refresh_artist_detail(mbid):
         return api_error("Invalid MusicBrainz artist ID.")
     try:
         cache_key = ("artist", mbid.casefold())
+        artist_metadata_worker.refresh_artist_metadata(mbid, "critical")
         with detail_cache.build_lock(cache_key) as generation:
-            payload = _artist_detail_payload(mbid, "critical", force_refresh=True)
+            assembled = detail_cache.cached_response(cache_key)
+            if assembled is not None:
+                return assembled
+            payload = _artist_detail_payload(
+                mbid,
+                "critical",
+                cache_only=True,
+            )
+            if payload is None:
+                raise requests.RequestException(
+                    "The refreshed artist metadata was not cached."
+                )
             return detail_cache.payload_response(cache_key, payload, generation)
     except requests.RequestException:
         return api_error(
             "MusicBrainz could not refresh this artist. The previous cache was kept.",
             502,
         )
+
+
+@blueprint.post("/api/music/artist/<mbid>/revalidate")
+@login_required
+def revalidate_artist_detail(mbid):
+    try:
+        mbid = str(UUID(mbid))
+    except ValueError:
+        return api_error("Invalid MusicBrainz artist ID.")
+    result = artist_metadata_worker.request_revalidation(mbid)
+    response = jsonify(result)
+    response.headers["Cache-Control"] = "no-store"
+    return response, 202 if result["polling"] else 200
+
+
+@blueprint.get("/api/music/artist/<mbid>/revalidation")
+@login_required
+def artist_revalidation_status(mbid):
+    try:
+        mbid = str(UUID(mbid))
+    except ValueError:
+        return api_error("Invalid MusicBrainz artist ID.")
+    response = jsonify(artist_metadata_worker.status(mbid))
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 def _release_group_detail_payload(mbid, priority, *, cache_only=False):

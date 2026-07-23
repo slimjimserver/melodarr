@@ -39,6 +39,7 @@ from backend.api_cache import (
     cache_key,
     cached_json_get,
     clear_cache,
+    commit_json_responses,
     get_cache_document,
     migrate_legacy_cache,
     upsert_cache_documents,
@@ -48,6 +49,7 @@ from backend.config import ARTWORK_CACHE_DIRECTORY
 from backend.services import lidarr, musicbrainz, plex
 from backend.storage import db, enqueue_lidarr_search, get_service, set_lidarr_refresh_command
 from backend import worker
+from backend.workers import artist_metadata as artist_metadata_worker
 from backend.workers import lidarr_searches as lidarr_search_worker
 from backend.workers import lidarr_library as lidarr_library_worker
 from backend.workers import plex as plex_worker
@@ -104,6 +106,16 @@ class DatabaseTestCase(unittest.TestCase):
         detail_cache.invalidate_all()
         with detail_cache._key_locks_lock:
             detail_cache._key_locks.clear()
+        with artist_metadata_worker.queue_lock:
+            artist_metadata_worker.queued_artist_ids.clear()
+            artist_metadata_worker.active_artist_phases.clear()
+            artist_metadata_worker.job_state.update(
+                running=False,
+                queued=0,
+                completed=0,
+                lastCompletedAt=None,
+            )
+        artist_metadata_worker.wake_requested.clear()
         with db() as connection:
             connection.execute("DELETE FROM pending_lidarr_searches")
             connection.execute("DELETE FROM recommendation_cache")
@@ -131,8 +143,8 @@ class ApplicationFactoryTests(DatabaseTestCase):
             for method in rule.methods
             if method not in {"HEAD", "OPTIONS"}
         }
-        self.assertEqual(len(rules), 52)
-        self.assertEqual(len(route_methods), 52)
+        self.assertEqual(len(rules), 54)
+        self.assertEqual(len(route_methods), 54)
 
     def test_factory_applies_test_configuration(self):
         self.assertTrue(self.app.config["TESTING"])
@@ -151,18 +163,28 @@ class WorkerEntrypointTests(unittest.TestCase):
     @patch("backend.worker.init_db")
     def test_worker_initializes_storage_and_background_loops(self, init_db, run, thread_class):
         calls = []
+        artist_metadata_thread = Mock()
         lidarr_thread = Mock()
         plex_thread = Mock()
         plex_metadata_thread = Mock()
         lidarr_library_thread = Mock()
         thread_class.side_effect = [
-            lidarr_thread, lidarr_library_thread, plex_thread, plex_metadata_thread
+            artist_metadata_thread,
+            lidarr_thread,
+            lidarr_library_thread,
+            plex_thread,
+            plex_metadata_thread,
         ]
         init_db.side_effect = lambda: calls.append("database")
         run.side_effect = lambda: calls.append("recommendations")
         worker.main()
         self.assertEqual(calls, ["database", "recommendations"])
-        self.assertEqual(thread_class.call_count, 4)
+        self.assertEqual(thread_class.call_count, 5)
+        thread_class.assert_any_call(
+            target=artist_metadata_worker.run,
+            name="musicbrainz-artist-revalidation",
+            daemon=True,
+        )
         thread_class.assert_any_call(
             target=lidarr_search_worker.run, name="lidarr-search-followups", daemon=True
         )
@@ -181,6 +203,7 @@ class WorkerEntrypointTests(unittest.TestCase):
         lidarr_library_thread.start.assert_called_once_with()
         plex_thread.start.assert_called_once_with()
         plex_metadata_thread.start.assert_called_once_with()
+        artist_metadata_thread.start.assert_called_once_with()
 
     @patch("backend.worker.Thread")
     def test_background_worker_uses_one_daemon_thread(self, thread_class):
@@ -314,6 +337,247 @@ class PlexMetadataWorkerTests(unittest.TestCase):
         self.assertTrue(plex_metadata_worker.full_enrichment_requested)
         self.assertEqual(plex_metadata_worker.job_state["queued"], 1)
         self.assertEqual(wake.call_count, 3)
+
+
+class ArtistMetadataWorkerTests(DatabaseTestCase):
+    artist_id = "11111111-1111-1111-1111-111111111111"
+
+    def _cache_value(self, key):
+        with cache_db() as connection:
+            row = connection.execute(
+                "SELECT value FROM api_cache WHERE cache_key = ?",
+                (key,),
+            ).fetchone()
+        return json.loads(row["value"]) if row else None
+
+    @patch("backend.workers.artist_metadata._cached_discography_page")
+    def test_click_queue_deduplicates_artist_and_requires_cached_discography(
+        self, cached_page
+    ):
+        cached_page.return_value = {
+            "release-groups": [],
+            "release-group-count": 0,
+        }
+
+        first = artist_metadata_worker.request_revalidation(self.artist_id)
+        second = artist_metadata_worker.request_revalidation(self.artist_id)
+
+        self.assertTrue(first["polling"])
+        self.assertEqual(first["status"], "queued")
+        self.assertTrue(second["polling"])
+        self.assertEqual(
+            artist_metadata_worker.queued_artist_ids,
+            {self.artist_id},
+        )
+        cached_page.assert_called_once_with(self.artist_id)
+
+    @patch("backend.workers.artist_metadata.musicbrainz.get")
+    def test_equal_count_records_check_without_full_refresh(self, get):
+        get.side_effect = [
+            {"release-groups": [{"id": "cached"}], "release-group-count": 1},
+            {"release-groups": [{"id": "live"}], "release-group-count": 1},
+        ]
+
+        artist_metadata_worker._process_artist(self.artist_id)
+
+        self.assertEqual(get.call_count, 2)
+        probe = get.call_args_list[1]
+        self.assertEqual(probe.args, ("/release-group", ""))
+        self.assertEqual(probe.kwargs["limit"], 1)
+        self.assertTrue(probe.kwargs["force_refresh"])
+        self.assertEqual(probe.kwargs["priority"], "background")
+        state = get_cache_document(
+            artist_metadata_worker.STATE_NAMESPACE,
+            self.artist_id,
+        )
+        self.assertEqual(state["outcome"], "unchanged")
+        self.assertEqual(state["cachedCount"], 1)
+        self.assertEqual(state["observedCount"], 1)
+        self.assertGreater(state["nextCheckAt"], state["lastCheckedAt"])
+
+        get.reset_mock()
+        result = artist_metadata_worker.request_revalidation(self.artist_id)
+        self.assertFalse(result["polling"])
+        self.assertEqual(result["status"], "unchanged")
+        get.assert_not_called()
+
+    def test_newly_cached_discography_does_not_trigger_redundant_probe(self):
+        page = {"release-groups": [], "release-group-count": 0}
+        commit_json_responses([musicbrainz.metadata_cache_record(
+            "/release-group",
+            "aliases",
+            page,
+            artist=self.artist_id,
+            limit=100,
+            offset=0,
+        )])
+
+        result = artist_metadata_worker.request_revalidation(self.artist_id)
+
+        self.assertFalse(result["polling"])
+        self.assertEqual(result["status"], "unchanged")
+        self.assertEqual(artist_metadata_worker.queued_artist_ids, set())
+        state = get_cache_document(
+            artist_metadata_worker.STATE_NAMESPACE,
+            self.artist_id,
+        )
+        self.assertEqual(state["cachedCount"], 0)
+
+    @patch("backend.workers.artist_metadata.musicbrainz.get")
+    def test_changed_count_refreshes_pages_then_artist_and_removes_old_pages(
+        self, get
+    ):
+        old_offset = 200
+        old_key = musicbrainz.metadata_cache_key(
+            "/release-group",
+            "aliases",
+            artist=self.artist_id,
+            limit=100,
+            offset=old_offset,
+        )
+        commit_json_responses([musicbrainz.metadata_cache_record(
+            "/release-group",
+            "aliases",
+            {"release-groups": [{"id": "obsolete"}], "release-group-count": 201},
+            artist=self.artist_id,
+            limit=100,
+            offset=old_offset,
+        )])
+        first_page_groups = [
+            {"id": f"group-{index}", "title": f"Group {index}"}
+            for index in range(100)
+        ]
+        second_page_groups = [
+            {"id": "group-100", "title": "Group 100"},
+            {"id": "group-101", "title": "Group 101"},
+        ]
+        get.side_effect = [
+            {"release-groups": [], "release-group-count": 201},
+            {"release-groups": [], "release-group-count": 102},
+            {
+                "release-groups": first_page_groups,
+                "release-group-count": 102,
+            },
+            {
+                "release-groups": second_page_groups,
+                "release-group-count": 102,
+            },
+            {
+                "id": self.artist_id,
+                "name": "Fresh Artist",
+                "relations": [],
+                "genres": [],
+            },
+        ]
+
+        artist_metadata_worker._process_artist(self.artist_id)
+
+        paths = [call.args[0] for call in get.call_args_list]
+        self.assertEqual(paths, [
+            "/release-group",
+            "/release-group",
+            "/release-group",
+            "/release-group",
+            f"/artist/{self.artist_id}",
+        ])
+        staged_calls = get.call_args_list[2:]
+        self.assertTrue(all(
+            call.kwargs["priority"] == "background"
+            and call.kwargs["force_refresh"]
+            and not call.kwargs["cache_response"]
+            for call in staged_calls
+        ))
+        self.assertEqual(get.call_args_list[2].kwargs["offset"], 0)
+        self.assertEqual(get.call_args_list[3].kwargs["offset"], 100)
+        self.assertIsNone(self._cache_value(old_key))
+
+        artist_key = musicbrainz.metadata_cache_key(
+            f"/artist/{self.artist_id}",
+            "aliases+url-rels+genres",
+        )
+        self.assertEqual(
+            self._cache_value(artist_key)["name"],
+            "Fresh Artist",
+        )
+        state = get_cache_document(
+            artist_metadata_worker.STATE_NAMESPACE,
+            self.artist_id,
+        )
+        self.assertEqual(state["outcome"], "refreshed")
+        self.assertEqual(state["cachedCount"], 102)
+        self.assertEqual(state["observedCount"], 102)
+
+    @patch("backend.workers.artist_metadata.musicbrainz.get")
+    def test_failed_staged_refresh_preserves_previous_cache(self, get):
+        old_page = {
+            "release-groups": [{"id": "old-group"}],
+            "release-group-count": 1,
+        }
+        old_artist = {
+            "id": self.artist_id,
+            "name": "Old Artist",
+        }
+        page_key = musicbrainz.metadata_cache_key(
+            "/release-group",
+            "aliases",
+            artist=self.artist_id,
+            limit=100,
+            offset=0,
+        )
+        artist_key = musicbrainz.metadata_cache_key(
+            f"/artist/{self.artist_id}",
+            "aliases+url-rels+genres",
+        )
+        commit_json_responses([
+            musicbrainz.metadata_cache_record(
+                "/release-group",
+                "aliases",
+                old_page,
+                artist=self.artist_id,
+                limit=100,
+                offset=0,
+            ),
+            musicbrainz.metadata_cache_record(
+                f"/artist/{self.artist_id}",
+                "aliases+url-rels+genres",
+                old_artist,
+            ),
+        ])
+        get.side_effect = [
+            old_page,
+            {
+                "release-groups": [
+                    {"id": "new-one"},
+                    {"id": "new-two"},
+                ],
+                "release-group-count": 2,
+            },
+            requests.Timeout("artist lookup timed out"),
+        ]
+
+        with self.assertRaises(requests.Timeout):
+            artist_metadata_worker.refresh_artist_metadata(
+                self.artist_id,
+                "background",
+            )
+
+        self.assertEqual(self._cache_value(page_key), old_page)
+        self.assertEqual(self._cache_value(artist_key), old_artist)
+
+    @patch("backend.workers.artist_metadata.time.time", return_value=1_000)
+    def test_failure_uses_retry_cooldown(self, now):
+        artist_metadata_worker._record_failure(self.artist_id)
+
+        state = get_cache_document(
+            artist_metadata_worker.STATE_NAMESPACE,
+            self.artist_id,
+        )
+        self.assertEqual(state["outcome"], "failed")
+        self.assertEqual(
+            state["nextCheckAt"],
+            1_000
+            + artist_metadata_worker.MUSICBRAINZ_ARTIST_REVALIDATION_RETRY_INTERVAL,
+        )
 
 
 class PlexScanWorkerTests(unittest.TestCase):
@@ -712,8 +976,19 @@ class DeploymentConfigTests(unittest.TestCase):
             app_typescript,
         )
         self.assertIn('loadState !== "idle"', app_typescript)
-        self.assertIn("const renderBatchSize = 40", app_typescript)
-        self.assertIn("window.requestAnimationFrame", app_typescript)
+        self.assertIn("const renderBatchSize = 24", app_typescript)
+        self.assertIn(
+            'sentinel.className = "library-render-sentinel"',
+            app_typescript,
+        )
+        self.assertIn(
+            "paginationObserver?.observe(renderSentinel)",
+            app_typescript,
+        )
+        self.assertNotIn(
+            "window.requestAnimationFrame(() => renderArtists(version, end))",
+            app_typescript,
+        )
         self.assertIn("const maxArtworkRequests = 6", app_typescript)
         self.assertIn("new IntersectionObserver", app_typescript)
         self.assertIn('includes("?") ? "&" : "?"', app_typescript)
@@ -1312,6 +1587,28 @@ class ApiCacheTests(DatabaseTestCase):
 
         self.assertIsNone(result)
         get.assert_not_called()
+
+    @patch("backend.api_cache.requests.get")
+    def test_live_response_can_be_staged_without_changing_cache(self, get):
+        url = "https://example.test/staged"
+        key = cache_key("staged-test", url)
+        get.return_value = Response(200, {"result": "staged"})
+
+        result = cached_json_get(
+            url,
+            namespace="staged-test",
+            ttl=60,
+            force_refresh=True,
+            cache_response=False,
+        )
+
+        self.assertEqual(result, {"result": "staged"})
+        with cache_db() as connection:
+            cached = connection.execute(
+                "SELECT 1 FROM api_cache WHERE cache_key = ?",
+                (key,),
+            ).fetchone()
+        self.assertIsNone(cached)
 
     @patch("backend.api_cache.requests.get")
     def test_cache_is_rechecked_after_waiting_for_request_slot(self, get):
@@ -2472,8 +2769,11 @@ class MusicRoutesTests(DatabaseTestCase):
         self.assertTrue(payload["availableInLidarr"])
         self.assertTrue(payload["fullyAvailableInLidarr"])
 
+    @patch("backend.routes.music.artist_metadata_worker.refresh_artist_metadata")
     @patch("backend.routes.music.musicbrainz.get")
-    def test_refresh_artist_force_fetches_complete_discography(self, get):
+    def test_refresh_artist_uses_atomic_critical_refresh(
+        self, get, refresh_artist_metadata
+    ):
         artist_id = "11111111-1111-1111-1111-111111111111"
         get.side_effect = [
             {"id": artist_id, "name": "Fresh Artist", "relations": [], "genres": []},
@@ -2490,8 +2790,60 @@ class MusicRoutesTests(DatabaseTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["name"], "Fresh Artist")
         self.assertEqual(get.call_count, 2)
-        self.assertTrue(all(call.kwargs["force_refresh"] for call in get.call_args_list))
+        refresh_artist_metadata.assert_called_once_with(artist_id, "critical")
+        self.assertTrue(all(call.kwargs["cache_only"] for call in get.call_args_list))
         self.assertTrue(all(call.kwargs["priority"] == "critical" for call in get.call_args_list))
+
+    @patch("backend.routes.music.artist_metadata_worker.request_revalidation")
+    def test_artist_revalidation_route_queues_background_check(self, request_check):
+        artist_id = "11111111-1111-1111-1111-111111111111"
+        request_check.return_value = {
+            "status": "queued",
+            "polling": True,
+            "lastRefreshAt": None,
+        }
+        csrf_token = self.register()
+
+        response = self.client.post(
+            f"/api/music/artist/{artist_id}/revalidate",
+            json={},
+            headers={"X-CSRF-Token": csrf_token},
+        )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.get_json()["status"], "queued")
+        request_check.assert_called_once_with(artist_id)
+
+    @patch("backend.routes.music.artist_metadata_worker.status")
+    def test_artist_revalidation_status_is_read_only(self, status):
+        artist_id = "11111111-1111-1111-1111-111111111111"
+        status.return_value = {
+            "status": "refreshing",
+            "polling": True,
+            "lastRefreshAt": None,
+        }
+        self.register()
+
+        response = self.client.get(
+            f"/api/music/artist/{artist_id}/revalidation",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["status"], "refreshing")
+        status.assert_called_once_with(artist_id)
+
+    @patch("backend.routes.music.artist_metadata_worker.request_revalidation")
+    def test_artist_revalidation_rejects_invalid_mbid(self, request_check):
+        csrf_token = self.register()
+
+        response = self.client.post(
+            "/api/music/artist/not-an-mbid/revalidate",
+            json={},
+            headers={"X-CSRF-Token": csrf_token},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        request_check.assert_not_called()
 
 
 class RecommendationAssemblyTests(unittest.TestCase):

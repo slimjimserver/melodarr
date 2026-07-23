@@ -37,7 +37,7 @@ Melodarr uses MusicBrainz for music metadata and can use ListenBrainz and Last.f
 - Filter recommendations and request controls using existing Lidarr entries, previous requests, and selected Plex music libraries.
 - Browse the artists and album-level releases already available in Plex, with links back to Plex.
 - Track queued Lidarr searches and album availability with automatic background jobs.
-- Cache metadata and artwork locally to reduce upstream requests and improve response times.
+- Cache metadata and artwork locally to reduce upstream requests, while revalidating viewed artist discographies in the background.
 - Create private user accounts through one-time, seven-day administrator invitations.
 - Inspect job status, run maintenance jobs, and flush individual caches from the administrator dashboard.
 

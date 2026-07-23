@@ -4,6 +4,7 @@ from threading import Thread
 
 if __package__:
     from .storage import init_db
+    from .workers import artist_metadata as artist_metadata_worker
     from .workers import lidarr_searches as lidarr_search_worker
     from .workers import lidarr_library as lidarr_library_worker
     from .workers import plex as plex_worker
@@ -11,6 +12,7 @@ if __package__:
     from .workers import recommendations as recommendation_worker
 else:  # Support `python backend/worker.py` for local development.
     from storage import init_db
+    from workers import artist_metadata as artist_metadata_worker
     from workers import lidarr_searches as lidarr_search_worker
     from workers import lidarr_library as lidarr_library_worker
     from workers import plex as plex_worker
@@ -19,8 +21,14 @@ else:  # Support `python backend/worker.py` for local development.
 
 
 def main():
-    """Initialize storage and run both background job loops."""
+    """Initialize storage and run the background job loops."""
     init_db()
+    artist_metadata_thread = Thread(
+        target=artist_metadata_worker.run,
+        name="musicbrainz-artist-revalidation",
+        daemon=True,
+    )
+    artist_metadata_thread.start()
     lidarr_thread = Thread(
         target=lidarr_search_worker.run,
         name="lidarr-search-followups",

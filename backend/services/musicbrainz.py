@@ -14,7 +14,7 @@ from pykakasi import kakasi
 logger = logging.getLogger(__name__)
 
 if __package__ == "backend.services":
-    from ..api_cache import cached_json_get
+    from ..api_cache import cache_key, cached_json_get
     from ..config import (
         COVER_ART_ARCHIVE_URL,
         MUSICBRAINZ_METADATA_CACHE_TTL,
@@ -23,7 +23,7 @@ if __package__ == "backend.services":
         USER_AGENT,
     )
 else:  # Support the existing `python backend/app.py` entry point.
-    from api_cache import cached_json_get
+    from api_cache import cache_key, cached_json_get
     from config import (
         COVER_ART_ARCHIVE_URL,
         MUSICBRAINZ_METADATA_CACHE_TTL,
@@ -226,6 +226,7 @@ def get(
     priority="interactive",
     force_refresh=False,
     cache_only=False,
+    cache_response=True,
     **extra,
 ):
     """Load one metadata resource or collection from MusicBrainz."""
@@ -242,7 +243,28 @@ def get(
         priority=priority,
         force_refresh=force_refresh,
         cache_only=cache_only,
+        cache_response=cache_response,
     )
+
+
+def metadata_cache_record(path, inc, value, **extra):
+    """Describe one MusicBrainz response for an atomic staged cache commit."""
+    params = {"fmt": "json", **extra}
+    if inc:
+        params["inc"] = inc
+    return {
+        "namespace": "musicbrainz-metadata",
+        "url": f"{MUSICBRAINZ_URL}{path}",
+        "params": params,
+        "value": value,
+        "ttl": MUSICBRAINZ_METADATA_CACHE_TTL,
+    }
+
+
+def metadata_cache_key(path, inc, **extra):
+    """Return the persistent key used by a MusicBrainz metadata request."""
+    record = metadata_cache_record(path, inc, None, **extra)
+    return cache_key(record["namespace"], record["url"], record["params"])
 
 
 def cover_art_url(mbid, size=250):

@@ -146,6 +146,25 @@ def _fresh_cache_value(key):
     return json.loads(row["value"]) if row else None
 
 
+def get_cache_expiry(key):
+    """Return the expiry of one fresh cache row without reading its value."""
+    now = time.time()
+
+    def read(connection):
+        return connection.execute(
+            "SELECT expires_at FROM api_cache "
+            "WHERE cache_key = ? AND expires_at > ?",
+            (key, now),
+        ).fetchone()
+
+    row = _cache_operation(
+        read,
+        locked_default=None,
+        description="read an HTTP response expiry",
+    )
+    return row["expires_at"] if row else None
+
+
 def cache_key(namespace, url, params=None):
     """Create a stable key without storing API keys or other credentials."""
     payload = json.dumps(
@@ -240,6 +259,41 @@ def replace_cache_documents(namespace, documents, ttl):
     )
 
 
+def commit_json_responses(responses, *, delete_keys=()):
+    """Atomically replace a staged set of external-API responses."""
+    now = time.time()
+    rows = [
+        (
+            cache_key(
+                response["namespace"],
+                response["url"],
+                response.get("params"),
+            ),
+            json.dumps(response["value"]),
+            now + response["ttl"],
+        )
+        for response in responses
+    ]
+    delete_keys = tuple(set(delete_keys))
+
+    def commit(connection):
+        if delete_keys:
+            connection.executemany(
+                "DELETE FROM api_cache WHERE cache_key = ?",
+                ((key,) for key in delete_keys),
+            )
+        connection.executemany(
+            "INSERT OR REPLACE INTO api_cache "
+            "(cache_key, value, expires_at) VALUES (?, ?, ?)",
+            rows,
+        )
+
+    _cache_operation(
+        commit,
+        description="commit staged external API responses",
+    )
+
+
 def cleanup_expired_cache():
     """Remove expired rows no more than once per configured interval."""
     global _last_cleanup_at
@@ -303,6 +357,7 @@ def cached_json_get(
     request_timeout=15,
     force_refresh=False,
     cache_only=False,
+    cache_response=True,
     request_get=None,
     after_response=None,
 ):
@@ -365,24 +420,30 @@ def cached_json_get(
             after_response(response)
         break
     value = response.json()
-    now = time.time()
+    if cache_response:
+        now = time.time()
 
-    def write_response(connection):
-        connection.execute(
-            "INSERT OR REPLACE INTO api_cache (cache_key, value, expires_at) VALUES (?, ?, ?)",
-            (key, json.dumps(value), now + ttl),
-        )
+        def write_response(connection):
+            connection.execute(
+                "INSERT OR REPLACE INTO api_cache "
+                "(cache_key, value, expires_at) VALUES (?, ?, ?)",
+                (key, json.dumps(value), now + ttl),
+            )
 
-    try:
-        _cache_operation(
-            write_response,
-            locked_default=None,
-            description="write an HTTP response",
-        )
-    except sqlite3.OperationalError as exc:
-        # A non-locking filesystem error should remain visible, but caching
-        # must never turn a successful upstream request into an API failure.
-        logger.warning("Could not write metadata cache at %s: %s", CACHE_DATABASE, exc)
+        try:
+            _cache_operation(
+                write_response,
+                locked_default=None,
+                description="write an HTTP response",
+            )
+        except sqlite3.OperationalError as exc:
+            # A non-locking filesystem error should remain visible, but caching
+            # must never turn a successful upstream request into an API failure.
+            logger.warning(
+                "Could not write metadata cache at %s: %s",
+                CACHE_DATABASE,
+                exc,
+            )
     cleanup_expired_cache()
     return (value, False) if include_cache_status else value
 

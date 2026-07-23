@@ -115,3 +115,11 @@ def invalidate_all():
     with _lock:
         _entries.clear()
         _generation += 1
+
+
+def invalidate(key):
+    """Drop one payload and prevent an older concurrent build from caching."""
+    global _generation
+    with _lock:
+        _entries.pop(key, None)
+        _generation += 1
