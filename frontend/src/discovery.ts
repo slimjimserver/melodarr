@@ -1,6 +1,7 @@
 (() => {
   type DetailKind = "artist" | "release-group" | "release";
   type DetailReference = { kind: DetailKind; id: string };
+  type DetailOrigin = { view: "discover" | "library"; scrollY: number };
   type ArtworkItem = { image: HTMLImageElement; source: string; fallback: HTMLElement };
   type ArtworkJob = { guard: ReturnType<typeof setTimeout> };
   type DetailRequest = {
@@ -18,6 +19,7 @@
   };
   let currentDetail: DetailReference | null = null;
   const detailHistory: DetailReference[] = [];
+  let detailOrigin: DetailOrigin = { view: "discover", scrollY: 0 };
   let requestedArtist: JsonObject | undefined;
   let lidarrExternalUrl: string | undefined;
   let recommendationPoll: ReturnType<typeof setTimeout> | undefined;
@@ -174,7 +176,10 @@
   function showView(id: AppView) {
     document.querySelectorAll(".view, .nav-link").forEach((element) => element.classList.remove("active"));
     $(`#${id}`).classList.add("active");
-    if (id === "discover") $("[data-view=discover]").classList.add("active");
+    if (id !== "detail") {
+      document.querySelectorAll<HTMLElement>(`[data-view="${id}"]`)
+        .forEach((button) => button.classList.add("active"));
+    }
     resetPageScroll();
   }
 
@@ -231,6 +236,15 @@
   function detailPath(kind: DetailKind, id: string) {
     const route: Record<DetailKind, string> = { artist: "artists", "release-group": "albums", release: "releases" };
     return `/${route[kind]}/${encodeURIComponent(id)}`;
+  }
+
+  function detailNavigationState(kind: DetailKind, id: string) {
+    return {
+      kind,
+      id,
+      detailOrigin,
+      detailHistory: [...detailHistory],
+    };
   }
 
   function resetDetailCover(showSkeleton = false) {
@@ -362,13 +376,28 @@
   }
 
   function showDetail(kind: DetailKind, id: string, addToHistory = true, updateHistory = true) {
-    if (addToHistory && currentDetail) detailHistory.push(currentDetail);
+    const activeView = document.querySelector<HTMLElement>(".view.active")?.id;
+    if (addToHistory && currentDetail && activeView === "detail") {
+      detailHistory.push(currentDetail);
+    } else if (addToHistory) {
+      detailHistory.length = 0;
+      detailOrigin = {
+        view: activeView === "library" ? "library" : "discover",
+        scrollY: window.scrollY,
+      };
+    }
     currentDetail = { kind, id };
-    if (updateHistory) window.history.pushState({ kind, id }, "", detailPath(kind, id));
+    if (updateHistory) {
+      window.history.pushState(
+        detailNavigationState(kind, id),
+        "",
+        detailPath(kind, id),
+      );
+    }
     const previous = detailHistory.at(-1);
     $("#back-to-search").textContent = previous
       ? `← Back to ${previous.kind === "artist" ? "artist" : previous.kind === "release-group" ? "album" : "release"}`
-      : "← Back to search";
+      : detailOrigin.view === "library" ? "← Back to library" : "← Back to search";
     showView("detail");
     $("#detail-results").replaceChildren(skeletonBlock("skeleton-card", kind === "release" ? 6 : 4));
     $("#detail-title").textContent = "";
@@ -1151,11 +1180,23 @@
       // current detail URL prevents old album pages from being re-added to
       // the trail and replayed by repeated clicks.
       showDetail(previous.kind, previous.id, false, false);
-      window.history.replaceState({ kind: previous.kind, id: previous.id }, "", detailPath(previous.kind, previous.id));
+      window.history.replaceState(
+        detailNavigationState(previous.kind, previous.id),
+        "",
+        detailPath(previous.kind, previous.id),
+      );
     } else {
       currentDetail = null;
-      showView("discover");
-      window.history.replaceState({ view: "discover" }, "", "/");
+      const origin = detailOrigin;
+      showView(origin.view);
+      window.history.replaceState(
+        { view: origin.view },
+        "",
+        origin.view === "library" ? "/library" : "/",
+      );
+      window.requestAnimationFrame(() => {
+        window.scrollTo({ top: origin.scrollY, left: 0, behavior: "auto" });
+      });
     }
   });
 
@@ -1180,11 +1221,31 @@
     if (!match) return false;
     const routes: Record<string, DetailKind> = { artists: "artist", albums: "release-group", releases: "release" };
     const kind = routes[match[1]];
+    const stateOrigin = window.history.state?.detailOrigin as DetailOrigin | undefined;
+    detailOrigin = stateOrigin?.view === "library"
+      ? { view: "library", scrollY: Number(stateOrigin.scrollY) || 0 }
+      : { view: "discover", scrollY: Number(stateOrigin?.scrollY) || 0 };
+    const stateHistory = window.history.state?.detailHistory;
+    detailHistory.length = 0;
+    if (Array.isArray(stateHistory)) {
+      stateHistory.forEach((entry: DetailReference) => {
+        if (
+          ["artist", "release-group", "release"].includes(entry?.kind)
+          && typeof entry.id === "string"
+        ) {
+          detailHistory.push(entry);
+        }
+      });
+    }
     showDetail(kind, decodeURIComponent(match[2]), false, false);
     return true;
   }
 
-  window.addEventListener("popstate", showDetailFromLocation);
+  window.addEventListener("popstate", () => {
+    if (showDetailFromLocation()) return;
+    currentDetail = null;
+    detailHistory.length = 0;
+  });
   window.addEventListener("melodarr-open-detail", (event) => {
     const detail = (event as CustomEvent<{ kind: DetailKind; id: string }>).detail;
     if (detail?.kind && detail?.id) showDetail(detail.kind, detail.id);

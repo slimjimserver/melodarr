@@ -61,7 +61,11 @@ def _run_scan(kind):
             result = plex.full_library_scan(config)
             server_id = config.get("machineIdentifier") or config.get("url", "")
             valid_artwork = {
-                plex_artist_artwork_key(server_id, artist.get("ratingKey"))
+                plex_artist_artwork_key(
+                    server_id,
+                    artist.get("ratingKey"),
+                    artist.get("thumb"),
+                )
                 for artist in result["artists"]
                 if artist.get("ratingKey") and artist.get("thumb")
             }

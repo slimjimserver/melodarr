@@ -397,6 +397,9 @@ function setupNavigation() {
     // marks every match rather than using the strict single-element helper.
     document.querySelectorAll<HTMLElement>(`[data-view="${view}"]`).forEach((button) => button.classList.add("active"));
     $(`#${view}`).classList.add("active");
+    if (view === "library") {
+      window.dispatchEvent(new Event("melodarr-library-visible"));
+    }
     if (view !== "settings" && maintenanceRefreshTimer !== undefined) {
       window.clearInterval(maintenanceRefreshTimer);
       maintenanceRefreshTimer = undefined;
@@ -783,7 +786,17 @@ function setupLibrary() {
   const search = $("#library-search") as HTMLInputElement;
   const filter = $("#library-filter");
   const filterCount = $("#library-filter-count");
+  const loadButton = $<HTMLButtonElement>("#load-library");
+  const renderBatchSize = 40;
+  const maxArtworkRequests = 6;
   let artistCards: HTMLElement[] = [];
+  let libraryArtists: JsonObject[] = [];
+  let loadState: "idle" | "loading" | "loaded" | "error" = "idle";
+  let renderVersion = 0;
+  let filterFrame: number | undefined;
+  let activeArtworkLoads = 0;
+  const artworkQueue: Array<{ image: HTMLImageElement; source: string }> = [];
+  const deferredArtwork = new Map<Element, string>();
 
   const normalizeSearch = (value: string) => value
     .normalize("NFKD")
@@ -793,26 +806,159 @@ function setupLibrary() {
 
   const filterArtists = () => {
     const query = normalizeSearch(search.value);
-    let visible = 0;
+    const visible = query
+      ? libraryArtists.filter((artist) => artist.search.includes(query)).length
+      : libraryArtists.length;
     artistCards.forEach((card) => {
       const matches = !query || (card.dataset.search || "").includes(query);
       card.hidden = !matches;
-      if (matches) visible += 1;
     });
     filterCount.textContent = query
-      ? `${visible} of ${artistCards.length} artists`
-      : `${artistCards.length} artists`;
+      ? `${visible} of ${libraryArtists.length} artists`
+      : `${libraryArtists.length} artists`;
     setMessage(
       $("#library-message"),
       query && !visible ? `No Plex artists match “${search.value.trim()}”.` : "",
     );
   };
 
-  search.addEventListener("input", filterArtists);
+  search.addEventListener("input", () => {
+    if (filterFrame !== undefined) return;
+    filterFrame = window.requestAnimationFrame(() => {
+      filterFrame = undefined;
+      filterArtists();
+    });
+  });
 
-  $("#load-library").addEventListener("click", async () => {
+  const pumpArtworkQueue = () => {
+    while (activeArtworkLoads < maxArtworkRequests && artworkQueue.length) {
+      const artwork = artworkQueue.shift()!;
+      if (!artwork.image.isConnected) continue;
+      activeArtworkLoads += 1;
+      let finished = false;
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        activeArtworkLoads -= 1;
+        window.clearTimeout(guard);
+        pumpArtworkQueue();
+      };
+      const guard = window.setTimeout(finish, 45_000);
+      artwork.image.addEventListener("load", finish, { once: true });
+      artwork.image.addEventListener("error", () => {
+        artwork.image.remove();
+        finish();
+      }, { once: true });
+      artwork.image.src = artwork.source;
+    }
+  };
+
+  const artworkObserver = "IntersectionObserver" in window
+    ? new IntersectionObserver((entries) => {
+        entries.forEach((entry) => {
+          if (!entry.isIntersecting) return;
+          artworkObserver?.unobserve(entry.target);
+          const source = deferredArtwork.get(entry.target);
+          deferredArtwork.delete(entry.target);
+          if (source) {
+            artworkQueue.push({
+              image: entry.target as HTMLImageElement,
+              source,
+            });
+            pumpArtworkQueue();
+          }
+        });
+      }, { rootMargin: "350px" })
+    : null;
+
+  const deferArtwork = (image: HTMLImageElement, source: string) => {
+    if (artworkObserver) {
+      deferredArtwork.set(image, source);
+      artworkObserver.observe(image);
+      return;
+    }
+    window.setTimeout(() => {
+      artworkQueue.push({ image, source });
+      pumpArtworkQueue();
+    }, 0);
+  };
+
+  const createArtistCard = (artist: JsonObject) => {
+    const card = document.createElement("div");
+    card.className = `library-card${artist.musicbrainzId ? " clickable" : ""}`;
+    card.dataset.search = artist.search;
+    const artwork = document.createElement("div");
+    artwork.className = "library-artwork";
+    if (artist.artwork) {
+      const image = document.createElement("img");
+      image.alt = "";
+      image.decoding = "async";
+      image.fetchPriority = "low";
+      image.width = 384;
+      image.height = 384;
+      // Do not assign src until the card is near the viewport. Large Plex
+      // libraries otherwise start hundreds of authenticated artwork requests.
+      const separator = String(artist.artwork).includes("?") ? "&" : "?";
+      deferArtwork(image, `${artist.artwork}${separator}size=card`);
+      artwork.append(image);
+    }
+    const info = document.createElement("div");
+    info.className = "library-card-info";
+    const name = document.createElement("strong");
+    name.textContent = artist.name;
+    const section = document.createElement("span");
+    section.textContent = artist.musicbrainzId
+      ? `${artist.section} · View discography`
+      : `${artist.section} · MusicBrainz match unavailable`;
+    info.append(name, section);
+    card.append(artwork, info);
+    if (artist.musicbrainzId) {
+      card.tabIndex = 0;
+      card.setAttribute("role", "link");
+      const openArtist = () => window.dispatchEvent(new CustomEvent(
+        "melodarr-open-detail",
+        { detail: { kind: "artist", id: artist.musicbrainzId } },
+      ));
+      card.addEventListener("click", openArtist);
+      card.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          openArtist();
+        }
+      });
+    }
+    return card;
+  };
+
+  const renderArtists = (version: number, offset = 0) => {
+    if (version !== renderVersion) return;
+    const fragment = document.createDocumentFragment();
+    const end = Math.min(offset + renderBatchSize, libraryArtists.length);
+    const query = normalizeSearch(search.value);
+    for (let index = offset; index < end; index += 1) {
+      const card = createArtistCard(libraryArtists[index]);
+      card.hidden = !!query && !libraryArtists[index].search.includes(query);
+      artistCards.push(card);
+      fragment.append(card);
+    }
+    results.append(fragment);
+    if (end < libraryArtists.length) {
+      window.requestAnimationFrame(() => renderArtists(version, end));
+    }
+  };
+
+  const loadLibrary = async (force = false) => {
+    if (loadState === "loading" || (!force && loadState !== "idle")) return;
+    loadState = "loading";
+    loadButton.disabled = true;
+    loadButton.textContent = "Loading…";
+    artworkObserver?.disconnect();
+    deferredArtwork.clear();
+    artworkQueue.length = 0;
     results.replaceChildren(skeletonBlock("library-card", 12));
+    renderVersion += 1;
     artistCards = [];
+    libraryArtists = [];
     search.value = "";
     filter.hidden = true;
     setMessage($("#library-message"), "Loading Plex library…");
@@ -820,61 +966,29 @@ function setupLibrary() {
     try {
       const library = await api("/api/library");
       results.replaceChildren();
+      libraryArtists = library.artists.map((artist: JsonObject) => ({
+        ...artist,
+        search: normalizeSearch(String(artist.name || "")),
+      }));
       $("#library-copy").textContent = `${library.artistCount} artists and ${library.releaseGroupCount} releases available in your Plex music libraries.`;
       setMessage($("#library-message"), "");
-      library.artists.forEach((artist: JsonObject) => {
-        const card = document.createElement("div");
-        card.className = `library-card${artist.musicbrainzId ? " clickable" : ""}`;
-        card.dataset.search = normalizeSearch(String(artist.name || ""));
-        const artwork = document.createElement("div");
-        artwork.className = "library-artwork";
-        if (artist.artwork) {
-          const image = document.createElement("img");
-          image.alt = "";
-          image.loading = "lazy";
-          image.decoding = "async";
-          image.width = 384;
-          image.height = 384;
-          // Plex serves 600px originals; the grid renders them at 175 CSS px.
-          image.src = `${artist.artwork}?size=card`;
-          image.addEventListener("error", () => image.remove());
-          artwork.append(image);
-        }
-        const info = document.createElement("div");
-        info.className = "library-card-info";
-        const name = document.createElement("strong");
-        name.textContent = artist.name;
-        const section = document.createElement("span");
-        section.textContent = artist.musicbrainzId
-          ? `${artist.section} · View discography`
-          : `${artist.section} · MusicBrainz match unavailable`;
-        info.append(name, section);
-        card.append(artwork, info);
-        if (artist.musicbrainzId) {
-          card.tabIndex = 0;
-          card.setAttribute("role", "link");
-          const openArtist = () => window.dispatchEvent(new CustomEvent(
-            "melodarr-open-detail",
-            { detail: { kind: "artist", id: artist.musicbrainzId } },
-          ));
-          card.addEventListener("click", openArtist);
-          card.addEventListener("keydown", (event) => {
-            if (event.key === "Enter" || event.key === " ") {
-              event.preventDefault();
-              openArtist();
-            }
-          });
-        }
-        artistCards.push(card);
-        results.append(card);
-      });
       filter.hidden = false;
       filterArtists();
+      loadState = "loaded";
+      renderArtists(renderVersion);
     } catch (error) {
       results.replaceChildren();
+      loadState = "error";
+      loadButton.textContent = "Retry";
       setMessage($("#library-message"), error.message, true);
+    } finally {
+      loadButton.disabled = false;
+      if (loadState === "loaded") loadButton.textContent = "Reload";
     }
-  });
+  };
+
+  loadButton.addEventListener("click", () => loadLibrary(true));
+  window.addEventListener("melodarr-library-visible", () => loadLibrary());
 }
 
 setupNavigation();

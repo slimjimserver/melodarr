@@ -84,7 +84,7 @@ def plex_artist_artwork(rating_key):
     server_id = config.get("machineIdentifier") or config.get("url", "")
     source_url = f"{config['url'].rstrip('/')}/{artist['thumb'].lstrip('/')}"
     return cached_artwork(
-        plex_artist_artwork_key(server_id, rating_key),
+        plex_artist_artwork_key(server_id, rating_key, artist["thumb"]),
         source_url,
         headers={"X-Plex-Token": config.get("token", "")},
         size=_requested_size(),

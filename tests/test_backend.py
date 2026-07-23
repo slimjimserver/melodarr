@@ -317,6 +317,42 @@ class PlexMetadataWorkerTests(unittest.TestCase):
 
 
 class PlexScanWorkerTests(unittest.TestCase):
+    @patch("backend.workers.plex.remove_stale_plex_artist_artwork")
+    @patch("backend.workers.plex.plex_metadata.request_enrichment")
+    @patch("backend.workers.plex.plex.full_library_scan")
+    @patch("backend.workers.plex.get_service")
+    def test_full_scan_retains_only_current_thumbnail_versions(
+        self,
+        get_service,
+        full_library_scan,
+        request_enrichment,
+        remove_stale_artwork,
+    ):
+        get_service.return_value = {
+            "url": "http://plex",
+            "machineIdentifier": "server-1",
+        }
+        full_library_scan.return_value = {
+            "artists": [{
+                "ratingKey": "100",
+                "thumb": "/library/metadata/100/thumb/200",
+            }],
+            "artistMbids": [],
+            "releaseMbids": [],
+            "changed": True,
+        }
+
+        plex_worker._run_scan("full")
+
+        remove_stale_artwork.assert_called_once_with({
+            artwork_cache.plex_artist_artwork_key(
+                "server-1",
+                "100",
+                "/library/metadata/100/thumb/200",
+            )
+        })
+        request_enrichment.assert_not_called()
+
     @patch("backend.workers.plex.plex_metadata.request_enrichment")
     @patch("backend.workers.plex.plex.recently_added_scan")
     @patch("backend.workers.plex.get_service")
@@ -656,6 +692,48 @@ class DeploymentConfigTests(unittest.TestCase):
             '"This artist is in your selected Plex libraries."',
             discovery_typescript,
         )
+
+    def test_library_auto_loads_once_and_renders_large_collections_in_batches(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(
+            os.path.join(project_root, "frontend", "src", "app.ts"),
+            encoding="utf-8",
+        ) as file:
+            app_typescript = file.read()
+        with open(
+            os.path.join(project_root, "frontend", "static", "index.html"),
+            encoding="utf-8",
+        ) as file:
+            frontend = file.read()
+
+        self.assertIn('new Event("melodarr-library-visible")', app_typescript)
+        self.assertIn(
+            'window.addEventListener("melodarr-library-visible"',
+            app_typescript,
+        )
+        self.assertIn('loadState !== "idle"', app_typescript)
+        self.assertIn("const renderBatchSize = 40", app_typescript)
+        self.assertIn("window.requestAnimationFrame", app_typescript)
+        self.assertIn("const maxArtworkRequests = 6", app_typescript)
+        self.assertIn("new IntersectionObserver", app_typescript)
+        self.assertIn('includes("?") ? "&" : "?"', app_typescript)
+        self.assertIn(">Reload</button>", frontend)
+
+    def test_artist_detail_returns_to_its_originating_view(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(
+            os.path.join(project_root, "frontend", "src", "discovery.ts"),
+            encoding="utf-8",
+        ) as file:
+            discovery_typescript = file.read()
+
+        self.assertIn('view: "discover" | "library"', discovery_typescript)
+        self.assertIn('activeView === "library"', discovery_typescript)
+        self.assertIn('"← Back to library"', discovery_typescript)
+        self.assertIn('origin.view === "library" ? "/library" : "/"', discovery_typescript)
+        self.assertIn("detailNavigationState(kind, id)", discovery_typescript)
+        self.assertIn("detailHistory: [...detailHistory]", discovery_typescript)
+        self.assertIn("top: origin.scrollY", discovery_typescript)
 
     def test_artist_detail_uses_the_lazy_discography_renderer(self):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -3191,12 +3269,21 @@ class ArtworkVariantTests(DatabaseTestCase):
 
     def test_stale_cleanup_keeps_variants_of_current_plex_artists(self):
         os.makedirs(ARTWORK_CACHE_DIRECTORY, exist_ok=True)
-        kept = artwork_cache.plex_artist_artwork_key("server-1", "100")
-        removed = artwork_cache.plex_artist_artwork_key("server-1", "200")
+        kept = artwork_cache.plex_artist_artwork_key(
+            "server-1", "100", "/thumb/100/new"
+        )
+        old_version = artwork_cache.plex_artist_artwork_key(
+            "server-1", "100", "/thumb/100/old"
+        )
+        removed = artwork_cache.plex_artist_artwork_key(
+            "server-1", "200", "/thumb/200"
+        )
         names = [
             f"{kept}.jpg",
             f"{kept}@thumb.webp",
             f"{kept}@card.webp",
+            f"{old_version}.jpg",
+            f"{old_version}@card.webp",
             f"{removed}.jpg",
             f"{removed}@thumb.webp",
         ]
@@ -3206,7 +3293,7 @@ class ArtworkVariantTests(DatabaseTestCase):
 
         deleted = artwork_cache.remove_stale_plex_artist_artwork({kept})
 
-        self.assertEqual(deleted, 2)
+        self.assertEqual(deleted, 4)
         for name in names[:3]:
             self.assertTrue(
                 os.path.isfile(os.path.join(ARTWORK_CACHE_DIRECTORY, name)), name
@@ -3215,6 +3302,44 @@ class ArtworkVariantTests(DatabaseTestCase):
             self.assertFalse(
                 os.path.exists(os.path.join(ARTWORK_CACHE_DIRECTORY, name)), name
             )
+
+    @patch("backend.routes.artwork.cached_artwork")
+    @patch("backend.routes.artwork.plex.cached_library_index")
+    @patch("backend.routes.artwork.get_service")
+    def test_plex_artist_route_uses_current_thumbnail_cache_key(
+        self,
+        get_service_mock,
+        cached_library_index,
+        cached_artwork,
+    ):
+        get_service_mock.return_value = {
+            "url": "http://plex:32400",
+            "token": "token",
+            "machineIdentifier": "server-1",
+        }
+        cached_library_index.return_value = {
+            "artistsByRatingKey": {
+                "100": {"thumb": "/library/metadata/100/thumb/200"}
+            }
+        }
+        cached_artwork.return_value = ("", 204)
+        self.register()
+
+        response = self.client.get(
+            "/api/artwork/plex-artist/100?v=browser-version&size=card"
+        )
+
+        self.assertEqual(response.status_code, 204)
+        cached_artwork.assert_called_once_with(
+            artwork_cache.plex_artist_artwork_key(
+                "server-1",
+                "100",
+                "/library/metadata/100/thumb/200",
+            ),
+            "http://plex:32400/library/metadata/100/thumb/200",
+            headers={"X-Plex-Token": "token"},
+            size="card",
+        )
 
 
 class CompressionTests(DatabaseTestCase):
@@ -3509,7 +3634,10 @@ class PlexClientTests(unittest.TestCase):
             {
                 "artists": [{
                     "key": "/library/metadata/65537/children",
+                    "ratingKey": "65537",
+                    "thumb": "/library/metadata/65537/thumb/100",
                     "url": "https://app.plex.tv/old-link",
+                    "artwork": "/api/artwork/plex-artist/65537",
                     "plexGuid": "",
                     "guids": ["plex://artist/artist-65537"],
                 }],
@@ -3525,6 +3653,22 @@ class PlexClientTests(unittest.TestCase):
             "https://listen.plex.tv/artist/artist-65537?"
             "source=server-1&key=%2Flibrary%2Fmetadata%2F65537",
         )
+        artwork = payload["artists"][0]["artwork"]
+        self.assertRegex(
+            artwork,
+            r"^/api/artwork/plex-artist/65537\?v=[0-9a-f]{16}$",
+        )
+        changed = plex._normalize_snapshot_urls(
+            {"url": "http://plex", "machineIdentifier": "server-1"},
+            {
+                "artists": [{
+                    "ratingKey": "65537",
+                    "thumb": "/library/metadata/65537/thumb/200",
+                }],
+                "releaseGroups": [],
+            },
+        )
+        self.assertNotEqual(artwork, changed["artists"][0]["artwork"])
 
     @patch("backend.services.plex.requests.get")
     def test_full_scan_only_reads_selected_music_sections(self, get):

@@ -18,6 +18,7 @@ if __package__ == "backend.services":
     from ..cache_memo import invalidate_document, memoized_document
     from ..config import PLEX_LIBRARY_CACHE_TTL
     from ..detail_cache import invalidate_all as invalidate_detail_payloads
+    from ..media_urls import plex_artist_artwork
 else:  # Support the existing `python backend/app.py` entry point.
     from api_cache import (
         get_cache_document,
@@ -28,6 +29,7 @@ else:  # Support the existing `python backend/app.py` entry point.
     from cache_memo import invalidate_document, memoized_document
     from config import PLEX_LIBRARY_CACHE_TTL
     from detail_cache import invalidate_all as invalidate_detail_payloads
+    from media_urls import plex_artist_artwork
 
 
 scan_lock = RLock()
@@ -137,7 +139,9 @@ def _normalize_snapshot_urls(config, payload):
                     config, item["key"], plex_guid
                 )
             if collection_name == "artists" and item.get("ratingKey") and item.get("thumb"):
-                item["artwork"] = f"/api/artwork/plex-artist/{item['ratingKey']}"
+                item["artwork"] = plex_artist_artwork(
+                    item["ratingKey"], item["thumb"]
+                )
     return payload
 
 
@@ -183,7 +187,7 @@ def _normalize_artist(config, section, item):
         "section": section.get("title"),
         "key": item.get("key", ""),
         "ratingKey": rating_key,
-        "artwork": f"/api/artwork/plex-artist/{rating_key}" if rating_key and item.get("thumb") else "",
+        "artwork": plex_artist_artwork(rating_key, item.get("thumb")),
         "plexGuid": plex_guid,
         "guids": guids,
         "musicbrainzId": _musicbrainz_id(guids),

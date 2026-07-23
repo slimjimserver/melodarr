@@ -188,14 +188,14 @@ def build_artwork_variant(original_path, cache_key, size):
             os.unlink(temporary_path)
 
 
-def plex_artist_artwork_key(server_id, rating_key):
-    """Return an opaque, filesystem-safe key for a Plex artist thumbnail."""
-    identity = f"{server_id}:{rating_key}".encode()
+def plex_artist_artwork_key(server_id, rating_key, thumb=""):
+    """Return a versioned, filesystem-safe key for a Plex artist thumbnail."""
+    identity = f"{server_id}:{rating_key}:{thumb}".encode()
     return f"plex-artist-{sha256(identity).hexdigest()}"
 
 
 def remove_stale_plex_artist_artwork(valid_keys):
-    """Remove permanent Plex thumbnails for artists no longer in the library."""
+    """Remove thumbnails for absent artists and superseded artwork revisions."""
     valid_keys = set(valid_keys)
     removed = 0
     try:
