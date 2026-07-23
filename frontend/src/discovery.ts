@@ -28,7 +28,11 @@
   let detailOrigin: DetailOrigin = { view: "discover", scrollY: 0 };
   let requestedArtist: JsonObject | undefined;
   let lidarrExternalUrl: string | undefined;
+  let lidarrExternalUrlRequest: Promise<string> | undefined;
+  let lidarrExternalUrlVersion = 0;
   let recommendationPoll: ReturnType<typeof setTimeout> | undefined;
+  let recommendationRequestVersion = 0;
+  let recommendationAbort: AbortController | undefined;
   let searchRequestVersion = 0;
   let searchDebounce: ReturnType<typeof setTimeout>;
   let searchAbort: AbortController | undefined;
@@ -45,12 +49,6 @@
   // full-size originals, so more covers can be in flight without a single view
   // occupying every web-request thread.
   const maxArtworkRequests = 6;
-
-  const normalizeSearch = (value: string) => value
-    .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLocaleLowerCase()
-    .trim();
 
   function discardDetachedArtwork() {
     for (let index = artworkQueue.length - 1; index >= 0; index -= 1) {
@@ -141,9 +139,11 @@
   ): Promise<JsonObject> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMilliseconds);
+    const abort = () => controller.abort();
     // A superseded typeahead query aborts through the caller's signal, while
     // the timeout above still bounds every request.
-    signal?.addEventListener("abort", () => controller.abort(), { once: true });
+    if (signal?.aborted) abort();
+    else signal?.addEventListener("abort", abort, { once: true });
 
     try {
       const response = await fetch(url, { signal: controller.signal });
@@ -157,27 +157,39 @@
       return body;
     } finally {
       clearTimeout(timeout);
+      signal?.removeEventListener("abort", abort);
     }
   }
 
   async function getLidarrExternalUrl() {
+    if (currentUser?.role !== "admin") return "";
     if (lidarrExternalUrl !== undefined) return lidarrExternalUrl;
-    const settings = await getJson("/api/settings");
-    lidarrExternalUrl = settings.lidarr.externalUrl || "";
-    return lidarrExternalUrl;
+    if (lidarrExternalUrlRequest) return lidarrExternalUrlRequest;
+
+    const requestVersion = lidarrExternalUrlVersion;
+    const request = getJson("/api/settings")
+      .then((settings) => {
+        const externalUrl = String(settings.lidarr.externalUrl || "");
+        if (requestVersion !== lidarrExternalUrlVersion) return "";
+        lidarrExternalUrl = externalUrl;
+        return externalUrl;
+      })
+      .catch(() => "");
+    lidarrExternalUrlRequest = request;
+    request.finally(() => {
+      if (lidarrExternalUrlRequest === request) {
+        lidarrExternalUrlRequest = undefined;
+      }
+    });
+    return request;
   }
 
-  async function postJson(url: string, body: JsonObject): Promise<JsonObject> {
-    const headers = new Headers({ "Content-Type": "application/json" });
-    if (currentUser?.csrfToken) headers.set("X-CSRF-Token", currentUser.csrfToken);
-    const response = await fetch(url, {
+  function postJson(url: string, body: JsonObject): Promise<JsonObject> {
+    return api(url, {
       method: "POST",
-      headers,
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-    const result = await response.json();
-    if (!response.ok) throw new Error(result.error || "Request failed.");
-    return result;
   }
 
   function showView(id: AppView) {
@@ -560,17 +572,6 @@
     return link;
   }
 
-  function isMobileDevice() {
-    return /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
-      || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
-  }
-
-  function mobilePlexDestination(plexUrl: string, plexampUrl: string) {
-    return isMobileDevice() && plexampUrl
-      ? { url: plexampUrl, label: "Open in Plexamp", openInNewTab: false }
-      : { url: plexUrl, label: "Open in Plex", openInNewTab: true };
-  }
-
   function plexampArtistUrl(plexArtist: JsonObject) {
     if (plexArtist.plexampUrl) return plexArtist.plexampUrl;
     const plexGuid = [plexArtist.plexGuid, ...(plexArtist.guids || [])]
@@ -848,6 +849,7 @@
     const searchText = new Map<JsonObject, string>();
     let releaseQuery = "";
     let wasSearching = false;
+    let filterFrame: number | undefined;
 
     (Object.values(data.sections || {}) as JsonObject[][]).forEach((groups) => {
       groups.forEach((group) => {
@@ -866,6 +868,8 @@
     byPrimary.forEach((groups) => groups.sort(
       (first, second) => (second.date || "").localeCompare(first.date || ""),
     ));
+    const totalReleaseCount = [...byPrimary.values()]
+      .reduce((count, groups) => count + groups.length, 0);
 
     const enabledSecondary = new Set<string>();
     const isVisible = (group: JsonObject) => (
@@ -908,8 +912,10 @@
       openBeforeSearch: boolean;
     }> = [];
 
-    function renderSection(section: (typeof sections)[number]) {
-      const visible = section.groups.filter(isVisible);
+    function renderSection(
+      section: (typeof sections)[number],
+      visible = section.groups.filter(isVisible),
+    ) {
       section.summary.textContent = `${section.element.dataset.label} (${visible.length})`;
       section.element.hidden = visible.length === 0;
       section.link.hidden = visible.length === 0;
@@ -965,36 +971,39 @@
     function refreshSections() {
       let visible = 0;
       sections.forEach((section) => {
-        const matching = section.groups.filter(isVisible).length;
-        visible += matching;
-        if (releaseQuery && matching) section.element.open = true;
-        renderSection(section);
+        const visibleGroups = section.groups.filter(isVisible);
+        visible += visibleGroups.length;
+        if (releaseQuery && visibleGroups.length) section.element.open = true;
+        renderSection(section, visibleGroups);
       });
-      const total = [...byPrimary.values()].reduce((count, groups) => count + groups.length, 0);
       filterCount.textContent = releaseQuery
-        ? `${visible} of ${total} releases`
-        : `${total} releases`;
+        ? `${visible} of ${totalReleaseCount} releases`
+        : `${totalReleaseCount} releases`;
       filterMessage.textContent = releaseQuery && !visible
         ? `No releases match “${filterInput.value.trim()}”.`
         : "";
     }
 
     filterInput.addEventListener("input", () => {
-      const nextQuery = normalizeSearch(filterInput.value);
-      const isSearching = Boolean(nextQuery);
-      if (!wasSearching && isSearching) {
-        sections.forEach((section) => {
-          section.openBeforeSearch = section.element.open;
-        });
-      }
-      releaseQuery = nextQuery;
-      if (wasSearching && !isSearching) {
-        sections.forEach((section) => {
-          section.element.open = section.openBeforeSearch;
-        });
-      }
-      wasSearching = isSearching;
-      refreshSections();
+      if (filterFrame !== undefined) return;
+      filterFrame = window.requestAnimationFrame(() => {
+        filterFrame = undefined;
+        const nextQuery = normalizeSearch(filterInput.value);
+        const isSearching = Boolean(nextQuery);
+        if (!wasSearching && isSearching) {
+          sections.forEach((section) => {
+            section.openBeforeSearch = section.element.open;
+          });
+        }
+        releaseQuery = nextQuery;
+        if (wasSearching && !isSearching) {
+          sections.forEach((section) => {
+            section.element.open = section.openBeforeSearch;
+          });
+        }
+        wasSearching = isSearching;
+        refreshSections();
+      });
     });
 
     if (secondaryCounts.size) {
@@ -1181,6 +1190,8 @@
     const results = $("#results");
 
     if (query.length < 2) {
+      searchAbort = undefined;
+      $("#search-form").classList.remove("searching");
       results.replaceChildren();
       $("#search-message").textContent = query ? "Enter at least two characters." : "";
       return;
@@ -1227,6 +1238,7 @@
         : error.message;
     } finally {
       if (requestVersion === searchRequestVersion) {
+        searchAbort = undefined;
         $("#search-form").classList.remove("searching");
       }
     }
@@ -1246,20 +1258,11 @@
     runSearch();
   });
 
-  function combineRecommendations(results: Array<{ source: string; data: JsonObject }>, key: string) {
-    const combined = new Map<string, JsonObject>();
-    results.forEach(({ source, data }) => data[key].forEach((item: JsonObject) => {
-      const existing = combined.get(item.id);
-      if (existing) {
-        existing.recommendationSource = `${existing.recommendationSource} and ${source}`;
-      } else {
-        combined.set(item.id, { ...item, recommendationSource: source });
-      }
-    }));
-    return [...combined.values()];
-  }
-
   async function loadRecommendations(button: HTMLButtonElement) {
+    const requestVersion = ++recommendationRequestVersion;
+    recommendationAbort?.abort();
+    const controller = new AbortController();
+    recommendationAbort = controller;
     clearTimeout(recommendationPoll);
     const message = $("#recommendations-message");
     const results = $("#recommendation-results");
@@ -1270,7 +1273,8 @@
     results.replaceChildren(placeholder);
     message.textContent = "Loading cached recommendations…";
     try {
-      const data = await getJson("/api/discover");
+      const data = await getJson("/api/discover", 30_000, controller.signal);
+      if (requestVersion !== recommendationRequestVersion) return;
       results.replaceChildren();
       if (data.pending) {
         message.textContent = "Your recommendation cache is being prepared. This page will populate automatically after the background scan finishes.";
@@ -1296,10 +1300,16 @@
       (data.tagRows || []).forEach((row: JsonObject) => results.append(recommendationRow(`More for your ${row.tag} taste`, row.albums, "release-group")));
       if (!artists.length && !albums.length && !data.chartArtists?.length && !(data.tagRows || []).length && !unavailableProviders.length) message.textContent = "No MusicBrainz-linked recommendations were found in the latest scan.";
     } catch (error) {
+      if (requestVersion !== recommendationRequestVersion) return;
       results.replaceChildren();
-      message.textContent = error.message;
+      message.textContent = error.name === "AbortError"
+        ? "Recommendations took too long to load."
+        : error.message;
     } finally {
-      button.disabled = false;
+      if (requestVersion === recommendationRequestVersion) {
+        recommendationAbort = undefined;
+        button.disabled = false;
+      }
     }
   }
 
@@ -1308,6 +1318,11 @@
   });
   window.addEventListener("melodarr-authenticated", () => loadRecommendations($("#load-recommendations")));
   window.addEventListener("melodarr-recommendations-changed", () => loadRecommendations($("#load-recommendations")));
+  window.addEventListener("melodarr-lidarr-settings-changed", () => {
+    lidarrExternalUrlVersion += 1;
+    lidarrExternalUrl = undefined;
+    lidarrExternalUrlRequest = undefined;
+  });
 
   $("#back-to-search").addEventListener("click", () => {
     const previous = detailHistory.pop();

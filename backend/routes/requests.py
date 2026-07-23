@@ -139,6 +139,10 @@ def request_release_group():
             "pending": True,
         }), 202
 
+    lidarr_config = get_service("lidarr")
+    if not lidarr_config:
+        return api_error("Lidarr is not configured.", 503)
+
     try:
         lookup = lidarr.lookup_album(mbid)
         lookup.raise_for_status()
@@ -147,7 +151,7 @@ def request_release_group():
             return api_error("Lidarr could not find this release group.", 404)
 
         album = albums[0]
-        defaults = (get_service("lidarr") or {}).get("defaults", {})
+        defaults = lidarr_config.get("defaults", {})
         if not defaults.get("qualityProfileId") or not defaults.get("metadataProfileId"):
             return api_error("Finish configuring Lidarr's quality and metadata profiles in Settings.", 503)
 
@@ -230,5 +234,7 @@ def request_release_group():
     except requests.HTTPError as exc:
         detail = exc.response.text[:300] if exc.response is not None else ""
         return api_error(f"Lidarr rejected the release group. {detail}", 502)
+    except (ValueError, TypeError):
+        return api_error("Lidarr configuration is invalid.", 503)
     except requests.RequestException:
         return api_error("Lidarr could not be reached.", 502)

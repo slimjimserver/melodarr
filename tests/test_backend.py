@@ -932,6 +932,30 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn('document.execCommand("copy")', typescript)
         self.assertIn("copied ? \"Invitation link copied.\"", typescript)
 
+    def test_settings_clear_submitted_secrets_and_invalidate_lidarr_links(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(
+            os.path.join(project_root, "frontend", "src", "app.ts"),
+            encoding="utf-8",
+        ) as file:
+            app_typescript = file.read()
+        with open(
+            os.path.join(project_root, "frontend", "src", "discovery.ts"),
+            encoding="utf-8",
+        ) as file:
+            discovery_typescript = file.read()
+
+        self.assertIn('plexForm.token.value = "";', app_typescript)
+        self.assertIn('form.apiKey.value = "";', app_typescript)
+        self.assertIn(
+            'new Event("melodarr-lidarr-settings-changed")',
+            app_typescript,
+        )
+        self.assertIn(
+            'window.addEventListener("melodarr-lidarr-settings-changed"',
+            discovery_typescript,
+        )
+
     def test_discovery_search_offers_track_to_release_group_results(self):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with open(
@@ -1277,6 +1301,27 @@ class AuthenticationTests(DatabaseTestCase):
         self.assertEqual(response.status_code, 200)
         with self.client.session_transaction() as saved_session:
             self.assertTrue(saved_session.permanent)
+
+    def test_blank_general_password_preserves_the_existing_password(self):
+        csrf_token = self.register()
+        saved = self.client.post(
+            "/api/account/general",
+            json={"username": "test-user", "password": ""},
+            headers={"X-CSRF-Token": csrf_token},
+        )
+        self.assertEqual(saved.status_code, 200)
+
+        signed_out = self.client.post(
+            "/api/auth/logout",
+            headers={"X-CSRF-Token": csrf_token},
+        )
+        self.assertEqual(signed_out.status_code, 200)
+
+        signed_in = self.client.post(
+            "/api/auth/login",
+            json={"username": "test-user", "password": "a-secure-password"},
+        )
+        self.assertEqual(signed_in.status_code, 200)
 
     def test_csrf_protects_authenticated_writes(self):
         token = self.register()
@@ -1917,6 +1962,22 @@ class LidarrRequestTests(DatabaseTestCase):
             return connection.execute(
                 "SELECT kind, mbid, name FROM request_history ORDER BY id"
             ).fetchall()
+
+    @patch("backend.routes.requests.lidarr.lookup_album")
+    @patch("backend.routes.requests.get_service", return_value=None)
+    def test_release_group_request_reports_unconfigured_lidarr_as_json(
+        self, get_service, lookup_album
+    ):
+        response = self.client.post(
+            "/api/request/release-group",
+            json={"mbid": self.album_mbid},
+            headers={"X-CSRF-Token": self.register()},
+        )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.get_json(), {"error": "Lidarr is not configured."})
+        get_service.assert_called_once_with("lidarr")
+        lookup_album.assert_not_called()
 
     @patch("backend.routes.requests.lidarr.update_artists")
     @patch("backend.routes.requests.lidarr.add_artist")

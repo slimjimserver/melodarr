@@ -30,7 +30,7 @@ interface AppElement extends HTMLElement {
   alt: string;
   fetchPriority: string;
 }
-type AccountPage = "profile" | "general" | "linked-accounts" | "invitations" | "notifications";
+type AccountPage = "profile" | "general" | "linked-accounts" | "invitations";
 type AppView = "discover" | "detail" | "library" | "settings" | "account";
 type SettingsPage = "services" | "jobs";
 
@@ -65,12 +65,32 @@ function requiredDescendant<T extends Element>(parent: ParentNode, selector: str
   return element;
 }
 
+function normalizeSearch(value: string) {
+  return value
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLocaleLowerCase()
+    .trim();
+}
+
+function isMobileDevice() {
+  return /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
+    || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+}
+
+function mobilePlexDestination(plexUrl: string, plexampUrl: string) {
+  return isMobileDevice() && plexampUrl
+    ? { url: plexampUrl, label: "Open in Plexamp", openInNewTab: false }
+    : { url: plexUrl, label: "Open in Plex", openInNewTab: true };
+}
+
 let lidarrOptions: JsonObject | undefined;
 let lidarrDefaults: LidarrDefaults = {};
 let currentUser: CurrentUser | undefined;
 let showAccountPage: ((page?: AccountPage, updateHistory?: boolean) => void) | undefined;
 let invitationToken = "";
 let maintenanceRefreshTimer: number | undefined;
+let maintenanceRefreshInFlight = false;
 // Plex holdings tell a requester what is already available, so the library is
 // readable by every account. Settings remains administrator-only.
 const VIEWS_FOR_EVERY_USER = ["discover", "detail", "library", "account"];
@@ -192,7 +212,16 @@ async function api<T = JsonObject>(url: string, options: RequestInit = {}): Prom
   }
   requestOptions.headers = headers;
   const response = await fetch(url, requestOptions);
-  const body = await response.json() as T & { error?: string };
+  const responseText = await response.text();
+  let body: T & { error?: string };
+  try {
+    body = (responseText ? JSON.parse(responseText) : {}) as T & { error?: string };
+  } catch {
+    const message = response.ok
+      ? "The server returned an invalid response."
+      : `Request failed with status ${response.status}.`;
+    throw new Error(message);
+  }
 
   if (!response.ok) {
     throw new Error(body.error || "Request failed.");
@@ -272,10 +301,13 @@ async function refreshSettings(loadLidarrOptions = true) {
 
   $("#lidarr-state").textContent = lidarr.configured ? `Connected · ${lidarr.url}` : "Not connected";
   $("#plex-state").textContent = plex.configured ? `Connected · ${plex.url}` : "Not connected";
-  $("#plex-settings [name=url]").value = plex.url || "";
+  const plexForm = $<AppForm>("#plex-settings");
+  plexForm.url.value = plex.url || "";
+  plexForm.token.value = "";
   populatePlexLibraries(plex.libraries || [], plex.librarySectionIds || []);
 
-  const form = $("#lidarr-settings");
+  const form = $<AppForm>("#lidarr-settings");
+  form.apiKey.value = "";
   if (lidarr.url) {
     const connection = parseLidarrUrl(lidarr.url);
     form.hostname.value = connection.hostname;
@@ -321,6 +353,8 @@ function tableCell(row: HTMLTableRowElement, value: string) {
 }
 
 async function refreshMaintenance() {
+  if (maintenanceRefreshInFlight) return;
+  maintenanceRefreshInFlight = true;
   const jobsTable = $<HTMLTableSectionElement>("#jobs-table");
   const cacheTable = $<HTMLTableSectionElement>("#cache-table");
   const message = $("#maintenance-message");
@@ -387,6 +421,8 @@ async function refreshMaintenance() {
     $("#metadata-cache-size").textContent = `Metadata DB · ${formatBytes(data.metadataDatabaseBytes)}`;
   } catch (error) {
     setMessage(message, error.message, true);
+  } finally {
+    maintenanceRefreshInFlight = false;
   }
 }
 
@@ -434,17 +470,6 @@ function setupNavigation() {
     if (!currentUser) throw new Error("Account navigation requires an authenticated user.");
     const username = encodeURIComponent(currentUser.username);
     return page === "profile" ? `/${username}` : `/${username}/settings/${page}`;
-  }
-
-  function isMobileDevice() {
-    return /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
-      || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
-  }
-
-  function mobilePlexDestination(plexUrl: string, plexampUrl: string) {
-    return isMobileDevice() && plexampUrl
-      ? { url: plexampUrl, label: "Open in Plexamp", openInNewTab: false }
-      : { url: plexUrl, label: "Open in Plex", openInNewTab: true };
   }
 
   function createHistoryItem(item: JsonObject, route: string) {
@@ -541,7 +566,29 @@ function setupNavigation() {
         const form = document.createElement("form") as AppForm; form.className = "service-card account-form";
         form.innerHTML = '<h2>General</h2><label>Username<input name="username" autocomplete="username" required></label><label>New password<small>Leave blank to keep your current password.</small><input name="password" type="password" autocomplete="new-password" minlength="12"></label><div class="form-actions"><p class="form-message"></p><button>Save general settings</button></div>';
         form.username.value = user.username;
-        form.addEventListener("submit", async (event) => { event.preventDefault(); const formMessage = requiredDescendant<HTMLElement>(form, ".form-message"); try { const result = await api("/api/account/general", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(Object.fromEntries(new FormData(form))) }); user.username = result.username; const accountMenu = $<HTMLAnchorElement>("#account-menu"); accountMenu.textContent = result.username.slice(0, 1).toUpperCase(); accountMenu.href = accountPath("profile"); formMessage.textContent = result.message; window.history.replaceState({ account: "general" }, "", accountPath("general")); } catch (error) { setMessage(formMessage, error.message, true); } });
+        form.addEventListener("submit", async (event) => {
+          event.preventDefault();
+          const formMessage = requiredDescendant<HTMLElement>(form, ".form-message");
+          try {
+            const result = await api("/api/account/general", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(Object.fromEntries(new FormData(form))),
+            });
+            user.username = result.username;
+            const accountMenu = $<HTMLAnchorElement>("#account-menu");
+            accountMenu.textContent = result.username.slice(0, 1).toUpperCase();
+            accountMenu.href = accountPath("profile");
+            formMessage.textContent = result.message;
+            window.history.replaceState(
+              { account: "general" },
+              "",
+              accountPath("general"),
+            );
+          } catch (error) {
+            setMessage(formMessage, error.message, true);
+          }
+        });
         content.append(form);
       } else if (page === "linked-accounts") {
         content.replaceChildren();
@@ -549,9 +596,43 @@ function setupNavigation() {
         form.innerHTML = '<h2>Linked accounts</h2><fieldset><legend>ListenBrainz</legend><label>Username<small>Used to tailor recommendations. Leave blank to disconnect it.</small><input name="listenbrainzUsername" autocomplete="username" placeholder="your-listenbrainz-name"></label></fieldset><fieldset><legend>Last.fm</legend><label>Username<input name="lastfmUsername" autocomplete="username" placeholder="your-lastfm-name"></label><label>API key<small>Create one in your Last.fm API account. Leave blank to keep your saved key.</small><input name="lastfmApiKey" type="password" autocomplete="off" placeholder="Last.fm API key"></label></fieldset><div class="form-actions"><p class="form-message"></p><button>Save linked accounts</button></div>';
         form.listenbrainzUsername.value = user.listenbrainzUsername || "";
         form.lastfmUsername.value = user.lastfmUsername || "";
-        form.addEventListener("submit", async (event) => { event.preventDefault(); const formMessage = requiredDescendant<HTMLElement>(form, ".form-message"); setMessage(formMessage, "Saving linked accounts…"); try { const listenbrainz = await api("/api/account/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username: form.listenbrainzUsername.value }) }); const lastfm = await api("/api/account/lastfm", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username: form.lastfmUsername.value, apiKey: form.lastfmApiKey.value }) }); user.listenbrainzUsername = form.listenbrainzUsername.value.trim(); user.lastfmUsername = form.lastfmUsername.value.trim(); user.lastfmConfigured = Boolean(user.lastfmUsername); form.lastfmApiKey.value = ""; setMessage(formMessage, `${listenbrainz.message} ${lastfm.message} Recommendations are being refreshed.`); window.dispatchEvent(new Event("melodarr-recommendations-changed")); } catch (error) { setMessage(formMessage, error.message, true); } });
+        form.addEventListener("submit", async (event) => {
+          event.preventDefault();
+          const formMessage = requiredDescendant<HTMLElement>(form, ".form-message");
+          setMessage(formMessage, "Saving linked accounts…");
+          try {
+            const [listenbrainz, lastfm] = await Promise.all([
+              api("/api/account/settings", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  username: form.listenbrainzUsername.value,
+                }),
+              }),
+              api("/api/account/lastfm", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  username: form.lastfmUsername.value,
+                  apiKey: form.lastfmApiKey.value,
+                }),
+              }),
+            ]);
+            user.listenbrainzUsername = form.listenbrainzUsername.value.trim();
+            user.lastfmUsername = form.lastfmUsername.value.trim();
+            user.lastfmConfigured = Boolean(user.lastfmUsername);
+            form.lastfmApiKey.value = "";
+            setMessage(
+              formMessage,
+              `${listenbrainz.message} ${lastfm.message} Recommendations are being refreshed.`,
+            );
+            window.dispatchEvent(new Event("melodarr-recommendations-changed"));
+          } catch (error) {
+            setMessage(formMessage, error.message, true);
+          }
+        });
         content.append(form);
-      } else if (page === "invitations" && user.role === "admin") {
+      } else if (page === "invitations") {
         content.replaceChildren();
         const form = document.createElement("form") as AppForm; form.className = "service-card account-form";
         form.innerHTML = '<h2>Account invitations</h2><p class="intro">Create a private, one-time signup link. Each link expires after seven days.</p><div class="form-actions"><p class="form-message"></p><button>Create invitation link</button></div><div class="invitation-result" hidden><label>Invitation link<input name="invitationLink" readonly></label><button class="outline" type="button">Copy link</button></div>';
@@ -577,9 +658,6 @@ function setupNavigation() {
           );
         });
         content.append(form);
-      } else {
-        content.replaceChildren();
-        const section = document.createElement("section"); section.className = "service-card account-form"; section.innerHTML = "<h2>Notifications</h2><p class=\"intro\">Notification preferences will be available here soon.</p>"; content.append(section);
       }
     } catch (error) { setMessage(message, error.message, true); }
   }
@@ -588,7 +666,7 @@ function setupNavigation() {
     if (!currentUser) return;
     showView("account", false);
     if (updateHistory) window.history.pushState({ account: page }, "", accountPath(page));
-    const allowedPages = ["profile", "general", "linked-accounts", "notifications"];
+    const allowedPages = ["profile", "general", "linked-accounts"];
     if (currentUser.role === "admin") allowedPages.push("invitations");
     renderAccount(allowedPages.includes(page) ? page : "profile");
   };
@@ -615,7 +693,7 @@ function setupNavigation() {
   });
 
   window.addEventListener("popstate", () => {
-    const accountMatch = window.location.pathname.match(/^\/([^/]+)(?:\/settings\/(general|linked-accounts|invitations|notifications))?\/?$/);
+    const accountMatch = window.location.pathname.match(/^\/([^/]+)(?:\/settings\/(general|linked-accounts|invitations))?\/?$/);
     if (accountMatch && currentUser && decodeURIComponent(accountMatch[1]).toLowerCase() === currentUser.username.toLowerCase()) {
       showAccountPage?.((accountMatch[2] || "profile") as AccountPage, false);
       return;
@@ -809,6 +887,7 @@ function setupLidarrSettings() {
       });
       setMessage(message, "Lidarr service saved.");
       await refreshSettings();
+      window.dispatchEvent(new Event("melodarr-lidarr-settings-changed"));
     } catch (error) {
       setMessage(message, error.message, true);
     } finally {
@@ -887,30 +966,37 @@ function setupLibrary() {
   let loadState: "idle" | "loading" | "loaded" | "error" = "idle";
   let renderVersion = 0;
   let filterFrame: number | undefined;
-  let activeArtworkLoads = 0;
+  const activeArtworkLoads = new Map<HTMLImageElement, number>();
   const artworkQueue: Array<{ image: HTMLImageElement; source: string }> = [];
   const deferredArtwork = new Map<Element, string>();
 
-  const normalizeSearch = (value: string) => value
-    .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLocaleLowerCase()
-    .trim();
+  const discardDetachedArtwork = () => {
+    for (let index = artworkQueue.length - 1; index >= 0; index -= 1) {
+      if (!artworkQueue[index].image.isConnected) artworkQueue.splice(index, 1);
+    }
+    activeArtworkLoads.forEach((guard, image) => {
+      if (image.isConnected) return;
+      window.clearTimeout(guard);
+      activeArtworkLoads.delete(image);
+      image.removeAttribute("src");
+    });
+  };
 
   const pumpArtworkQueue = () => {
-    while (activeArtworkLoads < maxArtworkRequests && artworkQueue.length) {
+    discardDetachedArtwork();
+    while (activeArtworkLoads.size < maxArtworkRequests && artworkQueue.length) {
       const artwork = artworkQueue.shift()!;
       if (!artwork.image.isConnected) continue;
-      activeArtworkLoads += 1;
       let finished = false;
       const finish = () => {
         if (finished) return;
         finished = true;
-        activeArtworkLoads -= 1;
+        activeArtworkLoads.delete(artwork.image);
         window.clearTimeout(guard);
         pumpArtworkQueue();
       };
       const guard = window.setTimeout(finish, 45_000);
+      activeArtworkLoads.set(artwork.image, guard);
       artwork.image.addEventListener("load", finish, { once: true });
       artwork.image.addEventListener("error", () => {
         artwork.image.remove();
@@ -1075,9 +1161,11 @@ function setupLibrary() {
     artworkQueue.length = 0;
     if (!visibleArtists.length) {
       results.replaceChildren();
+      discardDetachedArtwork();
       return;
     }
     results.replaceChildren(renderSentinel);
+    discardDetachedArtwork();
     renderArtists(renderVersion);
     window.requestAnimationFrame(maybeRenderMore);
   };
@@ -1104,6 +1192,7 @@ function setupLibrary() {
     artworkQueue.length = 0;
     paginationObserver?.disconnect();
     results.replaceChildren(skeletonBlock("library-card", 12));
+    discardDetachedArtwork();
     renderVersion += 1;
     libraryArtists = [];
     visibleArtists = [];

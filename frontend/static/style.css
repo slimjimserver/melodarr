@@ -106,8 +106,7 @@ nav { display: flex; height: 100%; gap: 8px; }
   font-size: 12px; font-weight: 600;
 }
 .logout:hover, .outline:hover, .secondary-action:hover, .account-menu:hover { border-color: var(--border-hover); background: var(--surface-hover); color: var(--foreground); transform: translateY(-1px); }
-.account-menu { display: grid; flex: 0 0 32px; width: 32px; height: 32px; place-items: center; border-radius: 50%; padding: 0; color: var(--accent-bright); font-size: 13px; text-decoration: none; }
-.account-menu { display: grid; width: 34px; height: 34px; place-items: center; border-radius: 50%; padding: 0; color: var(--accent-bright); font-size: 13px; text-decoration: none; }
+.account-menu { display: grid; flex: 0 0 32px; width: 34px; height: 34px; place-items: center; border-radius: 50%; padding: 0; color: var(--accent-bright); font-size: 13px; text-decoration: none; }
 
 /* Bottom tab bar — mobile only, shown by the narrow-viewport block below. */
 .tab-bar { display: none; }
@@ -375,34 +374,6 @@ details summary { margin-bottom: 17px; color: var(--accent-bright); cursor: poin
 #back-to-top { position: fixed; right: 24px; bottom: calc(24px + var(--tab-bar-height) + var(--safe-bottom)); z-index: 10; border: 1px solid var(--border-hover); border-radius: 999px; background: rgba(15, 15, 18, .82); color: var(--foreground); cursor: pointer; opacity: 0; padding: 12px 15px; pointer-events: none; transform: translateY(10px); backdrop-filter: blur(12px); transition: .2s var(--ease-out); font-size: 13px; font-weight: 600; }
 #back-to-top.visible { opacity: 1; pointer-events: auto; transform: none; }
 
-@media (max-width: 700px) {
-  input, select, textarea { font-size: 16px; }
-  header {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) 36px auto;
-    grid-template-rows: 48px 46px;
-    gap: 0 10px;
-    height: auto;
-    padding: 9px 16px 0;
-  }
-  .brand { min-width: 0; font-size: 20px; }
-  .brand img { width: 38px; height: 38px; border-radius: 10px; }
-  header > nav { display: grid; grid-column: 1 / -1; grid-row: 2; grid-template-columns: repeat(3, minmax(0, 1fr)); width: 100%; height: 46px; gap: 0; }
-  .nav-link { min-width: 0; padding: 0 6px; white-space: nowrap; font-size: 13px; }
-  .status { display: none; }
-  .account-menu { grid-column: 2; grid-row: 1; justify-self: center; }
-  .logout { grid-column: 3; grid-row: 1; white-space: nowrap; }
-  main { padding: 64px 20px; } h1 { letter-spacing: -.055em; } .search { height: auto; flex-wrap: wrap; } .search select { height: 52px; flex-basis: 105px; font-size: 16px; } .search input { height: 52px; } .search button { width: 100%; height: 48px; }
-  .library-top { flex-direction: column; align-items: flex-start; gap: 0; } .settings-fields, .settings-hero, .detail-heading { grid-template-columns: 1fr; } .settings-hero { gap: 18px; margin-bottom: 38px; }
-  .settings-tabs { margin-top: -14px; } .maintenance-heading { align-items: flex-start; flex-direction: column; }
-  .recommendations-heading { align-items: start; flex-direction: column; }
-  .recommendation-card { flex-basis: 132px; } .recommendation-art { width: 132px; }
-  .recommendations { width: 100%; margin-left: 0; transform: none; }
-  .detail-cover { width: min(280px, 100%); } .service-intro { grid-template-columns: 42px minmax(0, 1fr); } .service-state { grid-column: 2; justify-self: start; }
-  #detail-title { font-size: clamp(40px, 13vw, 58px); }
-  .discography-layout, .account-layout { grid-template-columns: 1fr; } .discography-nav { position: static; grid-template-columns: repeat(2, minmax(0, 1fr)); } .account-nav { grid-template-columns: repeat(2, minmax(0, 1fr)); } .account-nav p { grid-column: 1 / -1; } #back-to-top span { display: none; }
-}
-
 /* Pointer affordances. Touch browsers keep :hover applied after a tap, which
    leaves cards lifted and navigation looking selected, so every hover-only
    state is gated behind a real pointer. */
@@ -433,9 +404,10 @@ details summary { margin-bottom: 17px; color: var(--accent-bright); cursor: poin
   :root { --tab-bar-height: 58px; }
   input, select, textarea { font-size: 16px; }
   header { display: flex; gap: 12px; height: 62px; padding: 0 16px; padding-top: env(safe-area-inset-top, 0px); }
-  .header-nav, .logout { display: none; }
+  .header-nav { display: none; }
   .status { display: none; }
-  .brand { margin-right: auto; }
+  .brand { min-width: 0; margin-right: auto; font-size: 20px; }
+  .brand img { width: 38px; height: 38px; border-radius: 10px; }
 
   .tab-bar {
     display: grid; position: fixed; right: 0; bottom: 0; left: 0; z-index: 30;
@@ -443,7 +415,7 @@ details summary { margin-bottom: 17px; color: var(--accent-bright); cursor: poin
     border-top: 1px solid var(--border); background: rgba(6, 6, 8, .92);
     padding-bottom: var(--safe-bottom); backdrop-filter: blur(20px);
   }
-  .tab-bar .nav-link { display: grid; align-content: center; justify-items: center; gap: 3px; min-height: var(--tab-bar-height); border: 0; border-top: 2px solid transparent; padding: 8px 4px; font-size: 11px; font-weight: 600; }
+  .tab-bar .nav-link { display: grid; align-content: center; justify-items: center; min-width: 0; min-height: var(--tab-bar-height); gap: 3px; border: 0; border-top: 2px solid transparent; padding: 8px 4px; white-space: nowrap; font-size: 11px; font-weight: 600; }
   .tab-bar .nav-link.active { border-top-color: var(--accent); border-bottom-color: transparent; color: var(--accent-bright); }
   .tab-icon { font-size: 16px; line-height: 1; }
 
