@@ -21,5 +21,6 @@ jobs:
           SHORT_SHA="$(printf '%s' "${GITHUB_SHA}" | cut -c1-12)"
           echo "${{ secrets.REGISTRY_TOKEN }}" | docker login forgejo.ram-home.org -u "${GITHUB_ACTOR}" --password-stdin
           docker build -t "${IMAGE}:latest" -t "${IMAGE}:${SHORT_SHA}" .
+          docker run --rm -e PUID=99 -e PGID=100 "${IMAGE}:${SHORT_SHA}" sh -ec 'test "$(id -u)" = 99 && test "$(id -g)" = 100 && python -c "from backend.storage import init_db; from backend.api_cache import init_cache_db; from backend.config import load_session_secret; init_db(); init_cache_db(); load_session_secret()" && test -f /app/data/melodarr.db && test -f /app/data/cache/metadata.db && test -f /app/data/session-secret.key'
           docker push "${IMAGE}:latest"
           docker push "${IMAGE}:${SHORT_SHA}"

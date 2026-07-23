@@ -1,10 +1,12 @@
 """Flask application factory and extension registration."""
 
 import gzip
+import mimetypes
 import os
 from datetime import timedelta
 
-from flask import Flask, request
+from flask import Flask, current_app, request, send_file
+from werkzeug.utils import safe_join
 
 if __package__:
     from .api_cache import init_cache_db, migrate_legacy_cache
@@ -58,7 +60,7 @@ def compress_response(response):
     scripts and stylesheets are streamed too, so passthrough is turned off for
     them specifically in order to read and compress the body.
     """
-    response.headers.add("Vary", "Accept-Encoding")
+    response.vary.add("Accept-Encoding")
     if (
         response.status_code != 200
         or "Content-Encoding" in response.headers
@@ -75,6 +77,40 @@ def compress_response(response):
     response.headers["Content-Encoding"] = "gzip"
     response.headers["Content-Length"] = response.content_length
     return response
+
+
+def serve_precompressed_static():
+    """Serve build-time Brotli or gzip files without recompressing per request."""
+    if request.method not in {"GET", "HEAD"} or not request.path.startswith("/static/"):
+        return None
+    relative_path = request.path[len("/static/"):]
+    source_path = safe_join(current_app.static_folder, relative_path)
+    if source_path is None:
+        return None
+
+    encodings = sorted(
+        (
+            (request.accept_encodings[encoding], preference, encoding)
+            for preference, encoding in ((1, "br"), (0, "gzip"))
+            if request.accept_encodings[encoding] > 0
+        ),
+        reverse=True,
+    )
+    for _, _, encoding in encodings:
+        suffix = ".br" if encoding == "br" else ".gz"
+        compressed_path = f"{source_path}{suffix}"
+        if not os.path.isfile(compressed_path):
+            continue
+        response = send_file(
+            compressed_path,
+            conditional=True,
+            max_age=STATIC_CACHE_TTL,
+            mimetype=mimetypes.guess_type(source_path)[0],
+        )
+        response.headers["Content-Encoding"] = encoding
+        response.vary.add("Accept-Encoding")
+        return response
+    return None
 
 
 def cache_static_assets(response):
@@ -121,6 +157,7 @@ def create_app(config=None):
     migrate_legacy_cache()
     init_db()
     app.before_request(verify_csrf_token)
+    app.before_request(serve_precompressed_static)
     app.after_request(cache_static_assets)
     app.after_request(compress_response)
     for blueprint in BLUEPRINTS:

@@ -19,6 +19,8 @@ node_modules/
 # Generated frontend
 frontend/static/*.js
 frontend/static/*.js.map
+frontend/static/*.gz
+frontend/static/*.br
 
 # Runtime data and secrets
 data/

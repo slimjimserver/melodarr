@@ -52,7 +52,7 @@ Melodarr is designed to run with Docker Compose. The included [`docker-compose.y
    mkdir -p data
    ```
 
-   On Linux, the included Compose configuration runs the container as UID/GID `1000:1000`. Ensure that user can write to `./data`, or change the Compose `user` value to match the owner of the directory.
+   On Linux, the included Compose configuration runs Melodarr as UID/GID `1000:1000` by default. To use a different identity, set `PUID` and `PGID` in your shell or Compose `.env` file. The container prepares the data directory before dropping root privileges.
 
 3. Start Melodarr:
 
@@ -72,8 +72,10 @@ No additional environment variables are required for the included Docker Compose
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `MELODARR_DATABASE` | `<project>/melodarr.db` | Main SQLite database containing accounts, invitations, request history, and queued work. Compose sets this to `/app/data/melodarr.db`. |
-| `MELODARR_CACHE_DATABASE` | `cache/metadata.db` beside the main database | Disposable external API-response cache. Compose sets this to `/app/data/cache/metadata.db`. |
+| `PUID` | `1000` | Numeric user ID used to run Melodarr and own files beneath `/app/data`. Unraid commonly uses `99`. |
+| `PGID` | `1000` | Numeric group ID used to run Melodarr and own files beneath `/app/data`. Unraid commonly uses `100`. |
+| `MELODARR_DATABASE` | `<project>/melodarr.db` | Main SQLite database containing accounts, invitations, request history, and queued work. The image and Compose set this to `/app/data/melodarr.db`. |
+| `MELODARR_CACHE_DATABASE` | `cache/metadata.db` beside the main database | Disposable external API-response cache. The image and Compose set this to `/app/data/cache/metadata.db`. |
 | `MELODARR_SETTINGS` | `settings.json` beside the main database | Service configuration and credentials saved through the web UI. |
 | `MELODARR_SECRET_KEY_FILE` | `session-secret.key` beside the main database | Persistent generated session-signing key file. |
 | `MELODARR_SECRET_KEY` | Generated and saved to the key file | Explicit session-signing secret. Normally leave unset so Melodarr manages a persistent key in the data volume. |
@@ -81,6 +83,17 @@ No additional environment variables are required for the included Docker Compose
 | `MELODARR_COOKIE_SECURE` | `false` | Set to `true` when Melodarr is served through HTTPS so session cookies are marked secure. |
 | `PORT` | `5056` | Port used only by the local Flask development server. The production Gunicorn container listens on port `5056`. |
 | `FLASK_DEBUG` | unset | Set to `1` only when running the local development server. Do not enable it in production. |
+
+### Unraid Community Applications
+
+Use `/app/data` as the container path for the persistent appdata mapping and configure:
+
+```text
+PUID=99
+PGID=100
+```
+
+Do not also set Docker's `--user` option. The container starts as root only long enough to ensure `/app/data` exists with the requested ownership, then runs Melodarr as `PUID:PGID`. If the container is deliberately started with `--user`, Melodarr will honor that Docker-level identity but cannot change bind-mount ownership.
 
 For an HTTPS deployment, add this to the service's `environment` block in `docker-compose.yml`:
 

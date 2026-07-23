@@ -3,10 +3,11 @@
   "private": true,
   "packageManager": "pnpm@11.9.0",
   "scripts": {
-    "build": "tsc --project tsconfig.json",
+    "build": "tsc --project tsconfig.json --noEmit && node scripts/build.mjs",
     "check": "tsc --project tsconfig.json --noEmit"
   },
   "devDependencies": {
+    "esbuild": "0.28.1",
     "typescript": "5.9.3"
   }
 }

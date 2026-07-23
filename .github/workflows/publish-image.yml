@@ -9,6 +9,7 @@ on:
       - 'frontend/**'
       - 'tests/**'
       - 'Dockerfile'
+      - 'docker-entrypoint.sh'
       - '.dockerignore'
       - '.github/workflows/publish-image.yml'
   release:
@@ -39,6 +40,14 @@ jobs:
 
       - name: Test image
         run: docker run --rm "$IMAGE_NAME:$GITHUB_SHA" python -m unittest discover -s tests -v
+
+      - name: Test Unraid runtime identity
+        run: |
+          docker run --rm \
+            --env PUID=99 \
+            --env PGID=100 \
+            "$IMAGE_NAME:$GITHUB_SHA" \
+            sh -ec 'test "$(id -u)" = 99 && test "$(id -g)" = 100 && python -c "from backend.storage import init_db; from backend.api_cache import init_cache_db; from backend.config import load_session_secret; init_db(); init_cache_db(); load_session_secret()" && test -f /app/data/melodarr.db && test -f /app/data/cache/metadata.db && test -f /app/data/session-secret.key'
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v4

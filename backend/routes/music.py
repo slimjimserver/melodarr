@@ -8,12 +8,14 @@ import requests
 from flask import Blueprint, jsonify, request
 
 if __package__ == "backend.routes":
+    from .. import detail_cache
     from ..media_urls import artist_large_cover_art, release_group_cover_art
     from ..responses import api_error
     from ..security import login_required
     from ..services import lidarr, musicbrainz, plex
     from ..storage import get_service
 else:
+    import detail_cache
     from media_urls import artist_large_cover_art, release_group_cover_art
     from responses import api_error
     from security import login_required
@@ -220,21 +222,32 @@ def _lidarr_artist_detail_payload(mbid):
 @login_required
 def artist_detail(mbid):
     try:
-        prefetch = request.args.get("prefetch") == "1"
-        priority = "prefetch" if prefetch else "critical"
-        cached = _artist_detail_payload(mbid, priority, cache_only=True)
-        if cached is not None:
-            return jsonify(cached)
-        if prefetch:
-            return _prefetch_cache_miss()
-        if request.args.get("complete") != "1":
-            try:
-                provisional = _lidarr_artist_detail_payload(mbid)
-            except (ValueError, requests.RequestException):
-                provisional = None
-            if provisional is not None:
-                return jsonify(provisional)
-        return jsonify(_artist_detail_payload(mbid, priority))
+        cache_key = ("artist", mbid.casefold())
+        assembled = detail_cache.cached_response(cache_key)
+        if assembled is not None:
+            return assembled
+        with detail_cache.build_lock(cache_key) as generation:
+            assembled = detail_cache.cached_response(cache_key)
+            if assembled is not None:
+                return assembled
+            prefetch = request.args.get("prefetch") == "1"
+            priority = "prefetch" if prefetch else "critical"
+            cached = _artist_detail_payload(mbid, priority, cache_only=True)
+            if cached is not None:
+                return detail_cache.payload_response(
+                    cache_key, cached, generation
+                )
+            if prefetch:
+                return _prefetch_cache_miss()
+            if request.args.get("complete") != "1":
+                try:
+                    provisional = _lidarr_artist_detail_payload(mbid)
+                except (ValueError, requests.RequestException):
+                    provisional = None
+                if provisional is not None:
+                    return jsonify(provisional)
+            payload = _artist_detail_payload(mbid, priority)
+            return detail_cache.payload_response(cache_key, payload, generation)
     except requests.RequestException:
         return api_error("MusicBrainz could not load this artist.", 502)
 
@@ -247,7 +260,10 @@ def refresh_artist_detail(mbid):
     except ValueError:
         return api_error("Invalid MusicBrainz artist ID.")
     try:
-        return jsonify(_artist_detail_payload(mbid, "critical", force_refresh=True))
+        cache_key = ("artist", mbid.casefold())
+        with detail_cache.build_lock(cache_key) as generation:
+            payload = _artist_detail_payload(mbid, "critical", force_refresh=True)
+            return detail_cache.payload_response(cache_key, payload, generation)
     except requests.RequestException:
         return api_error(
             "MusicBrainz could not refresh this artist. The previous cache was kept.",
@@ -408,21 +424,32 @@ def _lidarr_release_group_detail_payload(mbid):
 @login_required
 def release_group_detail(mbid):
     try:
-        prefetch = request.args.get("prefetch") == "1"
-        priority = _musicbrainz_priority()
-        cached = _release_group_detail_payload(mbid, priority, cache_only=True)
-        if cached is not None:
-            return jsonify(cached)
-        if prefetch:
-            return _prefetch_cache_miss()
-        if request.args.get("complete") != "1":
-            try:
-                provisional = _lidarr_release_group_detail_payload(mbid)
-            except (ValueError, requests.RequestException):
-                provisional = None
-            if provisional is not None:
-                return jsonify(provisional)
-        return jsonify(_release_group_detail_payload(mbid, priority))
+        cache_key = ("release-group", mbid.casefold())
+        assembled = detail_cache.cached_response(cache_key)
+        if assembled is not None:
+            return assembled
+        with detail_cache.build_lock(cache_key) as generation:
+            assembled = detail_cache.cached_response(cache_key)
+            if assembled is not None:
+                return assembled
+            prefetch = request.args.get("prefetch") == "1"
+            priority = _musicbrainz_priority()
+            cached = _release_group_detail_payload(mbid, priority, cache_only=True)
+            if cached is not None:
+                return detail_cache.payload_response(
+                    cache_key, cached, generation
+                )
+            if prefetch:
+                return _prefetch_cache_miss()
+            if request.args.get("complete") != "1":
+                try:
+                    provisional = _lidarr_release_group_detail_payload(mbid)
+                except (ValueError, requests.RequestException):
+                    provisional = None
+                if provisional is not None:
+                    return jsonify(provisional)
+            payload = _release_group_detail_payload(mbid, priority)
+            return detail_cache.payload_response(cache_key, payload, generation)
     except requests.RequestException:
         return api_error("MusicBrainz could not load this album.", 502)
 
@@ -455,14 +482,22 @@ def _release_detail_payload(mbid, priority, *, cache_only=False):
 @login_required
 def release_detail(mbid):
     try:
-        prefetch = request.args.get("prefetch") == "1"
-        payload = _release_detail_payload(
-            mbid,
-            _musicbrainz_priority(),
-            cache_only=prefetch,
-        )
-        if payload is None:
-            return _prefetch_cache_miss()
-        return jsonify(payload)
+        cache_key = ("release", mbid.casefold())
+        assembled = detail_cache.cached_response(cache_key)
+        if assembled is not None:
+            return assembled
+        with detail_cache.build_lock(cache_key) as generation:
+            assembled = detail_cache.cached_response(cache_key)
+            if assembled is not None:
+                return assembled
+            prefetch = request.args.get("prefetch") == "1"
+            payload = _release_detail_payload(
+                mbid,
+                _musicbrainz_priority(),
+                cache_only=prefetch,
+            )
+            if payload is None:
+                return _prefetch_cache_miss()
+            return detail_cache.payload_response(cache_key, payload, generation)
     except requests.RequestException:
         return api_error("MusicBrainz could not load this release.", 502)

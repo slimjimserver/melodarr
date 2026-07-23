@@ -17,6 +17,7 @@ if __package__ == "backend.services":
     )
     from ..cache_memo import invalidate_document, memoized_document
     from ..config import PLEX_LIBRARY_CACHE_TTL
+    from ..detail_cache import invalidate_all as invalidate_detail_payloads
 else:  # Support the existing `python backend/app.py` entry point.
     from api_cache import (
         get_cache_document,
@@ -26,6 +27,7 @@ else:  # Support the existing `python backend/app.py` entry point.
     )
     from cache_memo import invalidate_document, memoized_document
     from config import PLEX_LIBRARY_CACHE_TTL
+    from detail_cache import invalidate_all as invalidate_detail_payloads
 
 
 scan_lock = RLock()
@@ -298,6 +300,7 @@ def _save_snapshot(
         "plex-library", _snapshot_id(config), payload, PLEX_LIBRARY_CACHE_TTL
     )
     invalidate_document(_index_key(_snapshot_id(config)))
+    invalidate_detail_payloads()
     documents = _guid_documents(config, guid_inventory or payload)
     if replace_guids:
         replace_cache_documents("plex-guid", documents, PLEX_LIBRARY_CACHE_TTL)
@@ -546,6 +549,7 @@ def apply_release_group_mappings(config, mappings):
             "plex-library", _snapshot_id(config), payload, PLEX_LIBRARY_CACHE_TTL
         )
         invalidate_document(_index_key(_snapshot_id(config)))
+        invalidate_detail_payloads()
         documents = _guid_documents(config, {
             "artists": [],
             "releaseGroups": changed,

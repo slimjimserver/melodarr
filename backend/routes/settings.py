@@ -6,6 +6,7 @@ from flask import Blueprint, jsonify, request
 if __package__ == "backend.routes":
     from ..api_cache import cache_stats, clear_cache
     from ..artwork_cache import artwork_cache_stats, clear_artwork_cache
+    from ..detail_cache import invalidate_all as invalidate_detail_payloads
     from ..responses import api_error
     from ..security import admin_required, login_required
     from ..services import lidarr, plex
@@ -24,6 +25,7 @@ if __package__ == "backend.routes":
 else:  # Support the existing `python backend/app.py` entry point.
     from api_cache import cache_stats, clear_cache
     from artwork_cache import artwork_cache_stats, clear_artwork_cache
+    from detail_cache import invalidate_all as invalidate_detail_payloads
     from responses import api_error
     from security import admin_required, login_required
     from services import lidarr, plex
@@ -224,14 +226,17 @@ def flush_cache(cache_id):
     if cache_id in {"plex-library", "plex-guid"}:
         clear_cache("plex-library")
         clear_cache("plex-guid")
+        invalidate_detail_payloads()
         plex_worker.request_full_scan()
         return jsonify({"message": "Plex library and GUID caches flushed; full scan queued."})
     if cache_id == "lidarr-library":
         clear_cache("lidarr-library")
+        invalidate_detail_payloads()
         lidarr_library_worker.request_scan()
         return jsonify({"message": "Lidarr library cache flushed; scan queued."})
     if cache_id in CACHE_NAMES or cache_id in available_namespaces:
         clear_cache(cache_id)
+        invalidate_detail_payloads()
         name = CACHE_NAMES.get(cache_id, cache_id.replace("-", " ").title())
         return jsonify({"message": f"{name} cache flushed."})
     if cache_id == "recommendations":
@@ -277,6 +282,7 @@ def configure_lidarr():
             defaults["metadataProfileId"] = options["metadataProfiles"][0]["id"]
         save_service("lidarr", config)
         clear_cache("lidarr-options")
+        invalidate_detail_payloads()
         return jsonify({"message": f"Connected to Lidarr {status.json().get('version', '')}.", "options": options})
     except requests.RequestException:
         return api_error("Could not connect to Lidarr. Check the URL, port, and API key.", 502)
@@ -337,6 +343,7 @@ def configure_plex():
         save_service("plex", config)
         clear_cache("plex-library")
         clear_cache("plex-guid")
+        invalidate_detail_payloads()
         plex_worker.request_full_scan()
         return jsonify({
             "message": "Connected to Plex; full music-library scan queued.",

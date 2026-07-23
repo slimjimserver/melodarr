@@ -14,6 +14,7 @@ if __package__ == "backend.services":
         LIDARR_OPTIONS_CACHE_TTL,
         USER_AGENT,
     )
+    from ..detail_cache import invalidate_all as invalidate_detail_payloads
     from ..storage import get_service
 else:  # Support the existing `python backend/app.py` entry point.
     from api_cache import cached_json_get, get_cache_document, set_cache_document
@@ -25,6 +26,7 @@ else:  # Support the existing `python backend/app.py` entry point.
         LIDARR_OPTIONS_CACHE_TTL,
         USER_AGENT,
     )
+    from detail_cache import invalidate_all as invalidate_detail_payloads
     from storage import get_service
 
 
@@ -173,6 +175,7 @@ def scan_library_availability(config=None):
     payload = {"artists": artists, "albums": albums}
     set_cache_document("lidarr-library", "albums", payload, LIDARR_LIBRARY_CACHE_TTL)
     invalidate_document(LIBRARY_INDEX_KEY)
+    invalidate_detail_payloads()
     return payload
 
 

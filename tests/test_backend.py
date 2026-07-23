@@ -32,6 +32,7 @@ from PIL import Image
 from backend import api_cache
 from backend import artwork_cache
 from backend import cache_memo
+from backend import detail_cache
 from backend import recommendations as recommendation_engine
 from backend.api_cache import (
     cache_db,
@@ -100,6 +101,9 @@ class DatabaseTestCase(unittest.TestCase):
         with artwork_cache._key_locks_lock:
             artwork_cache._key_locks.clear()
         artwork_cache._last_trim_at = None
+        detail_cache.invalidate_all()
+        with detail_cache._key_locks_lock:
+            detail_cache._key_locks.clear()
         with db() as connection:
             connection.execute("DELETE FROM pending_lidarr_searches")
             connection.execute("DELETE FROM recommendation_cache")
@@ -571,6 +575,26 @@ class LidarrSearchQueueTests(DatabaseTestCase):
 
 
 class DeploymentConfigTests(unittest.TestCase):
+    def test_production_frontend_is_minified_and_precompressed_without_maps(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(
+            os.path.join(project_root, "frontend", "scripts", "build.mjs"),
+            encoding="utf-8",
+        ) as file:
+            build_script = file.read()
+        with open(os.path.join(project_root, "Dockerfile"), encoding="utf-8") as file:
+            dockerfile = file.read()
+
+        self.assertIn("minify: true", build_script)
+        self.assertIn("sourcemap: false", build_script)
+        self.assertIn("brotliCompressSync", build_script)
+        self.assertIn("gzipSync", build_script)
+        self.assertNotIn(".js.map", dockerfile)
+        self.assertIn(
+            "COPY --from=frontend-build /app/frontend/static /app/frontend/static",
+            dockerfile,
+        )
+
     def test_auth_ui_uses_first_run_and_invitation_flows(self):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with open(
@@ -1955,6 +1979,34 @@ class DiscoveryRoutesTests(DatabaseTestCase):
 
 
 class MusicRoutesTests(DatabaseTestCase):
+    @patch("backend.routes.music.musicbrainz.get")
+    def test_completed_artist_payload_uses_shared_cache_and_etag(self, get):
+        get.side_effect = [
+            {
+                "id": "etag-artist",
+                "name": "Cached Artist",
+                "relations": [],
+                "genres": [],
+            },
+            {"release-groups": [], "release-group-count": 0},
+        ]
+        self.register()
+
+        first = self.client.get("/api/music/artist/etag-artist")
+        etag = first.headers.get("ETag")
+        second = self.client.get(
+            "/api/music/artist/etag-artist",
+            headers={"If-None-Match": etag},
+        )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.get_json()["name"], "Cached Artist")
+        self.assertEqual(first.headers["Cache-Control"], "private, max-age=60")
+        self.assertTrue(etag.startswith('W/"'))
+        self.assertEqual(second.status_code, 304)
+        self.assertEqual(second.data, b"")
+        self.assertEqual(get.call_count, 2)
+
     @patch("backend.routes.music.lidarr.tracked_artist")
     @patch("backend.routes.music.musicbrainz.get")
     def test_artist_prefetch_miss_does_not_call_providers(self, get, tracked_artist):
@@ -3151,6 +3203,24 @@ class ArtworkVariantTests(DatabaseTestCase):
 
 
 class CompressionTests(DatabaseTestCase):
+    def test_precompressed_static_asset_is_served_without_runtime_compression(self):
+        source_path = os.path.join(TEST_DATA.name, "precompressed.js")
+        with open(f"{source_path}.br", "wb") as file:
+            file.write(b"build-time-brotli")
+
+        with patch("backend.application.safe_join", return_value=source_path):
+            response = self.client.get(
+                "/static/app.js",
+                headers={"Accept-Encoding": "br, gzip"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, b"build-time-brotli")
+        self.assertEqual(response.headers["Content-Encoding"], "br")
+        self.assertIn("immutable", response.headers["Cache-Control"])
+        self.assertIn("Accept-Encoding", response.headers["Vary"])
+        response.close()
+
     @patch("backend.routes.library.plex.cached_library_snapshot")
     @patch("backend.routes.library.get_service")
     def test_large_json_is_gzipped_only_when_the_client_accepts_it(
