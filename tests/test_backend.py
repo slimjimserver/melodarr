@@ -917,8 +917,80 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertNotIn("<summary>Create an account</summary>", frontend)
         self.assertIn('name="remember"', frontend)
         self.assertIn('data-account-route="invitations"', frontend)
+        self.assertIn('data-discovery-src="/static/discovery.js"', frontend)
+        self.assertNotIn('<script src="/static/discovery.js"', frontend)
+        self.assertIn("function loadDiscovery()", typescript)
         self.assertIn("status.firstAccount", typescript)
         self.assertIn("status.invitationValid", typescript)
+
+    def test_color_theme_switcher_preserves_midnight_and_warm_palettes(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(
+            os.path.join(project_root, "frontend", "static", "index.html"),
+            encoding="utf-8",
+        ) as file:
+            frontend = file.read()
+        with open(
+            os.path.join(project_root, "frontend", "src", "theme.ts"),
+            encoding="utf-8",
+        ) as file:
+            theme_typescript = file.read()
+        with open(
+            os.path.join(project_root, "frontend", "src", "style.css"),
+            encoding="utf-8",
+        ) as file:
+            stylesheet = file.read()
+
+        self.assertIn('<script src="/static/theme.js"></script>', frontend)
+        self.assertIn('id="theme-toggle"', frontend)
+        self.assertIn('"melodarr-theme"', theme_typescript)
+        self.assertIn('theme = "midnight"', theme_typescript)
+        self.assertIn(':root[data-theme="midnight"]', stylesheet)
+        self.assertIn(':root[data-theme="warm"]', stylesheet)
+
+    def test_detail_navigation_and_mobile_back_to_top_preserve_context(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(
+            os.path.join(project_root, "frontend", "src", "discovery.ts"),
+            encoding="utf-8",
+        ) as file:
+            discovery_typescript = file.read()
+        with open(
+            os.path.join(project_root, "frontend", "src", "style.css"),
+            encoding="utf-8",
+        ) as file:
+            stylesheet = file.read()
+
+        self.assertIn(
+            'const currentNavigationView = id === "detail" ? detailOrigin.view : id;',
+            discovery_typescript,
+        )
+        self.assertIn(
+            "const isCurrent = button.dataset.view === currentNavigationView;",
+            discovery_typescript,
+        )
+        self.assertIn(
+            "#back-to-top { right: 16px; width: 44px; height: 44px; padding: 0; }",
+            stylesheet,
+        )
+
+    def test_recommendation_source_badges_stay_inside_mobile_cards(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(
+            os.path.join(project_root, "frontend", "src", "style.css"),
+            encoding="utf-8",
+        ) as file:
+            stylesheet = file.read()
+
+        self.assertIn(
+            "max-width: calc(100% - 16px)",
+            stylesheet,
+        )
+        self.assertNotIn(
+            ".recommendation-source { display: flex; position: absolute; "
+            "top: 8px; left: 8px; align-items: center; max-width: 136px;",
+            stylesheet,
+        )
 
     def test_invitation_copy_supports_http_lan_hosts(self):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -978,6 +1050,8 @@ class DeploymentConfigTests(unittest.TestCase):
             'showDetail("release-group", result.id)',
             discovery_typescript,
         )
+        self.assertIn("const batchSize =", discovery_typescript)
+        self.assertIn("deferredTasteRows", discovery_typescript)
 
     def test_brand_navigation_stays_inside_the_loaded_application(self):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1001,7 +1075,10 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn('<link rel="apple-touch-icon" href="/icons/melodarr-180.png">', frontend)
         self.assertIn('<link rel="manifest" href="/static/site.webmanifest">', frontend)
         self.assertIn('<a class="brand" href="/" aria-label="Melodarr home">', frontend)
-        self.assertIn('<img src="/icons/melodarr.svg" alt="">', frontend)
+        self.assertIn(
+            '<img src="/icons/melodarr.svg" alt="" width="32" height="32">',
+            frontend,
+        )
         self.assertIn('$(".brand").addEventListener("click"', app_typescript)
         self.assertIn('showView("discover")', app_typescript)
         self.assertIn('new Event("melodarr-home")', app_typescript)
@@ -1139,7 +1216,7 @@ class DeploymentConfigTests(unittest.TestCase):
         # detail/account views have none, so this must not use the strict
         # single-element helper that throws when a selector matches nothing.
         self.assertIn(
-            'document.querySelectorAll<HTMLElement>(`[data-view="${view}"]`)',
+            'document.querySelectorAll<HTMLElement>("[data-view]")',
             typescript,
         )
         self.assertNotIn('$(`[data-view=${view}]`)', typescript)
@@ -1153,16 +1230,17 @@ class DeploymentConfigTests(unittest.TestCase):
             frontend = file.read()
 
         self.assertIn(
-            '<button class="nav-link" data-view="library">Your library</button>',
+            '<button class="nav-link" type="button" '
+            'data-view="library">Your library</button>',
             frontend,
         )
         self.assertIn(
-            '<button class="nav-link" data-view="library">'
+            '<button class="nav-link" type="button" data-view="library">'
             '<span class="tab-icon" aria-hidden="true">▤</span>Library</button>',
             frontend,
         )
         self.assertNotIn(
-            'class="nav-link admin-only" data-view="library"',
+            'class="nav-link admin-only" type="button" data-view="library"',
             frontend,
         )
 

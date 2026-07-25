@@ -33,6 +33,7 @@ interface AppElement extends HTMLElement {
 type AccountPage = "profile" | "general" | "linked-accounts" | "invitations";
 type AppView = "discover" | "detail" | "library" | "settings" | "account";
 type SettingsPage = "services" | "jobs";
+type ThemeName = "midnight" | "warm";
 
 interface CurrentUser {
   username: string;
@@ -91,6 +92,7 @@ let showAccountPage: ((page?: AccountPage, updateHistory?: boolean) => void) | u
 let invitationToken = "";
 let maintenanceRefreshTimer: number | undefined;
 let maintenanceRefreshInFlight = false;
+let discoveryLoad: Promise<void> | undefined;
 // Plex holdings tell a requester what is already available, so the library is
 // readable by every account. Settings remains administrator-only.
 const VIEWS_FOR_EVERY_USER = ["discover", "detail", "library", "account"];
@@ -151,6 +153,58 @@ function setupStandalonePullToRefresh() {
 function setMessage(element: Element, message: string, isError = false) {
   element.textContent = message;
   element.className = `message${isError ? " error" : ""}`;
+}
+
+function setupTheme() {
+  const button = $<HTMLButtonElement>("#theme-toggle");
+  const icon = requiredDescendant<HTMLElement>(button, ".theme-icon");
+  const label = requiredDescendant<HTMLElement>(button, ".theme-label");
+  const storageKey = "melodarr-theme";
+
+  const applyTheme = (theme: ThemeName, persist = false) => {
+    const nextTheme: ThemeName = theme === "midnight" ? "warm" : "midnight";
+    document.documentElement.dataset.theme = theme;
+    icon.textContent = theme === "midnight" ? "☾" : "☀";
+    label.textContent = theme === "midnight" ? "Midnight" : "Warm";
+    button.setAttribute("aria-label", `Switch to ${nextTheme === "midnight" ? "Midnight" : "Warm"} theme`);
+    button.title = `Switch to ${nextTheme === "midnight" ? "Midnight" : "Warm"} theme`;
+    document.querySelector('meta[name="theme-color"]')?.setAttribute(
+      "content",
+      theme === "midnight" ? "#050506" : "#f6f0e7",
+    );
+    if (persist) {
+      try {
+        window.localStorage.setItem(storageKey, theme);
+      } catch {
+        // The selected theme still applies for this page when storage is
+        // unavailable in a strict privacy mode.
+      }
+    }
+  };
+
+  applyTheme(document.documentElement.dataset.theme === "warm" ? "warm" : "midnight");
+  button.addEventListener("click", () => {
+    applyTheme(
+      document.documentElement.dataset.theme === "midnight" ? "warm" : "midnight",
+      true,
+    );
+  });
+}
+
+function loadDiscovery() {
+  if (discoveryLoad) return discoveryLoad;
+  discoveryLoad = new Promise<void>((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = document.body.dataset.discoverySrc || "/static/discovery.js";
+    script.async = true;
+    script.addEventListener("load", () => resolve(), { once: true });
+    script.addEventListener("error", () => {
+      discoveryLoad = undefined;
+      reject(new Error("We couldn’t finish loading the music browser. Please refresh and try again."));
+    }, { once: true });
+    document.body.append(script);
+  });
+  return discoveryLoad;
 }
 
 async function copyInputValue(input: HTMLInputElement) {
@@ -218,13 +272,13 @@ async function api<T = JsonObject>(url: string, options: RequestInit = {}): Prom
     body = (responseText ? JSON.parse(responseText) : {}) as T & { error?: string };
   } catch {
     const message = response.ok
-      ? "The server returned an invalid response."
-      : `Request failed with status ${response.status}.`;
+      ? "We received an unexpected response. Please try again."
+      : "We couldn’t complete that request. Please try again.";
     throw new Error(message);
   }
 
   if (!response.ok) {
-    throw new Error(body.error || "Request failed.");
+    throw new Error(body.error || "We couldn’t complete that request. Please try again.");
   }
   return body;
 }
@@ -447,9 +501,13 @@ function setupNavigation() {
     if (!currentUser || (currentUser.role !== "admin" && !VIEWS_FOR_EVERY_USER.includes(view))) view = "discover";
     document.querySelectorAll(".nav-link, .view").forEach((element) => element.classList.remove("active"));
     // Account and detail are application views without a matching nav button,
-    // and the header and bottom tab bar both carry a button per view, so this
-    // marks every match rather than using the strict single-element helper.
-    document.querySelectorAll<HTMLElement>(`[data-view="${view}"]`).forEach((button) => button.classList.add("active"));
+    // and the header and bottom tab bar both carry a button per view.
+    document.querySelectorAll<HTMLElement>("[data-view]").forEach((button) => {
+      const isCurrent = button.dataset.view === view;
+      button.classList.toggle("active", isCurrent);
+      if (isCurrent) button.setAttribute("aria-current", "page");
+      else button.removeAttribute("aria-current");
+    });
     $(`#${view}`).classList.add("active");
     if (view === "library") {
       window.dispatchEvent(new Event("melodarr-library-visible"));
@@ -726,7 +784,7 @@ function setupNavigation() {
   document.querySelector("#refresh-maintenance")?.addEventListener("click", () => refreshMaintenance());
 }
 
-function applyCurrentUser(user: CurrentUser) {
+async function applyCurrentUser(user: CurrentUser) {
   currentUser = user;
   document.body.classList.add("authenticated");
   const isAdmin = user.role === "admin";
@@ -738,10 +796,15 @@ function applyCurrentUser(user: CurrentUser) {
   accountMenu.textContent = user.username.slice(0, 1).toUpperCase();
   accountMenu.href = `/${encodeURIComponent(user.username)}`;
   accountMenu.setAttribute("aria-label", `Open settings for ${user.username}`);
-  window.dispatchEvent(new Event("melodarr-authenticated"));
-  // Re-evaluate a bookmarked view or detail route only after its API calls
-  // have an authenticated session.
-  window.dispatchEvent(new PopStateEvent("popstate"));
+  try {
+    await loadDiscovery();
+    window.dispatchEvent(new Event("melodarr-authenticated"));
+    // Re-evaluate a bookmarked view or detail route only after its API calls
+    // have an authenticated session and the lazy discovery route is ready.
+    window.dispatchEvent(new PopStateEvent("popstate"));
+  } catch (error) {
+    showToast(error.message, true);
+  }
 }
 
 async function showAuth({ resetPath = false } = {}) {
@@ -800,7 +863,7 @@ async function completeAuthentication(endpoint: string, form: HTMLFormElement, m
       // soon as it has been consumed.
       window.history.replaceState({ view: "discover" }, "", "/");
     }
-    applyCurrentUser(user);
+    await applyCurrentUser(user);
     form.reset();
     if (user.role === "admin") await refreshSettings(window.location.pathname.startsWith("/settings"));
   } catch (error) {
@@ -837,6 +900,7 @@ async function signOut() {
   try {
     await api("/api/auth/logout", { method: "POST" });
   } finally {
+    window.dispatchEvent(new Event("melodarr-signed-out"));
     showAuth({ resetPath: true });
   }
 }
@@ -1187,6 +1251,7 @@ function setupLibrary() {
     }
     loadButton.disabled = true;
     loadButton.textContent = "Loading…";
+    results.setAttribute("aria-busy", "true");
     artworkObserver?.disconnect();
     deferredArtwork.clear();
     artworkQueue.length = 0;
@@ -1219,8 +1284,9 @@ function setupLibrary() {
       results.replaceChildren();
       loadState = "error";
       loadButton.textContent = "Retry";
-      setMessage($("#library-message"), error.message, true);
+      setMessage($("#library-message"), `We couldn’t load your Plex library. ${error.message}`, true);
     } finally {
+      results.removeAttribute("aria-busy");
       loadButton.disabled = false;
       if (loadState === "loaded") loadButton.textContent = "Reload";
     }
@@ -1230,6 +1296,7 @@ function setupLibrary() {
   window.addEventListener("melodarr-library-visible", () => loadLibrary());
 }
 
+setupTheme();
 setupNavigation();
 setupStandalonePullToRefresh();
 setupLidarrSettings();
@@ -1242,7 +1309,7 @@ api<CurrentUser>("/api/auth/me")
     if (["/setup", "/register"].includes(window.location.pathname)) {
       window.history.replaceState({ view: "discover" }, "", "/");
     }
-    applyCurrentUser(user);
+    await applyCurrentUser(user);
     if (user.role === "admin") await refreshSettings(window.location.pathname === "/settings");
   })
   .catch(() => showAuth());

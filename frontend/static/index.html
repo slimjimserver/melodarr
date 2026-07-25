@@ -8,21 +8,27 @@
   <link rel="icon" href="/icons/melodarr.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="/icons/melodarr-180.png">
   <link rel="manifest" href="/static/site.webmanifest">
+  <script src="/static/theme.js"></script>
   <link rel="stylesheet" href="/static/style.css">
 </head>
-<body>
+<body data-discovery-src="/static/discovery.js">
+  <a class="skip-link" href="#main-content">Skip to main content</a>
   <div id="pull-to-refresh" class="pull-to-refresh" aria-live="polite" aria-label="Pull down to refresh">↓</div>
   <header>
     <a class="brand" href="/" aria-label="Melodarr home">
-      <img src="/icons/melodarr.svg" alt="">
+      <img src="/icons/melodarr.svg" alt="" width="32" height="32">
       <span>melodarr</span>
     </a>
     <nav class="header-nav">
-      <button class="nav-link active" data-view="discover">Discover</button>
-      <button class="nav-link" data-view="library">Your library</button>
-      <button class="nav-link admin-only" data-view="settings">Settings</button>
+      <button class="nav-link active" type="button" data-view="discover" aria-current="page">Discover</button>
+      <button class="nav-link" type="button" data-view="library">Your library</button>
+      <button class="nav-link admin-only" type="button" data-view="settings">Settings</button>
     </nav>
-    <div id="status" class="status">Checking services…</div>
+    <div id="status" class="status" role="status" aria-live="polite">Checking services…</div>
+    <button id="theme-toggle" class="theme-toggle" type="button">
+      <span class="theme-icon" aria-hidden="true">☾</span>
+      <span class="theme-label">Midnight</span>
+    </button>
     <a id="account-menu" class="account-menu" href="/" aria-label="Open account settings" title="Account settings">●</a>
     <button id="logout" class="logout" type="button">Sign out</button>
   </header>
@@ -31,30 +37,30 @@
     <div class="auth-card">
       <p class="eyebrow">MELODARR</p>
       <h1 id="auth-title">Music, for<br><em>your people.</em></h1>
-      <p id="auth-intro" class="intro">Checking account access…</p>
+      <p id="auth-intro" class="intro">Getting your music space ready…</p>
       <form id="login-form" class="auth-form" hidden>
         <h2>Sign in</h2>
         <label>Username<input name="username" autocomplete="username" required></label>
         <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
         <label class="checkbox auth-checkbox"><input name="remember" type="checkbox"> Remember me for 30 days</label>
         <button>Sign in</button>
-        <p class="form-message"></p>
+        <p class="form-message" aria-live="polite"></p>
       </form>
       <form id="register-form" class="auth-form" hidden>
         <h2 id="register-title">Create owner account</h2>
         <label>Username<input name="username" autocomplete="username" minlength="3" maxlength="32" required></label>
         <label>Password<input name="password" type="password" autocomplete="new-password" minlength="12" required></label>
         <button>Create account</button>
-        <p class="form-message"></p>
+        <p class="form-message" aria-live="polite"></p>
       </form>
     </div>
   </section>
 
-  <main>
+  <main id="main-content" tabindex="-1">
     <section id="discover" class="view active">
-      <p class="eyebrow">YOUR MUSIC, ON REQUEST</p>
+      <p class="eyebrow">FIND YOUR NEXT FAVORITE</p>
       <h1>What do you want<br>to hear <em>next?</em></h1>
-      <p class="intro">Find an artist and send them straight to your music collection.</p>
+      <p class="intro">Search for an artist, album, or track and we’ll help add it to your collection.</p>
       <form id="search-form" class="search">
         <select id="search-type" aria-label="Search type">
           <option value="artist">Artists</option>
@@ -62,17 +68,17 @@
           <option value="track">Tracks</option>
         </select>
         <input id="search-input" autocomplete="off" placeholder="Search artists…" aria-label="Search">
-        <button>Search</button>
+        <button type="submit">Search</button>
       </form>
-      <p id="search-message" class="message"></p>
-      <div id="results" class="results"></div>
+      <p id="search-message" class="message" aria-live="polite" aria-atomic="true"></p>
+      <div id="results" class="results" aria-label="Search results"></div>
       <section class="recommendations" aria-labelledby="recommendations-title">
         <div class="recommendations-heading">
           <div><p class="eyebrow">LINKED ACCOUNTS</p><h2 id="recommendations-title">Recommended for you</h2></div>
           <button id="load-recommendations" class="outline" type="button">Get recommendations</button>
         </div>
-        <p id="recommendations-message" class="message">Add a ListenBrainz or Last.fm account in Linked accounts to discover recommendations based on your listening history.</p>
-        <div id="recommendation-results"></div>
+        <p id="recommendations-message" class="message" aria-live="polite">Connect ListenBrainz or Last.fm in Linked accounts and we’ll shape recommendations around what you love.</p>
+        <div id="recommendation-results" aria-label="Music recommendations"></div>
       </section>
     </section>
 
@@ -84,9 +90,9 @@
           <h1 id="detail-title"></h1>
           <p id="detail-subtitle" class="intro"></p>
         </div>
-        <div id="detail-cover" class="detail-cover" hidden><img id="detail-cover-image" alt=""></div>
+        <div id="detail-cover" class="detail-cover" hidden><img id="detail-cover-image" width="280" height="280" decoding="async" alt=""></div>
       </div>
-      <p id="detail-message" class="message"></p>
+      <p id="detail-message" class="message" aria-live="polite"></p>
       <div id="detail-results" class="results"></div>
     </section>
 
@@ -102,7 +108,7 @@
         <input id="library-search" type="search" placeholder="Search your Plex artists…" autocomplete="off">
         <span id="library-filter-count" aria-live="polite"></span>
       </div>
-      <p id="library-message" class="message"></p>
+      <p id="library-message" class="message" aria-live="polite"></p>
       <div id="library-results" class="library-results"></div>
     </section>
 
@@ -119,7 +125,7 @@
 
       <div id="settings-services" class="settings-stack settings-panel">
         <section class="settings-section">
-          <div class="service-intro"><img class="service-icon" src="/icons/plex.svg" alt="Plex"><div><h2>Plex library</h2><p>Detect artists you already own and open them directly in Plex.</p></div><span id="plex-state" class="service-state">Not connected</span></div>
+          <div class="service-intro"><img class="service-icon" src="/icons/plex.svg" width="42" height="42" loading="lazy" decoding="async" alt="Plex"><div><h2>Plex library</h2><p>Detect artists you already own and open them directly in Plex.</p></div><span id="plex-state" class="service-state">Not connected</span></div>
           <form id="plex-settings" class="service-card">
             <div class="settings-fields">
               <label>Plex address<input name="url" placeholder="http://plex:32400" required></label>
@@ -140,7 +146,7 @@
         </section>
 
         <section class="settings-section">
-          <div class="service-intro"><img class="service-icon" src="/icons/lidarr.svg" alt="Lidarr"><div><h2>Lidarr</h2><p>Where approved artist requests are added and monitored.</p></div><span id="lidarr-state" class="service-state">Not connected</span></div>
+          <div class="service-intro"><img class="service-icon" src="/icons/lidarr.svg" width="42" height="42" loading="lazy" decoding="async" alt="Lidarr"><div><h2>Lidarr</h2><p>Where approved artist requests are added and monitored.</p></div><span id="lidarr-state" class="service-state">Not connected</span></div>
           <form id="lidarr-settings" class="service-card lidarr-card">
           <div class="settings-fields">
             <label>Hostname or IP Address<input name="hostname" placeholder="lidarr" required></label>
@@ -242,13 +248,12 @@
     </form>
   </dialog>
   <nav class="tab-bar" aria-label="Primary">
-    <button class="nav-link active" data-view="discover"><span class="tab-icon" aria-hidden="true">◎</span>Discover</button>
-    <button class="nav-link" data-view="library"><span class="tab-icon" aria-hidden="true">▤</span>Library</button>
-    <button class="nav-link admin-only" data-view="settings"><span class="tab-icon" aria-hidden="true">⚙</span>Settings</button>
+    <button class="nav-link active" type="button" data-view="discover" aria-current="page"><span class="tab-icon" aria-hidden="true">◎</span>Discover</button>
+    <button class="nav-link" type="button" data-view="library"><span class="tab-icon" aria-hidden="true">▤</span>Library</button>
+    <button class="nav-link admin-only" type="button" data-view="settings"><span class="tab-icon" aria-hidden="true">⚙</span>Settings</button>
   </nav>
   <div id="toasts" class="toasts" aria-live="polite" aria-atomic="false"></div>
   <button id="back-to-top" type="button" aria-label="Back to top">↑ <span>Top</span></button>
   <script src="/static/app.js"></script>
-  <script src="/static/discovery.js"></script>
 </body>
 </html>

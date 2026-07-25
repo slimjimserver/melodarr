@@ -17,7 +17,7 @@ else:  # Support the existing `python backend/app.py` entry point.
 blueprint = Blueprint("pages", __name__)
 
 STATIC_ROOT = os.path.join(FRONTEND_ROOT, "static")
-FINGERPRINTED_ASSETS = ("app.js", "discovery.js", "style.css")
+FINGERPRINTED_ASSETS = ("theme.js", "app.js", "discovery.js", "style.css")
 _document_cache = {}
 
 

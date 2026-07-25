@@ -153,7 +153,7 @@
         throw error;
       }
       const body = await response.json() as JsonObject;
-      if (!response.ok) throw new Error(body.error || "MusicBrainz request failed.");
+      if (!response.ok) throw new Error(body.error || "MusicBrainz couldn’t complete that request just now.");
       return body;
     } finally {
       clearTimeout(timeout);
@@ -196,10 +196,13 @@
     if (id !== "detail") stopArtistRevalidation();
     document.querySelectorAll(".view, .nav-link").forEach((element) => element.classList.remove("active"));
     $(`#${id}`).classList.add("active");
-    if (id !== "detail") {
-      document.querySelectorAll<HTMLElement>(`[data-view="${id}"]`)
-        .forEach((button) => button.classList.add("active"));
-    }
+    const currentNavigationView = id === "detail" ? detailOrigin.view : id;
+    document.querySelectorAll<HTMLElement>("[data-view]").forEach((button) => {
+      const isCurrent = button.dataset.view === currentNavigationView;
+      button.classList.toggle("active", isCurrent);
+      if (isCurrent) button.setAttribute("aria-current", "page");
+      else button.removeAttribute("aria-current");
+    });
     resetPageScroll();
   }
 
@@ -228,9 +231,18 @@
     const text = document.createElement("p");
     text.textContent = description;
     info.append(heading, text);
-    card.append(artwork, info);
-    if (onClick) card.addEventListener("click", onClick);
-    if (detailKind && detailId) addDetailPrefetch(card, detailKind, detailId);
+    if (onClick) {
+      const openButton = document.createElement("button");
+      openButton.className = "card-open";
+      openButton.type = "button";
+      openButton.setAttribute("aria-label", `Open details for ${title}`);
+      openButton.append(artwork, info);
+      openButton.addEventListener("click", onClick);
+      if (detailKind && detailId) addDetailPrefetch(openButton, detailKind, detailId);
+      card.append(openButton);
+    } else {
+      card.append(artwork, info);
+    }
     return card;
   }
 
@@ -520,7 +532,9 @@
       ? `← Back to ${previous.kind === "artist" ? "artist" : previous.kind === "release-group" ? "album" : "release"}`
       : detailOrigin.view === "library" ? "← Back to library" : "← Back to search";
     showView("detail");
-    $("#detail-results").replaceChildren(skeletonBlock("skeleton-card", kind === "release" ? 6 : 4));
+    const detailResults = $("#detail-results");
+    detailResults.setAttribute("aria-busy", "true");
+    detailResults.replaceChildren(skeletonBlock("skeleton-card", kind === "release" ? 6 : 4));
     $("#detail-title").textContent = "";
     $("#detail-eyebrow").textContent = "";
     $("#detail-subtitle").textContent = "";
@@ -543,14 +557,19 @@
       .catch((error) => {
         if (currentDetail?.kind !== kind || currentDetail?.id !== id) return;
         $("#detail-message").textContent = error.name === "AbortError"
-          ? "MusicBrainz took too long to respond."
-          : `Could not load this page: ${error.message}`;
+          ? "MusicBrainz is taking a little longer than usual. Please try again in a moment."
+          : `We couldn’t load this page just now. ${error.message}`;
         const retry = document.createElement("button");
         retry.className = "outline";
         retry.type = "button";
         retry.textContent = kind === "artist" ? "Retry discography" : "Retry";
         retry.addEventListener("click", () => showDetail(kind, id, false, false));
-        $("#detail-results").replaceChildren(retry);
+        detailResults.replaceChildren(retry);
+      })
+      .finally(() => {
+        if (currentDetail?.kind === kind && currentDetail?.id === id) {
+          detailResults.removeAttribute("aria-busy");
+        }
       });
   }
 
@@ -568,6 +587,9 @@
     const image = document.createElement("img");
     image.src = icon;
     image.alt = "";
+    image.width = 24;
+    image.height = 24;
+    image.decoding = "async";
     link.append(image);
     return link;
   }
@@ -727,8 +749,6 @@
   function createRecommendationCarouselCard(item: JsonObject, kind: "artist" | "release-group") {
     const card = document.createElement("article");
     card.className = "recommendation-card";
-    card.tabIndex = 0;
-    card.setAttribute("role", "link");
     const fallback = document.createElement("div");
     fallback.className = "recommendation-art recommendation-fallback";
     let artwork: HTMLElement = fallback;
@@ -760,6 +780,8 @@
       const icon = document.createElement("img");
       icon.src = iconPath;
       icon.alt = alt;
+      icon.width = 13;
+      icon.height = 13;
       source.append(icon);
     });
     const sourceLabel = document.createElement("span");
@@ -774,10 +796,14 @@
     subtitle.textContent = kind === "artist" ? (item.type || "Artist") : [item.artist, item.type].filter(Boolean).join(" · ");
     info.append(title, subtitle);
     const open = () => showDetail(kind === "artist" ? "artist" : "release-group", item.id);
-    addDetailPrefetch(card, kind === "artist" ? "artist" : "release-group", item.id);
-    card.addEventListener("click", open);
-    card.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); open(); } });
-    card.append(artwork, source, info);
+    const openButton = document.createElement("button");
+    openButton.className = "recommendation-open";
+    openButton.type = "button";
+    openButton.setAttribute("aria-label", `Open details for ${item.name}`);
+    openButton.append(artwork, source, info);
+    openButton.addEventListener("click", open);
+    addDetailPrefetch(openButton, kind === "artist" ? "artist" : "release-group", item.id);
+    card.append(openButton);
     const requestButton = document.createElement("button");
     requestButton.className = "recommendation-request";
     requestButton.type = "button";
@@ -796,8 +822,58 @@
     group.className = "recommendation-row";
     const heading = document.createElement("h3"); heading.textContent = title;
     const carousel = document.createElement("div"); carousel.className = "recommendation-carousel";
-    items.forEach((item) => carousel.append(createRecommendationCarouselCard(item, kind)));
     group.append(heading, carousel);
+    const batchSize = window.matchMedia("(max-width: 700px)").matches ? 6 : 8;
+    let rendered = 0;
+    const more = document.createElement("button");
+    more.className = "outline recommendation-more";
+    more.type = "button";
+
+    const renderMore = () => {
+      const end = Math.min(rendered + batchSize, items.length);
+      const fragment = document.createDocumentFragment();
+      for (let index = rendered; index < end; index += 1) {
+        fragment.append(createRecommendationCarouselCard(items[index], kind));
+      }
+      carousel.append(fragment);
+      rendered = end;
+      if (rendered >= items.length) {
+        more.remove();
+      } else {
+        more.textContent = `Show ${Math.min(batchSize, items.length - rendered)} more`;
+        more.setAttribute("aria-label", `Show more from ${title}`);
+      }
+    };
+
+    more.addEventListener("click", renderMore);
+    renderMore();
+    if (rendered < items.length) group.append(more);
+    return group;
+  }
+
+  function deferredTasteRows(rows: JsonObject[]) {
+    const group = document.createElement("section");
+    group.className = "recommendation-later";
+    const copy = document.createElement("p");
+    copy.textContent = `${rows.length} more ${rows.length === 1 ? "shelf is" : "shelves are"} ready from your listening tastes.`;
+    const reveal = document.createElement("button");
+    reveal.className = "outline";
+    reveal.type = "button";
+    reveal.textContent = "Show more recommendations";
+    reveal.addEventListener("click", () => {
+      const fragment = document.createDocumentFragment();
+      rows.forEach((row) => fragment.append(
+        recommendationRow(`More for your ${row.tag} taste`, row.albums, "release-group"),
+      ));
+      group.className = "recommendation-expanded";
+      group.replaceChildren(fragment);
+      const firstHeading = group.querySelector<HTMLElement>("h3");
+      if (firstHeading) {
+        firstHeading.tabIndex = -1;
+        firstHeading.focus();
+      }
+    }, { once: true });
+    group.append(copy, reveal);
     return group;
   }
 
@@ -1193,14 +1269,15 @@
       searchAbort = undefined;
       $("#search-form").classList.remove("searching");
       results.replaceChildren();
-      $("#search-message").textContent = query ? "Enter at least two characters." : "";
+      $("#search-message").textContent = query ? "Type at least two characters so we can find a good match." : "";
       return;
     }
 
     const controller = new AbortController();
     searchAbort = controller;
-    $("#search-message").textContent = "Searching MusicBrainz…";
+    $("#search-message").textContent = "Looking through MusicBrainz…";
     $("#search-form").classList.add("searching");
+    results.setAttribute("aria-busy", "true");
     results.replaceChildren(skeletonBlock("skeleton-card", 5));
     try {
       const data = await getJson(
@@ -1212,7 +1289,7 @@
       results.replaceChildren();
       $("#search-message").textContent = data.results.length
         ? searchResultMessage(type, data.results.length)
-        : "No results found.";
+        : "We couldn’t find a match. Try a different spelling or search type.";
       data.results.forEach((result: JsonObject) => {
         const description = type === "artist"
           ? [result.type, result.country, result.disambiguation].filter(Boolean).join(" · ")
@@ -1234,12 +1311,13 @@
       if (requestVersion !== searchRequestVersion) return;
       results.replaceChildren();
       $("#search-message").textContent = error.name === "AbortError"
-        ? "MusicBrainz took too long to respond."
-        : error.message;
+        ? "MusicBrainz is taking a little longer than usual. Please try again in a moment."
+        : `We couldn’t finish that search. ${error.message}`;
     } finally {
       if (requestVersion === searchRequestVersion) {
         searchAbort = undefined;
         $("#search-form").classList.remove("searching");
+        results.removeAttribute("aria-busy");
       }
     }
   }
@@ -1267,11 +1345,12 @@
     const message = $("#recommendations-message");
     const results = $("#recommendation-results");
     button.disabled = true;
+    results.setAttribute("aria-busy", "true");
     const placeholder = document.createElement("div");
     placeholder.className = "recommendation-carousel";
     placeholder.append(skeletonBlock("skeleton-art", 8));
     results.replaceChildren(placeholder);
-    message.textContent = "Loading cached recommendations…";
+    message.textContent = "Gathering a few recommendations for you…";
     try {
       const data = await getJson("/api/discover", 30_000, controller.signal);
       if (requestVersion !== recommendationRequestVersion) return;
@@ -1297,18 +1376,22 @@
       if (otherReleases.length) results.append(recommendationRow("Albums", otherReleases, "release-group"));
       if (singles.length) results.append(recommendationRow("Singles", singles, "release-group"));
       if (data.chartArtists?.length) results.append(recommendationRow("Popular on Last.fm", data.chartArtists, "artist"));
-      (data.tagRows || []).forEach((row: JsonObject) => results.append(recommendationRow(`More for your ${row.tag} taste`, row.albums, "release-group")));
-      if (!artists.length && !albums.length && !data.chartArtists?.length && !(data.tagRows || []).length && !unavailableProviders.length) message.textContent = "No MusicBrainz-linked recommendations were found in the latest scan.";
+      const tagRows = (data.tagRows || []).filter((row: JsonObject) => row.albums?.length);
+      if (tagRows.length) results.append(deferredTasteRows(tagRows));
+      if (!artists.length && !albums.length && !data.chartArtists?.length && !tagRows.length && !unavailableProviders.length) {
+        message.textContent = "We don’t have a recommendation match yet. A little more listening history will help.";
+      }
     } catch (error) {
       if (requestVersion !== recommendationRequestVersion) return;
       results.replaceChildren();
       message.textContent = error.name === "AbortError"
-        ? "Recommendations took too long to load."
-        : error.message;
+        ? "Recommendations are taking a little longer than usual. Please try again in a moment."
+        : `We couldn’t load recommendations just now. ${error.message}`;
     } finally {
       if (requestVersion === recommendationRequestVersion) {
         recommendationAbort = undefined;
         button.disabled = false;
+        results.removeAttribute("aria-busy");
       }
     }
   }
@@ -1322,6 +1405,16 @@
     lidarrExternalUrlVersion += 1;
     lidarrExternalUrl = undefined;
     lidarrExternalUrlRequest = undefined;
+  });
+  window.addEventListener("melodarr-signed-out", () => {
+    recommendationRequestVersion += 1;
+    searchRequestVersion += 1;
+    recommendationAbort?.abort();
+    searchAbort?.abort();
+    clearTimeout(recommendationPoll);
+    clearTimeout(searchDebounce);
+    $("#recommendation-results").replaceChildren();
+    $("#results").replaceChildren();
   });
 
   $("#back-to-search").addEventListener("click", () => {

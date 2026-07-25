@@ -15,7 +15,7 @@ const compressibleExtensions = new Set([
 ]);
 
 await build({
-  entryPoints: ["src/app.ts", "src/discovery.ts"],
+  entryPoints: ["src/theme.ts", "src/app.ts", "src/discovery.ts", "src/style.css"],
   outdir: staticDirectory,
   bundle: false,
   legalComments: "none",

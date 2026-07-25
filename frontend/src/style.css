@@ -152,7 +152,7 @@ h1 em { font-style: normal; }
 .recommendation-open:focus-visible .recommendation-art { border-color: var(--accent-bright); box-shadow: 0 10px 25px rgba(68, 50, 38, .16), 0 0 0 2px rgba(168, 68, 45, .18); transform: translateY(-2px); }
 .recommendation-art { display: block; width: 154px; aspect-ratio: 1; border: 1px solid var(--border); border-radius: 12px; background: var(--background-elevated); object-fit: cover; transition: transform .2s var(--ease-out), border-color .2s var(--ease-out), box-shadow .2s var(--ease-out); }
 .recommendation-fallback { background: linear-gradient(135deg, #7f89ed, #252951 62%, #be6a9b); }
-.recommendation-source { display: flex; position: absolute; top: 8px; left: 8px; align-items: center; max-width: 136px; overflow: hidden; border: 1px solid rgba(255, 255, 255, .32); border-radius: 999px; background: rgba(55, 45, 39, .88); color: #fffaf4; padding: 3px 6px; white-space: nowrap; gap: 4px; font-size: 10px; font-weight: 700; }
+.recommendation-source { display: flex; position: absolute; top: 8px; left: 8px; align-items: center; max-width: calc(100% - 16px); overflow: hidden; border: 1px solid rgba(255, 255, 255, .32); border-radius: 999px; background: rgba(55, 45, 39, .88); color: #fffaf4; padding: 3px 6px; white-space: nowrap; gap: 4px; font-size: 10px; font-weight: 700; }
 .recommendation-source > img { width: 13px; height: 13px; flex: none; object-fit: contain; }
 .recommendation-source-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .recommendation-info { display: grid; gap: 3px; min-width: 0; }
