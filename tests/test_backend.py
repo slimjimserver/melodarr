@@ -997,6 +997,28 @@ class DeploymentConfigTests(unittest.TestCase):
             stylesheet,
         )
 
+    def test_mobile_logout_remains_visible_and_accessible(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(
+            os.path.join(project_root, "frontend", "static", "index.html"),
+            encoding="utf-8",
+        ) as file:
+            frontend = file.read()
+        with open(
+            os.path.join(project_root, "frontend", "src", "style.css"),
+            encoding="utf-8",
+        ) as file:
+            stylesheet = file.read()
+
+        self.assertIn('class="logout-icon"', frontend)
+        self.assertIn('<span class="logout-label">Sign out</span>', frontend)
+        self.assertIn(
+            ".logout { display: grid; flex: 0 0 44px; width: 44px; "
+            "height: 44px; place-items: center; padding: 0; }",
+            stylesheet,
+        )
+        self.assertNotIn(".logout { display: none; }", stylesheet)
+
     def test_invitation_copy_supports_http_lan_hosts(self):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with open(

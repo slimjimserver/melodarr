@@ -79,6 +79,7 @@ nav { display: flex; height: 100%; gap: 8px; }
   font-size: 12px; font-weight: 600;
 }
 .logout:hover, .outline:hover, .secondary-action:hover, .account-menu:hover { border-color: var(--border-hover); background: var(--surface-hover); color: var(--foreground); transform: translateY(-1px); }
+.logout-icon { display: none; width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 .account-menu { display: grid; flex: 0 0 44px; width: 44px; height: 44px; place-items: center; border-radius: 50%; padding: 0; color: var(--accent-bright); font-size: 13px; text-decoration: none; }
 
 /* Bottom tab bar — mobile only, shown by the narrow-viewport block below. */
@@ -503,7 +504,9 @@ button,
   }
   .brand { font-size: 19px; }
   .brand img { width: 36px; height: 36px; }
-  .logout { display: none; }
+  .logout { display: grid; flex: 0 0 44px; width: 44px; height: 44px; place-items: center; padding: 0; }
+  .logout-icon { display: block; }
+  .logout-label { position: absolute; width: 1px; height: 1px; overflow: hidden; margin: -1px; clip: rect(0 0 0 0); white-space: nowrap; }
   .account-menu { width: 44px; height: 44px; flex-basis: 44px; }
 
   .tab-bar {
