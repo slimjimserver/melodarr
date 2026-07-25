@@ -66,6 +66,96 @@ def _plex_release_summary(item):
     }
 
 
+def _availability_settled(*, available_in_lidarr, available_in_plex):
+    """Stop polling after every configured library has observed the item."""
+    expected = []
+    if get_service("lidarr"):
+        expected.append(bool(available_in_lidarr))
+    if get_service("plex"):
+        expected.append(bool(available_in_plex))
+    return all(expected) if expected else True
+
+
+def _availability_response(payload):
+    response = jsonify(payload)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@blueprint.get("/api/music/artist/<mbid>/availability")
+@login_required
+def artist_availability(mbid):
+    """Return live artist ownership without rebuilding MusicBrainz detail."""
+    plex_artist = _plex_artist(mbid)
+    lidarr_artist = lidarr.cached_artist_availability().get(mbid)
+    available_in_plex = bool(plex_artist)
+    available_in_lidarr = bool(lidarr_artist)
+    release_group_ids = list(dict.fromkeys(
+        value.strip()
+        for value in request.args.getlist("releaseGroup")
+        if value.strip()
+    ))[:50]
+    plex_groups = (
+        _plex_release_group_inventory() if release_group_ids else {}
+    )
+    lidarr_groups = (
+        lidarr.cached_library_availability() if release_group_ids else {}
+    )
+    return _availability_response({
+        "id": mbid,
+        "availableInPlex": available_in_plex,
+        "availableInLidarr": available_in_lidarr,
+        "plexUrl": plex_artist.get("url", "") if plex_artist else "",
+        "plexampUrl": plex_artist.get("plexampUrl", "") if plex_artist else "",
+        "releaseGroups": {
+            release_group_id: {
+                "availableInPlex": release_group_id in plex_groups,
+                "availableInLidarr": release_group_id in lidarr_groups,
+                "fullyAvailableInLidarr": bool(
+                    lidarr_groups.get(release_group_id, {}).get(
+                        "fullyAvailable"
+                    )
+                ),
+            }
+            for release_group_id in release_group_ids
+        },
+        "settled": _availability_settled(
+            available_in_lidarr=available_in_lidarr,
+            available_in_plex=available_in_plex,
+        ),
+    })
+
+
+@blueprint.get("/api/music/release-group/<mbid>/availability")
+@login_required
+def release_group_availability(mbid):
+    """Return live album completion and Plex editions from local indexes."""
+    plex_releases = _plex_release_group_inventory().get(mbid, [])
+    lidarr_album = lidarr.cached_library_availability().get(mbid)
+    available_in_plex = bool(plex_releases)
+    fully_available_in_lidarr = bool(
+        lidarr_album and lidarr_album.get("fullyAvailable")
+    )
+    return _availability_response({
+        "id": mbid,
+        "availableInPlex": available_in_plex,
+        "availableInLidarr": bool(lidarr_album),
+        "fullyAvailableInLidarr": fully_available_in_lidarr,
+        "plexReleases": [
+            _plex_release_summary(item) for item in plex_releases
+        ],
+        "ownedReleaseIds": sorted({
+            item["musicbrainzReleaseId"]
+            for item in plex_releases
+            if item.get("musicbrainzReleaseId")
+        }),
+        "settled": _availability_settled(
+            available_in_lidarr=fully_available_in_lidarr,
+            available_in_plex=available_in_plex,
+        ),
+    })
+
+
 def _artist_detail_payload(
     mbid,
     priority,

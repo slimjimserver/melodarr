@@ -17,6 +17,12 @@
     expiresAt: number;
     timer?: ReturnType<typeof setTimeout>;
   };
+  type DetailAvailabilityWatcher = {
+    kind: "artist" | "release-group";
+    id: string;
+    data: JsonObject;
+    timer?: ReturnType<typeof setTimeout>;
+  };
 
   const $ = <T extends Element = AppElement>(selector: string): T => {
     const element = document.querySelector<T>(selector);
@@ -24,6 +30,7 @@
     return element;
   };
   let currentDetail: DetailReference | null = null;
+  let currentDetailData: JsonObject | undefined;
   const detailHistory: DetailReference[] = [];
   let detailOrigin: DetailOrigin = { view: "discover", scrollY: 0 };
   let requestedArtist: JsonObject | undefined;
@@ -39,6 +46,7 @@
   const detailRequests = new Map<string, DetailRequest>();
   const detailUpgrades = new Map<string, Promise<JsonObject>>();
   let artistRevalidation: ArtistRevalidation | undefined;
+  let detailAvailabilityWatcher: DetailAvailabilityWatcher | undefined;
   const detailCacheMaxEntries = 32;
   const detailPrefetchTtl = 2 * 60 * 1000;
   const detailOpenedTtl = 15 * 60 * 1000;
@@ -193,7 +201,11 @@
   }
 
   function showView(id: AppView) {
-    if (id !== "detail") stopArtistRevalidation();
+    if (id !== "detail") {
+      stopArtistRevalidation();
+      stopDetailAvailability();
+      currentDetailData = undefined;
+    }
     document.querySelectorAll(".view, .nav-link").forEach((element) => element.classList.remove("active"));
     $(`#${id}`).classList.add("active");
     const currentNavigationView = id === "detail" ? detailOrigin.view : id;
@@ -259,6 +271,7 @@
   }
 
   function addPlexAvailability(element: HTMLElement, label = "Available in Plex") {
+    if (element.querySelector(".plex-availability")) return;
     const badge = document.createElement("span");
     badge.className = "plex-availability";
     badge.textContent = label;
@@ -509,6 +522,8 @@
 
   function showDetail(kind: DetailKind, id: string, addToHistory = true, updateHistory = true) {
     stopArtistRevalidation();
+    stopDetailAvailability();
+    currentDetailData = undefined;
     const activeView = document.querySelector<HTMLElement>(".view.active")?.id;
     if (addToHistory && currentDetail && activeView === "detail") {
       detailHistory.push(currentDetail);
@@ -617,7 +632,7 @@
     ];
 
     destinations.forEach(([icon, url, label]) => links.append(
-      createServiceIconLink(url, icon, label),
+      createServiceIconLink(url, icon, label, "external-link-musicbrainz"),
     ));
     if (spotify) {
       const mobile = isMobileDevice();
@@ -625,7 +640,7 @@
         spotify,
         "/icons/spotify.svg",
         mobile ? "Open in Spotify" : "Open on Spotify",
-        "",
+        "external-link-spotify",
         !mobile,
       ));
     }
@@ -635,7 +650,7 @@
         destination.url,
         "/icons/plex.svg",
         destination.label,
-        "",
+        "external-link-plex",
         destination.openInNewTab,
       ));
     }
@@ -647,8 +662,55 @@
         `${externalUrl}/${resource}/${encodeURIComponent(id)}`,
         "/icons/lidarr.svg",
         "Open in Lidarr",
+        "external-link-lidarr",
       ));
     });
+  }
+
+  function detailPlexLinks(kind: "artist" | "release-group", data: JsonObject) {
+    const plexRelease = kind === "release-group"
+      ? (data.plexReleases || []).find((release: JsonObject) => release.url)
+      : undefined;
+    return {
+      url: data.availableInPlex
+        ? String(kind === "artist" ? data.plexUrl || "" : plexRelease?.url || "")
+        : "",
+      plexampUrl: data.availableInPlex
+        ? String(
+          kind === "artist"
+            ? data.plexampUrl || ""
+            : plexRelease?.plexampUrl || "",
+        )
+        : "",
+    };
+  }
+
+  function updateDetailPlexLink(kind: "artist" | "release-group", data: JsonObject) {
+    const links = $("#detail-results").querySelector(".artist-meta .external-icons");
+    if (!links) return;
+    const existing = links.querySelector(".external-link-plex");
+    const destinationUrls = detailPlexLinks(kind, data);
+    if (!destinationUrls.url) {
+      existing?.remove();
+      return;
+    }
+    const destination = mobilePlexDestination(
+      destinationUrls.url,
+      destinationUrls.plexampUrl,
+    );
+    const updated = createServiceIconLink(
+      destination.url,
+      "/icons/plex.svg",
+      destination.label,
+      "external-link-plex",
+      destination.openInNewTab,
+    );
+    if (existing) {
+      existing.replaceWith(updated);
+      return;
+    }
+    const lidarrLink = links.querySelector(".external-link-lidarr");
+    links.insertBefore(updated, lidarrLink);
   }
 
   function createMeta(kind: DetailKind, data: JsonObject) {
@@ -657,18 +719,214 @@
     const id = document.createElement("strong");
     id.textContent = `MusicBrainz ID: ${data.id}`;
     meta.append(id);
-    const plexRelease = kind === "release-group"
-      ? (data.plexReleases || []).find((release: JsonObject) => release.url)
-      : undefined;
-    const plexUrl = data.availableInPlex
-      ? (kind === "artist" ? data.plexUrl : plexRelease?.url || "")
-      : "";
-    const plexampUrl = data.availableInPlex
-      ? (kind === "artist" ? data.plexampUrl : plexRelease?.plexampUrl || "")
-      : "";
-    addExternalLinks(meta, kind, data.id, data.spotify, plexUrl, plexampUrl);
+    const plexLinks = kind === "artist" || kind === "release-group"
+      ? detailPlexLinks(kind, data)
+      : { url: "", plexampUrl: "" };
+    addExternalLinks(
+      meta,
+      kind,
+      data.id,
+      data.spotify,
+      plexLinks.url,
+      plexLinks.plexampUrl,
+    );
     return meta;
   }
+
+  function stopDetailAvailability() {
+    if (detailAvailabilityWatcher?.timer) {
+      clearTimeout(detailAvailabilityWatcher.timer);
+    }
+    detailAvailabilityWatcher = undefined;
+  }
+
+  function artistReleaseGroups(data: JsonObject) {
+    return (Object.values(data.sections || {}) as JsonObject[][]).flat();
+  }
+
+  function incompleteArtistReleaseGroups(data: JsonObject) {
+    return artistReleaseGroups(data).filter(
+      (group) => group.availableInLidarr && !group.fullyAvailableInLidarr,
+    );
+  }
+
+  function applyArtistReleaseGroupAvailability(
+    data: JsonObject,
+    updates: JsonObject,
+  ) {
+    const groups = new Map(
+      artistReleaseGroups(data).map((group) => [String(group.id), group]),
+    );
+    Object.entries(updates || {}).forEach(([id, status]: [string, JsonObject]) => {
+      const group = groups.get(id);
+      if (!group) return;
+      group.availableInPlex = Boolean(
+        group.availableInPlex || status.availableInPlex,
+      );
+      group.availableInLidarr = Boolean(
+        group.availableInLidarr || status.availableInLidarr,
+      );
+      group.fullyAvailableInLidarr = Boolean(
+        group.fullyAvailableInLidarr || status.fullyAvailableInLidarr,
+      );
+      if (status.availableInLidarr) group.availabilityPending = false;
+    });
+
+    $("#detail-results").querySelectorAll<HTMLElement>("[data-release-group-id]")
+      .forEach((card) => {
+        const group = groups.get(String(card.dataset.releaseGroupId));
+        const button = card.querySelector<HTMLButtonElement>(
+          ".release-group-request",
+        );
+        if (!group || !button) return;
+        if (group.fullyAvailableInLidarr) {
+          button.textContent = "Available";
+          button.disabled = true;
+          button.title = "This release group is fully available in Lidarr";
+        } else if (group.availableInLidarr && !group.availabilityPending) {
+          button.textContent = "Search missing";
+          button.disabled = false;
+          button.title = "";
+        }
+      });
+  }
+
+  function applyDetailAvailability(
+    watcher: DetailAvailabilityWatcher,
+    availability: JsonObject,
+  ) {
+    Object.assign(watcher.data, availability);
+    updateDetailPlexLink(watcher.kind, watcher.data);
+    const action = $("#detail-results")
+      .querySelector<HTMLButtonElement>(".detail-availability-action");
+
+    if (watcher.kind === "artist") {
+      if (action && watcher.data.availableInLidarr) {
+        action.textContent = "In Lidarr";
+        action.disabled = true;
+        action.title = "This artist is already in Lidarr";
+      }
+      applyArtistReleaseGroupAvailability(
+        watcher.data,
+        availability.releaseGroups || {},
+      );
+      return;
+    }
+
+    if (action) {
+      if (watcher.data.fullyAvailableInLidarr) {
+        action.textContent = "Available";
+        action.disabled = true;
+        action.title = "This release group is fully available in Lidarr";
+      } else if (watcher.data.availableInLidarr) {
+        action.textContent = "Search missing";
+      }
+    }
+
+    const ownedReleaseIds = new Set(
+      (watcher.data.ownedReleaseIds || []).map(String),
+    );
+    (watcher.data.releases || []).forEach((release: JsonObject) => {
+      release.availableInPlex = ownedReleaseIds.has(String(release.id));
+    });
+    $("#detail-results").querySelectorAll<HTMLElement>("[data-release-id]")
+      .forEach((card) => {
+        const available = ownedReleaseIds.has(String(card.dataset.releaseId));
+        const badge = card.querySelector(".plex-availability");
+        if (available) addPlexAvailability(card, "This edition is in Plex");
+        else badge?.remove();
+      });
+  }
+
+  function scheduleDetailAvailability(
+    watcher: DetailAvailabilityWatcher,
+    delay = 15_000,
+  ) {
+    if (
+      detailAvailabilityWatcher !== watcher
+      || document.visibilityState === "hidden"
+    ) return;
+    watcher.timer = setTimeout(() => pollDetailAvailability(watcher), delay);
+  }
+
+  async function pollDetailAvailability(watcher: DetailAvailabilityWatcher) {
+    watcher.timer = undefined;
+    if (
+      detailAvailabilityWatcher !== watcher
+      || currentDetail?.kind !== watcher.kind
+      || currentDetail.id !== watcher.id
+      || !$("#detail").classList.contains("active")
+    ) return;
+    if (document.visibilityState === "hidden") return;
+
+    try {
+      const availabilityUrl = new URL(
+        `/api/music/${watcher.kind}/${encodeURIComponent(watcher.id)}/availability`,
+        window.location.origin,
+      );
+      if (watcher.kind === "artist") {
+        incompleteArtistReleaseGroups(watcher.data)
+          .slice(0, 50)
+          .forEach((group) => {
+            availabilityUrl.searchParams.append(
+              "releaseGroup",
+              String(group.id),
+            );
+          });
+      }
+      const availability = await getJson(
+        `${availabilityUrl.pathname}${availabilityUrl.search}`,
+      );
+      if (
+        detailAvailabilityWatcher !== watcher
+        || currentDetail?.kind !== watcher.kind
+        || currentDetail.id !== watcher.id
+      ) return;
+      applyDetailAvailability(watcher, availability);
+      if (
+        availability.settled
+        && (
+          watcher.kind !== "artist"
+          || !incompleteArtistReleaseGroups(watcher.data).length
+        )
+      ) {
+        stopDetailAvailability();
+      } else {
+        scheduleDetailAvailability(watcher);
+      }
+    } catch {
+      if (detailAvailabilityWatcher === watcher) {
+        scheduleDetailAvailability(watcher, 30_000);
+      }
+    }
+  }
+
+  function startDetailAvailability(
+    kind: DetailKind,
+    data: JsonObject,
+    delay = 5_000,
+  ) {
+    stopDetailAvailability();
+    if (kind !== "artist" && kind !== "release-group") return;
+    const watcher: DetailAvailabilityWatcher = {
+      kind,
+      id: String(data.id),
+      data,
+    };
+    detailAvailabilityWatcher = watcher;
+    scheduleDetailAvailability(watcher, delay);
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    const watcher = detailAvailabilityWatcher;
+    if (
+      document.visibilityState === "visible"
+      && watcher
+      && !watcher.timer
+    ) {
+      scheduleDetailAvailability(watcher, 0);
+    }
+  });
 
   function fillRequestSelect(select: HTMLSelectElement, options: JsonObject[], labelKey: string, valueKey: string) {
     select.replaceChildren();
@@ -700,6 +958,26 @@
       button.textContent = result.alreadyExists
         ? "Available"
         : (result.pending ? "Queued" : "Requested");
+      if (
+        currentDetail?.kind === "release-group"
+        && currentDetail.id === releaseGroup.id
+        && currentDetailData
+      ) {
+        startDetailAvailability("release-group", currentDetailData, 0);
+      } else if (
+        currentDetail?.kind === "artist"
+        && currentDetailData
+      ) {
+        const group = artistReleaseGroups(currentDetailData)
+          .find((item) => String(item.id) === releaseGroup.id);
+        if (group) {
+          // Keep the just-requested state stable until the Lidarr library
+          // snapshot observes it, then transition to Search missing/Available.
+          group.availableInLidarr = true;
+          group.availabilityPending = true;
+          startDetailAvailability("artist", currentDetailData, 0);
+        }
+      }
     } catch (error) {
       showToast(error.message, true);
       button.textContent = "Request release group";
@@ -903,6 +1181,7 @@
       });
     }
     card.append(groupRequest);
+    card.dataset.releaseGroupId = String(group.id);
     return card;
   }
 
@@ -1120,6 +1399,7 @@
 
   function renderDetail(kind: DetailKind, data: JsonObject) {
     const results = $("#detail-results");
+    currentDetailData = data;
     results.replaceChildren();
     $("#detail-message").textContent = "";
 
@@ -1137,7 +1417,7 @@
       if (facts) meta.append(document.createElement("br"), `Artist information: ${facts}`);
       results.append(meta);
       const requestButton = document.createElement("button");
-      requestButton.className = "request-artist";
+      requestButton.className = "request-artist detail-availability-action";
       if (data.availableInLidarr) {
         requestButton.textContent = "In Lidarr";
         requestButton.disabled = true;
@@ -1177,6 +1457,7 @@
 
       results.append(renderDiscography(data));
       startArtistRevalidation(data);
+      startDetailAvailability("artist", data);
       return;
     }
 
@@ -1206,7 +1487,7 @@
       [data.type, data.date].filter(Boolean).forEach((value) => subtitle.append(` · ${value}`));
       results.append(createMeta("release-group", data));
       const requestButton = document.createElement("button");
-      requestButton.className = "request-artist";
+      requestButton.className = "request-artist detail-availability-action";
       if (data.fullyAvailableInLidarr) {
         requestButton.textContent = "Available";
         requestButton.disabled = true;
@@ -1224,9 +1505,11 @@
           [release.date, release.country, release.format, release.trackCount ? `${release.trackCount} tracks` : "", release.status, release.disambiguation].filter(Boolean).join(" · "),
           () => showDetail("release", release.id),
         );
+        card.dataset.releaseId = String(release.id);
         if (release.availableInPlex) addPlexAvailability(card, "This edition is in Plex");
         results.append(card);
       });
+      startDetailAvailability("release-group", data);
       return;
     }
 
@@ -1413,6 +1696,8 @@
     searchAbort?.abort();
     clearTimeout(recommendationPoll);
     clearTimeout(searchDebounce);
+    stopDetailAvailability();
+    currentDetailData = undefined;
     $("#recommendation-results").replaceChildren();
     $("#results").replaceChildren();
   });
@@ -1446,6 +1731,8 @@
 
   window.addEventListener("melodarr-home", () => {
     currentDetail = null;
+    currentDetailData = undefined;
+    stopDetailAvailability();
     detailHistory.length = 0;
     searchRequestVersion += 1;
     clearTimeout(searchDebounce);
@@ -1488,6 +1775,8 @@
   window.addEventListener("popstate", () => {
     if (showDetailFromLocation()) return;
     currentDetail = null;
+    currentDetailData = undefined;
+    stopDetailAvailability();
     detailHistory.length = 0;
   });
   window.addEventListener("melodarr-open-detail", (event) => {
@@ -1521,6 +1810,13 @@
       const result = await postJson("/api/request", body);
       $("#request-dialog").close();
       showToast(result.message);
+      if (
+        currentDetail?.kind === "artist"
+        && currentDetail.id === requestedArtist.id
+        && currentDetailData
+      ) {
+        startDetailAvailability("artist", currentDetailData, 0);
+      }
     } catch (error) {
       $("#request-message").textContent = error.message;
     }

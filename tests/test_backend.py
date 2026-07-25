@@ -144,8 +144,8 @@ class ApplicationFactoryTests(DatabaseTestCase):
             for method in rule.methods
             if method not in {"HEAD", "OPTIONS"}
         }
-        self.assertEqual(len(rules), 54)
-        self.assertEqual(len(route_methods), 54)
+        self.assertEqual(len(rules), 56)
+        self.assertEqual(len(route_methods), 56)
 
     def test_factory_applies_test_configuration(self):
         self.assertTrue(self.app.config["TESTING"])
@@ -2941,6 +2941,116 @@ class DiscoveryRoutesTests(DatabaseTestCase):
 
 
 class MusicRoutesTests(DatabaseTestCase):
+    @patch("backend.routes.music.get_service")
+    @patch("backend.routes.music.lidarr.cached_artist_availability")
+    @patch("backend.routes.music._plex_artist")
+    def test_artist_availability_returns_live_cached_service_links(
+        self, plex_artist, artist_availability, get_service
+    ):
+        get_service.side_effect = lambda name: {"configured": name}
+        plex_artist.return_value = {
+            "url": "https://app.plex.tv/artist",
+            "plexampUrl": "https://listen.plex.tv/artist/example",
+        }
+        artist_availability.return_value = {
+            "artist-id": {"id": 42, "name": "Tracked Artist"},
+        }
+        self.register()
+
+        response = self.client.get(
+            "/api/music/artist/artist-id/availability"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        self.assertEqual(response.get_json(), {
+            "id": "artist-id",
+            "availableInPlex": True,
+            "availableInLidarr": True,
+            "plexUrl": "https://app.plex.tv/artist",
+            "plexampUrl": "https://listen.plex.tv/artist/example",
+            "releaseGroups": {},
+            "settled": True,
+        })
+
+    @patch("backend.routes.music.get_service")
+    @patch("backend.routes.music.lidarr.cached_library_availability")
+    @patch("backend.routes.music.lidarr.cached_artist_availability")
+    @patch("backend.routes.music._plex_release_group_inventory")
+    @patch("backend.routes.music._plex_artist")
+    def test_artist_availability_includes_incomplete_discography_groups(
+        self,
+        plex_artist,
+        plex_inventory,
+        artist_availability,
+        album_availability,
+        get_service,
+    ):
+        get_service.side_effect = lambda name: {"configured": name}
+        plex_artist.return_value = {"url": "https://app.plex.tv/artist"}
+        plex_inventory.return_value = {"group-id": [{"name": "Owned Album"}]}
+        artist_availability.return_value = {"artist-id": {"id": 42}}
+        album_availability.return_value = {
+            "group-id": {"fullyAvailable": True},
+        }
+        self.register()
+
+        response = self.client.get(
+            "/api/music/artist/artist-id/availability"
+            "?releaseGroup=group-id"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["releaseGroups"], {
+            "group-id": {
+                "availableInPlex": True,
+                "availableInLidarr": True,
+                "fullyAvailableInLidarr": True,
+            },
+        })
+
+    @patch("backend.routes.music.get_service")
+    @patch("backend.routes.music.lidarr.cached_library_availability")
+    @patch("backend.routes.music._plex_release_group_inventory")
+    def test_release_group_availability_waits_for_lidarr_download_completion(
+        self, plex_inventory, lidarr_availability, get_service
+    ):
+        get_service.side_effect = lambda name: {"configured": name}
+        plex_inventory.return_value = {
+            "group-id": [{
+                "name": "Owned Album",
+                "releaseType": "album",
+                "musicbrainzReleaseId": "release-id",
+                "url": "https://app.plex.tv/album",
+                "plexampUrl": "https://listen.plex.tv/album/example",
+            }],
+        }
+        lidarr_availability.return_value = {
+            "group-id": {
+                "fullyAvailable": False,
+                "trackFileCount": 3,
+                "totalTrackCount": 10,
+            },
+        }
+        self.register()
+
+        response = self.client.get(
+            "/api/music/release-group/group-id/availability"
+        )
+        payload = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        self.assertTrue(payload["availableInPlex"])
+        self.assertTrue(payload["availableInLidarr"])
+        self.assertFalse(payload["fullyAvailableInLidarr"])
+        self.assertFalse(payload["settled"])
+        self.assertEqual(payload["ownedReleaseIds"], ["release-id"])
+        self.assertEqual(
+            payload["plexReleases"][0]["url"],
+            "https://app.plex.tv/album",
+        )
+
     @patch("backend.routes.music.musicbrainz.get")
     def test_completed_artist_payload_uses_shared_cache_and_etag(self, get):
         get.side_effect = [
