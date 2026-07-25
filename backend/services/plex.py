@@ -33,7 +33,7 @@ else:  # Support the existing `python backend/app.py` entry point.
 
 
 scan_lock = RLock()
-SNAPSHOT_VERSION = 3
+SNAPSHOT_VERSION = 4
 
 
 def _index_key(snapshot_id):
@@ -200,9 +200,30 @@ def _normalize_artist(config, section, item):
 def _normalize_release_group(config, section, item):
     guids = _guids(item)
     plex_guid = _plex_metadata_guid(guids, "album")
+    artist_rating_key = str(
+        item.get("parentRatingKey") or item.get("grandparentRatingKey") or ""
+    )
+    artist_key = (
+        item.get("parentKey")
+        or item.get("grandparentKey")
+        or (
+            f"/library/metadata/{artist_rating_key}"
+            if artist_rating_key
+            else ""
+        )
+    )
     return {
         "name": item.get("title"),
         "artistName": item.get("parentTitle") or item.get("grandparentTitle"),
+        "artistKey": artist_key,
+        "artistRatingKey": artist_rating_key,
+        "artistPlexGuid": _plex_metadata_guid(
+            [
+                item.get("parentGuid", ""),
+                item.get("grandparentGuid", ""),
+            ],
+            "artist",
+        ),
         "year": item.get("year"),
         "releaseType": item.get("subtype") or "album",
         "thumb": item.get("thumb"),
@@ -219,12 +240,52 @@ def _normalize_release_group(config, section, item):
     }
 
 
+def _parent_artist(config, section, release_group, headers):
+    """Load or minimally reconstruct the artist owning a recent Plex album."""
+    key = release_group.get("artistKey") or ""
+    if key:
+        try:
+            response = requests.get(
+                f"{config['url']}{key.removesuffix('/children')}",
+                params={"includeGuids": 1},
+                headers=headers,
+                timeout=20,
+            )
+            response.raise_for_status()
+            metadata = response.json().get("MediaContainer", {}).get("Metadata", [])
+            if metadata:
+                return _normalize_artist(config, section, metadata[0])
+        except requests.RequestException:
+            # The album is already useful inventory even if Plex is still
+            # materializing its parent metadata. Keep a minimal artist entry
+            # and let the next scan replace it with the complete record.
+            pass
+
+    rating_key = release_group.get("artistRatingKey") or ""
+    plex_guid = release_group.get("artistPlexGuid") or ""
+    return {
+        "name": release_group.get("artistName"),
+        "sortName": "",
+        "thumb": None,
+        "section": section.get("title"),
+        "key": key,
+        "ratingKey": rating_key,
+        "artwork": "",
+        "plexGuid": plex_guid,
+        "guids": [plex_guid] if plex_guid else [],
+        "musicbrainzId": "",
+        "url": _plex_url(config, key),
+        "plexampUrl": _plexamp_url(config, key, plex_guid),
+    }
+
+
 def _scan_sections(config, sections, *, recently_added=False):
     base = config["url"]
     headers = _headers(config, accept_json=True)
     result = {"artists": [], "releaseGroups": []}
     for section in sections:
         endpoint = "recentlyAdded" if recently_added else "all"
+        section_releases = []
         for media_type, collection, normalizer in (
             (8, "artists", _normalize_artist),
             (9, "releaseGroups", _normalize_release_group),
@@ -237,9 +298,36 @@ def _scan_sections(config, sections, *, recently_added=False):
             )
             response.raise_for_status()
             metadata = response.json().get("MediaContainer", {}).get("Metadata", [])
-            result[collection].extend(
+            normalized = [
                 normalizer(config, section, item) for item in metadata
-            )
+            ]
+            result[collection].extend(normalized)
+            if collection == "releaseGroups":
+                section_releases = normalized
+        if recently_added:
+            known_artist_ids = {
+                artist.get("ratingKey")
+                for artist in result["artists"]
+                if artist.get("ratingKey")
+            }
+            parent_releases = {}
+            for release_group in section_releases:
+                rating_key = release_group.get("artistRatingKey")
+                identity = rating_key or "|".join((
+                    release_group.get("section") or "",
+                    release_group.get("artistName") or "",
+                )).casefold()
+                if (
+                    identity
+                    and rating_key not in known_artist_ids
+                ):
+                    parent_releases.setdefault(identity, release_group)
+            for release_group in parent_releases.values():
+                artist = _parent_artist(config, section, release_group, headers)
+                if artist.get("name"):
+                    result["artists"].append(artist)
+                    if artist.get("ratingKey"):
+                        known_artist_ids.add(artist["ratingKey"])
     for collection in result.values():
         collection.sort(key=lambda item: (item.get("name") or "").casefold())
     return result
@@ -530,25 +618,50 @@ def unresolved_musicbrainz_releases(config):
     ]
 
 
-def apply_release_group_mappings(config, mappings):
-    """Persist resolved release-to-release-group relationships in the snapshot."""
+def apply_release_group_mappings(config, mappings, *, artist_mappings=None):
+    """Persist release-group mappings and inferred parent-artist MBIDs."""
     if not mappings:
         return 0
+    artist_mappings = artist_mappings or {}
     with scan_lock:
         payload = get_cache_document(
             "plex-library", _snapshot_id(config), allow_expired=True
         )
         if not payload:
             return 0
-        changed = []
+        changed_releases = []
+        artists_by_rating_key = {
+            artist.get("ratingKey"): artist
+            for artist in payload.get("artists", [])
+            if artist.get("ratingKey")
+        }
+        artists_by_name = {}
+        for artist in payload.get("artists", []):
+            name = (artist.get("name") or "").casefold()
+            if name:
+                artists_by_name.setdefault(name, []).append(artist)
+        changed_artists = []
         for item in payload.get("releaseGroups", []):
             release_id = item.get("musicbrainzReleaseId")
             if release_id not in mappings:
                 continue
             item["musicbrainzReleaseGroupId"] = mappings[release_id] or ""
             item["releaseGroupResolved"] = True
-            changed.append(item)
-        if not changed:
+            changed_releases.append(item)
+
+            artist_id = artist_mappings.get(release_id)
+            if not artist_id:
+                continue
+            artist = artists_by_rating_key.get(item.get("artistRatingKey"))
+            if artist is None:
+                candidates = artists_by_name.get(
+                    (item.get("artistName") or "").casefold(), []
+                )
+                artist = candidates[0] if len(candidates) == 1 else None
+            if artist is not None and not artist.get("musicbrainzId"):
+                artist["musicbrainzId"] = artist_id
+                changed_artists.append(artist)
+        if not changed_releases and not changed_artists:
             return 0
         set_cache_document(
             "plex-library", _snapshot_id(config), payload, PLEX_LIBRARY_CACHE_TTL
@@ -556,8 +669,8 @@ def apply_release_group_mappings(config, mappings):
         invalidate_document(_index_key(_snapshot_id(config)))
         invalidate_detail_payloads()
         documents = _guid_documents(config, {
-            "artists": [],
-            "releaseGroups": changed,
+            "artists": changed_artists,
+            "releaseGroups": changed_releases,
         })
         upsert_cache_documents("plex-guid", documents, PLEX_LIBRARY_CACHE_TTL)
-        return len(changed)
+        return len(changed_releases)

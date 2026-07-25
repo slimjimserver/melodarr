@@ -237,19 +237,21 @@ class PlexMetadataWorkerTests(unittest.TestCase):
     ):
         unresolved.return_value = [{"musicbrainzReleaseId": "release-1"}]
         musicbrainz_get.return_value = {
-            "release-group": {"id": "release-group-1"}
+            "release-group": {"id": "release-group-1"},
+            "artist-credit": [{"artist": {"id": "artist-1"}}],
         }
 
         plex_metadata_worker._resolve_release_groups({"url": "http://plex"})
 
         musicbrainz_get.assert_called_once_with(
             "/release/release-1",
-            "release-groups",
+            "release-groups+artist-credits",
             priority="background",
         )
         apply_mappings.assert_called_once_with(
             {"url": "http://plex"},
             {"release-1": "release-group-1"},
+            artist_mappings={"release-1": "artist-1"},
         )
 
     @patch("backend.workers.plex_metadata.plex.music_library")
@@ -304,7 +306,8 @@ class PlexMetadataWorkerTests(unittest.TestCase):
         self, musicbrainz_get, apply_mappings, unresolved
     ):
         musicbrainz_get.return_value = {
-            "release-group": {"id": "release-group-2"}
+            "release-group": {"id": "release-group-2"},
+            "artist-credit": [{"artist": {"id": "artist-2"}}],
         }
 
         plex_metadata_worker._resolve_release_groups(
@@ -313,7 +316,9 @@ class PlexMetadataWorkerTests(unittest.TestCase):
 
         unresolved.assert_not_called()
         apply_mappings.assert_called_once_with(
-            {"url": "http://plex"}, {"release-2": "release-group-2"}
+            {"url": "http://plex"},
+            {"release-2": "release-group-2"},
+            artist_mappings={"release-2": "artist-2"},
         )
 
     @patch("backend.workers.plex_metadata.wake_requested.set")
@@ -4614,6 +4619,94 @@ class PlexClientTests(unittest.TestCase):
                 "WHERE cache_key LIKE 'plex-guid:%'"
             ).fetchone()["count"]
         self.assertEqual(guid_rows, 2)
+
+    @patch("backend.services.plex.requests.get")
+    def test_recent_album_hydrates_parent_artist_missing_from_recent_feed(self, get):
+        get.side_effect = [
+            Response(payload={"MediaContainer": {"Metadata": []}}),
+            Response(payload={"MediaContainer": {"Metadata": [{
+                "title": "A New Album",
+                "parentTitle": "A New Artist",
+                "parentRatingKey": "10",
+                "parentKey": "/library/metadata/10/children",
+                "parentGuid": "plex://artist/new-artist",
+                "ratingKey": "20",
+                "guid": "plex://album/new-album",
+                "Guid": [{
+                    "id": "mbid://11111111-1111-1111-1111-111111111111",
+                }],
+            }]}}),
+            Response(payload={"MediaContainer": {"Metadata": [{
+                "title": "A New Artist",
+                "ratingKey": "10",
+                "key": "/library/metadata/10/children",
+                "guid": "plex://artist/new-artist",
+            }]}}),
+        ]
+
+        result = plex._scan_sections(
+            {
+                "url": "http://plex:32400",
+                "token": "token",
+                "machineIdentifier": "server-1",
+            },
+            [{"id": "music", "title": "Music"}],
+            recently_added=True,
+        )
+
+        self.assertEqual([artist["name"] for artist in result["artists"]], [
+            "A New Artist",
+        ])
+        self.assertEqual(result["artists"][0]["ratingKey"], "10")
+        self.assertEqual(
+            result["releaseGroups"][0]["artistRatingKey"],
+            "10",
+        )
+        self.assertIn("/library/metadata/10", get.call_args_list[2].args[0])
+        self.assertNotIn("/children", get.call_args_list[2].args[0])
+
+    @patch("backend.services.plex.set_cache_document")
+    @patch("backend.services.plex.upsert_cache_documents")
+    @patch("backend.services.plex.get_cache_document")
+    def test_release_mapping_also_matches_its_unmatched_parent_artist(
+        self, get_document, upsert_documents, set_document
+    ):
+        payload = {
+            "artists": [{
+                "name": "A New Artist",
+                "ratingKey": "10",
+                "plexGuid": "plex://artist/new-artist",
+                "guids": ["plex://artist/new-artist"],
+                "musicbrainzId": "",
+            }],
+            "releaseGroups": [{
+                "name": "A New Album",
+                "artistName": "A New Artist",
+                "artistRatingKey": "10",
+                "ratingKey": "20",
+                "musicbrainzReleaseId": "release-1",
+            }],
+        }
+        get_document.return_value = payload
+
+        changed = plex.apply_release_group_mappings(
+            {"url": "http://plex", "machineIdentifier": "server-1"},
+            {"release-1": "release-group-1"},
+            artist_mappings={"release-1": "artist-1"},
+        )
+
+        self.assertEqual(changed, 1)
+        self.assertEqual(payload["artists"][0]["musicbrainzId"], "artist-1")
+        self.assertEqual(
+            payload["releaseGroups"][0]["musicbrainzReleaseGroupId"],
+            "release-group-1",
+        )
+        saved_guid_inventory = upsert_documents.call_args.args[1]
+        self.assertEqual(
+            saved_guid_inventory["server-1:artist:10"]["musicbrainzId"],
+            "artist-1",
+        )
+        set_document.assert_called_once()
 
     def test_cached_plex_urls_are_repaired_without_rescanning(self):
         payload = plex._normalize_snapshot_urls(

@@ -71,14 +71,25 @@ def _resolve_release_groups(config, release_ids=None):
         release_ids = set(release_ids)
     job_state.update(phase="release groups", completed=0, total=len(release_ids))
     mappings = {}
+    artist_mappings = {}
+    resolved_artist_ids = set()
     for index, release_id in enumerate(sorted(release_ids), start=1):
         try:
             metadata = musicbrainz.get(
                 f"/release/{release_id}",
-                "release-groups",
+                "release-groups+artist-credits",
                 priority="background",
             )
             mappings[release_id] = (metadata.get("release-group") or {}).get("id", "")
+            artist_ids = {
+                credit.get("artist", {}).get("id")
+                for credit in metadata.get("artist-credit", [])
+                if isinstance(credit, dict)
+                and (credit.get("artist") or {}).get("id")
+            }
+            if len(artist_ids) == 1:
+                artist_mappings[release_id] = next(iter(artist_ids))
+                resolved_artist_ids.update(artist_ids)
         except requests.RequestException as exc:
             if _confirmed_missing(exc):
                 mappings[release_id] = ""
@@ -90,9 +101,19 @@ def _resolve_release_groups(config, release_ids=None):
                 )
         job_state["completed"] = index
         if len(mappings) >= 25:
-            plex.apply_release_group_mappings(config, mappings)
+            plex.apply_release_group_mappings(
+                config,
+                mappings,
+                artist_mappings=artist_mappings,
+            )
             mappings.clear()
-    plex.apply_release_group_mappings(config, mappings)
+            artist_mappings.clear()
+    plex.apply_release_group_mappings(
+        config,
+        mappings,
+        artist_mappings=artist_mappings,
+    )
+    return resolved_artist_ids
 
 
 def _warm_artist_discographies(config, artist_ids=None):
@@ -145,7 +166,9 @@ def _run_enrichment(artist_ids=None, release_ids=None):
         # Make Plex artist clicks fast first; exact edition-to-group mapping can
         # then continue behind the already-warmed discographies.
         _warm_artist_discographies(config, artist_ids)
-        _resolve_release_groups(config, release_ids)
+        inferred_artist_ids = _resolve_release_groups(config, release_ids)
+        if inferred_artist_ids:
+            _warm_artist_discographies(config, inferred_artist_ids)
     except (ValueError, requests.RequestException) as exc:
         logger.warning("Plex MusicBrainz enrichment failed: %s", exc)
     except Exception:
