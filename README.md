@@ -12,21 +12,15 @@ Melodarr uses MusicBrainz for music metadata and can use ListenBrainz and Last.f
 
 ## 2. Preview
 
-### Discover music
 
-![Melodarr Discover page showing music search and personalized recommendations](docs/screenshots/melodarr_discover_page.png)
+### 📱 Screenshots
 
-### Explore an artist's discography
+| Discover | Artist |
+| :---: | :---: |
+| <img src="https://raw.githubusercontent.com/slimjimserver/melodarr/main/docs/screenshots/melodarr_discover_page.png" alt="discover" width="100%" /> | <img src="https://raw.githubusercontent.com/slimjimserver/melodarr/main/docs/screenshots/melodarr_artist_page.png" alt="artist" width="100%" /> |
+| **Release Group** | **Linked Accounts** |
+| <img src="https://raw.githubusercontent.com/slimjimserver/melodarr/main/docs/screenshots/melodarr_release_group_page.png" alt="release-group" width="100%" /> | <img src="https://raw.githubusercontent.com/slimjimserver/melodarr/main/docs/screenshots/melodarr_linked_account_page.png" alt="linked-accounts" width="100%" /> |
 
-![Melodarr artist page showing artist information and album availability](docs/screenshots/melodarr_artist_page.png)
-
-### Review releases and request missing music
-
-![Melodarr release group page showing editions and the search missing action](docs/screenshots/melodarr_release_group_page.png)
-
-### Link listening accounts
-
-![Melodarr linked accounts page for ListenBrainz and Last.fm](docs/screenshots/melodarr_linked_account_page.png)
 
 ## 3. Features
 
