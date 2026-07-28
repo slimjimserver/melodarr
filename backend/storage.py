@@ -77,6 +77,12 @@ def get_service(service):
     return value if isinstance(value, dict) else None
 
 
+def get_lastfm_api_key():
+    """Return the shared administrator-managed Last.fm API key."""
+    config = get_service("lastfm") or {}
+    return str(config.get("apiKey") or "").strip()
+
+
 def save_service(service, values):
     """Persist settings for one external service."""
     settings = load_settings_file() or {}
@@ -251,7 +257,7 @@ def recommendation_users():
     """Return the user fields needed to assemble recommendation caches."""
     with db() as connection:
         return connection.execute(
-            "SELECT id, username, listenbrainz_username, lastfm_username, lastfm_api_key FROM users"
+            "SELECT id, username, listenbrainz_username, lastfm_username FROM users"
         ).fetchall()
 
 
@@ -320,6 +326,7 @@ def pending_lidarr_search_stats():
 def init_db():
     """Create current tables and migrate legacy service settings to JSON."""
     legacy_settings = {}
+    legacy_lastfm_api_key = ""
     with db() as connection:
         # WAL lets request threads read account and queue state while a
         # background worker commits unrelated updates.
@@ -347,6 +354,19 @@ def init_db():
             connection.execute("ALTER TABLE users ADD COLUMN lastfm_username TEXT")
         if "lastfm_api_key" not in user_columns:
             connection.execute("ALTER TABLE users ADD COLUMN lastfm_api_key TEXT")
+        legacy_lastfm_row = connection.execute(
+            """
+            SELECT lastfm_api_key
+            FROM users
+            WHERE NULLIF(TRIM(lastfm_api_key), '') IS NOT NULL
+            ORDER BY CASE WHEN role = 'admin' THEN 0 ELSE 1 END, created_at, id
+            LIMIT 1
+            """
+        ).fetchone()
+        if legacy_lastfm_row:
+            legacy_lastfm_api_key = str(
+                legacy_lastfm_row["lastfm_api_key"] or ""
+            ).strip()
         for column in ("plex_id", "plex_username", "plex_email", "plex_avatar"):
             if column not in user_columns:
                 connection.execute(f"ALTER TABLE users ADD COLUMN {column} TEXT")
@@ -465,8 +485,30 @@ def init_db():
             }
 
     settings = load_settings_file()
+    settings_changed = settings is None
     if settings is None:
-        write_settings_file(legacy_settings)
+        settings = legacy_settings
+    lastfm_config = settings.get("lastfm")
+    if (
+        legacy_lastfm_api_key
+        and (
+            not isinstance(lastfm_config, dict)
+            or not str(lastfm_config.get("apiKey") or "").strip()
+        )
+    ):
+        settings["lastfm"] = {"apiKey": legacy_lastfm_api_key}
+        settings_changed = True
+    if settings_changed:
+        write_settings_file(settings)
+
+    # Legacy releases stored an application API key on every user. Once a
+    # shared copy has safely reached settings.json, scrub those duplicates.
+    if get_lastfm_api_key():
+        with db() as connection:
+            connection.execute(
+                "UPDATE users SET lastfm_api_key = NULL "
+                "WHERE lastfm_api_key IS NOT NULL"
+            )
 
     # The JSON file is safely written before removing the old table, so an
     # upgrade retains existing configurations without leaving credentials in

@@ -276,6 +276,23 @@
           </fieldset>
         </form>
         </section>
+
+        <section class="settings-section">
+          <div class="service-intro"><img class="service-icon" src="/icons/last-fm.svg" width="42" height="42" loading="lazy" decoding="async" alt="Last.fm"><div><h2>Last.fm</h2><p>Use one shared API key for personalized recommendations across Melodarr.</p></div><span id="lastfm-state" class="service-state">Not configured</span></div>
+          <form id="lastfm-settings" class="service-card">
+            <label>API key
+              <small>The saved key is never displayed. Enter a key to save it or replace the existing one.</small>
+              <input name="apiKey" type="password" autocomplete="off" placeholder="Last.fm API key">
+            </label>
+            <div class="form-actions">
+              <p class="form-message" aria-live="polite"></p>
+              <div>
+                <button id="clear-lastfm-key" class="secondary-action" type="button" hidden>Clear saved key</button>
+                <button id="save-lastfm-key" type="submit">Save API key</button>
+              </div>
+            </div>
+          </form>
+        </section>
       </div>
 
       <div id="settings-requests" class="settings-stack settings-panel" hidden>
@@ -473,11 +490,8 @@
             <input name="listenbrainzUsername" autocomplete="off" placeholder="listenbrainz-name">
           </label>
           <label>Last.fm username
+            <small>Uses the shared API key configured by an administrator.</small>
             <input name="lastfmUsername" autocomplete="off" placeholder="lastfm-name">
-          </label>
-          <label class="wide-field">Last.fm API key
-            <small>Leave blank to keep the saved key.</small>
-            <input name="lastfmApiKey" type="password" autocomplete="off" placeholder="Saved key remains unchanged">
           </label>
         </div>
       </fieldset>

@@ -5,7 +5,6 @@ type AppForm = HTMLFormElement & {
   remember: HTMLInputElement;
   listenbrainzUsername: HTMLInputElement;
   lastfmUsername: HTMLInputElement;
-  lastfmApiKey: HTMLInputElement;
   invitationLink: HTMLInputElement;
 };
 interface AppElement extends HTMLElement {
@@ -96,7 +95,10 @@ type AdminUserForm = HTMLFormElement & {
   password: HTMLInputElement;
   listenbrainzUsername: HTMLInputElement;
   lastfmUsername: HTMLInputElement;
-  lastfmApiKey: HTMLInputElement;
+};
+
+type LastfmSettingsForm = HTMLFormElement & {
+  apiKey: HTMLInputElement;
 };
 
 interface PlexConnection extends JsonObject {
@@ -534,6 +536,15 @@ async function refreshSettings(loadLidarrOptions = true) {
   const settings = await api("/api/settings");
   const { lidarr, plex } = settings;
   lidarrDefaults = lidarr.defaults || {};
+
+  const lastfmConfigured = Boolean(settings.lastfm?.configured);
+  $("#lastfm-state").textContent = lastfmConfigured ? "API key configured" : "Not configured";
+  const lastfmForm = $<LastfmSettingsForm>("#lastfm-settings");
+  lastfmForm.apiKey.value = "";
+  lastfmForm.apiKey.placeholder = lastfmConfigured
+    ? "Enter a new key to replace the saved key"
+    : "Last.fm API key";
+  $("#clear-lastfm-key").hidden = !lastfmConfigured;
 
   $("#lidarr-state").textContent = lidarr.configured ? `Connected · ${lidarr.url}` : "Not connected";
   $("#plex-state").textContent = plex.configured
@@ -974,8 +985,7 @@ function setupNavigation() {
           </fieldset>
           <fieldset>
             <legend>Last.fm</legend>
-            <label>Username<input name="lastfmUsername" autocomplete="username" placeholder="your-lastfm-name"></label>
-            <label>API key<small>Create one in your Last.fm API account. Leave blank to keep your saved key.</small><input name="lastfmApiKey" type="password" autocomplete="off" placeholder="Last.fm API key"></label>
+            <label>Username<small>Used to tailor recommendations from your Last.fm listening history. An administrator manages the shared API key.</small><input name="lastfmUsername" autocomplete="username" placeholder="your-lastfm-name"></label>
           </fieldset>
           <div class="form-actions"><p class="form-message"></p><button>Save linked accounts</button></div>
         `;
@@ -1037,14 +1047,12 @@ function setupNavigation() {
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
                   username: form.lastfmUsername.value,
-                  apiKey: form.lastfmApiKey.value,
                 }),
               }),
             ]);
             user.listenbrainzUsername = form.listenbrainzUsername.value.trim();
             user.lastfmUsername = form.lastfmUsername.value.trim();
             user.lastfmConfigured = Boolean(user.lastfmUsername);
-            form.lastfmApiKey.value = "";
             setMessage(
               formMessage,
               `${listenbrainz.message} ${lastfm.message} Recommendations are being refreshed.`,
@@ -1732,7 +1740,6 @@ function setupAdminUsers() {
       password: form.password.value,
       listenbrainzUsername: form.listenbrainzUsername.value.trim(),
       lastfmUsername: form.lastfmUsername.value.trim(),
-      lastfmApiKey: form.lastfmApiKey.value,
     };
     saveButton.disabled = true;
     form.setAttribute("aria-busy", "true");
@@ -2107,6 +2114,55 @@ function setupLidarrSettings() {
     } finally {
       submitButton.disabled = false;
     }
+  });
+}
+
+function setupLastfmSettings() {
+  const form = $<LastfmSettingsForm>("#lastfm-settings");
+  const saveButton = $<HTMLButtonElement>("#save-lastfm-key");
+  const clearButton = $<HTMLButtonElement>("#clear-lastfm-key");
+  const message = requiredDescendant<HTMLElement>(form, ".form-message");
+
+  const saveApiKey = async (apiKey: string, successMessage: string) => {
+    saveButton.disabled = true;
+    clearButton.disabled = true;
+    form.setAttribute("aria-busy", "true");
+    setMessage(message, apiKey ? "Saving Last.fm API key…" : "Clearing Last.fm API key…");
+    try {
+      const result = await api("/api/settings/lastfm", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ apiKey }),
+      });
+      form.apiKey.value = "";
+      setMessage(message, result.message || successMessage);
+      await refreshSettings(false);
+      window.dispatchEvent(new Event("melodarr-recommendations-changed"));
+    } catch (error) {
+      setMessage(message, error.message, true);
+    } finally {
+      saveButton.disabled = false;
+      clearButton.disabled = false;
+      form.removeAttribute("aria-busy");
+    }
+  };
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const apiKey = form.apiKey.value.trim();
+    if (!apiKey) {
+      setMessage(message, "Enter a Last.fm API key to save.", true);
+      form.apiKey.focus();
+      return;
+    }
+    await saveApiKey(apiKey, "Last.fm API key saved.");
+  });
+
+  clearButton.addEventListener("click", async () => {
+    if (!window.confirm(
+      "Clear the shared Last.fm API key? Personalized Last.fm recommendations will stop for every user until a new key is saved.",
+    )) return;
+    await saveApiKey("", "Last.fm API key cleared.");
   });
 }
 
@@ -2487,6 +2543,7 @@ setupAdminRequests();
 setupAdminUsers();
 setupStandalonePullToRefresh();
 setupLidarrSettings();
+setupLastfmSettings();
 setupPlexSettings();
 setupLibrary();
 setupAuth();

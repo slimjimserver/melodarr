@@ -11,6 +11,7 @@ if __package__:
     from .services import lastfm, lidarr, listenbrainz, musicbrainz, plex
     from .storage import (
         get_request_history,
+        get_lastfm_api_key,
         get_service,
         recommendation_users,
         save_recommendation_cache,
@@ -20,6 +21,7 @@ else:  # Support the existing `python backend/app.py` entry point.
     from services import lastfm, lidarr, listenbrainz, musicbrainz, plex
     from storage import (
         get_request_history,
+        get_lastfm_api_key,
         get_service,
         recommendation_users,
         save_recommendation_cache,
@@ -657,9 +659,10 @@ def build_recommendation_cache(user, *, shared_exclusions=None):
         },
     }
     has_listenbrainz = bool(_user_value(user, "listenbrainz_username"))
+    lastfm_api_key = get_lastfm_api_key()
     has_lastfm = bool(
         _user_value(user, "lastfm_username")
-        and _user_value(user, "lastfm_api_key")
+        and lastfm_api_key
     )
     if not has_listenbrainz and not has_lastfm:
         return payload
@@ -688,8 +691,8 @@ def build_recommendation_cache(user, *, shared_exclusions=None):
                 user["listenbrainz_username"],
                 exc,
             )
-    if user["lastfm_username"] and user["lastfm_api_key"]:
-        username, api_key = user["lastfm_username"], user["lastfm_api_key"]
+    if user["lastfm_username"] and lastfm_api_key:
+        username, api_key = user["lastfm_username"], lastfm_api_key
         lastfm_failed = False
         personalized_albums = []
         try:
@@ -834,13 +837,14 @@ def build_recommendation_cache(user, *, shared_exclusions=None):
 def refresh_recommendation_cache():
     retry_required = False
     shared_exclusions = None
+    lastfm_api_key = get_lastfm_api_key()
     for user in recommendation_users():
         try:
             has_provider = bool(
                 _user_value(user, "listenbrainz_username")
                 or (
                     _user_value(user, "lastfm_username")
-                    and _user_value(user, "lastfm_api_key")
+                    and lastfm_api_key
                 )
             )
             if has_provider and shared_exclusions is None:

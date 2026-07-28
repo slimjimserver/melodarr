@@ -10,13 +10,13 @@ if __package__ == "backend.routes":
     from .account import _profile_history_item, _profile_plex_index
     from ..responses import api_error
     from ..security import admin_required, current_user
-    from ..storage import db, delete_recommendation_cache
+    from ..storage import db, delete_recommendation_cache, get_lastfm_api_key
     from ..workers import recommendations as recommendation_worker
 else:  # Support the existing `python backend/app.py` entry point.
     from routes.account import _profile_history_item, _profile_plex_index
     from responses import api_error
     from security import admin_required, current_user
-    from storage import db, delete_recommendation_cache
+    from storage import db, delete_recommendation_cache, get_lastfm_api_key
     from workers import recommendations as recommendation_worker
 
 
@@ -29,7 +29,6 @@ EDITABLE_FIELDS = frozenset({
     "password",
     "listenbrainzUsername",
     "lastfmUsername",
-    "lastfmApiKey",
 })
 READ_ONLY_FIELDS = frozenset({
     "authProvider",
@@ -51,7 +50,6 @@ USER_LIST_QUERY = """
         users.plex_avatar,
         users.listenbrainz_username,
         users.lastfm_username,
-        users.lastfm_api_key,
         users.created_at,
         COUNT(request_history.id) AS request_count
     FROM users
@@ -89,7 +87,7 @@ def _user_payload(row):
         "listenbrainzUsername": row["listenbrainz_username"] or "",
         "lastfmUsername": row["lastfm_username"] or "",
         "lastfmConfigured": bool(
-            row["lastfm_username"] and row["lastfm_api_key"]
+            row["lastfm_username"] and get_lastfm_api_key()
         ),
     }
 
@@ -245,7 +243,6 @@ def update_user(user_id):
     recommendation_fields = (
         "listenbrainzUsername",
         "lastfmUsername",
-        "lastfmApiKey",
     )
     for field in recommendation_fields:
         if field in values and values[field] is not None and not isinstance(
@@ -301,35 +298,17 @@ def update_user(user_id):
                     parameters.append(listenbrainz_username)
                     recommendation_inputs_changed = True
 
-            lastfm_username = existing["lastfm_username"]
-            lastfm_api_key = existing["lastfm_api_key"]
             if "lastfmUsername" in values:
                 lastfm_username = (
                     str(values["lastfmUsername"] or "").strip() or None
                 )
-                if not lastfm_username:
-                    lastfm_api_key = None
-            # A blank API key intentionally preserves the existing key unless
-            # the username was cleared, matching blank-password semantics.
-            supplied_lastfm_api_key = (
-                str(values.get("lastfmApiKey") or "").strip()
-                if "lastfmApiKey" in values
-                else ""
-            )
-            if supplied_lastfm_api_key:
-                lastfm_api_key = supplied_lastfm_api_key
-            if lastfm_username and not lastfm_api_key:
-                return api_error(
-                    "A Last.fm API key is required when setting a Last.fm username."
-                )
-            if lastfm_username != existing["lastfm_username"]:
-                updates.append("lastfm_username = ?")
-                parameters.append(lastfm_username)
-                recommendation_inputs_changed = True
-            if lastfm_api_key != existing["lastfm_api_key"]:
-                updates.append("lastfm_api_key = ?")
-                parameters.append(lastfm_api_key)
-                recommendation_inputs_changed = True
+                if lastfm_username != existing["lastfm_username"]:
+                    updates.extend([
+                        "lastfm_username = ?",
+                        "lastfm_api_key = NULL",
+                    ])
+                    parameters.append(lastfm_username)
+                    recommendation_inputs_changed = True
 
             if updates:
                 connection.execute(

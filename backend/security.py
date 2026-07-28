@@ -8,17 +8,17 @@ from flask import g, has_request_context, jsonify, request, session
 
 if __package__:
     from .responses import api_error
-    from .storage import db
+    from .storage import db, get_lastfm_api_key
 else:  # Support the existing `python backend/app.py` entry point.
     from responses import api_error
-    from storage import db
+    from storage import db, get_lastfm_api_key
 
 
 def get_user(user_id):
     with db() as connection:
         return connection.execute(
             "SELECT id, username, password_hash, role, listenbrainz_username, "
-            "lastfm_username, lastfm_api_key, plex_id, plex_username, "
+            "lastfm_username, plex_id, plex_username, "
             "plex_email, plex_avatar FROM users WHERE id = ?",
             (user_id,),
         ).fetchone()
@@ -56,7 +56,9 @@ def user_payload(user, include_csrf=False):
         "plexEmail": user["plex_email"] or "",
         "listenbrainzUsername": user["listenbrainz_username"] or "",
         "lastfmUsername": user["lastfm_username"] or "",
-        "lastfmConfigured": bool(user["lastfm_username"] and user["lastfm_api_key"]),
+        "lastfmConfigured": bool(
+            user["lastfm_username"] and get_lastfm_api_key()
+        ),
     }
     if include_csrf:
         payload["csrfToken"] = session["csrf_token"]

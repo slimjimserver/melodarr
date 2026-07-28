@@ -19,6 +19,7 @@ if __package__ == "backend.routes":
         db,
         count_request_history,
         delete_recommendation_cache,
+        get_lastfm_api_key,
         get_request_history,
         get_service,
     )
@@ -31,6 +32,7 @@ else:  # Support the existing `python backend/app.py` entry point.
         db,
         count_request_history,
         delete_recommendation_cache,
+        get_lastfm_api_key,
         get_request_history,
         get_service,
     )
@@ -238,7 +240,9 @@ def account_settings():
         "plexEmail": user["plex_email"] or "",
         "listenbrainzUsername": user["listenbrainz_username"] or "",
         "lastfmUsername": user["lastfm_username"] or "",
-        "lastfmConfigured": bool(user["lastfm_username"] and user["lastfm_api_key"]),
+        "lastfmConfigured": bool(
+            user["lastfm_username"] and get_lastfm_api_key()
+        ),
     })
 
 
@@ -358,9 +362,8 @@ def configure_listenbrainz():
 def configure_lastfm():
     values = request.get_json(silent=True) or {}
     username = str(values.get("username", "")).strip()
-    supplied_api_key = str(values.get("apiKey", "")).strip()
     user = current_user()
-    if not username and not supplied_api_key:
+    if not username:
         with db() as connection:
             connection.execute(
                 "UPDATE users SET lastfm_username = NULL, lastfm_api_key = NULL WHERE id = ?",
@@ -368,15 +371,18 @@ def configure_lastfm():
             )
         _recommendation_inputs_changed(user["id"])
         return jsonify({"message": "Last.fm account removed."})
-    api_key = supplied_api_key or user["lastfm_api_key"] or ""
-    if not username or not api_key:
-        return api_error("Enter both a Last.fm username and API key.")
+    api_key = get_lastfm_api_key()
+    if not api_key:
+        return api_error(
+            "Last.fm is not configured. Ask an administrator to add the API key.",
+            503,
+        )
     try:
         lastfm.get("user.getinfo", username, api_key)
         with db() as connection:
             connection.execute(
-                "UPDATE users SET lastfm_username = ?, lastfm_api_key = ? WHERE id = ?",
-                (username, api_key, user["id"]),
+                "UPDATE users SET lastfm_username = ?, lastfm_api_key = NULL WHERE id = ?",
+                (username, user["id"]),
             )
         _recommendation_inputs_changed(user["id"])
         return jsonify({"message": "Last.fm account saved."})

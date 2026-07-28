@@ -121,7 +121,8 @@ Service credentials are configured after signing in; they are not environment va
 - **Lidarr (required for requests):** hostname or IP address, port, SSL choice, API key, and optionally an external browser-facing URL. After testing the connection, choose the root folder, quality and metadata profiles, monitoring behavior, tags, and automatic-search behavior.
 - **Plex (optional):** sign in with the Plex account that owns the server, choose one of its advertised connections, and select one or more music libraries to scan. Plex tokens are retrieved through the secure Plex PIN flow and are never pasted into Melodarr.
 - **ListenBrainz (optional, per user):** public ListenBrainz username.
-- **Last.fm (optional, per user):** Last.fm username and API key.
+- **Last.fm API access (optional, administrator-managed):** the owner or an administrator saves one Last.fm API key for the whole Melodarr instance. The key is never returned by the API or shown again after it is saved.
+- **Last.fm listening history (optional, per user):** each user can add their own public Last.fm username to receive recommendations based on their listening history. Individual users do not need Last.fm API keys.
 
 Settings and service credentials are stored in `data/settings.json` when using Docker. Keep the data directory private. Back up `melodarr.db`, `settings.json`, and `session-secret.key`; the reproducible `cache/` directory can be excluded from backups.
 

@@ -9,7 +9,7 @@ if __package__ == "backend.routes":
     from ..detail_cache import invalidate_all as invalidate_detail_payloads
     from ..responses import api_error
     from ..security import admin_required, login_required
-    from ..services import lidarr
+    from ..services import lastfm, lidarr
     from ..storage import (
         clear_recommendation_cache,
         get_service,
@@ -28,7 +28,7 @@ else:  # Support the existing `python backend/app.py` entry point.
     from detail_cache import invalidate_all as invalidate_detail_payloads
     from responses import api_error
     from security import admin_required, login_required
-    from services import lidarr
+    from services import lastfm, lidarr
     from storage import (
         clear_recommendation_cache,
         get_service,
@@ -68,7 +68,9 @@ def health():
 @blueprint.get("/api/settings")
 @admin_required
 def settings():
-    lidarr_config, plex_config = get_service("lidarr"), get_service("plex")
+    lidarr_config = get_service("lidarr")
+    plex_config = get_service("plex")
+    lastfm_config = get_service("lastfm") or {}
     return jsonify({
         "lidarr": {
             "configured": bool(lidarr_config),
@@ -82,6 +84,11 @@ def settings():
             "serverName": plex_config.get("serverName", "") if plex_config else "",
             "libraries": plex_config.get("libraries", []) if plex_config else [],
             "librarySectionIds": plex_config.get("librarySectionIds", []) if plex_config else [],
+        },
+        "lastfm": {
+            "configured": bool(
+                str(lastfm_config.get("apiKey") or "").strip()
+            ),
         },
     })
 
@@ -289,6 +296,47 @@ def configure_lidarr():
         return jsonify({"message": f"Connected to Lidarr {status.json().get('version', '')}.", "options": options})
     except requests.RequestException:
         return api_error("Could not connect to Lidarr. Check the URL, port, and API key.", 502)
+
+
+@blueprint.post("/api/settings/lastfm")
+@admin_required
+def configure_lastfm():
+    """Validate and save the application-wide Last.fm API key."""
+    values = request.get_json(silent=True)
+    if not isinstance(values, dict) or "apiKey" not in values:
+        return api_error("Enter a Last.fm API key.")
+    if not isinstance(values["apiKey"], str):
+        return api_error("Last.fm API key must be text.")
+
+    api_key = values["apiKey"].strip()
+    if api_key:
+        try:
+            # chart.gettopartists does not depend on an end-user account; the
+            # client signature still accepts a username for all API methods.
+            lastfm.get(
+                "chart.gettopartists",
+                "melodarr",
+                api_key,
+                limit=1,
+            )
+        except ValueError as exc:
+            return api_error(str(exc))
+        except requests.RequestException:
+            return api_error(
+                "Could not connect to Last.fm. Try again shortly.",
+                502,
+            )
+        save_service("lastfm", {"apiKey": api_key})
+        message = "Last.fm API key saved."
+    else:
+        save_service("lastfm", {})
+        message = "Last.fm API key removed."
+
+    clear_cache("lastfm")
+    clear_recommendation_cache()
+    invalidate_detail_payloads()
+    recommendation_worker.request_refresh()
+    return jsonify({"message": message})
 
 
 @blueprint.post("/api/settings/lidarr/test")

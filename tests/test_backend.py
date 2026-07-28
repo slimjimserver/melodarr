@@ -52,7 +52,9 @@ from backend.services import lidarr, musicbrainz, plex, plex_auth
 from backend.storage import (
     db,
     enqueue_lidarr_search,
+    get_lastfm_api_key,
     get_service,
+    init_db,
     save_service,
     set_lidarr_refresh_command,
     write_settings_file,
@@ -154,8 +156,8 @@ class ApplicationFactoryTests(DatabaseTestCase):
             for method in rule.methods
             if method not in {"HEAD", "OPTIONS"}
         }
-        self.assertEqual(len(rules), 65)
-        self.assertEqual(len(route_methods), 65)
+        self.assertEqual(len(rules), 66)
+        self.assertEqual(len(route_methods), 66)
 
     def test_factory_applies_test_configuration(self):
         self.assertTrue(self.app.config["TESTING"])
@@ -1106,6 +1108,31 @@ class DeploymentConfigTests(unittest.TestCase):
             'window.addEventListener("melodarr-lidarr-settings-changed"',
             discovery_typescript,
         )
+
+    def test_lastfm_key_is_admin_managed_and_user_forms_only_collect_usernames(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(
+            os.path.join(project_root, "frontend", "static", "index.html"),
+            encoding="utf-8",
+        ) as file:
+            frontend = file.read()
+        with open(
+            os.path.join(project_root, "frontend", "src", "app.ts"),
+            encoding="utf-8",
+        ) as file:
+            app_typescript = file.read()
+
+        self.assertIn('id="lastfm-settings"', frontend)
+        self.assertIn('id="lastfm-state"', frontend)
+        self.assertIn('id="save-lastfm-key"', frontend)
+        self.assertIn('id="clear-lastfm-key"', frontend)
+        self.assertIn('name="apiKey"', frontend)
+        self.assertIn('name="lastfmUsername"', frontend)
+        self.assertIn('"/api/settings/lastfm"', app_typescript)
+        self.assertIn('"/api/account/lastfm"', app_typescript)
+        self.assertNotIn('name="lastfmApiKey"', frontend)
+        self.assertNotIn('name="lastfmApiKey"', app_typescript)
+        self.assertNotIn("lastfmApiKey", app_typescript)
 
     def test_discovery_search_offers_track_to_release_group_results(self):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -2235,6 +2262,7 @@ class AdminUsersTests(DatabaseTestCase):
 
     def test_admin_list_uses_plex_display_name_and_counts_requests(self):
         self.register()
+        save_service("lastfm", {"apiKey": "admin-shared-key"})
         user_id = self.add_user(
             "generated-plex-name",
             plex_id="plex-42",
@@ -2551,11 +2579,11 @@ class AdminUsersTests(DatabaseTestCase):
         self, request_refresh
     ):
         csrf_token = self.register()
+        save_service("lastfm", {"apiKey": "admin-shared-key"})
         original_hash = generate_password_hash("original-password")
         user_id = self.add_user(
             "old-name",
             lastfm_username="old-lastfm",
-            lastfm_api_key="existing-api-key",
         )
         with db() as connection:
             connection.execute(
@@ -2576,7 +2604,6 @@ class AdminUsersTests(DatabaseTestCase):
                 "password": "",
                 "listenbrainzUsername": "new-listens",
                 "lastfmUsername": "new-lastfm",
-                "lastfmApiKey": "",
             },
             headers={"X-CSRF-Token": csrf_token},
         )
@@ -2591,7 +2618,7 @@ class AdminUsersTests(DatabaseTestCase):
         self.assertNotIn("lastfmApiKey", user)
         with db() as connection:
             saved = connection.execute(
-                "SELECT password_hash, lastfm_api_key FROM users WHERE id = ?",
+                "SELECT password_hash, lastfm_username FROM users WHERE id = ?",
                 (user_id,),
             ).fetchone()
             cached = connection.execute(
@@ -2599,7 +2626,7 @@ class AdminUsersTests(DatabaseTestCase):
                 (user_id,),
             ).fetchone()
         self.assertEqual(saved["password_hash"], original_hash)
-        self.assertEqual(saved["lastfm_api_key"], "existing-api-key")
+        self.assertEqual(saved["lastfm_username"], "new-lastfm")
         self.assertIsNone(cached)
         request_refresh.assert_called_once_with()
 
@@ -2762,6 +2789,171 @@ class AdminUsersTests(DatabaseTestCase):
 
 
 class SettingsMaintenanceTests(DatabaseTestCase):
+    def test_legacy_user_key_is_promoted_and_per_user_copies_are_scrubbed(self):
+        self.register()
+        with db() as connection:
+            connection.execute(
+                "UPDATE users SET lastfm_api_key = ? WHERE username = ?",
+                ("legacy-admin-key", "test-user"),
+            )
+            connection.execute(
+                "INSERT INTO users "
+                "(username, password_hash, role, lastfm_api_key, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    "legacy-listener",
+                    generate_password_hash("listener-password"),
+                    "user",
+                    "legacy-user-key",
+                    time.time(),
+                ),
+            )
+        write_settings_file({})
+
+        init_db()
+
+        self.assertEqual(get_lastfm_api_key(), "legacy-admin-key")
+        with db() as connection:
+            remaining = connection.execute(
+                "SELECT COUNT(*) AS total FROM users "
+                "WHERE lastfm_api_key IS NOT NULL"
+            ).fetchone()["total"]
+        self.assertEqual(remaining, 0)
+
+    @patch("backend.routes.settings.recommendation_worker.request_refresh")
+    @patch("backend.routes.settings.lastfm.get")
+    def test_admin_can_save_replace_and_clear_the_shared_lastfm_key(
+        self, lastfm_get, request_refresh
+    ):
+        token = self.register()
+        initial = self.client.get("/api/settings")
+        self.assertEqual(initial.status_code, 200)
+        self.assertEqual(initial.get_json()["lastfm"], {"configured": False})
+
+        saved = self.client.post(
+            "/api/settings/lastfm",
+            json={"apiKey": "first-shared-key"},
+            headers={"X-CSRF-Token": token},
+        )
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(
+            saved.get_json()["message"],
+            "Last.fm API key saved.",
+        )
+        self.assertEqual(get_service("lastfm"), {"apiKey": "first-shared-key"})
+        lastfm_get.assert_called_once_with(
+            "chart.gettopartists",
+            "melodarr",
+            "first-shared-key",
+            limit=1,
+        )
+
+        configured = self.client.get("/api/settings")
+        self.assertEqual(
+            configured.get_json()["lastfm"],
+            {"configured": True},
+        )
+        self.assertNotIn("first-shared-key", configured.get_data(as_text=True))
+        self.assertNotIn("first-shared-key", saved.get_data(as_text=True))
+
+        replaced = self.client.post(
+            "/api/settings/lastfm",
+            json={"apiKey": "replacement-shared-key"},
+            headers={"X-CSRF-Token": token},
+        )
+        self.assertEqual(replaced.status_code, 200)
+        self.assertEqual(
+            get_service("lastfm"),
+            {"apiKey": "replacement-shared-key"},
+        )
+        self.assertNotIn(
+            "replacement-shared-key",
+            replaced.get_data(as_text=True),
+        )
+
+        cleared = self.client.post(
+            "/api/settings/lastfm",
+            json={"apiKey": "   "},
+            headers={"X-CSRF-Token": token},
+        )
+        self.assertEqual(cleared.status_code, 200)
+        self.assertEqual(
+            cleared.get_json()["message"],
+            "Last.fm API key removed.",
+        )
+        self.assertFalse(get_service("lastfm"))
+        self.assertEqual(
+            self.client.get("/api/settings").get_json()["lastfm"],
+            {"configured": False},
+        )
+        self.assertEqual(lastfm_get.call_count, 2)
+        self.assertEqual(request_refresh.call_count, 3)
+
+    @patch("backend.routes.settings.lastfm.get")
+    def test_shared_lastfm_key_is_validated_and_never_returned(
+        self, lastfm_get
+    ):
+        token = self.register()
+        lastfm_get.side_effect = ValueError("Invalid Last.fm API key.")
+
+        invalid = self.client.post(
+            "/api/settings/lastfm",
+            json={"apiKey": "invalid-shared-key"},
+            headers={"X-CSRF-Token": token},
+        )
+        missing = self.client.post(
+            "/api/settings/lastfm",
+            json={},
+            headers={"X-CSRF-Token": token},
+        )
+        wrong_type = self.client.post(
+            "/api/settings/lastfm",
+            json={"apiKey": ["not", "a", "string"]},
+            headers={"X-CSRF-Token": token},
+        )
+
+        self.assertEqual(invalid.status_code, 400)
+        self.assertEqual(missing.status_code, 400)
+        self.assertEqual(wrong_type.status_code, 400)
+        self.assertFalse(get_service("lastfm"))
+        self.assertNotIn(
+            "invalid-shared-key",
+            invalid.get_data(as_text=True),
+        )
+
+    def test_only_administrators_can_manage_the_shared_lastfm_key(self):
+        admin_token = self.register()
+        with db() as connection:
+            connection.execute(
+                "INSERT INTO users "
+                "(username, password_hash, role, created_at) VALUES (?, ?, ?, ?)",
+                (
+                    "ordinary-user",
+                    generate_password_hash("listener-password"),
+                    "user",
+                    time.time(),
+                ),
+            )
+        self.client.post(
+            "/api/auth/logout",
+            headers={"X-CSRF-Token": admin_token},
+        )
+        login = self.client.post(
+            "/api/auth/login",
+            json={
+                "username": "ordinary-user",
+                "password": "listener-password",
+            },
+        )
+        response = self.client.post(
+            "/api/settings/lastfm",
+            json={"apiKey": "user-supplied-key"},
+            headers={"X-CSRF-Token": login.get_json()["csrfToken"]},
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(get_service("lastfm"))
+
     @patch("backend.routes.settings.lidarr_library_worker.request_scan")
     @patch("backend.routes.settings.plex_metadata_worker.request_enrichment")
     @patch("backend.routes.settings.plex_worker.request_full_scan")
@@ -3012,6 +3204,94 @@ class ListenBrainzLinkingTests(DatabaseTestCase):
         self.assertTrue(response.get_json()["validationDeferred"])
         self.assertEqual(self.saved_username(), "bitemyear")
         self.assertIn("validation deferred", logs.output[0])
+
+
+class LastFmLinkingTests(DatabaseTestCase):
+    def saved_lastfm_fields(self):
+        with db() as connection:
+            return connection.execute(
+                "SELECT lastfm_username, lastfm_api_key "
+                "FROM users WHERE username = ?",
+                ("test-user",),
+            ).fetchone()
+
+    @patch("backend.routes.account.recommendation_worker.request_refresh")
+    @patch("backend.routes.account.lastfm.get")
+    def test_user_saves_only_a_username_with_the_shared_key(
+        self, lastfm_get, request_refresh
+    ):
+        save_service("lastfm", {"apiKey": "admin-shared-key"})
+        token = self.register()
+
+        response = self.client.post(
+            "/api/account/lastfm",
+            json={"username": "personal-listener"},
+            headers={"X-CSRF-Token": token},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json()["message"],
+            "Last.fm account saved.",
+        )
+        lastfm_get.assert_called_once_with(
+            "user.getinfo",
+            "personal-listener",
+            "admin-shared-key",
+        )
+        saved = self.saved_lastfm_fields()
+        self.assertEqual(saved["lastfm_username"], "personal-listener")
+        self.assertIsNone(saved["lastfm_api_key"])
+        account = self.client.get("/api/account/settings")
+        self.assertEqual(account.get_json()["lastfmUsername"], "personal-listener")
+        self.assertTrue(account.get_json()["lastfmConfigured"])
+        self.assertNotIn("admin-shared-key", account.get_data(as_text=True))
+        self.assertNotIn("apiKey", account.get_data(as_text=True))
+        request_refresh.assert_called_once_with()
+
+    @patch("backend.routes.account.lastfm.get")
+    def test_username_requires_an_admin_configured_shared_key(self, lastfm_get):
+        response = self.client.post(
+            "/api/account/lastfm",
+            json={"username": "personal-listener"},
+            headers={"X-CSRF-Token": self.register()},
+        )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("administrator", response.get_json()["error"].lower())
+        self.assertIsNone(self.saved_lastfm_fields()["lastfm_username"])
+        lastfm_get.assert_not_called()
+
+    @patch("backend.routes.account.recommendation_worker.request_refresh")
+    @patch("backend.routes.account.lastfm.get")
+    def test_user_can_clear_their_username_without_supplying_a_key(
+        self, lastfm_get, request_refresh
+    ):
+        save_service("lastfm", {"apiKey": "admin-shared-key"})
+        token = self.register()
+        with db() as connection:
+            connection.execute(
+                "UPDATE users SET lastfm_username = ?, lastfm_api_key = ? "
+                "WHERE username = ?",
+                ("old-listener", "legacy-user-key", "test-user"),
+            )
+
+        response = self.client.post(
+            "/api/account/lastfm",
+            json={"username": " "},
+            headers={"X-CSRF-Token": token},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json()["message"],
+            "Last.fm account removed.",
+        )
+        saved = self.saved_lastfm_fields()
+        self.assertIsNone(saved["lastfm_username"])
+        self.assertIsNone(saved["lastfm_api_key"])
+        lastfm_get.assert_not_called()
+        request_refresh.assert_called_once_with()
 
 
 class ApiCacheTests(DatabaseTestCase):
@@ -4226,6 +4506,66 @@ class MusicBrainzClientTests(unittest.TestCase):
         )
 
 
+class LastFmDiscoveryTests(DatabaseTestCase):
+    @patch("backend.routes.discovery.recommendation_engine.lastfm_recommendations")
+    def test_personal_recommendations_use_the_shared_key(
+        self, lastfm_recommendations
+    ):
+        token = self.register()
+        save_service("lastfm", {"apiKey": "admin-shared-key"})
+        with db() as connection:
+            connection.execute(
+                "UPDATE users SET lastfm_username = ?, lastfm_api_key = ? "
+                "WHERE username = ?",
+                (
+                    "personal-listener",
+                    "legacy-key-that-must-not-be-used",
+                    "test-user",
+                ),
+            )
+        lastfm_recommendations.return_value = (
+            [{"id": "artist-id", "name": "Artist"}],
+            [{"id": "album-id", "name": "Album"}],
+        )
+
+        response = self.client.get(
+            "/api/recommendations/lastfm",
+            headers={"X-CSRF-Token": token},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        lastfm_recommendations.assert_called_once_with(
+            "personal-listener",
+            "admin-shared-key",
+        )
+        self.assertEqual(response.get_json()["username"], "personal-listener")
+        serialized = response.get_data(as_text=True)
+        self.assertNotIn("admin-shared-key", serialized)
+        self.assertNotIn("legacy-key-that-must-not-be-used", serialized)
+
+    @patch("backend.routes.discovery.lastfm.get")
+    def test_global_chart_uses_the_shared_key_without_a_personal_username(
+        self, lastfm_get
+    ):
+        token = self.register()
+        save_service("lastfm", {"apiKey": "admin-shared-key"})
+        lastfm_get.return_value = {"artists": {"artist": []}}
+
+        response = self.client.get(
+            "/api/charts/lastfm",
+            headers={"X-CSRF-Token": token},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        lastfm_get.assert_called_once_with(
+            "chart.gettopartists",
+            "melodarr",
+            "admin-shared-key",
+            limit=20,
+        )
+        self.assertNotIn("admin-shared-key", response.get_data(as_text=True))
+
+
 class DiscoveryRoutesTests(DatabaseTestCase):
     @patch("backend.routes.discovery.plex.cached_library_index")
     @patch("backend.routes.discovery.get_service")
@@ -5366,6 +5706,7 @@ class RecommendationAssemblyTests(unittest.TestCase):
         lastfm_get,
         lastfm_top_tags,
     ):
+        save_service("lastfm", {"apiKey": "admin-shared-key"})
         listenbrainz_recommendations.return_value = (
             [{"id": "lb-artist", "name": "LB Artist"}],
             [{"id": "lb-album", "name": "LB Album"}],
@@ -5441,6 +5782,7 @@ class RecommendationAssemblyTests(unittest.TestCase):
         lastfm_get,
         lastfm_top_tags,
     ):
+        save_service("lastfm", {"apiKey": "admin-shared-key"})
         listenbrainz_recommendations.side_effect = requests.Timeout("timed out")
         lastfm_recommendations.return_value = (
             [{"id": "lf-artist", "name": "LF Artist"}],

@@ -34,7 +34,7 @@ blueprint = Blueprint("auth", __name__)
 PLEX_FLOW_TTL = 15 * 60
 USER_COLUMNS = (
     "id, username, password_hash, role, listenbrainz_username, "
-    "lastfm_username, lastfm_api_key, plex_id, plex_username, "
+    "lastfm_username, plex_id, plex_username, "
     "plex_email, plex_avatar"
 )
 
