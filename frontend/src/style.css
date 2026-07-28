@@ -321,6 +321,7 @@ h1 em { font-style: normal; }
 .user-avatar img { position: absolute; inset: 0; display: block; width: 100%; height: 100%; object-fit: cover; }
 .user-avatar-large { flex-basis: 50px; width: 50px; height: 50px; font-size: 16px; }
 .user-request-count { color: var(--foreground-subtle); font-variant-numeric: tabular-nums; }
+.user-request-count a { color: var(--foreground); font-weight: 700; text-decoration-color: var(--border-hover); text-underline-offset: 3px; }
 .user-badge { display: inline-flex; align-items: center; min-height: 26px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); color: var(--foreground-subtle); padding: 4px 8px; font-size: 10px; font-weight: 700; }
 .user-type.plex { border-color: rgba(204, 123, 25, .34); background: rgba(204, 123, 25, .1); color: #9b5a0a; }
 .user-role.admin { border-color: rgba(168, 68, 45, .38); background: rgba(168, 68, 45, .1); color: var(--accent-bright); }
@@ -356,12 +357,17 @@ h1 em { font-style: normal; }
 .admin-request-requester > span:last-child { display: grid; min-width: 0; gap: 3px; }
 .admin-request-requester strong, .admin-request-requester small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .admin-request-requester strong { color: var(--foreground); font-size: 12px; }
+.admin-request-requester-link { overflow: hidden; color: var(--foreground); font-size: 12px; font-weight: 700; text-overflow: ellipsis; text-decoration-color: var(--border-hover); text-underline-offset: 3px; white-space: nowrap; }
 .admin-request-requester small { color: var(--foreground-muted); font-size: 10px; }
 .admin-request-requester time { color: inherit; }
 .admin-request-plex { margin: 0 11px 0 0; }
 .admin-request-empty { margin: 0; border: 1px dashed var(--border); border-radius: 12px; padding: 25px; text-align: center; }
 .admin-request-load-error { display: flex; align-items: center; justify-content: center; gap: 12px; border: 1px dashed var(--border); border-radius: 12px; padding: 22px; }
 .admin-request-load-error .message { margin: 0; }
+.admin-request-pagination { display: flex; align-items: center; justify-content: center; gap: 14px; margin-top: 18px; }
+.admin-request-pagination[hidden] { display: none; }
+.admin-request-pagination span { min-width: 110px; color: var(--foreground-muted); font-size: 12px; font-weight: 650; text-align: center; }
+.admin-request-pagination button { min-width: 92px; }
 .skeleton.admin-request-item { min-height: 70px; }
 .maintenance-section:first-child { border-top: 0; padding-top: 0; }
 .maintenance-heading { display: flex; align-items: center; justify-content: space-between; gap: 22px; margin-bottom: 16px; }
@@ -446,6 +452,11 @@ dialog::backdrop { background: rgba(48, 39, 32, .52); }
 .account-content { min-width: 0; }
 .account-section + .account-section { margin-top: 34px; }
 .account-section h2, .account-form h2 { margin: 0 0 14px; font-size: 20px; letter-spacing: -.03em; }
+.profile-summary { display: flex; align-items: center; gap: 15px; border: 1px solid var(--border); border-radius: 14px; background: rgba(255, 250, 243, .7); padding: 18px; }
+.profile-summary h2 { margin-bottom: 4px; }
+.profile-summary p { margin: 0; color: var(--foreground-muted); font-size: 12px; }
+.profile-actions { display: flex; margin-top: 14px; }
+.profile-actions a { text-decoration: none; }
 .history-item { display: flex; align-items: center; border: 1px solid var(--border); border-radius: 11px; background: rgba(255, 250, 243, .7); color: var(--foreground); overflow: hidden; transition: border-color .2s var(--ease-out), background .2s var(--ease-out); }
 .history-detail { display: flex; flex: 1; align-items: center; justify-content: space-between; min-width: 0; gap: 16px; color: var(--foreground); padding: 11px 15px; text-decoration: none; }
 .history-copy { display: grid; min-width: 0; gap: 4px; }
@@ -454,6 +465,10 @@ dialog::backdrop { background: rgba(48, 39, 32, .52); }
 .history-request-date { flex: 0 0 auto; color: var(--foreground-muted); white-space: nowrap; font-size: 12px; }
 .history-plex { display: inline-flex; flex: 0 0 auto; align-items: center; justify-content: center; width: 32px; height: 32px; margin-right: 11px; border: 1px solid rgba(229, 160, 13, .3); border-radius: 8px; background: rgba(229, 160, 13, .06); padding: 7px; }
 .history-plex img { display: block; width: 100%; height: 100%; object-fit: contain; }
+.request-pagination { display: grid; grid-template-columns: minmax(90px, 1fr) auto minmax(90px, 1fr); align-items: center; gap: 14px; margin-top: 24px; }
+.request-pagination button:first-child { justify-self: start; }
+.request-pagination button:last-child { justify-self: end; }
+.request-pagination span { color: var(--foreground-muted); text-align: center; font-size: 12px; font-variant-numeric: tabular-nums; }
 .account-form { max-width: 580px; }
 .linked-account-summary { display: flex; align-items: center; gap: 14px; }
 .linked-account-summary > img { flex: 0 0 auto; object-fit: contain; }
@@ -591,6 +606,9 @@ details summary { margin-bottom: 17px; color: var(--accent-bright); cursor: poin
   .account-nav p { grid-column: 1 / -1; }
   .account-nav-action { grid-column: 1 / -1; }
   .history-detail { align-items: flex-start; }
+  .request-pagination { grid-template-columns: 1fr 1fr; }
+  .request-pagination span { grid-column: 1 / -1; grid-row: 1; }
+  .request-pagination button { width: 100%; }
   #back-to-top { right: 16px; width: 44px; height: 44px; padding: 0; }
   #back-to-top span { display: none; }
   .dialog-actions { position: sticky; bottom: 0; background: #fffaf3; padding-bottom: calc(17px + var(--safe-bottom)); }
@@ -874,6 +892,7 @@ button,
 :root[data-theme="midnight"] .maintenance-table-wrap,
 :root[data-theme="midnight"] .option-picker,
 :root[data-theme="midnight"] .account-nav,
+:root[data-theme="midnight"] .profile-summary,
 :root[data-theme="midnight"] .history-item,
 :root[data-theme="midnight"] .admin-request-item,
 :root[data-theme="midnight"] .users-table-wrap { background: var(--surface); }

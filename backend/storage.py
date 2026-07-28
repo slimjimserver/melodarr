@@ -84,15 +84,24 @@ def save_service(service, values):
     write_settings_file(settings)
 
 
-def get_request_history(user_id, limit=100):
+def get_request_history(user_id, limit=100, offset=0):
     """Return the most recent private request-history rows for one user."""
     with db() as connection:
         return connection.execute(
             "SELECT kind, mbid, name, artist_name, release_type, release_date, "
             "created_at FROM request_history "
-            "WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
-            (user_id, limit),
+            "WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+            (user_id, limit, offset),
         ).fetchall()
+
+
+def count_request_history(user_id):
+    """Return the number of private request-history rows for one user."""
+    with db() as connection:
+        return connection.execute(
+            "SELECT COUNT(*) AS total FROM request_history WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()["total"]
 
 
 def record_request(

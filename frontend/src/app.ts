@@ -30,7 +30,7 @@ interface AppElement extends HTMLElement {
   alt: string;
   fetchPriority: string;
 }
-type AccountPage = "profile" | "general" | "linked-accounts" | "invitations";
+type AccountPage = "profile" | "requests" | "general" | "linked-accounts" | "invitations";
 type AppView = "discover" | "detail" | "library" | "settings" | "account";
 type SettingsPage = "services" | "requests" | "users" | "jobs";
 type ThemeName = "midnight" | "warm";
@@ -81,6 +81,13 @@ interface AdminRequest {
   plexUrl?: string;
   plexampUrl?: string;
   requester: AdminUserIdentity;
+}
+
+interface AdminRequestPagination {
+  page: number;
+  pageSize: number;
+  total: number;
+  totalPages: number;
 }
 
 type AdminUserForm = HTMLFormElement & {
@@ -148,7 +155,12 @@ function mobilePlexDestination(plexUrl: string, plexampUrl: string) {
 let lidarrOptions: JsonObject | undefined;
 let lidarrDefaults: LidarrDefaults = {};
 let currentUser: CurrentUser | undefined;
-let showAccountPage: ((page?: AccountPage, updateHistory?: boolean) => void) | undefined;
+let showAccountPage: ((
+  page?: AccountPage,
+  updateHistory?: boolean,
+  username?: string,
+  requestPage?: number,
+) => void) | undefined;
 let invitationToken = "";
 let setupPlexFlowToken = "";
 let setupPlexServers: PlexServer[] = [];
@@ -161,6 +173,12 @@ let editingAdminUser: AdminUser | undefined;
 let adminUsersRequest = 0;
 let adminRequests: AdminRequest[] = [];
 let adminRequestsRequest = 0;
+let adminRequestsPagination: AdminRequestPagination = {
+  page: 1,
+  pageSize: 100,
+  total: 0,
+  totalPages: 0,
+};
 let discoveryLoad: Promise<void> | undefined;
 // Plex holdings tell a requester what is already available, so the library is
 // readable by every account. Settings remains administrator-only.
@@ -683,6 +701,17 @@ function showSettingsPage(page: SettingsPage, updateHistory = true) {
 }
 
 function setupNavigation() {
+  let activeAccountUsername = "";
+  let activeAccountRequestPage = 1;
+
+  function isOwnAccountUsername(username: string) {
+    if (!currentUser) return false;
+    const normalizedUsername = username.toLocaleLowerCase();
+    return [currentUser.username, currentUser.plexUsername]
+      .filter(Boolean)
+      .some((candidate) => candidate!.toLocaleLowerCase() === normalizedUsername);
+  }
+
   function showView(view: AppView, updateHistory = true) {
     if (!currentUser || (currentUser.role !== "admin" && !VIEWS_FOR_EVERY_USER.includes(view))) view = "discover";
     document.querySelectorAll(".nav-link, .view").forEach((element) => element.classList.remove("active"));
@@ -710,10 +739,19 @@ function setupNavigation() {
     resetPageScroll();
   }
 
-  function accountPath(page: AccountPage) {
+  function accountPath(
+    page: AccountPage,
+    username = activeAccountUsername || currentUser?.username || "",
+    requestPage = activeAccountRequestPage,
+  ) {
     if (!currentUser) throw new Error("Account navigation requires an authenticated user.");
-    const username = encodeURIComponent(currentUser.username);
-    return page === "profile" ? `/${username}` : `/${username}/settings/${page}`;
+    const encodedUsername = encodeURIComponent(username);
+    if (page === "profile") return `/${encodedUsername}`;
+    if (page === "requests") {
+      const query = requestPage > 1 ? `?page=${requestPage}` : "";
+      return `/${encodedUsername}/requests${query}`;
+    }
+    return `/${encodedUsername}/settings/${page}`;
   }
 
   function createHistoryItem(item: JsonObject, route: string) {
@@ -784,9 +822,16 @@ function setupNavigation() {
   async function renderAccount(page: AccountPage) {
     const user = currentUser;
     if (!user) return;
+    const targetUsername = activeAccountUsername || user.username;
+    const isOwnAccount = isOwnAccountUsername(targetUsername);
     const content = $("#account-content");
     $("#account-title").textContent = page === "profile" ? "Profile" : page.split("-").map((word) => word[0].toUpperCase() + word.slice(1)).join(" ");
     document.querySelectorAll<HTMLElement>("[data-account-route]").forEach((link) => link.classList.toggle("active", link.dataset.accountRoute === page));
+    document.querySelectorAll<HTMLElement>("[data-account-owner-only]").forEach((element) => {
+      element.hidden = !isOwnAccount || (
+        element.classList.contains("admin-only") && user.role !== "admin"
+      );
+    });
     content.replaceChildren();
     const message = document.createElement("p");
     message.className = "message";
@@ -794,9 +839,46 @@ function setupNavigation() {
     content.append(message);
     try {
       if (page === "profile") {
-        const data = await api("/api/account/profile");
+        const data = await api(
+          `/api/account/profile?username=${encodeURIComponent(targetUsername)}&page=1`,
+        );
         content.replaceChildren();
-        [["Artists", data.requests.artist, "artists"], ["Release groups", data.requests["release-group"], "albums"]].forEach(([title, requests, route]) => {
+        const identity = data.user as AdminUserIdentity;
+        const section = document.createElement("section");
+        section.className = "account-section profile-summary";
+        const avatar = createUserAvatar(identity);
+        avatar.classList.add("user-avatar-large");
+        const copy = document.createElement("div");
+        const heading = document.createElement("h2");
+        heading.textContent = adminUserDisplayName(identity);
+        const accountType = document.createElement("p");
+        accountType.textContent = `${identity.userType === "plex" ? "Plex user" : "Local account"} · ${identity.role === "admin" ? "Administrator" : "User"}`;
+        copy.append(heading, accountType);
+        section.append(avatar, copy);
+
+        const actions = document.createElement("div");
+        actions.className = "profile-actions";
+        const requestsLink = document.createElement("a");
+        requestsLink.className = "outline";
+        requestsLink.href = accountPath("requests", targetUsername, 1);
+        requestsLink.textContent = "View requests";
+        requestsLink.addEventListener("click", (event) => {
+          if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+          event.preventDefault();
+          showAccountPage?.("requests", true, targetUsername, 1);
+        });
+        actions.append(requestsLink);
+        content.append(section, actions);
+      } else if (page === "requests") {
+        const data = await api(
+          `/api/account/profile?username=${encodeURIComponent(targetUsername)}&page=${encodeURIComponent(activeAccountRequestPage)}`,
+        );
+        content.replaceChildren();
+        const requestGroups: [string, JsonObject[], string][] = [
+          ["Artists", data.requests?.artist || [], "artists"],
+          ["Release groups", data.requests?.["release-group"] || [], "albums"],
+        ];
+        requestGroups.forEach(([title, requests, route]) => {
           const section = document.createElement("section");
           section.className = "account-section";
           const heading = document.createElement("h2"); heading.textContent = title;
@@ -805,6 +887,37 @@ function setupNavigation() {
           requests.forEach((item: JsonObject) => list.append(createHistoryItem(item, route)));
           section.append(heading, list); content.append(section);
         });
+
+        const pagination = data.pagination || {
+          page: activeAccountRequestPage,
+          pageSize: 100,
+          total: requestGroups.reduce((total, [, requests]) => total + requests.length, 0),
+          totalPages: 1,
+        };
+        const paginationControls = document.createElement("nav");
+        paginationControls.className = "request-pagination";
+        paginationControls.setAttribute("aria-label", "Request history pages");
+        const previous = document.createElement("button");
+        previous.type = "button";
+        previous.className = "outline";
+        previous.textContent = "Previous";
+        previous.disabled = pagination.page <= 1;
+        const status = document.createElement("span");
+        status.textContent = pagination.total
+          ? `Page ${pagination.page.toLocaleString()} of ${pagination.totalPages.toLocaleString()} · ${pagination.total.toLocaleString()} requests`
+          : "No requests";
+        const next = document.createElement("button");
+        next.type = "button";
+        next.className = "outline";
+        next.textContent = "Next";
+        next.disabled = pagination.totalPages === 0 || pagination.page >= pagination.totalPages;
+        const showRequestPage = (nextPage: number) => {
+          showAccountPage?.("requests", true, targetUsername, nextPage);
+        };
+        previous.addEventListener("click", () => showRequestPage(pagination.page - 1));
+        next.addEventListener("click", () => showRequestPage(pagination.page + 1));
+        paginationControls.append(previous, status, next);
+        content.append(paginationControls);
       } else if (page === "general") {
         content.replaceChildren();
         const form = document.createElement("form") as AppForm; form.className = "service-card account-form";
@@ -820,6 +933,7 @@ function setupNavigation() {
               body: JSON.stringify(Object.fromEntries(new FormData(form))),
             });
             user.username = result.username;
+            activeAccountUsername = result.username;
             const accountMenu = $<HTMLAnchorElement>("#account-menu");
             accountMenu.textContent = result.username.slice(0, 1).toUpperCase();
             accountMenu.href = accountPath("profile");
@@ -971,12 +1085,31 @@ function setupNavigation() {
     } catch (error) { setMessage(message, error.message, true); }
   }
 
-  showAccountPage = (page = "profile", updateHistory = true) => {
-    if (!currentUser) return;
+  showAccountPage = (
+    page = "profile",
+    updateHistory = true,
+    username = activeAccountUsername || currentUser?.username,
+    requestPage = 1,
+  ) => {
+    if (!currentUser || !username) return;
+    const isOwnAccount = isOwnAccountUsername(username);
+    if (!isOwnAccount && currentUser.role !== "admin") {
+      showView("discover");
+      return;
+    }
+    activeAccountUsername = username;
+    activeAccountRequestPage = page === "requests" ? Math.max(1, requestPage) : 1;
     showView("account", false);
-    if (updateHistory) window.history.pushState({ account: page }, "", accountPath(page));
-    const allowedPages = ["profile", "general", "linked-accounts"];
-    if (currentUser.role === "admin") allowedPages.push("invitations");
+    if (updateHistory) {
+      window.history.pushState(
+        { account: page, username, page: activeAccountRequestPage },
+        "",
+        accountPath(page, username, activeAccountRequestPage),
+      );
+    }
+    const allowedPages: AccountPage[] = ["profile", "requests"];
+    if (isOwnAccount) allowedPages.push("general", "linked-accounts");
+    if (isOwnAccount && currentUser.role === "admin") allowedPages.push("invitations");
     renderAccount(allowedPages.includes(page) ? page : "profile");
   };
 
@@ -1002,11 +1135,6 @@ function setupNavigation() {
   });
 
   window.addEventListener("popstate", () => {
-    const accountMatch = window.location.pathname.match(/^\/([^/]+)(?:\/settings\/(general|linked-accounts|invitations))?\/?$/);
-    if (accountMatch && currentUser && decodeURIComponent(accountMatch[1]).toLowerCase() === currentUser.username.toLowerCase()) {
-      showAccountPage?.((accountMatch[2] || "profile") as AccountPage, false);
-      return;
-    }
     if (["/settings", "/settings/requests", "/settings/users", "/settings/jobs"].includes(window.location.pathname)) {
       showView("settings", false);
       const page: SettingsPage = window.location.pathname.endsWith("/requests")
@@ -1015,6 +1143,22 @@ function setupNavigation() {
           ? "users"
           : window.location.pathname.endsWith("/jobs") ? "jobs" : "services";
       showSettingsPage(page, false);
+      return;
+    }
+    const accountMatch = window.location.pathname.match(
+      /^\/([^/]+)(?:\/(requests)|\/settings\/(general|linked-accounts|invitations))?\/?$/,
+    );
+    const accountUsername = accountMatch ? decodeURIComponent(accountMatch[1]) : "";
+    const canViewAccount = accountMatch && currentUser && (
+      isOwnAccountUsername(accountUsername)
+      || currentUser.role === "admin"
+    );
+    if (accountMatch && canViewAccount) {
+      const accountPage = (accountMatch[2] || accountMatch[3] || "profile") as AccountPage;
+      const requestPage = accountPage === "requests"
+        ? Math.max(1, Number.parseInt(new URLSearchParams(window.location.search).get("page") || "1", 10) || 1)
+        : 1;
+      showAccountPage?.(accountPage, false, accountUsername, requestPage);
       return;
     }
     const view = window.location.pathname.slice(1) || "discover";
@@ -1032,7 +1176,7 @@ function setupNavigation() {
   $<HTMLAnchorElement>("#account-menu").addEventListener("click", (event) => {
     if (!currentUser || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
     event.preventDefault();
-    showAccountPage?.("profile");
+    showAccountPage?.("profile", true, currentUser.username);
   });
   document.querySelectorAll<HTMLElement>("[data-account-route]").forEach((link) => link.addEventListener("click", (event) => { event.preventDefault(); showAccountPage?.(link.dataset.accountRoute as AccountPage); }));
   document.querySelector("#account-logout")?.addEventListener("click", () => signOut());
@@ -1151,7 +1295,9 @@ function createAdminRequestItem(item: AdminRequest) {
   const requester = document.createElement("div");
   requester.className = "admin-request-requester";
   const requesterCopy = document.createElement("span");
-  const requesterName = document.createElement("strong");
+  const requesterName = document.createElement("a");
+  requesterName.className = "admin-request-requester-link";
+  requesterName.href = `/${encodeURIComponent(adminUserDisplayName(item.requester))}`;
   requesterName.textContent = adminUserDisplayName(item.requester);
   const requesterMeta = document.createElement("small");
   const requestedAtDate = joinedDate(item.created_at);
@@ -1175,11 +1321,23 @@ function createAdminRequestItem(item: AdminRequest) {
 }
 
 function setAdminRequestStats() {
-  $("#admin-requests-total").textContent = adminRequests.length.toLocaleString();
+  $("#admin-requests-total").textContent = adminRequestsPagination.total.toLocaleString();
   $("#admin-requests-artists").textContent = adminRequests
     .filter((item) => item.kind === "artist").length.toLocaleString();
   $("#admin-requests-releases").textContent = adminRequests
     .filter((item) => item.kind === "release-group").length.toLocaleString();
+}
+
+function renderAdminRequestPagination() {
+  const pagination = $("#admin-requests-pagination");
+  const previous = $<HTMLButtonElement>("#admin-requests-previous");
+  const next = $<HTMLButtonElement>("#admin-requests-next");
+  const pageLabel = $("#admin-requests-page");
+  const { page, totalPages } = adminRequestsPagination;
+  pagination.hidden = totalPages <= 1;
+  previous.disabled = page <= 1;
+  next.disabled = totalPages === 0 || page >= totalPages;
+  pageLabel.textContent = `Page ${page.toLocaleString()} of ${Math.max(totalPages, 1).toLocaleString()}`;
 }
 
 function renderAdminRequests() {
@@ -1214,29 +1372,53 @@ function renderAdminRequests() {
   }
 
   const filtered = query || kind !== "all";
+  const { page, pageSize, total } = adminRequestsPagination;
+  const firstResult = total ? ((page - 1) * pageSize) + 1 : 0;
+  const lastResult = total ? firstResult + adminRequests.length - 1 : 0;
   setMessage(
     $("#admin-requests-message"),
     filtered
-      ? `${visibleRequests.length.toLocaleString()} of ${adminRequests.length.toLocaleString()} requests.`
-      : `${adminRequests.length.toLocaleString()} ${adminRequests.length === 1 ? "request" : "requests"}.`,
+      ? `${visibleRequests.length.toLocaleString()} of ${adminRequests.length.toLocaleString()} requests on this page.`
+      : total
+        ? `Showing ${firstResult.toLocaleString()}–${lastResult.toLocaleString()} of ${total.toLocaleString()} requests.`
+        : "No requests.",
   );
+  renderAdminRequestPagination();
 }
 
-async function refreshAdminRequests() {
+async function refreshAdminRequests(page = adminRequestsPagination.page) {
   const request = ++adminRequestsRequest;
   const list = $("#admin-requests-list");
   list.replaceChildren(skeletonBlock("admin-request-item", 6));
   setMessage($("#admin-requests-message"), "Loading requests…");
+  $<HTMLButtonElement>("#admin-requests-previous").disabled = true;
+  $<HTMLButtonElement>("#admin-requests-next").disabled = true;
   try {
-    const result = await api<{ requests: AdminRequest[] }>("/api/admin/requests");
+    const result = await api<{
+      requests: AdminRequest[];
+      pagination: AdminRequestPagination;
+    }>(`/api/admin/requests?page=${encodeURIComponent(page)}`);
     if (request !== adminRequestsRequest) return;
     adminRequests = result.requests || [];
+    adminRequestsPagination = result.pagination || {
+      page,
+      pageSize: 100,
+      total: adminRequests.length,
+      totalPages: adminRequests.length ? 1 : 0,
+    };
     setAdminRequestStats();
     renderAdminRequests();
   } catch (error) {
     if (request !== adminRequestsRequest) return;
     adminRequests = [];
+    adminRequestsPagination = {
+      page,
+      pageSize: 100,
+      total: 0,
+      totalPages: 0,
+    };
     setAdminRequestStats();
+    renderAdminRequestPagination();
     list.replaceChildren();
     const errorState = document.createElement("div");
     errorState.className = "admin-request-load-error";
@@ -1256,6 +1438,14 @@ async function refreshAdminRequests() {
 
 function setupAdminRequests() {
   $("#refresh-admin-requests").addEventListener("click", () => refreshAdminRequests());
+  $("#admin-requests-previous").addEventListener("click", () => {
+    if (adminRequestsPagination.page <= 1) return;
+    refreshAdminRequests(adminRequestsPagination.page - 1);
+  });
+  $("#admin-requests-next").addEventListener("click", () => {
+    if (adminRequestsPagination.page >= adminRequestsPagination.totalPages) return;
+    refreshAdminRequests(adminRequestsPagination.page + 1);
+  });
   $<HTMLInputElement>("#admin-requests-search").addEventListener(
     "input",
     () => renderAdminRequests(),
@@ -1337,9 +1527,17 @@ function renderAdminUsers() {
     identity.append(createUserAvatar(user), copy);
     identityCell.append(identity);
 
-    const requests = tableCell(row, Number(user.requestCount || 0).toLocaleString());
+    const requests = tableCell(row, "");
     requests.dataset.label = "Requests";
     requests.className = "user-request-count";
+    const requestLink = document.createElement("a");
+    requestLink.href = `/${encodeURIComponent(adminUserDisplayName(user))}/requests`;
+    requestLink.textContent = Number(user.requestCount || 0).toLocaleString();
+    requestLink.setAttribute(
+      "aria-label",
+      `View requests from ${adminUserDisplayName(user)}`,
+    );
+    requests.append(requestLink);
 
     const typeCell = tableCell(row, "");
     typeCell.dataset.label = "User type";

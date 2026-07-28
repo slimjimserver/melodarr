@@ -154,8 +154,8 @@ class ApplicationFactoryTests(DatabaseTestCase):
             for method in rule.methods
             if method not in {"HEAD", "OPTIONS"}
         }
-        self.assertEqual(len(rules), 64)
-        self.assertEqual(len(route_methods), 64)
+        self.assertEqual(len(rules), 65)
+        self.assertEqual(len(route_methods), 65)
 
     def test_factory_applies_test_configuration(self):
         self.assertTrue(self.app.config["TESTING"])
@@ -1290,7 +1290,21 @@ class DeploymentConfigTests(unittest.TestCase):
 
         self.assertIn('<a id="account-menu"', frontend)
         self.assertIn("accountMenu.href = `/${encodeURIComponent(user.username)}`", typescript)
-        self.assertIn('showAccountPage?.("profile")', typescript)
+        self.assertIn(
+            'showAccountPage?.("profile", true, currentUser.username)',
+            typescript,
+        )
+        self.assertIn(
+            '<a data-account-route="requests" href="#">Requests</a>',
+            frontend,
+        )
+        self.assertIn('return `/${encodedUsername}/requests${query}`', typescript)
+        self.assertIn('className = "request-pagination"', typescript)
+        self.assertIn(
+            '/api/account/profile?username=${encodeURIComponent(targetUsername)}'
+            '&page=${encodeURIComponent(activeAccountRequestPage)}',
+            typescript,
+        )
         # The header and the mobile tab bar both carry a button per view, and
         # detail/account views have none, so this must not use the strict
         # single-element helper that throws when a selector matches nothing.
@@ -2342,6 +2356,12 @@ class AdminUsersTests(DatabaseTestCase):
 
         self.assertEqual(response.status_code, 200)
         requests_payload = response.get_json()["requests"]
+        self.assertEqual(response.get_json()["pagination"], {
+            "page": 1,
+            "pageSize": 100,
+            "total": 3,
+            "totalPages": 1,
+        })
         self.assertEqual(
             [item["name"] for item in requests_payload],
             ["Newest at Same Time", "Album One", "Artist One"],
@@ -2396,6 +2416,73 @@ class AdminUsersTests(DatabaseTestCase):
         self.assertNotIn("never-return-this-plex-key", serialized)
         self.assertNotIn("never-return-this-plex-id", serialized)
         self.assertNotIn("password_hash", serialized)
+
+    @patch(
+        "backend.routes.admin._profile_plex_index",
+        return_value={"artistsByMbid": {}, "releaseGroupsByMbid": {}},
+    )
+    def test_admin_request_list_paginates_at_100_items(
+        self, profile_plex_index
+    ):
+        self.register()
+        user_id = self.add_user("prolific-listener")
+        with db() as connection:
+            connection.executemany(
+                "INSERT INTO request_history "
+                "(user_id, kind, mbid, name, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [
+                    (
+                        user_id,
+                        "artist",
+                        f"artist-{index}",
+                        f"Request {index}",
+                        index,
+                    )
+                    for index in range(205)
+                ],
+            )
+
+        first = self.client.get("/api/admin/requests").get_json()
+        second = self.client.get("/api/admin/requests?page=2").get_json()
+        third = self.client.get("/api/admin/requests?page=3").get_json()
+
+        self.assertEqual(len(first["requests"]), 100)
+        self.assertEqual(first["requests"][0]["name"], "Request 204")
+        self.assertEqual(first["requests"][-1]["name"], "Request 105")
+        self.assertEqual(len(second["requests"]), 100)
+        self.assertEqual(second["requests"][0]["name"], "Request 104")
+        self.assertEqual(second["requests"][-1]["name"], "Request 5")
+        self.assertEqual(
+            [item["name"] for item in third["requests"]],
+            [
+                "Request 4",
+                "Request 3",
+                "Request 2",
+                "Request 1",
+                "Request 0",
+            ],
+        )
+        self.assertEqual(first["pagination"], {
+            "page": 1,
+            "pageSize": 100,
+            "total": 205,
+            "totalPages": 3,
+        })
+        self.assertEqual(second["pagination"]["page"], 2)
+        self.assertEqual(third["pagination"]["page"], 3)
+        profile_plex_index.assert_called()
+
+    def test_admin_request_list_rejects_invalid_pages(self):
+        self.register()
+
+        for page in ("0", "-1", "nope", "1.5"):
+            with self.subTest(page=page):
+                response = self.client.get(
+                    f"/api/admin/requests?page={page}"
+                )
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("positive integer", response.get_json()["error"])
 
     def test_admin_request_list_requires_an_administrator(self):
         self.assertEqual(
@@ -3506,7 +3593,18 @@ class AccountProfileTests(DatabaseTestCase):
         response = self.client.get("/api/account/profile")
 
         self.assertEqual(response.status_code, 200)
-        item = response.get_json()["requests"]["release-group"][0]
+        payload = response.get_json()
+        self.assertEqual(payload["user"], {
+            "id": user_id,
+            "username": "test-user",
+            "localUsername": "test-user",
+            "userType": "local",
+            "role": "admin",
+            "plexUsername": "",
+            "plexEmail": "",
+            "plexAvatar": "",
+        })
+        item = payload["requests"]["release-group"][0]
         self.assertEqual(item["artist_name"], "Stray Kids")
         self.assertEqual(item["release_type"], "Album")
         self.assertEqual(item["release_date"], "2020-03-18")
@@ -3554,6 +3652,206 @@ class AccountProfileTests(DatabaseTestCase):
         self.assertEqual(item["release_date"], "2019-04-05")
         self.assertFalse(item["availableInPlex"])
         self.assertTrue(musicbrainz_get.call_args.kwargs["cache_only"])
+
+    @patch("backend.routes.account.get_service", return_value=None)
+    def test_profile_request_history_paginates_at_100_items(
+        self, get_service
+    ):
+        self.register()
+        with db() as connection:
+            user_id = connection.execute(
+                "SELECT id FROM users WHERE username = 'test-user'"
+            ).fetchone()["id"]
+            connection.executemany(
+                "INSERT INTO request_history "
+                "(user_id, kind, mbid, name, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [
+                    (
+                        user_id,
+                        "artist" if index % 2 else "release-group",
+                        f"request-{index}",
+                        f"Request {index}",
+                        index,
+                    )
+                    for index in range(205)
+                ],
+            )
+
+        first = self.client.get("/api/account/profile").get_json()
+        second = self.client.get("/api/account/profile?page=2").get_json()
+        third = self.client.get("/api/account/profile?page=3").get_json()
+
+        self.assertEqual(
+            sum(len(items) for items in first["requests"].values()),
+            100,
+        )
+        self.assertEqual(
+            sum(len(items) for items in second["requests"].values()),
+            100,
+        )
+        self.assertEqual(
+            sum(len(items) for items in third["requests"].values()),
+            5,
+        )
+        self.assertEqual(first["pagination"], {
+            "page": 1,
+            "pageSize": 100,
+            "total": 205,
+            "totalPages": 3,
+        })
+        self.assertEqual(second["pagination"]["page"], 2)
+        self.assertEqual(third["pagination"]["page"], 3)
+        first_names = {
+            item["name"]
+            for items in first["requests"].values()
+            for item in items
+        }
+        third_names = {
+            item["name"]
+            for items in third["requests"].values()
+            for item in items
+        }
+        self.assertIn("Request 204", first_names)
+        self.assertNotIn("Request 104", first_names)
+        self.assertEqual(
+            third_names,
+            {f"Request {index}" for index in range(5)},
+        )
+
+    def test_profile_request_history_rejects_invalid_pages(self):
+        self.register()
+
+        for page in ("0", "-1", "nope", "1.5"):
+            with self.subTest(page=page):
+                response = self.client.get(
+                    f"/api/account/profile?page={page}"
+                )
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("positive integer", response.get_json()["error"])
+
+    @patch("backend.routes.account.get_service", return_value=None)
+    def test_admin_can_view_another_profile_by_local_or_plex_username(
+        self, get_service
+    ):
+        self.register()
+        with db() as connection:
+            cursor = connection.execute(
+                "INSERT INTO users "
+                "(username, password_hash, role, plex_id, plex_username, "
+                "plex_email, plex_avatar, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "generated-plex-name",
+                    generate_password_hash("listener-password"),
+                    "user",
+                    "private-plex-id",
+                    "Plex Listener",
+                    "plex@example.com",
+                    "https://plex.example/avatar.jpg",
+                    100,
+                ),
+            )
+            user_id = cursor.lastrowid
+            connection.execute(
+                "INSERT INTO request_history "
+                "(user_id, kind, mbid, name, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (user_id, "artist", "artist-1", "Requested Artist", 200),
+            )
+
+        by_local = self.client.get(
+            "/api/account/profile?username=GENERATED-PLEX-NAME"
+        )
+        by_plex = self.client.get(
+            "/api/account/profile?username=Plex%20Listener"
+        )
+
+        self.assertEqual(by_local.status_code, 200)
+        self.assertEqual(by_plex.status_code, 200)
+        payload = by_plex.get_json()
+        self.assertEqual(payload["username"], "generated-plex-name")
+        self.assertEqual(payload["user"], {
+            "id": user_id,
+            "username": "Plex Listener",
+            "localUsername": "generated-plex-name",
+            "userType": "plex",
+            "role": "user",
+            "plexUsername": "Plex Listener",
+            "plexEmail": "plex@example.com",
+            "plexAvatar": "https://plex.example/avatar.jpg",
+        })
+        self.assertEqual(
+            payload["requests"]["artist"][0]["name"],
+            "Requested Artist",
+        )
+        self.assertEqual(by_local.get_json()["user"], payload["user"])
+        serialized = by_plex.get_data(as_text=True)
+        self.assertNotIn("private-plex-id", serialized)
+        self.assertNotIn("password_hash", serialized)
+
+    def test_non_admin_cannot_view_another_users_profile(self):
+        admin_csrf = self.register()
+        with db() as connection:
+            connection.executemany(
+                "INSERT INTO users "
+                "(username, password_hash, role, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                [
+                    (
+                        "ordinary-user",
+                        generate_password_hash("listener-password"),
+                        "user",
+                        100,
+                    ),
+                    (
+                        "another-user",
+                        generate_password_hash("listener-password"),
+                        "user",
+                        200,
+                    ),
+                ],
+            )
+        self.client.post(
+            "/api/auth/logout",
+            headers={"X-CSRF-Token": admin_csrf},
+        )
+        login = self.client.post(
+            "/api/auth/login",
+            json={
+                "username": "ordinary-user",
+                "password": "listener-password",
+            },
+        )
+        self.assertEqual(login.status_code, 200)
+
+        own_profile = self.client.get(
+            "/api/account/profile?username=ORDINARY-USER"
+        )
+        other_profile = self.client.get(
+            "/api/account/profile?username=another-user"
+        )
+        missing_profile = self.client.get(
+            "/api/account/profile?username=missing-user"
+        )
+
+        self.assertEqual(own_profile.status_code, 200)
+        self.assertEqual(
+            own_profile.get_json()["user"]["localUsername"],
+            "ordinary-user",
+        )
+        self.assertEqual(other_profile.status_code, 403)
+        self.assertEqual(missing_profile.status_code, 403)
+
+    def test_admin_profile_lookup_returns_not_found(self):
+        self.register()
+
+        response = self.client.get(
+            "/api/account/profile?username=missing-user"
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.get_json()["error"], "User not found.")
 
 
 class LidarrClientTests(unittest.TestCase):

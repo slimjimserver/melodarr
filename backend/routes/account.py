@@ -17,6 +17,7 @@ if __package__ == "backend.routes":
     from ..services import lastfm, listenbrainz, musicbrainz, plex
     from ..storage import (
         db,
+        count_request_history,
         delete_recommendation_cache,
         get_request_history,
         get_service,
@@ -28,6 +29,7 @@ else:  # Support the existing `python backend/app.py` entry point.
     from services import lastfm, listenbrainz, musicbrainz, plex
     from storage import (
         db,
+        count_request_history,
         delete_recommendation_cache,
         get_request_history,
         get_service,
@@ -36,6 +38,16 @@ else:  # Support the existing `python backend/app.py` entry point.
 
 
 blueprint = Blueprint("account", __name__)
+REQUESTS_PAGE_SIZE = 100
+
+
+def _requested_page():
+    raw_page = request.args.get("page", "1")
+    try:
+        page = int(raw_page)
+    except (TypeError, ValueError):
+        return None
+    return page if page > 0 else None
 
 
 def _recommendation_inputs_changed(user_id):
@@ -122,6 +134,75 @@ def _profile_history_item(row, plex_index):
     return item
 
 
+def _profile_user_payload(user):
+    """Return profile identity without authentication or integration secrets."""
+    is_plex_user = bool(user["plex_id"])
+    return {
+        "id": user["id"],
+        "username": (
+            user["plex_username"] or user["username"]
+            if is_plex_user
+            else user["username"]
+        ),
+        "localUsername": user["username"],
+        "userType": "plex" if is_plex_user else "local",
+        "role": user["role"],
+        "plexUsername": user["plex_username"] or "",
+        "plexEmail": user["plex_email"] or "",
+        "plexAvatar": user["plex_avatar"] or "",
+    }
+
+
+def _requested_profile_user(signed_in_user):
+    requested_username = request.args.get("username")
+    if requested_username is None:
+        return signed_in_user, None
+
+    requested_username = requested_username.strip()
+    if not requested_username:
+        return None, api_error("User not found.", 404)
+    own_names = {
+        str(signed_in_user["username"] or "").casefold(),
+        str(signed_in_user["plex_username"] or "").casefold(),
+    }
+    if requested_username.casefold() in own_names:
+        return signed_in_user, None
+    if signed_in_user["role"] != "admin":
+        return None, api_error(
+            "Administrator access is required to view another user's profile.",
+            403,
+        )
+
+    with db() as connection:
+        user = connection.execute(
+            """
+            SELECT
+                id,
+                username,
+                role,
+                plex_id,
+                plex_username,
+                plex_email,
+                plex_avatar
+            FROM users
+            WHERE username = ? COLLATE NOCASE
+                OR plex_username = ? COLLATE NOCASE
+            ORDER BY
+                CASE WHEN username = ? COLLATE NOCASE THEN 0 ELSE 1 END,
+                id
+            LIMIT 1
+            """,
+            (
+                requested_username,
+                requested_username,
+                requested_username,
+            ),
+        ).fetchone()
+    if not user:
+        return None, api_error("User not found.", 404)
+    return user, None
+
+
 @blueprint.post("/api/account/invitations")
 @admin_required
 def create_invitation():
@@ -164,12 +245,35 @@ def account_settings():
 @blueprint.get("/api/account/profile")
 @login_required
 def account_profile():
-    user = current_user()
+    signed_in_user = current_user()
+    user, error = _requested_profile_user(signed_in_user)
+    if error:
+        return error
+    page = _requested_page()
+    if page is None:
+        return api_error("Page must be a positive integer.")
+    total = count_request_history(user["id"])
     history = {"artist": [], "release-group": []}
     plex_index = _profile_plex_index()
-    for row in get_request_history(user["id"]):
+    for row in get_request_history(
+        user["id"],
+        limit=REQUESTS_PAGE_SIZE,
+        offset=(page - 1) * REQUESTS_PAGE_SIZE,
+    ):
         history[row["kind"]].append(_profile_history_item(row, plex_index))
-    return jsonify({"username": user["username"], "requests": history})
+    return jsonify({
+        "username": user["username"],
+        "user": _profile_user_payload(user),
+        "requests": history,
+        "pagination": {
+            "page": page,
+            "pageSize": REQUESTS_PAGE_SIZE,
+            "total": total,
+            "totalPages": (
+                (total + REQUESTS_PAGE_SIZE - 1) // REQUESTS_PAGE_SIZE
+            ),
+        },
+    })
 
 
 @blueprint.post("/api/account/general")

@@ -22,6 +22,7 @@ else:  # Support the existing `python backend/app.py` entry point.
 
 blueprint = Blueprint("admin", __name__)
 USERNAME_PATTERN = re.compile(r"[A-Za-z0-9_.-]{3,32}")
+REQUESTS_PAGE_SIZE = 100
 EDITABLE_FIELDS = frozenset({
     "role",
     "localUsername",
@@ -140,8 +141,19 @@ def users():
 @blueprint.get("/api/admin/requests")
 @admin_required
 def requests():
-    """Return every user's request history to an administrator."""
+    """Return one page of every user's request history to an administrator."""
+    raw_page = request.args.get("page", "1")
+    try:
+        page = int(raw_page)
+    except (TypeError, ValueError):
+        return api_error("Page must be a positive integer.")
+    if page < 1:
+        return api_error("Page must be a positive integer.")
+
     with db() as connection:
+        total = connection.execute(
+            "SELECT COUNT(*) AS total FROM request_history"
+        ).fetchone()["total"]
         rows = connection.execute(
             """
             SELECT
@@ -163,7 +175,9 @@ def requests():
             FROM request_history
             JOIN users ON users.id = request_history.user_id
             ORDER BY request_history.created_at DESC, request_history.id DESC
-            """
+            LIMIT ? OFFSET ?
+            """,
+            (REQUESTS_PAGE_SIZE, (page - 1) * REQUESTS_PAGE_SIZE),
         ).fetchall()
 
     plex_index = _profile_plex_index()
@@ -178,7 +192,17 @@ def requests():
         )
         history_item["requester"] = _requester_payload(row)
         payload.append(history_item)
-    return jsonify({"requests": payload})
+    return jsonify({
+        "requests": payload,
+        "pagination": {
+            "page": page,
+            "pageSize": REQUESTS_PAGE_SIZE,
+            "total": total,
+            "totalPages": (
+                (total + REQUESTS_PAGE_SIZE - 1) // REQUESTS_PAGE_SIZE
+            ),
+        },
+    })
 
 
 @blueprint.patch("/api/admin/users/<int:user_id>")

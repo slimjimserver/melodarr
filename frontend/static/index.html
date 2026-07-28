@@ -290,8 +290,8 @@
           </div>
           <div class="user-stats" aria-label="Request summary">
             <div><strong id="admin-requests-total">—</strong><span>Total requests</span></div>
-            <div><strong id="admin-requests-artists">—</strong><span>Artists</span></div>
-            <div><strong id="admin-requests-releases">—</strong><span>Release groups</span></div>
+            <div><strong id="admin-requests-artists">—</strong><span>Artists on page</span></div>
+            <div><strong id="admin-requests-releases">—</strong><span>Releases on page</span></div>
           </div>
           <div class="admin-request-filters">
             <label class="users-filter" for="admin-requests-search">
@@ -311,6 +311,11 @@
           <div id="admin-requests-list" class="admin-request-list" aria-label="Global request history">
             <p class="message">Open Requests to load request history.</p>
           </div>
+          <nav id="admin-requests-pagination" class="admin-request-pagination" aria-label="Request history pages" hidden>
+            <button id="admin-requests-previous" class="outline" type="button">Previous</button>
+            <span id="admin-requests-page" aria-live="polite">Page 1 of 1</span>
+            <button id="admin-requests-next" class="outline" type="button">Next</button>
+          </nav>
         </section>
       </div>
 
@@ -390,10 +395,11 @@
       <div class="account-layout">
         <nav class="account-nav" aria-label="Account navigation">
           <a data-account-route="profile" href="#">Profile</a>
-          <p>Settings</p>
-          <a data-account-route="general" href="#">General</a>
-          <a data-account-route="linked-accounts" href="#">Linked accounts</a>
-          <a class="admin-only" data-account-route="invitations" href="#" hidden>Invitations</a>
+          <a data-account-route="requests" href="#">Requests</a>
+          <p data-account-owner-only>Settings</p>
+          <a data-account-owner-only data-account-route="general" href="#">General</a>
+          <a data-account-owner-only data-account-route="linked-accounts" href="#">Linked accounts</a>
+          <a class="admin-only" data-account-owner-only data-account-route="invitations" href="#" hidden>Invitations</a>
         </nav>
         <div id="account-content" class="account-content"></div>
       </div>
