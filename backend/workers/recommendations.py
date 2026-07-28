@@ -30,9 +30,13 @@ def status():
     }
 
 
-def run():
+def run(initial_delay=0):
     global last_completed_at, next_execution_at
+    next_execution_at = time.time() + initial_delay
     while True:
+        timeout = max(0.0, next_execution_at - time.time())
+        refresh_requested.wait(timeout)
+        refresh_requested.clear()
         running.set()
         interval = RECOMMENDATION_RETRY_INTERVAL
         try:
@@ -46,5 +50,3 @@ def run():
             last_completed_at = time.time()
             running.clear()
         next_execution_at = time.time() + interval
-        refresh_requested.wait(interval)
-        refresh_requested.clear()

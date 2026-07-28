@@ -265,10 +265,11 @@ def _run_sync(*, full=False):
             job_state["lastSuccessfulAt"] = completed_at
 
 
-def run():
-    """Run immediately, then service five-minute and manual sync requests."""
+def run(initial_delay=0):
+    """Run after its startup offset, then service daily and manual requests."""
     global sync_requested, full_sync_requested
-    job_state["nextExecutionAt"] = time.time()
+    startup_sync_pending = True
+    job_state["nextExecutionAt"] = time.time() + initial_delay
     while True:
         now = time.time()
         with request_lock:
@@ -278,7 +279,13 @@ def run():
             full_sync_requested = False
         due = now >= (job_state["nextExecutionAt"] or now)
         if requested or due:
-            _run_sync(full=full)
+            try:
+                _run_sync(full=full)
+            finally:
+                if startup_sync_pending:
+                    # Coalesce this with any refresh requested for imported rows.
+                    recommendation_worker.request_refresh()
+                    startup_sync_pending = False
 
         timeout = max(
             0.1,

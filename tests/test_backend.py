@@ -242,7 +242,9 @@ class WorkerEntrypointTests(unittest.TestCase):
     @patch("backend.worker.Thread")
     @patch("backend.worker.recommendation_worker.run")
     @patch("backend.worker.init_db")
-    def test_worker_initializes_storage_and_background_loops(self, init_db, run, thread_class):
+    def test_worker_initializes_storage_and_background_loops(
+        self, init_db, run, thread_class
+    ):
         calls = []
         artist_metadata_thread = Mock()
         lidarr_thread = Mock()
@@ -259,7 +261,7 @@ class WorkerEntrypointTests(unittest.TestCase):
             plex_history_thread,
         ]
         init_db.side_effect = lambda: calls.append("database")
-        run.side_effect = lambda: calls.append("recommendations")
+        run.side_effect = lambda *_args: calls.append("recommendations")
         worker.main()
         self.assertEqual(calls, ["database", "recommendations"])
         self.assertEqual(thread_class.call_count, 6)
@@ -272,10 +274,16 @@ class WorkerEntrypointTests(unittest.TestCase):
             target=lidarr_search_worker.run, name="lidarr-search-followups", daemon=True
         )
         thread_class.assert_any_call(
-            target=lidarr_library_worker.run, name="lidarr-library-scan", daemon=True
+            target=lidarr_library_worker.run,
+            args=(worker.LIDARR_LIBRARY_STARTUP_DELAY,),
+            name="lidarr-library-scan",
+            daemon=True,
         )
         thread_class.assert_any_call(
-            target=plex_worker.run, name="plex-library-scans", daemon=True
+            target=plex_worker.run,
+            args=(worker.PLEX_LIBRARY_STARTUP_DELAY,),
+            name="plex-library-scans",
+            daemon=True,
         )
         thread_class.assert_any_call(
             target=plex_metadata_worker.run,
@@ -284,6 +292,7 @@ class WorkerEntrypointTests(unittest.TestCase):
         )
         thread_class.assert_any_call(
             target=plex_history_worker.run,
+            args=(worker.PLEX_HISTORY_STARTUP_DELAY,),
             name="plex-listening-history",
             daemon=True,
         )
@@ -293,6 +302,50 @@ class WorkerEntrypointTests(unittest.TestCase):
         plex_metadata_thread.start.assert_called_once_with()
         plex_history_thread.start.assert_called_once_with()
         artist_metadata_thread.start.assert_called_once_with()
+        run.assert_called_once_with(worker.RECOMMENDATION_STARTUP_DEADLINE)
+
+    @patch("backend.workers.lidarr_library.time.time", return_value=100)
+    @patch("backend.workers.lidarr_library._run_scan", side_effect=StopIteration)
+    def test_lidarr_startup_delay_preserves_an_early_manual_wake(
+        self, run_scan, current_time
+    ):
+        lidarr_library_worker.wake_requested.set()
+
+        with self.assertRaises(StopIteration):
+            lidarr_library_worker.run(initial_delay=10)
+
+        run_scan.assert_called_once_with()
+        lidarr_library_worker.wake_requested.clear()
+
+    @patch(
+        "backend.workers.recommendations.refresh_recommendation_cache",
+        side_effect=StopIteration,
+    )
+    @patch("backend.workers.recommendations.time.time", return_value=100)
+    @patch("backend.workers.recommendations.refresh_requested.wait")
+    def test_recommendations_wait_for_startup_deadline(
+        self, wait, current_time, refresh
+    ):
+        recommendation_worker.refresh_requested.clear()
+
+        with self.assertRaises(StopIteration):
+            recommendation_worker.run(initial_delay=120)
+
+        wait.assert_called_once_with(120)
+
+    @patch("backend.workers.plex_history.recommendation_worker.request_refresh")
+    @patch("backend.workers.plex_history._run_sync", side_effect=StopIteration)
+    def test_first_history_attempt_releases_recommendation_startup(
+        self, run_sync, request_refresh
+    ):
+        with plex_history_worker.request_lock:
+            plex_history_worker.sync_requested = True
+
+        with self.assertRaises(StopIteration):
+            plex_history_worker.run(initial_delay=60)
+
+        run_sync.assert_called_once_with(full=False)
+        request_refresh.assert_called_once_with()
 
     @patch("backend.worker.Thread")
     def test_background_worker_uses_one_daemon_thread(self, thread_class):

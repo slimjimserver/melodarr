@@ -1,5 +1,4 @@
-"""Dedicated recommendation-worker process entry point."""
-
+"""Dedicated background-worker process entry point."""
 from threading import Thread
 
 if __package__:
@@ -22,8 +21,14 @@ else:  # Support `python backend/worker.py` for local development.
     from workers import recommendations as recommendation_worker
 
 
+LIDARR_LIBRARY_STARTUP_DELAY = 10
+PLEX_LIBRARY_STARTUP_DELAY = 30
+PLEX_HISTORY_STARTUP_DELAY = 60
+RECOMMENDATION_STARTUP_DEADLINE = 120
+
+
 def main():
-    """Initialize storage and run the background job loops."""
+    """Initialize storage and start background jobs in a controlled sequence."""
     init_db()
     artist_metadata_thread = Thread(
         target=artist_metadata_worker.run,
@@ -39,12 +44,14 @@ def main():
     lidarr_thread.start()
     lidarr_library_thread = Thread(
         target=lidarr_library_worker.run,
+        args=(LIDARR_LIBRARY_STARTUP_DELAY,),
         name="lidarr-library-scan",
         daemon=True,
     )
     lidarr_library_thread.start()
     plex_thread = Thread(
         target=plex_worker.run,
+        args=(PLEX_LIBRARY_STARTUP_DELAY,),
         name="plex-library-scans",
         daemon=True,
     )
@@ -57,11 +64,12 @@ def main():
     plex_metadata_thread.start()
     plex_history_thread = Thread(
         target=plex_history_worker.run,
+        args=(PLEX_HISTORY_STARTUP_DELAY,),
         name="plex-listening-history",
         daemon=True,
     )
     plex_history_thread.start()
-    recommendation_worker.run()
+    recommendation_worker.run(RECOMMENDATION_STARTUP_DEADLINE)
 
 
 def start_background_thread():
