@@ -30,7 +30,7 @@ else:  # Support the existing `python backend/worker.py` entry point.
 
 logger = logging.getLogger(__name__)
 HISTORY_RETENTION = 365 * 24 * 60 * 60
-SYNC_INTERVAL = 5 * 60
+SYNC_INTERVAL = 24 * 60 * 60
 CURSOR_OVERLAP = 60 * 60
 
 wake_requested = Event()

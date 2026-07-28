@@ -188,7 +188,7 @@ def maintenance():
                 "id": "plex-history",
                 "name": "Plex Listening History",
                 "type": "process",
-                "schedule": "Every 5 minutes",
+                "schedule": "Every 24 hours",
                 **plex_listen_stats(),
                 **plex_history_status,
             },

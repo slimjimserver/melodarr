@@ -3126,6 +3126,7 @@ class SettingsMaintenanceTests(DatabaseTestCase):
         )
         jobs = {job["id"]: job for job in job_rows}
         self.assertEqual(jobs["lidarr-library"]["schedule"], "Every 4 minutes")
+        self.assertEqual(jobs["plex-history"]["schedule"], "Every 24 hours")
 
         recommendation = self.client.post(
             "/api/settings/jobs/recommendations/run",

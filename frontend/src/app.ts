@@ -645,21 +645,15 @@ async function refreshMaintenance() {
         status.textContent = `Error · ${job.lastError}`;
       }
       else if (job.id === "plex-history" && job.lastCompletedAt) {
-        const scanned = Number(job.scanned || 0).toLocaleString();
-        const tracks = Number(job.tracks || 0).toLocaleString();
-        const normalized = Number(job.normalized || 0).toLocaleString();
-        const selected = Number(job.selected || 0).toLocaleString();
-        const fetched = Number(job.fetched || 0).toLocaleString();
-        const mapped = Number(job.mapped || 0).toLocaleString();
-        const inserted = Number(job.inserted || 0).toLocaleString();
+        const userCount = Number(job.users || 0);
         const stored = Number(job.stored || 0).toLocaleString();
-        status.textContent = `${scanned} scanned · ${tracks} music · ${normalized} valid · ${selected} library · ${fetched} in-window · ${mapped} mapped · ${inserted} new · ${stored} stored`;
+        const users = userCount.toLocaleString();
+        status.textContent = `${stored} listens · ${users} ${userCount === 1 ? "user" : "users"}`;
+        const timing = [`Last ${new Date(Number(job.lastCompletedAt) * 1000).toLocaleString()}`];
         if (job.nextExecutionAt) {
-          const sections = Number(job.sections || 0).toLocaleString();
-          const cachedArtists = Number(job.cachedArtists || 0).toLocaleString();
-          const cachedAlbums = Number(job.cachedAlbums || 0).toLocaleString();
-          status.title = `${sections} music sections · ${cachedArtists} cached artists · ${cachedAlbums} cached albums · Next ${new Date(job.nextExecutionAt * 1000).toLocaleString()}`;
+          timing.push(`Next ${new Date(Number(job.nextExecutionAt) * 1000).toLocaleString()}`);
         }
+        status.title = timing.join(" · ");
       }
       else if (job.nextExecutionAt) status.textContent = `Next ${new Date(job.nextExecutionAt * 1000).toLocaleString()}`;
       else status.textContent = "Idle";
