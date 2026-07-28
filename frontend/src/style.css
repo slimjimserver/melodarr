@@ -326,6 +326,7 @@ h1 em { font-style: normal; }
 .user-type.plex { border-color: rgba(204, 123, 25, .34); background: rgba(204, 123, 25, .1); color: #9b5a0a; }
 .user-role.admin { border-color: rgba(168, 68, 45, .38); background: rgba(168, 68, 45, .1); color: var(--accent-bright); }
 .user-action-buttons { display: flex; justify-content: flex-end; gap: 7px; }
+.user-action-buttons a { display: inline-flex; align-items: center; justify-content: center; text-decoration: none; }
 .edit-user, .delete-user { min-width: 64px; }
 .delete-user { border-color: rgba(164, 52, 52, .3); color: var(--danger); }
 .delete-user:disabled { cursor: not-allowed; opacity: .45; }
@@ -570,7 +571,7 @@ details summary { margin-bottom: 17px; color: var(--accent-bright); cursor: poin
   .users-table td:first-child::before, .users-table .user-actions::before, .users-table .table-empty::before { display: none; }
   .users-table .user-actions { grid-column: 1 / -1; padding-top: 3px; padding-bottom: 13px; text-align: left; }
   .user-action-buttons { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .users-table .user-actions button { width: 100%; }
+  .users-table .user-actions :is(button, a) { width: 100%; }
   .users-table .table-empty { grid-column: 1 / -1; padding: 24px 16px; text-align: center; }
   .user-identity { min-width: 0; }
   .user-identity strong, .user-identity small { max-width: min(72vw, 380px); }

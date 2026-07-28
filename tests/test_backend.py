@@ -13,7 +13,7 @@ from threading import Event, Thread
 from urllib.parse import parse_qs, urlparse
 from unittest.mock import Mock, patch
 
-from werkzeug.security import generate_password_hash
+from werkzeug.security import check_password_hash, generate_password_hash
 
 # Application paths are resolved when backend.config is first imported. Keep
 # every test artifact outside the repository and disable daemon workers before
@@ -1340,6 +1340,54 @@ class DeploymentConfigTests(unittest.TestCase):
             typescript,
         )
         self.assertNotIn('$(`[data-view=${view}]`)', typescript)
+
+    def test_admin_user_edit_link_navigates_to_the_profile(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(
+            os.path.join(project_root, "frontend", "src", "app.ts"),
+            encoding="utf-8",
+        ) as file:
+            typescript = file.read()
+
+        self.assertIn('const edit = document.createElement("a")', typescript)
+        self.assertIn(
+            "edit.href = `/${encodeURIComponent(routeUsername)}`",
+            typescript,
+        )
+        self.assertIn(
+            'showAccountPage?.("profile", true, routeUsername)',
+            typescript,
+        )
+        self.assertNotIn(
+            'edit.addEventListener("click", () => openAdminUserDialog(user))',
+            typescript,
+        )
+
+    def test_admin_account_navigation_targets_other_users_settings(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(
+            os.path.join(project_root, "frontend", "src", "app.ts"),
+            encoding="utf-8",
+        ) as file:
+            typescript = file.read()
+
+        self.assertIn(
+            'if (isOwnAccount || currentUser.role === "admin")',
+            typescript,
+        )
+        self.assertIn(
+            'if (currentUser.role === "admin") allowedPages.push("invitations")',
+            typescript,
+        )
+        self.assertIn(
+            'api(accountApiPath("/api/account/general")',
+            typescript,
+        )
+        self.assertIn(
+            'api(accountApiPath("/api/account/settings")',
+            typescript,
+        )
+        self.assertIn("}, targetUsername);", typescript)
 
     def test_library_navigation_is_available_to_every_authenticated_user(self):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -3828,6 +3876,238 @@ class LidarrRequestTests(DatabaseTestCase):
             (self.album_mbid, 33, 44, "New Album"),
         )
         request_work.assert_called_once_with()
+
+
+class AccountSettingsAccessTests(DatabaseTestCase):
+    def add_target_user(self):
+        with db() as connection:
+            cursor = connection.execute(
+                "INSERT INTO users "
+                "(username, password_hash, role, listenbrainz_username, "
+                "lastfm_username, plex_id, plex_username, plex_email, "
+                "plex_avatar, created_at) "
+                "VALUES (?, ?, 'user', ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "target-user",
+                    generate_password_hash("target-old-password"),
+                    "old-listenbrainz",
+                    "old-lastfm",
+                    None,
+                    "Plex Listener",
+                    "listener@example.com",
+                    "https://plex.example/listener.jpg",
+                    100,
+                ),
+            )
+        return cursor.lastrowid
+
+    @patch("backend.routes.account.recommendation_worker.request_refresh")
+    @patch("backend.routes.account.lastfm.get")
+    @patch("backend.routes.account.listenbrainz.user_listen_count")
+    def test_admin_settings_requests_read_and_update_the_target_account(
+        self,
+        listen_count,
+        lastfm_get,
+        request_refresh,
+    ):
+        csrf = self.register()
+        target_id = self.add_target_user()
+        save_service("lastfm", {"apiKey": "shared-lastfm-key"})
+        listen_count.return_value = Response(200, {"payload": {"count": 10}})
+
+        settings = self.client.get(
+            "/api/account/settings?username=Plex%20Listener"
+        )
+        general = self.client.post(
+            "/api/account/general?username=Plex%20Listener",
+            json={
+                "username": "renamed-target",
+                "password": "target-new-password",
+            },
+            headers={"X-CSRF-Token": csrf},
+        )
+        listenbrainz = self.client.post(
+            "/api/account/settings?username=renamed-target",
+            json={"username": "new-listenbrainz"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        lastfm = self.client.post(
+            "/api/account/lastfm?username=renamed-target",
+            json={"username": "new-lastfm"},
+            headers={"X-CSRF-Token": csrf},
+        )
+
+        self.assertEqual(settings.status_code, 200)
+        self.assertEqual(settings.get_json()["username"], "target-user")
+        self.assertEqual(
+            settings.get_json()["listenbrainzUsername"],
+            "old-listenbrainz",
+        )
+        self.assertEqual(settings.get_json()["lastfmUsername"], "old-lastfm")
+        self.assertEqual(settings.get_json()["plexUsername"], "Plex Listener")
+        self.assertNotIn("password_hash", settings.get_data(as_text=True))
+        self.assertEqual(general.status_code, 200)
+        self.assertEqual(general.get_json()["username"], "renamed-target")
+        self.assertEqual(listenbrainz.status_code, 200)
+        self.assertEqual(lastfm.status_code, 200)
+        listen_count.assert_called_once_with("new-listenbrainz")
+        lastfm_get.assert_called_once_with(
+            "user.getinfo",
+            "new-lastfm",
+            "shared-lastfm-key",
+        )
+        self.assertEqual(request_refresh.call_count, 2)
+
+        with db() as connection:
+            admin = connection.execute(
+                "SELECT username, listenbrainz_username, lastfm_username "
+                "FROM users WHERE username = 'test-user'"
+            ).fetchone()
+            target = connection.execute(
+                "SELECT username, password_hash, listenbrainz_username, "
+                "lastfm_username FROM users WHERE id = ?",
+                (target_id,),
+            ).fetchone()
+        self.assertEqual(admin["username"], "test-user")
+        self.assertIsNone(admin["listenbrainz_username"])
+        self.assertIsNone(admin["lastfm_username"])
+        self.assertEqual(target["username"], "renamed-target")
+        self.assertTrue(
+            check_password_hash(
+                target["password_hash"],
+                "target-new-password",
+            )
+        )
+        self.assertEqual(
+            target["listenbrainz_username"],
+            "new-listenbrainz",
+        )
+        self.assertEqual(target["lastfm_username"], "new-lastfm")
+
+    def test_non_admin_cannot_read_or_update_another_users_settings(self):
+        admin_csrf = self.register()
+        target_id = self.add_target_user()
+        with db() as connection:
+            connection.execute(
+                "INSERT INTO users "
+                "(username, password_hash, role, created_at) "
+                "VALUES (?, ?, 'user', ?)",
+                (
+                    "ordinary-user",
+                    generate_password_hash("ordinary-password"),
+                    200,
+                ),
+            )
+        self.client.post(
+            "/api/auth/logout",
+            headers={"X-CSRF-Token": admin_csrf},
+        )
+        login = self.client.post(
+            "/api/auth/login",
+            json={
+                "username": "ordinary-user",
+                "password": "ordinary-password",
+            },
+        )
+        csrf = login.get_json()["csrfToken"]
+
+        settings = self.client.get(
+            "/api/account/settings?username=target-user"
+        )
+        general = self.client.post(
+            "/api/account/general?username=target-user",
+            json={"username": "stolen-name", "password": ""},
+            headers={"X-CSRF-Token": csrf},
+        )
+        linked = self.client.post(
+            "/api/account/settings?username=target-user",
+            json={"username": ""},
+            headers={"X-CSRF-Token": csrf},
+        )
+
+        self.assertEqual(settings.status_code, 403)
+        self.assertEqual(general.status_code, 403)
+        self.assertEqual(linked.status_code, 403)
+        with db() as connection:
+            target = connection.execute(
+                "SELECT username, listenbrainz_username FROM users WHERE id = ?",
+                (target_id,),
+            ).fetchone()
+        self.assertEqual(target["username"], "target-user")
+        self.assertEqual(
+            target["listenbrainz_username"],
+            "old-listenbrainz",
+        )
+
+    @patch("backend.routes.auth.plex_auth.get_resources")
+    @patch("backend.routes.auth.plex_auth.get_account")
+    @patch("backend.routes.auth.plex_auth.poll_pin")
+    @patch("backend.routes.auth.plex_auth.create_pin")
+    def test_admin_can_link_plex_to_the_target_account(
+        self,
+        create_pin,
+        poll_pin,
+        get_account,
+        get_resources,
+    ):
+        csrf = self.register()
+        target_id = self.add_target_user()
+        save_service("plex", {
+            "url": "http://plex:32400",
+            "token": "server-owner-token",
+            "machineIdentifier": "server-1",
+        })
+        create_pin.return_value = {
+            "id": 987,
+            "authorizationUrl": "https://app.plex.tv/auth/#!?code=TARGET",
+            "expiresAt": time.time() + 600,
+        }
+        poll_pin.return_value = "target-token"
+        get_account.return_value = {
+            "id": "target-plex-id",
+            "username": "target-plex-user",
+            "email": "target-plex@example.com",
+            "thumb": "https://plex.example/target.jpg",
+        }
+        get_resources.return_value = [{
+            "clientIdentifier": "server-1",
+        }]
+
+        started = self.client.post(
+            "/api/auth/plex/start",
+            json={"purpose": "link", "username": "target-user"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(started.status_code, 201)
+        flow_token = started.get_json()["flowToken"]
+        with db() as connection:
+            flow = connection.execute(
+                "SELECT user_id FROM plex_auth_flows"
+            ).fetchone()
+        self.assertEqual(flow["user_id"], target_id)
+
+        linked = self.client.post(
+            "/api/auth/plex/poll",
+            json={"flowToken": flow_token},
+            headers={"X-CSRF-Token": csrf},
+        )
+
+        self.assertEqual(linked.status_code, 200)
+        self.assertEqual(
+            linked.get_json()["plexUsername"],
+            "target-plex-user",
+        )
+        with db() as connection:
+            admin = connection.execute(
+                "SELECT plex_id FROM users WHERE username = 'test-user'"
+            ).fetchone()
+            target = connection.execute(
+                "SELECT plex_id, plex_username FROM users WHERE id = ?",
+                (target_id,),
+            ).fetchone()
+        self.assertIsNone(admin["plex_id"])
+        self.assertEqual(target["plex_id"], "target-plex-id")
+        self.assertEqual(target["plex_username"], "target-plex-user")
 
 
 class AccountProfileTests(DatabaseTestCase):

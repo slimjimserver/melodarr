@@ -16,7 +16,13 @@ if __package__ == "backend.routes":
     from ..api_cache import clear_cache
     from ..detail_cache import invalidate_all as invalidate_detail_payloads
     from ..responses import api_error
-    from ..security import current_user, login_required, start_session, user_payload
+    from ..security import (
+        current_user,
+        login_required,
+        resolve_account_user,
+        start_session,
+        user_payload,
+    )
     from ..services import plex, plex_auth
     from ..storage import db, get_service, save_service
     from ..workers import plex as plex_worker
@@ -24,7 +30,13 @@ else:  # Support the existing `python backend/app.py` entry point.
     from api_cache import clear_cache
     from detail_cache import invalidate_all as invalidate_detail_payloads
     from responses import api_error
-    from security import current_user, login_required, start_session, user_payload
+    from security import (
+        current_user,
+        login_required,
+        resolve_account_user,
+        start_session,
+        user_payload,
+    )
     from services import plex, plex_auth
     from storage import db, get_service, save_service
     from workers import plex as plex_worker
@@ -98,7 +110,13 @@ def _load_flow(flow_token, purpose=None):
             user = current_user()
             if not user:
                 return None, api_error("Sign in is required.", 401)
-            if user["id"] != row["user_id"]:
+            if (
+                user["id"] != row["user_id"]
+                and not (
+                    row["purpose"] == "link"
+                    and user["role"] == "admin"
+                )
+            ):
                 return None, api_error(
                     "This Plex sign-in belongs to another Melodarr user.", 403
                 )
@@ -404,11 +422,17 @@ def start_plex_auth():
             return api_error(
                 "Plex is not configured on this Melodarr instance.", 403
             )
-        if user["plex_id"]:
+        target_user, error = resolve_account_user(
+            user,
+            values.get("username"),
+        )
+        if error:
+            return error
+        if target_user["plex_id"]:
             return api_error(
                 "This Melodarr account is already linked to Plex.", 409
             )
-        flow_user_id = user["id"]
+        flow_user_id = target_user["id"]
     elif purpose == "server":
         with db() as connection:
             has_users = connection.execute("SELECT 1 FROM users LIMIT 1").fetchone()

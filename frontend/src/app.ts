@@ -381,6 +381,7 @@ async function startPlexAuthentication(
   purpose: "login" | "server" | "link",
   message: Element,
   onComplete: (result: JsonObject) => Promise<void> | void,
+  accountUsername?: string,
 ) {
   const popup = window.open(
     "",
@@ -399,7 +400,10 @@ async function startPlexAuthentication(
     const started = await api("/api/auth/plex/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ purpose }),
+      body: JSON.stringify({
+        purpose,
+        ...(accountUsername ? { username: accountUsername } : {}),
+      }),
     });
     popup.location.href = started.authorizationUrl;
     const deadline = Math.min(
@@ -835,13 +839,16 @@ function setupNavigation() {
     if (!user) return;
     const targetUsername = activeAccountUsername || user.username;
     const isOwnAccount = isOwnAccountUsername(targetUsername);
+    const accountApiPath = (path: string) => (
+      `${path}?username=${encodeURIComponent(activeAccountUsername || targetUsername)}`
+    );
     const content = $("#account-content");
     $("#account-title").textContent = page === "profile" ? "Profile" : page.split("-").map((word) => word[0].toUpperCase() + word.slice(1)).join(" ");
     document.querySelectorAll<HTMLElement>("[data-account-route]").forEach((link) => link.classList.toggle("active", link.dataset.accountRoute === page));
     document.querySelectorAll<HTMLElement>("[data-account-owner-only]").forEach((element) => {
-      element.hidden = !isOwnAccount || (
-        element.classList.contains("admin-only") && user.role !== "admin"
-      );
+      element.hidden = element.classList.contains("admin-only")
+        ? user.role !== "admin"
+        : !isOwnAccount && user.role !== "admin";
     });
     content.replaceChildren();
     const message = document.createElement("p");
@@ -880,6 +887,81 @@ function setupNavigation() {
         });
         actions.append(requestsLink);
         content.append(section, actions);
+        if (user.role === "admin") {
+          const roleForm = document.createElement("form");
+          roleForm.className = "service-card account-form";
+          roleForm.innerHTML = `
+            <h2>Account access</h2>
+            <label>
+              Role
+              <small class="account-role-help">Controls access to administrative settings.</small>
+              <select name="role">
+                <option value="user">User</option>
+                <option value="admin">Administrator</option>
+              </select>
+            </label>
+            <div class="form-actions">
+              <p class="form-message"></p>
+              <button>Save account access</button>
+            </div>
+          `;
+          const roleSelect = requiredDescendant<HTMLSelectElement>(
+            roleForm,
+            'select[name="role"]',
+          );
+          const roleHelp = requiredDescendant<HTMLElement>(
+            roleForm,
+            ".account-role-help",
+          );
+          const roleMessage = requiredDescendant<HTMLElement>(
+            roleForm,
+            ".form-message",
+          );
+          const saveRole = requiredDescendant<HTMLButtonElement>(
+            roleForm,
+            "button",
+          );
+          const currentSession = user.id !== undefined
+            ? user.id === identity.id
+            : isOwnAccount;
+          roleSelect.value = identity.role;
+          roleSelect.disabled = currentSession;
+          saveRole.disabled = currentSession;
+          if (currentSession) {
+            roleHelp.textContent = "You cannot change your own role while signed in.";
+          }
+          roleForm.addEventListener("submit", async (event) => {
+            event.preventDefault();
+            if (currentSession) return;
+            saveRole.disabled = true;
+            setMessage(roleMessage, "Saving account access…");
+            try {
+              const result = await api<{ user: AdminUserIdentity; message?: string }>(
+                `/api/admin/users/${encodeURIComponent(String(identity.id))}`,
+                {
+                  method: "PATCH",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ role: roleSelect.value }),
+                },
+              );
+              identity.role = result.user.role;
+              roleSelect.value = identity.role;
+              accountType.textContent = `${identity.userType === "plex" ? "Plex user" : "Local account"} · ${identity.role === "admin" ? "Administrator" : "User"}`;
+              adminUsers = adminUsers.map((candidate) => (
+                candidate.id === identity.id
+                  ? { ...candidate, role: identity.role }
+                  : candidate
+              ));
+              setAdminUserStats();
+              setMessage(roleMessage, result.message || "Account access saved.");
+            } catch (error) {
+              setMessage(roleMessage, error.message, true);
+            } finally {
+              saveRole.disabled = false;
+            }
+          });
+          content.append(roleForm);
+        }
       } else if (page === "requests") {
         const data = await api(
           `/api/account/profile?username=${encodeURIComponent(targetUsername)}&page=${encodeURIComponent(activeAccountRequestPage)}`,
@@ -930,24 +1012,27 @@ function setupNavigation() {
         paginationControls.append(previous, status, next);
         content.append(paginationControls);
       } else if (page === "general") {
+        const accountSettings = await api(accountApiPath("/api/account/settings"));
         content.replaceChildren();
         const form = document.createElement("form") as AppForm; form.className = "service-card account-form";
         form.innerHTML = '<h2>General</h2><label>Username<input name="username" autocomplete="username" required></label><label>New password<small>Leave blank to keep your current password.</small><input name="password" type="password" autocomplete="new-password" minlength="12"></label><div class="form-actions"><p class="form-message"></p><button>Save general settings</button></div>';
-        form.username.value = user.username;
+        form.username.value = accountSettings.username;
         form.addEventListener("submit", async (event) => {
           event.preventDefault();
           const formMessage = requiredDescendant<HTMLElement>(form, ".form-message");
           try {
-            const result = await api("/api/account/general", {
+            const result = await api(accountApiPath("/api/account/general"), {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify(Object.fromEntries(new FormData(form))),
             });
-            user.username = result.username;
             activeAccountUsername = result.username;
-            const accountMenu = $<HTMLAnchorElement>("#account-menu");
-            accountMenu.textContent = result.username.slice(0, 1).toUpperCase();
-            accountMenu.href = accountPath("profile");
+            if (isOwnAccount) {
+              user.username = result.username;
+              const accountMenu = $<HTMLAnchorElement>("#account-menu");
+              accountMenu.textContent = result.username.slice(0, 1).toUpperCase();
+              accountMenu.href = accountPath("profile");
+            }
             formMessage.textContent = result.message;
             window.history.replaceState(
               { account: "general" },
@@ -960,7 +1045,7 @@ function setupNavigation() {
         });
         content.append(form);
       } else if (page === "linked-accounts") {
-        const accountSettings = await api("/api/account/settings");
+        const accountSettings = await api(accountApiPath("/api/account/settings"));
         content.replaceChildren();
         const form = document.createElement("form") as AppForm; form.className = "service-card account-form";
         form.innerHTML = `
@@ -989,9 +1074,9 @@ function setupNavigation() {
           </fieldset>
           <div class="form-actions"><p class="form-message"></p><button>Save linked accounts</button></div>
         `;
-        user.plexLinked = Boolean(accountSettings.plexLinked);
-        user.plexUsername = accountSettings.plexUsername || "";
-        user.plexEmail = accountSettings.plexEmail || "";
+        let plexLinked = Boolean(accountSettings.plexLinked);
+        let plexUsername = accountSettings.plexUsername || "";
+        let plexEmail = accountSettings.plexEmail || "";
         form.listenbrainzUsername.value = accountSettings.listenbrainzUsername || "";
         form.lastfmUsername.value = accountSettings.lastfmUsername || "";
         const plexStatus = requiredDescendant<HTMLElement>(form, "#account-plex-status");
@@ -999,8 +1084,8 @@ function setupNavigation() {
         const plexButton = requiredDescendant<HTMLButtonElement>(form, "#account-link-plex");
         const plexMessage = requiredDescendant<HTMLElement>(form, "#account-plex-message");
         const renderPlexLinkStatus = () => {
-          if (user.plexLinked) {
-            plexStatus.textContent = user.plexUsername || user.plexEmail || "Plex account linked";
+          if (plexLinked) {
+            plexStatus.textContent = plexUsername || plexEmail || "Plex account linked";
             plexDetail.textContent = "You can sign in with either your local credentials or Plex.";
             plexButton.hidden = true;
           } else if (accountSettings.plexConfigured) {
@@ -1019,13 +1104,18 @@ function setupNavigation() {
         plexButton.addEventListener("click", async () => {
           plexButton.disabled = true;
           await startPlexAuthentication("link", plexMessage, async (result) => {
-            user.plexLinked = true;
-            user.plexUsername = result.plexUsername || "";
-            user.plexEmail = result.plexEmail || "";
+            plexLinked = true;
+            plexUsername = result.plexUsername || "";
+            plexEmail = result.plexEmail || "";
+            if (isOwnAccount) {
+              user.plexLinked = plexLinked;
+              user.plexUsername = plexUsername;
+              user.plexEmail = plexEmail;
+            }
             renderPlexLinkStatus();
             setMessage(plexMessage, result.message);
-          });
-          if (!user.plexLinked && accountSettings.plexConfigured) {
+          }, targetUsername);
+          if (!plexLinked && accountSettings.plexConfigured) {
             plexButton.disabled = false;
           }
         });
@@ -1035,14 +1125,14 @@ function setupNavigation() {
           setMessage(formMessage, "Saving linked accounts…");
           try {
             const [listenbrainz, lastfm] = await Promise.all([
-              api("/api/account/settings", {
+              api(accountApiPath("/api/account/settings"), {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
                   username: form.listenbrainzUsername.value,
                 }),
               }),
-              api("/api/account/lastfm", {
+              api(accountApiPath("/api/account/lastfm"), {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -1050,9 +1140,11 @@ function setupNavigation() {
                 }),
               }),
             ]);
-            user.listenbrainzUsername = form.listenbrainzUsername.value.trim();
-            user.lastfmUsername = form.lastfmUsername.value.trim();
-            user.lastfmConfigured = Boolean(user.lastfmUsername);
+            if (isOwnAccount) {
+              user.listenbrainzUsername = form.listenbrainzUsername.value.trim();
+              user.lastfmUsername = form.lastfmUsername.value.trim();
+              user.lastfmConfigured = Boolean(user.lastfmUsername);
+            }
             setMessage(
               formMessage,
               `${listenbrainz.message} ${lastfm.message} Recommendations are being refreshed.`,
@@ -1116,8 +1208,10 @@ function setupNavigation() {
       );
     }
     const allowedPages: AccountPage[] = ["profile", "requests"];
-    if (isOwnAccount) allowedPages.push("general", "linked-accounts");
-    if (isOwnAccount && currentUser.role === "admin") allowedPages.push("invitations");
+    if (isOwnAccount || currentUser.role === "admin") {
+      allowedPages.push("general", "linked-accounts");
+    }
+    if (currentUser.role === "admin") allowedPages.push("invitations");
     renderAccount(allowedPages.includes(page) ? page : "profile");
   };
 
@@ -1581,12 +1675,23 @@ function renderAdminUsers() {
     actionCell.className = "user-actions";
     const actionButtons = document.createElement("div");
     actionButtons.className = "user-action-buttons";
-    const edit = document.createElement("button");
-    edit.type = "button";
+    const edit = document.createElement("a");
     edit.className = "outline edit-user";
+    const routeUsername = adminUserDisplayName(user);
+    edit.href = `/${encodeURIComponent(routeUsername)}`;
     edit.textContent = "Edit";
-    edit.setAttribute("aria-label", `Edit settings for ${adminUserDisplayName(user)}`);
-    edit.addEventListener("click", () => openAdminUserDialog(user));
+    edit.setAttribute("aria-label", `Edit settings for ${routeUsername}`);
+    edit.addEventListener("click", (event) => {
+      if (
+        event.button !== 0
+        || event.metaKey
+        || event.ctrlKey
+        || event.shiftKey
+        || event.altKey
+      ) return;
+      event.preventDefault();
+      showAccountPage?.("profile", true, routeUsername);
+    });
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "outline delete-user";

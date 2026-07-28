@@ -45,6 +45,58 @@ def current_user():
     return user
 
 
+def resolve_account_user(signed_in_user, requested_username=None):
+    """Resolve a username-scoped account without allowing user enumeration."""
+    if requested_username is None:
+        return signed_in_user, None
+
+    requested_username = str(requested_username).strip()
+    if not requested_username:
+        return None, api_error("User not found.", 404)
+    own_names = {
+        str(signed_in_user["username"] or "").casefold(),
+        str(signed_in_user["plex_username"] or "").casefold(),
+    }
+    if requested_username.casefold() in own_names:
+        return signed_in_user, None
+    if signed_in_user["role"] != "admin":
+        return None, api_error(
+            "Administrator access is required to access another user's account.",
+            403,
+        )
+
+    with db() as connection:
+        user = connection.execute(
+            """
+            SELECT
+                id,
+                username,
+                role,
+                listenbrainz_username,
+                lastfm_username,
+                plex_id,
+                plex_username,
+                plex_email,
+                plex_avatar
+            FROM users
+            WHERE username = ? COLLATE NOCASE
+                OR plex_username = ? COLLATE NOCASE
+            ORDER BY
+                CASE WHEN username = ? COLLATE NOCASE THEN 0 ELSE 1 END,
+                id
+            LIMIT 1
+            """,
+            (
+                requested_username,
+                requested_username,
+                requested_username,
+            ),
+        ).fetchone()
+    if not user:
+        return None, api_error("User not found.", 404)
+    return user, None
+
+
 def user_payload(user, include_csrf=False):
     payload = {
         "id": user["id"],

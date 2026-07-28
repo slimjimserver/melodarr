@@ -13,7 +13,12 @@ from werkzeug.security import generate_password_hash
 
 if __package__ == "backend.routes":
     from ..responses import api_error
-    from ..security import admin_required, current_user, login_required
+    from ..security import (
+        admin_required,
+        current_user,
+        login_required,
+        resolve_account_user,
+    )
     from ..services import lastfm, listenbrainz, musicbrainz, plex
     from ..storage import (
         db,
@@ -26,7 +31,12 @@ if __package__ == "backend.routes":
     from ..workers import recommendations as recommendation_worker
 else:  # Support the existing `python backend/app.py` entry point.
     from responses import api_error
-    from security import admin_required, current_user, login_required
+    from security import (
+        admin_required,
+        current_user,
+        login_required,
+        resolve_account_user,
+    )
     from services import lastfm, listenbrainz, musicbrainz, plex
     from storage import (
         db,
@@ -155,56 +165,6 @@ def _profile_user_payload(user):
     }
 
 
-def _requested_profile_user(signed_in_user):
-    requested_username = request.args.get("username")
-    if requested_username is None:
-        return signed_in_user, None
-
-    requested_username = requested_username.strip()
-    if not requested_username:
-        return None, api_error("User not found.", 404)
-    own_names = {
-        str(signed_in_user["username"] or "").casefold(),
-        str(signed_in_user["plex_username"] or "").casefold(),
-    }
-    if requested_username.casefold() in own_names:
-        return signed_in_user, None
-    if signed_in_user["role"] != "admin":
-        return None, api_error(
-            "Administrator access is required to view another user's profile.",
-            403,
-        )
-
-    with db() as connection:
-        user = connection.execute(
-            """
-            SELECT
-                id,
-                username,
-                role,
-                plex_id,
-                plex_username,
-                plex_email,
-                plex_avatar
-            FROM users
-            WHERE username = ? COLLATE NOCASE
-                OR plex_username = ? COLLATE NOCASE
-            ORDER BY
-                CASE WHEN username = ? COLLATE NOCASE THEN 0 ELSE 1 END,
-                id
-            LIMIT 1
-            """,
-            (
-                requested_username,
-                requested_username,
-                requested_username,
-            ),
-        ).fetchone()
-    if not user:
-        return None, api_error("User not found.", 404)
-    return user, None
-
-
 @blueprint.post("/api/account/invitations")
 @admin_required
 def create_invitation():
@@ -232,8 +192,14 @@ def create_invitation():
 @blueprint.get("/api/account/settings")
 @login_required
 def account_settings():
-    user = current_user()
+    user, error = resolve_account_user(
+        current_user(),
+        request.args.get("username"),
+    )
+    if error:
+        return error
     return jsonify({
+        "username": user["username"],
         "plexConfigured": bool(get_service("plex")),
         "plexLinked": bool(user["plex_id"]),
         "plexUsername": user["plex_username"] or "",
@@ -250,7 +216,10 @@ def account_settings():
 @login_required
 def account_profile():
     signed_in_user = current_user()
-    user, error = _requested_profile_user(signed_in_user)
+    user, error = resolve_account_user(
+        signed_in_user,
+        request.args.get("username"),
+    )
     if error:
         return error
     page = _requested_page()
@@ -283,6 +252,12 @@ def account_profile():
 @blueprint.post("/api/account/general")
 @login_required
 def account_general():
+    user, error = resolve_account_user(
+        current_user(),
+        request.args.get("username"),
+    )
+    if error:
+        return error
     values = request.get_json(silent=True) or {}
     username = str(values.get("username", "")).strip()
     password = str(values.get("password", ""))
@@ -295,12 +270,12 @@ def account_general():
             if password:
                 connection.execute(
                     "UPDATE users SET username = ?, password_hash = ? WHERE id = ?",
-                    (username, generate_password_hash(password), current_user()["id"]),
+                    (username, generate_password_hash(password), user["id"]),
                 )
             else:
                 connection.execute(
                     "UPDATE users SET username = ? WHERE id = ?",
-                    (username, current_user()["id"]),
+                    (username, user["id"]),
                 )
         return jsonify({"message": "General settings saved.", "username": username})
     except sqlite3.IntegrityError:
@@ -310,10 +285,16 @@ def account_general():
 @blueprint.post("/api/account/settings")
 @login_required
 def configure_listenbrainz():
+    user, error = resolve_account_user(
+        current_user(),
+        request.args.get("username"),
+    )
+    if error:
+        return error
+    user_id = user["id"]
     values = request.get_json(silent=True) or {}
     username = str(values.get("username", "")).strip()
     if not username:
-        user_id = current_user()["id"]
         with db() as connection:
             connection.execute(
                 "UPDATE users SET listenbrainz_username = NULL WHERE id = ?",
@@ -339,7 +320,6 @@ def configure_listenbrainz():
             exc,
         )
 
-    user_id = current_user()["id"]
     with db() as connection:
         connection.execute(
             "UPDATE users SET listenbrainz_username = ? WHERE id = ?",
@@ -360,9 +340,14 @@ def configure_listenbrainz():
 @blueprint.post("/api/account/lastfm")
 @login_required
 def configure_lastfm():
+    user, error = resolve_account_user(
+        current_user(),
+        request.args.get("username"),
+    )
+    if error:
+        return error
     values = request.get_json(silent=True) or {}
     username = str(values.get("username", "")).strip()
-    user = current_user()
     if not username:
         with db() as connection:
             connection.execute(
