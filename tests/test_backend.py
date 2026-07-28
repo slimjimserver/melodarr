@@ -1049,6 +1049,27 @@ class DeploymentConfigTests(unittest.TestCase):
         )
         self.assertNotIn(".logout { display: none; }", stylesheet)
 
+    def test_logout_resets_stale_authentication_messages(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(
+            os.path.join(project_root, "frontend", "src", "app.ts"),
+            encoding="utf-8",
+        ) as file:
+            typescript = file.read()
+
+        self.assertIn(
+            'setMessage(requiredDescendant(loginForm, ".form-message"), "");',
+            typescript,
+        )
+        self.assertIn(
+            'setMessage(requiredDescendant(plexLoginOption, ".form-message"), "");',
+            typescript,
+        )
+        self.assertIn('$<HTMLButtonElement>("#plex-login").disabled = false;', typescript)
+        self.assertIn('element.classList.add("message");', typescript)
+        self.assertIn('element.classList.toggle("error", isError);', typescript)
+        self.assertNotIn("element.className = `message", typescript)
+
     def test_invitation_copy_supports_http_lan_hosts(self):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with open(

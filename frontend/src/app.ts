@@ -172,7 +172,8 @@ function setupStandalonePullToRefresh() {
 
 function setMessage(element: Element, message: string, isError = false) {
   element.textContent = message;
-  element.className = `message${isError ? " error" : ""}`;
+  element.classList.add("message");
+  element.classList.toggle("error", isError);
 }
 
 function setupTheme() {
@@ -1035,6 +1036,12 @@ async function showAuth({ resetPath = false } = {}) {
   const loginForm = $("#login-form");
   const registerForm = $("#register-form");
   const plexLoginOption = $("#plex-login-option");
+  loginForm.reset();
+  registerForm.reset();
+  setMessage(requiredDescendant(loginForm, ".form-message"), "");
+  setMessage(requiredDescendant(registerForm, ".form-message"), "");
+  setMessage(requiredDescendant(plexLoginOption, ".form-message"), "");
+  $<HTMLButtonElement>("#plex-login").disabled = false;
   loginForm.hidden = true;
   registerForm.hidden = true;
   plexLoginOption.hidden = true;
