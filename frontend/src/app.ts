@@ -888,19 +888,7 @@ function setupNavigation() {
         copy.append(heading, accountType);
         section.append(avatar, copy);
 
-        const actions = document.createElement("div");
-        actions.className = "profile-actions";
-        const requestsLink = document.createElement("a");
-        requestsLink.className = "outline";
-        requestsLink.href = accountPath("requests", targetUsername, 1);
-        requestsLink.textContent = "View requests";
-        requestsLink.addEventListener("click", (event) => {
-          if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-          event.preventDefault();
-          showAccountPage?.("requests", true, targetUsername, 1);
-        });
-        actions.append(requestsLink);
-        content.append(section, actions);
+        content.append(section);
         if (user.role === "admin") {
           const roleForm = document.createElement("form");
           roleForm.className = "service-card account-form";

@@ -456,8 +456,6 @@ dialog::backdrop { background: rgba(48, 39, 32, .52); }
 .profile-summary { display: flex; align-items: center; gap: 15px; border: 1px solid var(--border); border-radius: 14px; background: rgba(255, 250, 243, .7); padding: 18px; }
 .profile-summary h2 { margin-bottom: 4px; }
 .profile-summary p { margin: 0; color: var(--foreground-muted); font-size: 12px; }
-.profile-actions { display: flex; margin-top: 14px; }
-.profile-actions a { text-decoration: none; }
 .history-item { display: flex; align-items: center; border: 1px solid var(--border); border-radius: 11px; background: rgba(255, 250, 243, .7); color: var(--foreground); overflow: hidden; transition: border-color .2s var(--ease-out), background .2s var(--ease-out); }
 .history-detail { display: flex; flex: 1; align-items: center; justify-content: space-between; min-width: 0; gap: 16px; color: var(--foreground); padding: 11px 15px; text-decoration: none; }
 .history-copy { display: grid; min-width: 0; gap: 4px; }
