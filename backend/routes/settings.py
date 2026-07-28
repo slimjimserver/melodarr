@@ -9,7 +9,7 @@ if __package__ == "backend.routes":
     from ..detail_cache import invalidate_all as invalidate_detail_payloads
     from ..responses import api_error
     from ..security import admin_required, login_required
-    from ..services import lidarr, plex
+    from ..services import lidarr
     from ..storage import (
         clear_recommendation_cache,
         get_service,
@@ -28,7 +28,7 @@ else:  # Support the existing `python backend/app.py` entry point.
     from detail_cache import invalidate_all as invalidate_detail_payloads
     from responses import api_error
     from security import admin_required, login_required
-    from services import lidarr, plex
+    from services import lidarr
     from storage import (
         clear_recommendation_cache,
         get_service,
@@ -79,6 +79,7 @@ def settings():
         "plex": {
             "configured": bool(plex_config),
             "url": plex_config.get("url", "") if plex_config else "",
+            "serverName": plex_config.get("serverName", "") if plex_config else "",
             "libraries": plex_config.get("libraries", []) if plex_config else [],
             "librarySectionIds": plex_config.get("librarySectionIds", []) if plex_config else [],
         },
@@ -315,67 +316,3 @@ def get_lidarr_options():
         return jsonify(lidarr.options())
     except (ValueError, requests.RequestException):
         return api_error("Lidarr could not be reached. Recheck its connection in Settings.", 502)
-
-
-@blueprint.post("/api/settings/plex")
-@admin_required
-def configure_plex():
-    values = request.get_json(silent=True) or {}
-    old = get_service("plex") or {}
-    config = {
-        "url": str(values.get("url", "")).strip().rstrip("/"),
-        "token": str(values.get("token", "")).strip() or old.get("token", ""),
-    }
-    if not config["url"] or not config["token"]:
-        return api_error("Enter both a Plex URL and token.")
-    try:
-        config["machineIdentifier"] = plex.machine_identifier(config)
-        libraries = plex.music_sections(config)
-        requested_ids = values.get("librarySectionIds")
-        if requested_ids is None:
-            requested_ids = old.get("librarySectionIds", [item["id"] for item in libraries])
-        if not isinstance(requested_ids, list):
-            requested_ids = [requested_ids]
-        available_ids = {item["id"] for item in libraries}
-        selected_ids = [str(value) for value in requested_ids if str(value) in available_ids]
-        if not selected_ids:
-            return api_error("Select at least one Plex music library.")
-        config["libraries"] = libraries
-        config["librarySectionIds"] = selected_ids
-        save_service("plex", config)
-        clear_cache("plex-library")
-        clear_cache("plex-guid")
-        invalidate_detail_payloads()
-        plex_worker.request_full_scan()
-        return jsonify({
-            "message": "Connected to Plex; full music-library scan queued.",
-            "libraries": libraries,
-            "librarySectionIds": selected_ids,
-        })
-    except (ValueError, requests.RequestException):
-        return api_error("Could not connect to Plex. Check the URL and token.", 502)
-
-
-@blueprint.post("/api/settings/plex/test")
-@admin_required
-def test_plex():
-    values = request.get_json(silent=True) or {}
-    old = get_service("plex") or {}
-    config = {
-        "url": str(values.get("url", "")).strip().rstrip("/"),
-        "token": str(values.get("token", "")).strip() or old.get("token", ""),
-    }
-    if not config["url"] or not config["token"]:
-        return api_error("Enter a Plex address and token before testing.")
-    try:
-        machine_identifier = plex.machine_identifier(config)
-        libraries = plex.music_sections(config)
-        if not libraries:
-            return api_error("Plex has no music libraries available for Melodarr.")
-        return jsonify({
-            "message": "Connected to Plex. Select the music libraries Melodarr should scan.",
-            "machineIdentifier": machine_identifier,
-            "libraries": libraries,
-        })
-    except (ValueError, requests.RequestException):
-        return api_error("Could not connect to Plex. Check the URL and token.", 502)

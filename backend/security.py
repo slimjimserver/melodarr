@@ -18,7 +18,8 @@ def get_user(user_id):
     with db() as connection:
         return connection.execute(
             "SELECT id, username, password_hash, role, listenbrainz_username, "
-            "lastfm_username, lastfm_api_key FROM users WHERE id = ?",
+            "lastfm_username, lastfm_api_key, plex_id, plex_username, "
+            "plex_email, plex_avatar FROM users WHERE id = ?",
             (user_id,),
         ).fetchone()
 
@@ -48,6 +49,8 @@ def user_payload(user, include_csrf=False):
     payload = {
         "username": user["username"],
         "role": user["role"],
+        "authProvider": "plex" if user["plex_id"] else "local",
+        "plexUsername": user["plex_username"] or "",
         "listenbrainzUsername": user["listenbrainz_username"] or "",
         "lastfmUsername": user["lastfm_username"] or "",
         "lastfmConfigured": bool(user["lastfm_username"] and user["lastfm_api_key"]),
@@ -92,7 +95,9 @@ def verify_csrf_token():
     """Reject state-changing API requests without the session's CSRF token."""
     if request.method not in {"POST", "PUT", "PATCH", "DELETE"} or not request.path.startswith("/api/"):
         return None
-    if request.path in {"/api/auth/login", "/api/auth/register"}:
+    if request.path in {"/api/auth/login", "/api/auth/register"} or request.path.startswith(
+        "/api/auth/plex/"
+    ):
         return None
     expected_token = session.get("csrf_token", "")
     received_token = request.headers.get("X-CSRF-Token", "")

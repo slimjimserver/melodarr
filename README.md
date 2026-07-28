@@ -119,7 +119,7 @@ MELODARR_COOKIE_SECURE: "true"
 Service credentials are configured after signing in; they are not environment variables.
 
 - **Lidarr (required for requests):** hostname or IP address, port, SSL choice, API key, and optionally an external browser-facing URL. After testing the connection, choose the root folder, quality and metadata profiles, monitoring behavior, tags, and automatic-search behavior.
-- **Plex (optional):** server URL, authentication token, and one or more music libraries to scan.
+- **Plex (optional):** sign in with the Plex account that owns the server, choose one of its advertised connections, and select one or more music libraries to scan. Plex tokens are retrieved through the secure Plex PIN flow and are never pasted into Melodarr.
 - **ListenBrainz (optional, per user):** public ListenBrainz username.
 - **Last.fm (optional, per user):** Last.fm username and API key.
 

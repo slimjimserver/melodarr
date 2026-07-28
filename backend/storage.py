@@ -321,6 +321,10 @@ def init_db():
                 username TEXT NOT NULL UNIQUE COLLATE NOCASE,
                 password_hash TEXT NOT NULL,
                 role TEXT NOT NULL CHECK(role IN ('admin', 'user')),
+                plex_id TEXT,
+                plex_username TEXT,
+                plex_email TEXT,
+                plex_avatar TEXT,
                 listenbrainz_username TEXT,
                 lastfm_username TEXT,
                 lastfm_api_key TEXT,
@@ -334,6 +338,32 @@ def init_db():
             connection.execute("ALTER TABLE users ADD COLUMN lastfm_username TEXT")
         if "lastfm_api_key" not in user_columns:
             connection.execute("ALTER TABLE users ADD COLUMN lastfm_api_key TEXT")
+        for column in ("plex_id", "plex_username", "plex_email", "plex_avatar"):
+            if column not in user_columns:
+                connection.execute(f"ALTER TABLE users ADD COLUMN {column} TEXT")
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS users_plex_id_unique "
+            "ON users(plex_id) WHERE plex_id IS NOT NULL"
+        )
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS plex_auth_flows (
+                flow_hash TEXT PRIMARY KEY,
+                pin_id INTEGER NOT NULL,
+                client_identifier TEXT NOT NULL,
+                purpose TEXT NOT NULL CHECK(purpose IN ('login', 'server')),
+                user_id INTEGER REFERENCES users(id),
+                created_at REAL NOT NULL,
+                expires_at REAL NOT NULL,
+                auth_token TEXT,
+                account_json TEXT,
+                resources_json TEXT,
+                selection_json TEXT,
+                libraries_json TEXT
+            )
+        """)
+        connection.execute(
+            "DELETE FROM plex_auth_flows WHERE expires_at <= ?", (time.time(),)
+        )
         connection.execute("""
             CREATE TABLE IF NOT EXISTS request_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -39,7 +39,7 @@
   </header>
 
   <section id="auth" class="auth-view">
-    <div class="auth-card">
+    <div id="auth-card" class="auth-card">
       <p class="eyebrow">MELODARR</p>
       <h1 id="auth-title">Music, for<br><em>your people.</em></h1>
       <p id="auth-intro" class="intro">Getting your music space ready…</p>
@@ -58,6 +58,84 @@
         <button>Create account</button>
         <p class="form-message" aria-live="polite"></p>
       </form>
+      <div id="plex-login-option" class="plex-login-option" hidden>
+        <span>or</span>
+        <button id="plex-login" class="plex-button" type="button">
+          Sign in with <img src="/icons/plex.svg" alt="Plex">
+        </button>
+        <p class="form-message" aria-live="polite"></p>
+      </div>
+    </div>
+
+    <div id="setup-wizard" class="setup-card" hidden>
+      <div class="setup-brand">
+        <img src="/icons/melodarr.svg" alt="" width="58" height="58">
+        <span>melodarr</span>
+      </div>
+      <ol class="setup-steps" aria-label="Setup progress">
+        <li class="active" data-setup-step="1"><span>1</span><strong>Media server</strong></li>
+        <li data-setup-step="2"><span>2</span><strong>Sign in</strong></li>
+        <li data-setup-step="3"><span>3</span><strong>Configure Plex</strong></li>
+      </ol>
+
+      <section id="setup-choice" class="setup-panel">
+        <p class="eyebrow">WELCOME TO MELODARR</p>
+        <h1>Choose your<br><em>media server.</em></h1>
+        <p class="intro">Connect your music library now, or create a local administrator and add Plex later.</p>
+        <div class="server-choice">
+          <img src="/icons/plex.svg" alt="Plex" width="112" height="40">
+          <p>Use your Plex account to securely discover a server you own.</p>
+          <button id="setup-choose-plex" class="plex-button" type="button">Configure Plex</button>
+        </div>
+        <button id="setup-skip-plex" class="outline setup-skip" type="button">Skip for now</button>
+      </section>
+
+      <section id="setup-plex-login" class="setup-panel" hidden>
+        <p class="eyebrow">PLEX ACCOUNT</p>
+        <h2>Sign in as the server owner</h2>
+        <p class="setup-copy">Plex will open in a secure window. Use the account that owns the server you want Melodarr to scan.</p>
+        <div class="plex-signin-box">
+          <button id="setup-plex-login-button" class="plex-button" type="button">
+            Sign in with <img src="/icons/plex.svg" alt="Plex">
+          </button>
+        </div>
+        <p class="form-message" aria-live="polite"></p>
+        <button class="outline setup-back" data-setup-back="choice" type="button">Go back</button>
+      </section>
+
+      <section id="setup-local-account" class="setup-panel" hidden>
+        <p class="eyebrow">LOCAL ADMINISTRATOR</p>
+        <h2>Create your owner account</h2>
+        <p class="setup-copy">You can connect Plex later from Settings. Plex integration will still require signing in with a server-owner account.</p>
+        <form id="setup-local-form" class="auth-form">
+          <label>Username<input name="username" autocomplete="username" minlength="3" maxlength="32" required></label>
+          <label>Password<input name="password" type="password" autocomplete="new-password" minlength="12" required></label>
+          <button>Create local administrator</button>
+          <p class="form-message" aria-live="polite"></p>
+        </form>
+        <button class="outline setup-back" data-setup-back="choice" type="button">Go back</button>
+      </section>
+
+      <section id="setup-plex-server" class="setup-panel" hidden>
+        <p class="eyebrow">PLEX SERVER</p>
+        <h2>Configure your music library</h2>
+        <p id="setup-plex-account" class="setup-copy"></p>
+        <div class="setup-server-fields">
+          <label>Server<select id="setup-plex-server-select"></select></label>
+          <label>Connection<select id="setup-plex-connection-select"></select></label>
+        </div>
+        <div class="setup-actions">
+          <p id="setup-plex-message" class="message form-message" aria-live="polite"></p>
+          <button id="setup-test-plex" class="secondary-action" type="button">Load music libraries</button>
+        </div>
+        <fieldset id="setup-plex-libraries" disabled>
+          <div id="setup-plex-library-sections" class="option-picker" role="group" aria-label="Plex music libraries"></div>
+        </fieldset>
+        <div class="setup-actions">
+          <button class="outline setup-back" data-setup-back="plex-login" type="button">Sign in again</button>
+          <button id="setup-finish-plex" type="button" disabled>Finish setup</button>
+        </div>
+      </section>
     </div>
   </section>
 
@@ -131,23 +209,38 @@
       <div id="settings-services" class="settings-stack settings-panel">
         <section class="settings-section">
           <div class="service-intro"><img class="service-icon" src="/icons/plex.svg" width="42" height="42" loading="lazy" decoding="async" alt="Plex"><div><h2>Plex library</h2><p>Detect artists you already own and open them directly in Plex.</p></div><span id="plex-state" class="service-state">Not connected</span></div>
-          <form id="plex-settings" class="service-card">
-            <div class="settings-fields">
-              <label>Plex address<input name="url" placeholder="http://plex:32400" required></label>
-              <label>Authentication token<input name="token" type="password" placeholder="Plex token (leave blank to keep saved token)"></label>
-            </div>
-            <div class="form-actions"><p class="form-message"></p><button type="button" id="test-plex" class="secondary-action">Test connection</button></div>
-            <fieldset id="plex-libraries" disabled>
-              <hr>
-              <div class="defaults-heading"><div><h3>Music libraries</h3><p class="field-help">Only selected Plex music libraries are scanned and used to filter recommendations.</p></div></div>
-              <div class="option-field">
-                <span class="option-field-label">Select music libraries</span>
-                <div id="plex-library-sections" class="option-picker" role="group" aria-label="Plex music libraries"></div>
-                <small>Select every library Melodarr should use.</small>
+          <div id="plex-settings" class="service-card plex-connect-card">
+            <div class="plex-connect-intro">
+              <div>
+                <h3>Connect with Plex</h3>
+                <p>Sign in with the account that owns your Plex server. Melodarr will retrieve its available connections securely.</p>
               </div>
-              <div class="form-actions"><span></span><button>Save Plex connection</button></div>
-            </fieldset>
-          </form>
+              <button id="connect-plex" class="plex-button" type="button">Sign in with <img src="/icons/plex.svg" alt="Plex"></button>
+            </div>
+            <p class="form-message" aria-live="polite"></p>
+            <div id="plex-current-connection" class="plex-current-connection" hidden>
+              <div><span>Server</span><strong id="plex-current-server"></strong></div>
+              <div><span>Connection</span><strong id="plex-current-url"></strong></div>
+              <div><span>Music libraries</span><strong id="plex-current-libraries"></strong></div>
+            </div>
+            <div id="plex-settings-config" hidden>
+              <hr>
+              <div class="settings-fields">
+                <label>Server<select id="settings-plex-server-select"></select></label>
+                <label>Connection<select id="settings-plex-connection-select"></select></label>
+              </div>
+              <div class="form-actions"><span></span><button id="settings-test-plex" class="secondary-action" type="button">Load music libraries</button></div>
+              <fieldset id="plex-libraries" disabled>
+                <div class="defaults-heading"><div><h3>Music libraries</h3><p class="field-help">Only selected Plex music libraries are scanned and used to filter recommendations.</p></div></div>
+                <div class="option-field">
+                  <span class="option-field-label">Select music libraries</span>
+                  <div id="plex-library-sections" class="option-picker" role="group" aria-label="Plex music libraries"></div>
+                  <small>Select every library Melodarr should use.</small>
+                </div>
+                <div class="form-actions"><span></span><button id="settings-save-plex" type="button" disabled>Save Plex connection</button></div>
+              </fieldset>
+            </div>
+          </div>
         </section>
 
         <section class="settings-section">

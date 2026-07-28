@@ -47,8 +47,15 @@ from backend.api_cache import (
 )
 from backend.application import create_app
 from backend.config import ARTWORK_CACHE_DIRECTORY
-from backend.services import lidarr, musicbrainz, plex
-from backend.storage import db, enqueue_lidarr_search, get_service, set_lidarr_refresh_command
+from backend.services import lidarr, musicbrainz, plex, plex_auth
+from backend.storage import (
+    db,
+    enqueue_lidarr_search,
+    get_service,
+    save_service,
+    set_lidarr_refresh_command,
+    write_settings_file,
+)
 from backend import worker
 from backend.workers import artist_metadata as artist_metadata_worker
 from backend.workers import lidarr_searches as lidarr_search_worker
@@ -118,11 +125,13 @@ class DatabaseTestCase(unittest.TestCase):
             )
         artist_metadata_worker.wake_requested.clear()
         with db() as connection:
+            connection.execute("DELETE FROM plex_auth_flows")
             connection.execute("DELETE FROM pending_lidarr_searches")
             connection.execute("DELETE FROM recommendation_cache")
             connection.execute("DELETE FROM request_history")
             connection.execute("DELETE FROM account_invitations")
             connection.execute("DELETE FROM users")
+        write_settings_file({})
         with cache_db() as connection:
             connection.execute("DELETE FROM api_cache")
 
@@ -144,8 +153,8 @@ class ApplicationFactoryTests(DatabaseTestCase):
             for method in rule.methods
             if method not in {"HEAD", "OPTIONS"}
         }
-        self.assertEqual(len(rules), 56)
-        self.assertEqual(len(route_methods), 56)
+        self.assertEqual(len(rules), 58)
+        self.assertEqual(len(route_methods), 58)
 
     def test_factory_applies_test_configuration(self):
         self.assertTrue(self.app.config["TESTING"])
@@ -919,6 +928,11 @@ class DeploymentConfigTests(unittest.TestCase):
             encoding="utf-8",
         ) as file:
             typescript = file.read()
+        with open(
+            os.path.join(project_root, "frontend", "src", "style.css"),
+            encoding="utf-8",
+        ) as file:
+            stylesheet = file.read()
         self.assertNotIn("<summary>Create an account</summary>", frontend)
         self.assertIn('name="remember"', frontend)
         self.assertIn('data-account-route="invitations"', frontend)
@@ -927,6 +941,18 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn("function loadDiscovery()", typescript)
         self.assertIn("status.firstAccount", typescript)
         self.assertIn("status.invitationValid", typescript)
+        self.assertIn('id="setup-wizard"', frontend)
+        self.assertIn('id="setup-choose-plex"', frontend)
+        self.assertIn('id="setup-skip-plex"', frontend)
+        self.assertIn('id="setup-plex-message"', frontend)
+        self.assertIn('id="plex-current-connection"', frontend)
+        self.assertIn('"#setup-plex-message"', typescript)
+        self.assertIn('"#plex-current-connection"', typescript)
+        self.assertIn("if (popup.closed)", typescript)
+        self.assertIn('"/api/auth/plex/start"', typescript)
+        self.assertIn(".service-card > .plex-current-connection", stylesheet)
+        self.assertNotIn("#plex-settings-config { display: grid !important", stylesheet)
+        self.assertNotIn('name="token"', frontend)
 
     def test_color_theme_switcher_preserves_midnight_and_warm_palettes(self):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1031,7 +1057,7 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn('document.execCommand("copy")', typescript)
         self.assertIn("copied ? \"Invitation link copied.\"", typescript)
 
-    def test_settings_clear_submitted_secrets_and_invalidate_lidarr_links(self):
+    def test_settings_use_plex_login_and_invalidate_lidarr_links(self):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with open(
             os.path.join(project_root, "frontend", "src", "app.ts"),
@@ -1044,7 +1070,8 @@ class DeploymentConfigTests(unittest.TestCase):
         ) as file:
             discovery_typescript = file.read()
 
-        self.assertIn('plexForm.token.value = "";', app_typescript)
+        self.assertIn('startPlexAuthentication("server"', app_typescript)
+        self.assertNotIn('"/api/settings/plex/test"', app_typescript)
         self.assertIn('form.apiKey.value = "";', app_typescript)
         self.assertIn(
             'new Event("melodarr-lidarr-settings-changed")',
@@ -1340,6 +1367,324 @@ class AuthenticationTests(DatabaseTestCase):
         self.assertEqual(payload["role"], "admin")
         self.assertTrue(payload["csrfToken"])
 
+    def test_plex_poll_stays_pending_until_the_pin_is_authorized(self):
+        with (
+            patch("backend.routes.auth.plex_auth.create_pin") as create_pin,
+            patch("backend.routes.auth.plex_auth.poll_pin", return_value=""),
+        ):
+            create_pin.return_value = {
+                "id": 42,
+                "authorizationUrl": "https://app.plex.tv/auth/#!?code=ABCD",
+                "expiresAt": time.time() + 600,
+            }
+            flow_token = self.client.post(
+                "/api/auth/plex/start", json={"purpose": "server"}
+            ).get_json()["flowToken"]
+
+            response = self.client.post(
+                "/api/auth/plex/poll", json={"flowToken": flow_token}
+            )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertTrue(response.get_json()["pending"])
+
+    def test_starting_plex_auth_purges_expired_flows(self):
+        with db() as connection:
+            connection.execute(
+                "INSERT INTO plex_auth_flows "
+                "(flow_hash, pin_id, client_identifier, purpose, created_at, "
+                "expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+                ("expired-flow", 1, "old-client", "server", time.time() - 60, time.time() - 1),
+            )
+
+        with patch("backend.routes.auth.plex_auth.create_pin") as create_pin:
+            create_pin.return_value = {
+                "id": 42,
+                "authorizationUrl": "https://app.plex.tv/auth/#!?code=ABCD",
+                "expiresAt": time.time() + 600,
+            }
+            response = self.client.post(
+                "/api/auth/plex/start", json={"purpose": "server"}
+            )
+
+        self.assertEqual(response.status_code, 201)
+        with db() as connection:
+            rows = connection.execute(
+                "SELECT flow_hash FROM plex_auth_flows"
+            ).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertNotEqual(rows[0]["flow_hash"], "expired-flow")
+
+    def test_plex_owner_setup_discovers_server_and_creates_admin(self):
+        owned_server = {
+            "name": "Music Plex",
+            "product": "Plex Media Server",
+            "clientIdentifier": "server-1",
+            "provides": ["server"],
+            "owned": True,
+            "accessToken": "server-token",
+            "connections": [{
+                "uri": "https://server-1.plex.direct:32400",
+                "protocol": "https",
+                "address": "server-1.plex.direct",
+                "port": 32400,
+                "local": True,
+                "secure": True,
+            }],
+        }
+        libraries = [
+            {"id": "1", "title": "Main Music"},
+            {"id": "2", "title": "Concerts"},
+        ]
+        with (
+            patch("backend.routes.auth.plex_auth.create_pin") as create_pin,
+            patch("backend.routes.auth.plex_auth.poll_pin", return_value="account-token"),
+            patch("backend.routes.auth.plex_auth.get_account") as get_account,
+            patch(
+                "backend.routes.auth.plex_auth.get_resources",
+                return_value=[owned_server],
+            ),
+            patch(
+                "backend.routes.auth.plex.machine_identifier",
+                return_value="server-1",
+            ),
+            patch("backend.routes.auth.plex.music_sections", return_value=libraries),
+            patch("backend.routes.auth.plex_worker.request_full_scan") as request_scan,
+        ):
+            create_pin.return_value = {
+                "id": 42,
+                "authorizationUrl": "https://app.plex.tv/auth/#!?code=ABCD",
+                "expiresAt": time.time() + 600,
+            }
+            get_account.return_value = {
+                "id": "99",
+                "username": "plex-owner",
+                "title": "Plex Owner",
+                "email": "owner@example.com",
+                "thumb": "https://plex.tv/avatar.png",
+            }
+
+            started = self.client.post(
+                "/api/auth/plex/start", json={"purpose": "server"}
+            )
+            self.assertEqual(started.status_code, 201)
+            flow_token = started.get_json()["flowToken"]
+
+            signed_in = self.client.post(
+                "/api/auth/plex/poll", json={"flowToken": flow_token}
+            )
+            self.assertEqual(signed_in.status_code, 200)
+            self.assertEqual(signed_in.get_json()["servers"][0]["id"], "server-1")
+            self.assertNotIn("accessToken", signed_in.get_json()["servers"][0])
+
+            inspected = self.client.post(
+                "/api/auth/plex/inspect",
+                json={
+                    "flowToken": flow_token,
+                    "serverId": "server-1",
+                    "connectionUri": "https://server-1.plex.direct:32400",
+                },
+            )
+            self.assertEqual(inspected.status_code, 200)
+            self.assertEqual(inspected.get_json()["libraries"], libraries)
+
+            completed = self.client.post(
+                "/api/auth/plex/complete",
+                json={"flowToken": flow_token, "librarySectionIds": ["1"]},
+            )
+
+        self.assertEqual(completed.status_code, 200)
+        self.assertEqual(completed.get_json()["role"], "admin")
+        self.assertEqual(completed.get_json()["authProvider"], "plex")
+        plex_settings = get_service("plex")
+        self.assertEqual(plex_settings["token"], "server-token")
+        self.assertEqual(plex_settings["machineIdentifier"], "server-1")
+        self.assertEqual(plex_settings["librarySectionIds"], ["1"])
+        request_scan.assert_called_once_with()
+
+    def test_server_setup_requires_an_owned_plex_server(self):
+        shared_server = {
+            "name": "Shared Plex",
+            "product": "Plex Media Server",
+            "clientIdentifier": "shared-1",
+            "provides": ["server"],
+            "owned": False,
+            "accessToken": "shared-token",
+            "connections": [{
+                "uri": "https://shared.plex.direct:32400",
+                "protocol": "https",
+                "address": "shared.plex.direct",
+                "port": 32400,
+                "local": False,
+                "secure": True,
+            }],
+        }
+        with (
+            patch("backend.routes.auth.plex_auth.create_pin") as create_pin,
+            patch("backend.routes.auth.plex_auth.poll_pin", return_value="account-token"),
+            patch("backend.routes.auth.plex_auth.get_account") as get_account,
+            patch(
+                "backend.routes.auth.plex_auth.get_resources",
+                return_value=[shared_server],
+            ),
+        ):
+            create_pin.return_value = {
+                "id": 43,
+                "authorizationUrl": "https://app.plex.tv/auth/#!?code=EFGH",
+                "expiresAt": time.time() + 600,
+            }
+            get_account.return_value = {
+                "id": "100",
+                "username": "shared-user",
+                "title": "Shared User",
+                "email": "shared@example.com",
+                "thumb": "",
+            }
+            flow_token = self.client.post(
+                "/api/auth/plex/start", json={"purpose": "server"}
+            ).get_json()["flowToken"]
+            response = self.client.post(
+                "/api/auth/plex/poll", json={"flowToken": flow_token}
+            )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("owns the server", response.get_json()["error"])
+
+    def test_plex_sso_creates_a_user_with_access_to_the_configured_server(self):
+        csrf_token = self.register()
+        save_service("plex", {
+            "url": "http://plex:32400",
+            "token": "owner-token",
+            "machineIdentifier": "server-1",
+            "libraries": [{"id": "1", "title": "Music"}],
+            "librarySectionIds": ["1"],
+        })
+        self.client.post(
+            "/api/auth/logout", headers={"X-CSRF-Token": csrf_token}
+        )
+        shared_server = {
+            "name": "Music Plex",
+            "product": "Plex Media Server",
+            "clientIdentifier": "server-1",
+            "provides": ["server"],
+            "owned": False,
+            "accessToken": "user-token",
+            "connections": [{
+                "uri": "https://server-1.plex.direct:32400",
+                "protocol": "https",
+                "address": "server-1.plex.direct",
+                "port": 32400,
+                "local": False,
+                "secure": True,
+            }],
+        }
+        with (
+            patch("backend.routes.auth.plex_auth.create_pin") as create_pin,
+            patch("backend.routes.auth.plex_auth.poll_pin", return_value="user-token"),
+            patch("backend.routes.auth.plex_auth.get_account") as get_account,
+            patch(
+                "backend.routes.auth.plex_auth.get_resources",
+                return_value=[shared_server],
+            ),
+        ):
+            create_pin.return_value = {
+                "id": 44,
+                "authorizationUrl": "https://app.plex.tv/auth/#!?code=IJKL",
+                "expiresAt": time.time() + 600,
+            }
+            get_account.return_value = {
+                "id": "101",
+                "username": "plex-friend",
+                "title": "Plex Friend",
+                "email": "friend@example.com",
+                "thumb": "",
+            }
+            flow_token = self.client.post(
+                "/api/auth/plex/start", json={"purpose": "login"}
+            ).get_json()["flowToken"]
+            response = self.client.post(
+                "/api/auth/plex/poll", json={"flowToken": flow_token}
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["role"], "user")
+        self.assertEqual(response.get_json()["authProvider"], "plex")
+        with db() as connection:
+            saved = connection.execute(
+                "SELECT plex_id FROM users WHERE username = 'plex-friend'"
+            ).fetchone()
+        self.assertEqual(saved["plex_id"], "101")
+
+    def test_legacy_plex_owner_must_link_the_local_admin_before_sso(self):
+        csrf_token = self.register()
+        save_service("plex", {
+            "url": "http://plex:32400",
+            "token": "owner-token",
+            "machineIdentifier": "server-1",
+            "libraries": [{"id": "1", "title": "Music"}],
+            "librarySectionIds": ["1"],
+        })
+        self.client.post(
+            "/api/auth/logout", headers={"X-CSRF-Token": csrf_token}
+        )
+        owned_server = {
+            "name": "Music Plex",
+            "product": "Plex Media Server",
+            "clientIdentifier": "server-1",
+            "provides": ["server"],
+            "owned": True,
+            "accessToken": "owner-token",
+            "connections": [{
+                "uri": "http://plex:32400",
+                "protocol": "http",
+                "address": "plex",
+                "port": 32400,
+                "local": True,
+                "secure": False,
+            }],
+        }
+        with (
+            patch("backend.routes.auth.plex_auth.create_pin") as create_pin,
+            patch("backend.routes.auth.plex_auth.poll_pin", return_value="owner-token"),
+            patch("backend.routes.auth.plex_auth.get_account") as get_account,
+            patch(
+                "backend.routes.auth.plex_auth.get_resources",
+                return_value=[owned_server],
+            ),
+        ):
+            create_pin.return_value = {
+                "id": 45,
+                "authorizationUrl": "https://app.plex.tv/auth/#!?code=MNOP",
+                "expiresAt": time.time() + 600,
+            }
+            get_account.return_value = {
+                "id": "102",
+                "username": "plex-owner",
+                "title": "Plex Owner",
+                "email": "owner@example.com",
+                "thumb": "",
+            }
+            flow_token = self.client.post(
+                "/api/auth/plex/start", json={"purpose": "login"}
+            ).get_json()["flowToken"]
+            response = self.client.post(
+                "/api/auth/plex/poll", json={"flowToken": flow_token}
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("local administrator", response.get_json()["error"])
+        with db() as connection:
+            users = connection.execute(
+                "SELECT username, plex_id FROM users"
+            ).fetchall()
+            remaining_flows = connection.execute(
+                "SELECT COUNT(*) FROM plex_auth_flows"
+            ).fetchone()[0]
+        self.assertEqual([(row["username"], row["plex_id"]) for row in users], [
+            ("test-user", None),
+        ])
+        self.assertEqual(remaining_flows, 0)
+
     def test_registration_requires_one_time_admin_invitation_after_setup(self):
         csrf_token = self.register()
         invitation_response = self.client.post(
@@ -1525,30 +1870,14 @@ class SettingsMaintenanceTests(DatabaseTestCase):
         request_full.assert_called_once_with()
         request_enrichment.assert_called_once_with()
 
-    @patch("backend.routes.settings.plex_worker.request_full_scan")
-    @patch("backend.routes.settings.plex.music_sections")
-    @patch("backend.routes.settings.plex.machine_identifier")
-    def test_plex_settings_save_only_selected_music_libraries(
-        self, machine_identifier, music_sections, request_full_scan
-    ):
-        machine_identifier.return_value = "server-1"
-        music_sections.return_value = [
-            {"id": "1", "title": "Main Music"},
-            {"id": "2", "title": "Audiobooks"},
-        ]
+    def test_raw_plex_tokens_are_not_accepted_by_settings(self):
         token = self.register()
         response = self.client.post(
             "/api/settings/plex",
-            json={
-                "url": "http://plex:32400",
-                "token": "plex-token",
-                "librarySectionIds": ["1"],
-            },
+            json={"url": "http://plex:32400", "token": "manually-copied-token"},
             headers={"X-CSRF-Token": token},
         )
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(get_service("plex")["librarySectionIds"], ["1"])
-        request_full_scan.assert_called_once_with()
+        self.assertEqual(response.status_code, 405)
 
     @patch("backend.routes.settings.plex_worker.request_full_scan")
     def test_flushing_plex_library_cache_queues_a_full_scan(self, request_full_scan):
@@ -4650,6 +4979,68 @@ class LibraryIndexMemoizationTests(DatabaseTestCase):
             {"22222222-2222-2222-2222-222222222222"},
         )
         self.assertEqual(set(first["artistsByRatingKey"]), {"10"})
+
+
+class PlexAuthenticationClientTests(unittest.TestCase):
+    @patch("backend.services.plex_auth.requests.post")
+    def test_pin_creation_builds_the_plex_authorization_url(self, post):
+        post.return_value = Response(payload={
+            "id": 42,
+            "code": "ABCD",
+            "expiresAt": "2026-07-28T18:00:00Z",
+        })
+
+        result = plex_auth.create_pin("client-id")
+
+        self.assertEqual(result["id"], 42)
+        self.assertIn("https://app.plex.tv/auth/#!?", result["authorizationUrl"])
+        self.assertIn("clientID=client-id", result["authorizationUrl"])
+        self.assertIn("code=ABCD", result["authorizationUrl"])
+        post.assert_called_once()
+
+    @patch("backend.services.plex_auth.requests.get")
+    def test_poll_pin_treats_a_null_token_as_pending(self, get):
+        get.return_value = Response(payload={"id": 42, "authToken": None})
+
+        token = plex_auth.poll_pin(42, "client-id")
+
+        self.assertEqual(token, "")
+
+    @patch("backend.services.plex_auth.requests.get")
+    def test_resource_discovery_normalizes_owned_server_connections(self, get):
+        get.return_value = Response(
+            content=(
+                b'<MediaContainer>'
+                b'<Device name="Music Plex" product="Plex Media Server" '
+                b'clientIdentifier="server-1" provides="server" owned="1" '
+                b'accessToken="server-token">'
+                b'<Connection uri="https://server-1.plex.direct:32400" '
+                b'protocol="https" address="server-1.plex.direct" port="32400" '
+                b'local="1"/>'
+                b'<Connection uri="http://192.168.1.10:32400" protocol="http" '
+                b'address="192.168.1.10" port="32400" local="1"/>'
+                b'</Device>'
+                b'</MediaContainer>'
+            ),
+            headers={"Content-Type": "application/xml"},
+        )
+
+        servers = plex_auth.get_resources("account-token", "client-id")
+
+        self.assertEqual(servers[0]["clientIdentifier"], "server-1")
+        self.assertTrue(servers[0]["owned"])
+        self.assertTrue(servers[0]["connections"][0]["secure"])
+        self.assertFalse(servers[0]["connections"][1]["secure"])
+        self.assertEqual(
+            servers[0]["connections"][1]["uri"],
+            "http://192.168.1.10:32400",
+        )
+        self.assertEqual(servers[0]["accessToken"], "server-token")
+        self.assertEqual(
+            get.call_args.args[0],
+            "https://plex.tv/api/resources",
+        )
+        self.assertEqual(get.call_args.kwargs["params"], {"includeHttps": "1"})
 
 
 class PlexClientTests(unittest.TestCase):

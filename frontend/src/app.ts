@@ -39,9 +39,23 @@ interface CurrentUser {
   username: string;
   role: "admin" | "user";
   csrfToken?: string;
+  authProvider?: "local" | "plex";
+  plexUsername?: string;
   listenbrainzUsername?: string;
   lastfmUsername?: string;
   lastfmConfigured?: boolean;
+}
+
+interface PlexConnection extends JsonObject {
+  uri: string;
+  local: boolean;
+  secure: boolean;
+}
+
+interface PlexServer extends JsonObject {
+  id: string;
+  name: string;
+  connections: PlexConnection[];
 }
 
 interface LidarrDefaults extends JsonObject {
@@ -90,6 +104,10 @@ let lidarrDefaults: LidarrDefaults = {};
 let currentUser: CurrentUser | undefined;
 let showAccountPage: ((page?: AccountPage, updateHistory?: boolean) => void) | undefined;
 let invitationToken = "";
+let setupPlexFlowToken = "";
+let setupPlexServers: PlexServer[] = [];
+let settingsPlexFlowToken = "";
+let settingsPlexServers: PlexServer[] = [];
 let maintenanceRefreshTimer: number | undefined;
 let maintenanceRefreshInFlight = false;
 let discoveryLoad: Promise<void> | undefined;
@@ -283,6 +301,100 @@ async function api<T = JsonObject>(url: string, options: RequestInit = {}): Prom
   return body;
 }
 
+function wait(milliseconds: number) {
+  return new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
+async function startPlexAuthentication(
+  purpose: "login" | "server",
+  message: Element,
+  onComplete: (result: JsonObject) => Promise<void> | void,
+) {
+  const popup = window.open(
+    "",
+    "Melodarr Plex Sign In",
+    "popup=yes,scrollbars=yes,width=600,height=700",
+  );
+  if (!popup) {
+    setMessage(message, "Allow popups for Melodarr, then try again.", true);
+    return;
+  }
+  popup.document.title = "Opening Plex…";
+  popup.document.body.textContent = "Opening secure Plex sign-in…";
+  setMessage(message, "Opening secure Plex sign-in…");
+
+  try {
+    const started = await api("/api/auth/plex/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ purpose }),
+    });
+    popup.location.href = started.authorizationUrl;
+    const deadline = Math.min(
+      Number(started.expiresAt || (Date.now() / 1000) + 900) * 1000,
+      Date.now() + 15 * 60 * 1000,
+    );
+
+    while (Date.now() < deadline) {
+      if (popup.closed) {
+        throw new Error("Plex sign-in was closed. Try again.");
+      }
+      const result = await api("/api/auth/plex/poll", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ flowToken: started.flowToken }),
+      });
+      if (!result.pending) {
+        popup.close();
+        await onComplete({ ...result, flowToken: started.flowToken });
+        return;
+      }
+      await wait(1_000);
+    }
+    throw new Error("Plex sign-in expired before it was completed.");
+  } catch (error) {
+    popup.close();
+    setMessage(message, error.message, true);
+  }
+}
+
+function plexControlElements(scope: "setup" | "settings") {
+  return {
+    server: $<HTMLSelectElement>(`#${scope}-plex-server-select`),
+    connection: $<HTMLSelectElement>(`#${scope}-plex-connection-select`),
+  };
+}
+
+function populatePlexConnections(scope: "setup" | "settings", servers: PlexServer[]) {
+  const controls = plexControlElements(scope);
+  const server = servers.find((item) => item.id === controls.server.value) || servers[0];
+  controls.connection.replaceChildren();
+  (server?.connections || []).forEach((connection) => {
+    const location = connection.local ? "local" : "remote";
+    const security = connection.secure ? " · secure" : "";
+    controls.connection.add(
+      new Option(`${connection.uri} · ${location}${security}`, connection.uri),
+    );
+  });
+  controls.connection.disabled = !server?.connections.length;
+}
+
+function populatePlexServers(scope: "setup" | "settings", servers: PlexServer[]) {
+  const controls = plexControlElements(scope);
+  controls.server.replaceChildren();
+  servers.forEach((server) => controls.server.add(new Option(server.name, server.id)));
+  controls.server.disabled = servers.length === 0;
+  populatePlexConnections(scope, servers);
+}
+
+function selectedPlexConnection(scope: "setup" | "settings") {
+  const controls = plexControlElements(scope);
+  return {
+    serverId: controls.server.value,
+    connectionUri: controls.connection.value,
+  };
+}
+
 function addSelectOptions(select: HTMLSelectElement, options: JsonObject[], labelKey: string, valueKey: string, selected: Array<string | number | undefined> = []) {
   const selectedValues = new Set(selected.map(String));
   select.replaceChildren();
@@ -354,10 +466,25 @@ async function refreshSettings(loadLidarrOptions = true) {
   lidarrDefaults = lidarr.defaults || {};
 
   $("#lidarr-state").textContent = lidarr.configured ? `Connected · ${lidarr.url}` : "Not connected";
-  $("#plex-state").textContent = plex.configured ? `Connected · ${plex.url}` : "Not connected";
-  const plexForm = $<AppForm>("#plex-settings");
-  plexForm.url.value = plex.url || "";
-  plexForm.token.value = "";
+  $("#plex-state").textContent = plex.configured
+    ? `Connected · ${plex.serverName || plex.url}`
+    : "Not connected";
+  $("#connect-plex").firstChild!.textContent = plex.configured
+    ? "Reconnect with "
+    : "Sign in with ";
+  const currentPlexConnection = $("#plex-current-connection");
+  currentPlexConnection.hidden = !plex.configured;
+  $("#plex-current-server").textContent =
+    plex.serverName || (plex.configured ? "Plex Media Server" : "");
+  $("#plex-current-url").textContent = plex.url || "";
+  const selectedPlexLibraryIds = new Set(
+    (plex.librarySectionIds || []).map((value: string | number) => String(value)),
+  );
+  const selectedPlexLibraryNames = (plex.libraries || [])
+    .filter((library: JsonObject) => selectedPlexLibraryIds.has(String(library.id)))
+    .map((library: JsonObject) => library.title);
+  $("#plex-current-libraries").textContent =
+    selectedPlexLibraryNames.join(", ") || (plex.configured ? "None selected" : "");
   populatePlexLibraries(plex.libraries || [], plex.librarySectionIds || []);
 
   const form = $<AppForm>("#lidarr-settings");
@@ -807,13 +934,45 @@ async function applyCurrentUser(user: CurrentUser) {
   }
 }
 
+function showSetupPanel(
+  panel: "choice" | "plex-login" | "local-account" | "plex-server",
+) {
+  const panelIds = {
+    choice: "setup-choice",
+    "plex-login": "setup-plex-login",
+    "local-account": "setup-local-account",
+    "plex-server": "setup-plex-server",
+  };
+  Object.values(panelIds).forEach((id) => {
+    $(`#${id}`).hidden = id !== panelIds[panel];
+  });
+  const step = panel === "choice" ? 1 : panel === "plex-server" ? 3 : 2;
+  const localPath = panel === "local-account";
+  document.querySelectorAll<HTMLElement>("[data-setup-step]").forEach((item) => {
+    const itemStep = Number(item.dataset.setupStep);
+    item.hidden = localPath && itemStep === 3;
+    item.classList.toggle("active", itemStep === step);
+    item.classList.toggle("completed", itemStep < step);
+  });
+  const secondLabel = document.querySelector<HTMLElement>(
+    '[data-setup-step="2"] strong',
+  );
+  if (secondLabel) secondLabel.textContent = localPath ? "Admin account" : "Sign in";
+}
+
 async function showAuth({ resetPath = false } = {}) {
   currentUser = undefined;
   document.body.classList.remove("authenticated");
+  const authCard = $("#auth-card");
+  const setupWizard = $("#setup-wizard");
   const loginForm = $("#login-form");
   const registerForm = $("#register-form");
+  const plexLoginOption = $("#plex-login-option");
   loginForm.hidden = true;
   registerForm.hidden = true;
+  plexLoginOption.hidden = true;
+  authCard.hidden = false;
+  setupWizard.hidden = true;
   if (resetPath) window.history.replaceState({}, "", "/");
 
   const parameters = new URLSearchParams(window.location.search);
@@ -824,10 +983,9 @@ async function showAuth({ resetPath = false } = {}) {
     if (status.firstAccount) {
       invitationToken = "";
       window.history.replaceState({ setup: true }, "", "/setup");
-      $("#auth-title").innerHTML = "Create your<br><em>owner account.</em>";
-      $("#auth-intro").textContent = "Set up the first Melodarr administrator account.";
-      $("#register-title").textContent = "Create owner account";
-      registerForm.hidden = false;
+      authCard.hidden = true;
+      setupWizard.hidden = false;
+      showSetupPanel("choice");
     } else if (invitationToken && status.invitationValid) {
       $("#auth-title").innerHTML = "You’re<br><em>invited.</em>";
       $("#auth-intro").textContent = "Create your account using this one-time invitation.";
@@ -843,6 +1001,7 @@ async function showAuth({ resetPath = false } = {}) {
         : "Sign in to discover and request music.";
       invitationToken = "";
       loginForm.hidden = false;
+      plexLoginOption.hidden = !status.plexConfigured;
     }
   } catch (error) {
     $("#auth-intro").textContent = error.message;
@@ -874,6 +1033,7 @@ async function completeAuthentication(endpoint: string, form: HTMLFormElement, m
 function setupAuth() {
   const loginForm = $<AppForm>("#login-form");
   const registerForm = $<AppForm>("#register-form");
+  const setupLocalForm = $<AppForm>("#setup-local-form");
   loginForm.addEventListener("submit", (event) => {
     event.preventDefault();
     completeAuthentication(
@@ -891,6 +1051,135 @@ function setupAuth() {
       requiredDescendant(registerForm, ".form-message"),
       { invitationToken },
     );
+  });
+  setupLocalForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    completeAuthentication(
+      "/api/auth/register",
+      setupLocalForm,
+      requiredDescendant(setupLocalForm, ".form-message"),
+    );
+  });
+
+  $("#setup-choose-plex").addEventListener("click", () => showSetupPanel("plex-login"));
+  $("#setup-skip-plex").addEventListener("click", () => showSetupPanel("local-account"));
+  document.querySelectorAll<HTMLElement>("[data-setup-back]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const destination = button.dataset.setupBack;
+      if (destination === "plex-login") showSetupPanel("plex-login");
+      else showSetupPanel("choice");
+    });
+  });
+
+  const setupPlexButton = $<HTMLButtonElement>("#setup-plex-login-button");
+  const setupPlexMessage = $("#setup-plex-login .form-message");
+  const setupPlexServerMessage =
+    document.querySelector<HTMLElement>("#setup-plex-message")
+    || document.querySelector<HTMLElement>("#setup-plex-server .form-message")
+    || $<HTMLElement>("#setup-plex-server .message");
+  setupPlexButton.addEventListener("click", async () => {
+    setupPlexButton.disabled = true;
+    await startPlexAuthentication("server", setupPlexMessage, async (result) => {
+      setupPlexFlowToken = result.flowToken;
+      setupPlexServers = result.servers;
+      populatePlexServers("setup", setupPlexServers);
+      $("#setup-plex-account").textContent =
+        `Signed in as ${result.account.username || result.account.email}. Choose how Melodarr should reach your server.`;
+      showSetupPanel("plex-server");
+      setMessage(setupPlexServerMessage, "");
+    });
+    setupPlexButton.disabled = false;
+  });
+
+  const regularPlexButton = $<HTMLButtonElement>("#plex-login");
+  const regularPlexMessage = $("#plex-login-option .form-message");
+  regularPlexButton.addEventListener("click", async () => {
+    regularPlexButton.disabled = true;
+    await startPlexAuthentication("login", regularPlexMessage, async (result) => {
+      window.history.replaceState({ view: "discover" }, "", "/");
+      await applyCurrentUser(result as CurrentUser);
+      if (result.role === "admin") await refreshSettings();
+    });
+    regularPlexButton.disabled = false;
+  });
+
+  const resetSetupPlexLibraries = () => {
+    $("#setup-plex-libraries").disabled = true;
+    $<HTMLButtonElement>("#setup-finish-plex").disabled = true;
+  };
+  plexControlElements("setup").server.addEventListener("change", () => {
+    populatePlexConnections("setup", setupPlexServers);
+    resetSetupPlexLibraries();
+  });
+  plexControlElements("setup").connection.addEventListener(
+    "change",
+    resetSetupPlexLibraries,
+  );
+
+  const inspectButton = $<HTMLButtonElement>("#setup-test-plex");
+  inspectButton.addEventListener("click", async () => {
+    inspectButton.disabled = true;
+    setMessage(setupPlexServerMessage, "Connecting to Plex…");
+    try {
+      const result = await api("/api/auth/plex/inspect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          flowToken: setupPlexFlowToken,
+          ...selectedPlexConnection("setup"),
+        }),
+      });
+      populateOptionPicker(
+        $("#setup-plex-library-sections"),
+        result.libraries,
+        "title",
+        "id",
+        result.libraries.map((library: JsonObject) => library.id),
+      );
+      $("#setup-plex-libraries").disabled = false;
+      $<HTMLButtonElement>("#setup-finish-plex").disabled = false;
+      setMessage(setupPlexServerMessage, result.message);
+    } catch (error) {
+      $("#setup-plex-libraries").disabled = true;
+      $<HTMLButtonElement>("#setup-finish-plex").disabled = true;
+      setMessage(setupPlexServerMessage, error.message, true);
+    } finally {
+      inspectButton.disabled = false;
+    }
+  });
+
+  const finishButton = $<HTMLButtonElement>("#setup-finish-plex");
+  finishButton.addEventListener("click", async () => {
+    const selectedIds = selectedOptionPickerValues("#setup-plex-library-sections");
+    if (!selectedIds.length) {
+      setMessage(
+        setupPlexServerMessage,
+        "Select at least one Plex music library.",
+        true,
+      );
+      return;
+    }
+    finishButton.disabled = true;
+    setMessage(
+      setupPlexServerMessage,
+      "Saving Plex and creating your administrator…",
+    );
+    try {
+      const user = await api<CurrentUser>("/api/auth/plex/complete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          flowToken: setupPlexFlowToken,
+          librarySectionIds: selectedIds,
+        }),
+      });
+      window.history.replaceState({ view: "discover" }, "", "/");
+      await applyCurrentUser(user);
+      await refreshSettings();
+    } catch (error) {
+      setMessage(setupPlexServerMessage, error.message, true);
+      finishButton.disabled = false;
+    }
   });
   $("#logout").addEventListener("click", () => signOut());
 }
@@ -961,57 +1250,92 @@ function setupLidarrSettings() {
 }
 
 function setupPlexSettings() {
-  const form = $<AppForm>("#plex-settings");
-  const testButton = $("#test-plex");
-  const message = requiredDescendant<HTMLElement>(form, ".form-message");
+  const card = $("#plex-settings");
+  const connectButton = $<HTMLButtonElement>("#connect-plex");
+  const testButton = $<HTMLButtonElement>("#settings-test-plex");
+  const saveButton = $<HTMLButtonElement>("#settings-save-plex");
+  const message = requiredDescendant<HTMLElement>(card, ".form-message");
+
+  plexControlElements("settings").server.addEventListener("change", () => {
+    populatePlexConnections("settings", settingsPlexServers);
+    $("#plex-libraries").disabled = true;
+    saveButton.disabled = true;
+  });
+  plexControlElements("settings").connection.addEventListener("change", () => {
+    $("#plex-libraries").disabled = true;
+    saveButton.disabled = true;
+  });
+
+  connectButton.addEventListener("click", async () => {
+    connectButton.disabled = true;
+    await startPlexAuthentication("server", message, async (result) => {
+      settingsPlexFlowToken = result.flowToken;
+      settingsPlexServers = result.servers;
+      populatePlexServers("settings", settingsPlexServers);
+      $("#plex-current-connection").hidden = true;
+      $("#plex-settings-config").hidden = false;
+      $("#plex-libraries").disabled = true;
+      saveButton.disabled = true;
+      setMessage(
+        message,
+        `Signed in as ${result.account.username || result.account.email}. Choose a server connection.`,
+      );
+    });
+    connectButton.disabled = false;
+  });
 
   testButton.addEventListener("click", async () => {
     testButton.disabled = true;
-    setMessage(message, "Testing Plex connection…");
+    setMessage(message, "Connecting to Plex…");
     try {
-      const result = await api("/api/settings/plex/test", {
+      const result = await api("/api/auth/plex/inspect", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(Object.fromEntries(new FormData(form))),
+        body: JSON.stringify({
+          flowToken: settingsPlexFlowToken,
+          ...selectedPlexConnection("settings"),
+        }),
       });
-      const current = selectedOptionPickerValues("#plex-library-sections");
-      populatePlexLibraries(result.libraries, current.length ? current : result.libraries.map((library: JsonObject) => library.id));
+      populatePlexLibraries(
+        result.libraries,
+        result.libraries.map((library: JsonObject) => library.id),
+      );
+      saveButton.disabled = false;
       setMessage(message, result.message);
     } catch (error) {
       $("#plex-libraries").disabled = true;
+      saveButton.disabled = true;
       setMessage(message, error.message, true);
     } finally {
       testButton.disabled = false;
     }
   });
 
-  form.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const submitButton = requiredDescendant<HTMLButtonElement>(form, "fieldset button");
+  saveButton.addEventListener("click", async () => {
     const selectedIds = selectedOptionPickerValues("#plex-library-sections");
     if (!selectedIds.length) {
       setMessage(message, "Select at least one Plex music library.", true);
       return;
     }
-    const body: JsonObject = Object.fromEntries(new FormData(form));
-    body.librarySectionIds = selectedIds;
-    submitButton.disabled = true;
+    saveButton.disabled = true;
     setMessage(message, "Saving Plex libraries…");
 
     try {
-      const result = await api("/api/settings/plex", {
+      const user = await api<CurrentUser>("/api/auth/plex/complete", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+        body: JSON.stringify({
+          flowToken: settingsPlexFlowToken,
+          librarySectionIds: selectedIds,
+        }),
       });
-      populatePlexLibraries(result.libraries, result.librarySectionIds);
-      requiredDescendant<HTMLInputElement>(form, "[name=token]").value = "";
-      setMessage(message, result.message);
+      currentUser = user;
+      $("#plex-settings-config").hidden = true;
+      setMessage(message, "Connected to Plex; full music-library scan queued.");
       await refreshSettings();
     } catch (error) {
       setMessage(message, error.message, true);
-    } finally {
-      submitButton.disabled = false;
+      saveButton.disabled = false;
     }
   });
 }

@@ -86,7 +86,7 @@ nav { display: flex; height: 100%; gap: 8px; }
 .tab-bar { display: none; }
 
 .auth-view { display: grid; min-height: 100vh; place-items: center; padding: 32px 24px; }
-.auth-card, .artist-card, .service-card, .artist-meta, .library-card, .discography-nav {
+.auth-card, .setup-card, .artist-card, .service-card, .artist-meta, .library-card, .discography-nav {
   position: relative; overflow: hidden; border: 1px solid var(--border); background: rgba(255, 252, 247, .88);
   box-shadow: 0 10px 30px rgba(68, 50, 38, .07), inset 0 1px rgba(255, 255, 255, .8);
 }
@@ -95,6 +95,44 @@ nav { display: flex; height: 100%; gap: 8px; }
 .auth-card .intro { margin-bottom: 28px; }
 .auth-form { display: grid; gap: 13px; }
 .auth-form h2 { margin: 0 0 4px; font-size: 20px; letter-spacing: -.03em; }
+.plex-login-option { display: grid; gap: 12px; margin-top: 18px; text-align: center; }
+.plex-login-option > span { display: flex; align-items: center; gap: 12px; color: var(--foreground-muted); font-size: 11px; text-transform: uppercase; }
+.plex-login-option > span::before, .plex-login-option > span::after { flex: 1; height: 1px; background: var(--border); content: ""; }
+.plex-button {
+  display: inline-flex; min-height: 44px; align-items: center; justify-content: center; gap: 7px; border: 1px solid rgba(204, 123, 25, .72) !important; border-radius: 10px; background: rgba(204, 123, 25, .2) !important; color: var(--foreground) !important; cursor: pointer; padding: 0 18px; box-shadow: inset 0 1px rgba(255, 255, 255, .1) !important; font-weight: 700;
+}
+.plex-button img { display: block; width: auto; height: 20px; }
+.plex-button:disabled, button:disabled { cursor: wait; opacity: .58; }
+
+.setup-card { width: min(100%, 900px); border-radius: 20px; padding: clamp(22px, 4vw, 38px); }
+.setup-brand { display: flex; align-items: center; justify-content: center; gap: 13px; margin-bottom: 30px; font-size: 34px; font-weight: 720; letter-spacing: -.06em; }
+.setup-brand img { border-radius: 14px; }
+.setup-steps { display: grid; grid-template-columns: repeat(3, 1fr); margin: 0 0 30px; padding: 0; list-style: none; }
+.setup-steps li { display: flex; position: relative; align-items: center; gap: 10px; min-height: 64px; border: 1px solid var(--border); border-right: 0; background: var(--surface); color: var(--foreground-muted); padding: 10px 16px; font-size: 12px; }
+.setup-steps li:first-child { border-radius: 11px 0 0 11px; }
+.setup-steps li:last-child { border-right: 1px solid var(--border); border-radius: 0 11px 11px 0; }
+.setup-steps li span { display: grid; flex: 0 0 32px; width: 32px; height: 32px; place-items: center; border: 1px solid var(--border-hover); border-radius: 50%; color: var(--foreground); }
+.setup-steps li.active { color: var(--foreground); }
+.setup-steps li.active span { border-color: var(--accent-bright); color: var(--accent-bright); box-shadow: 0 0 0 3px var(--accent-glow); }
+.setup-steps li.completed span { border-color: var(--accent); background: var(--accent); color: #fff; font-size: 0; }
+.setup-steps li.completed span::after { content: "\2713"; font-size: 14px; }
+.setup-panel { animation: reveal .35s var(--ease-out); }
+.setup-panel h1 { font-size: clamp(38px, 7vw, 66px); }
+.setup-panel h2 { margin: 0 0 8px; font-size: clamp(25px, 4vw, 36px); letter-spacing: -.04em; }
+.setup-panel .intro { margin: 18px 0 26px; }
+.setup-copy { max-width: 650px; margin: 0 0 24px; color: var(--foreground-muted); line-height: 1.6; }
+.server-choice { display: grid; grid-template-columns: 130px minmax(0, 1fr) auto; align-items: center; gap: 22px; border: 1px solid var(--border); border-radius: 15px; background: var(--surface); padding: 22px; }
+.server-choice img { width: 112px; max-height: 40px; }
+.server-choice p { margin: 0; color: var(--foreground-muted); font-size: 13px; line-height: 1.5; }
+.setup-skip { margin-top: 16px; }
+.plex-signin-box { display: grid; place-items: center; margin: 18px 0; border: 1px solid var(--border); border-radius: 14px; background: rgba(0, 0, 0, .14); padding: 32px; }
+.setup-back { margin-top: 14px; }
+.setup-server-fields { display: grid; grid-template-columns: minmax(180px, .7fr) minmax(0, 1.3fr); gap: 16px; }
+.setup-actions { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 18px; }
+.setup-actions .form-message { flex: 1; }
+.setup-panel fieldset { margin: 18px 0 0; border: 0; padding: 0; }
+.setup-panel fieldset:disabled { opacity: .5; }
+#setup-finish-plex { min-height: 44px; border: 1px solid var(--accent-bright); border-radius: 10px; background: var(--accent); color: #fff; padding: 0 18px; font-weight: 700; }
 
 input, select {
   height: 46px; border: 1px solid var(--border-hover); border-radius: 10px; outline: none; background: rgba(255, 253, 249, .94); color: var(--foreground); padding: 0 12px;
@@ -311,6 +349,17 @@ small { color: var(--foreground-muted); font-size: 11px; font-weight: 400; }
 .service-card fieldset { display: grid; gap: 18px; margin: 0; border: 0; padding: 0; }
 .defaults-heading h3 { margin: 0; }
 .field-help { margin: 5px 0 0; color: var(--foreground-muted); font-size: 12px; }
+.plex-connect-intro { display: flex !important; align-items: center; justify-content: space-between; gap: 22px; }
+.plex-connect-intro h3 { margin: 0 0 6px; }
+.plex-connect-intro p { max-width: 560px; margin: 0; color: var(--foreground-muted); font-size: 13px; line-height: 1.5; }
+.service-card > .plex-current-connection {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px;
+  border: 1px solid var(--border); border-radius: 12px; background: var(--surface); padding: 14px;
+}
+.plex-current-connection > div { display: grid; min-width: 0; gap: 5px; }
+.plex-current-connection span { color: var(--foreground-muted); font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+.plex-current-connection strong { overflow-wrap: anywhere; color: var(--foreground); font-size: 12px; line-height: 1.45; }
+#plex-settings-config { display: grid; gap: 18px; }
 
 dialog { width: min(650px, calc(100% - 28px)); border: 1px solid var(--border-hover); border-radius: 18px; background: #fffaf3; color: var(--foreground); padding: 0; box-shadow: 0 30px 80px rgba(55, 42, 33, .3); }
 dialog::backdrop { background: rgba(48, 39, 32, .52); }
@@ -434,6 +483,22 @@ details summary { margin-bottom: 17px; color: var(--accent-bright); cursor: poin
   #back-to-top { right: 16px; width: 44px; height: 44px; padding: 0; }
   #back-to-top span { display: none; }
   .dialog-actions { position: sticky; bottom: 0; background: #fffaf3; padding-bottom: calc(17px + var(--safe-bottom)); }
+  .auth-view { padding: 18px 12px; }
+  .setup-card { padding: 20px 16px; }
+  .setup-brand { margin-bottom: 20px; font-size: 28px; }
+  .setup-brand img { width: 48px; height: 48px; }
+  .setup-steps { margin-bottom: 22px; }
+  .setup-steps li { min-height: 54px; justify-content: center; padding: 8px; }
+  .setup-steps li strong { display: none; }
+  .setup-steps li span { flex-basis: 30px; width: 30px; height: 30px; }
+  .server-choice { grid-template-columns: 1fr; justify-items: start; gap: 15px; }
+  .server-choice .plex-button { width: 100%; }
+  .setup-server-fields { grid-template-columns: 1fr; }
+  .setup-actions { align-items: stretch; flex-direction: column; }
+  .setup-actions button { width: 100%; }
+  .plex-connect-intro { align-items: stretch; flex-direction: column; }
+  .plex-connect-intro .plex-button { width: 100%; }
+  .service-card > .plex-current-connection { grid-template-columns: 1fr; }
 }
 
 /* Warm, low-cost visual system. These final declarations intentionally
@@ -613,6 +678,7 @@ button,
   box-shadow: inset 0 1px rgba(255, 255, 255, .06);
 }
 :root[data-theme="midnight"] .auth-card,
+:root[data-theme="midnight"] .setup-card,
 :root[data-theme="midnight"] .artist-card,
 :root[data-theme="midnight"] .service-card,
 :root[data-theme="midnight"] .artist-meta,
