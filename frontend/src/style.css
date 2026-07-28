@@ -386,6 +386,13 @@ dialog::backdrop { background: rgba(48, 39, 32, .52); }
 .history-plex { display: inline-flex; flex: 0 0 auto; align-items: center; justify-content: center; width: 32px; height: 32px; margin-right: 11px; border: 1px solid rgba(229, 160, 13, .3); border-radius: 8px; background: rgba(229, 160, 13, .06); padding: 7px; }
 .history-plex img { display: block; width: 100%; height: 100%; object-fit: contain; }
 .account-form { max-width: 580px; }
+.linked-account-summary { display: flex; align-items: center; gap: 14px; }
+.linked-account-summary > img { flex: 0 0 auto; object-fit: contain; }
+.linked-account-summary > div { display: grid; min-width: 0; flex: 1; gap: 4px; }
+.linked-account-summary strong { overflow-wrap: anywhere; font-size: 14px; }
+.linked-account-summary small { color: var(--foreground-muted); line-height: 1.45; }
+.linked-account-summary .plex-button { flex: 0 0 auto; }
+#account-plex-message { min-height: 18px; margin: 0; }
 .dialog-title { display: flex; justify-content: space-between; }
 .dialog-title h2 { margin: 0; font-size: 30px; letter-spacing: -.04em; }
 .close-dialog { border: 0; background: transparent; color: var(--foreground-muted); cursor: pointer; font-size: 13px; font-weight: 600; }
@@ -499,6 +506,9 @@ details summary { margin-bottom: 17px; color: var(--accent-bright); cursor: poin
   .plex-connect-intro { align-items: stretch; flex-direction: column; }
   .plex-connect-intro .plex-button { width: 100%; }
   .service-card > .plex-current-connection { grid-template-columns: 1fr; }
+  .linked-account-summary { align-items: stretch; flex-direction: column; }
+  .linked-account-summary > img { align-self: flex-start; }
+  .linked-account-summary .plex-button { width: 100%; }
 }
 
 /* Warm, low-cost visual system. These final declarations intentionally

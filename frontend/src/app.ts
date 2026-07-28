@@ -40,7 +40,9 @@ interface CurrentUser {
   role: "admin" | "user";
   csrfToken?: string;
   authProvider?: "local" | "plex";
+  plexLinked?: boolean;
   plexUsername?: string;
+  plexEmail?: string;
   listenbrainzUsername?: string;
   lastfmUsername?: string;
   lastfmConfigured?: boolean;
@@ -306,7 +308,7 @@ function wait(milliseconds: number) {
 }
 
 async function startPlexAuthentication(
-  purpose: "login" | "server",
+  purpose: "login" | "server" | "link",
   message: Element,
   onComplete: (result: JsonObject) => Promise<void> | void,
 ) {
@@ -776,11 +778,76 @@ function setupNavigation() {
         });
         content.append(form);
       } else if (page === "linked-accounts") {
+        const accountSettings = await api("/api/account/settings");
         content.replaceChildren();
         const form = document.createElement("form") as AppForm; form.className = "service-card account-form";
-        form.innerHTML = '<h2>Linked accounts</h2><fieldset><legend>ListenBrainz</legend><label>Username<small>Used to tailor recommendations. Leave blank to disconnect it.</small><input name="listenbrainzUsername" autocomplete="username" placeholder="your-listenbrainz-name"></label></fieldset><fieldset><legend>Last.fm</legend><label>Username<input name="lastfmUsername" autocomplete="username" placeholder="your-lastfm-name"></label><label>API key<small>Create one in your Last.fm API account. Leave blank to keep your saved key.</small><input name="lastfmApiKey" type="password" autocomplete="off" placeholder="Last.fm API key"></label></fieldset><div class="form-actions"><p class="form-message"></p><button>Save linked accounts</button></div>';
-        form.listenbrainzUsername.value = user.listenbrainzUsername || "";
-        form.lastfmUsername.value = user.lastfmUsername || "";
+        form.innerHTML = `
+          <h2>Linked accounts</h2>
+          <fieldset>
+            <legend>Plex</legend>
+            <div class="linked-account-summary">
+              <img src="/icons/plex.svg" width="42" height="42" alt="">
+              <div>
+                <strong id="account-plex-status"></strong>
+                <small id="account-plex-detail"></small>
+              </div>
+              <button id="account-link-plex" class="plex-button" type="button">
+                Link with <img src="/icons/plex.svg" alt="Plex">
+              </button>
+            </div>
+            <p id="account-plex-message" class="form-message" aria-live="polite"></p>
+          </fieldset>
+          <fieldset>
+            <legend>ListenBrainz</legend>
+            <label>Username<small>Used to tailor recommendations. Leave blank to disconnect it.</small><input name="listenbrainzUsername" autocomplete="username" placeholder="your-listenbrainz-name"></label>
+          </fieldset>
+          <fieldset>
+            <legend>Last.fm</legend>
+            <label>Username<input name="lastfmUsername" autocomplete="username" placeholder="your-lastfm-name"></label>
+            <label>API key<small>Create one in your Last.fm API account. Leave blank to keep your saved key.</small><input name="lastfmApiKey" type="password" autocomplete="off" placeholder="Last.fm API key"></label>
+          </fieldset>
+          <div class="form-actions"><p class="form-message"></p><button>Save linked accounts</button></div>
+        `;
+        user.plexLinked = Boolean(accountSettings.plexLinked);
+        user.plexUsername = accountSettings.plexUsername || "";
+        user.plexEmail = accountSettings.plexEmail || "";
+        form.listenbrainzUsername.value = accountSettings.listenbrainzUsername || "";
+        form.lastfmUsername.value = accountSettings.lastfmUsername || "";
+        const plexStatus = requiredDescendant<HTMLElement>(form, "#account-plex-status");
+        const plexDetail = requiredDescendant<HTMLElement>(form, "#account-plex-detail");
+        const plexButton = requiredDescendant<HTMLButtonElement>(form, "#account-link-plex");
+        const plexMessage = requiredDescendant<HTMLElement>(form, "#account-plex-message");
+        const renderPlexLinkStatus = () => {
+          if (user.plexLinked) {
+            plexStatus.textContent = user.plexUsername || user.plexEmail || "Plex account linked";
+            plexDetail.textContent = "You can sign in with either your local credentials or Plex.";
+            plexButton.hidden = true;
+          } else if (accountSettings.plexConfigured) {
+            plexStatus.textContent = "Not linked";
+            plexDetail.textContent = "Link a Plex account that has access to this server.";
+            plexButton.hidden = false;
+            plexButton.disabled = false;
+          } else {
+            plexStatus.textContent = "Plex is not configured";
+            plexDetail.textContent = "An administrator must connect a Plex server first.";
+            plexButton.hidden = false;
+            plexButton.disabled = true;
+          }
+        };
+        renderPlexLinkStatus();
+        plexButton.addEventListener("click", async () => {
+          plexButton.disabled = true;
+          await startPlexAuthentication("link", plexMessage, async (result) => {
+            user.plexLinked = true;
+            user.plexUsername = result.plexUsername || "";
+            user.plexEmail = result.plexEmail || "";
+            renderPlexLinkStatus();
+            setMessage(plexMessage, result.message);
+          });
+          if (!user.plexLinked && accountSettings.plexConfigured) {
+            plexButton.disabled = false;
+          }
+        });
         form.addEventListener("submit", async (event) => {
           event.preventDefault();
           const formMessage = requiredDescendant<HTMLElement>(form, ".form-message");

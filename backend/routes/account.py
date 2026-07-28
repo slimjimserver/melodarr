@@ -151,6 +151,10 @@ def create_invitation():
 def account_settings():
     user = current_user()
     return jsonify({
+        "plexConfigured": bool(get_service("plex")),
+        "plexLinked": bool(user["plex_id"]),
+        "plexUsername": user["plex_username"] or "",
+        "plexEmail": user["plex_email"] or "",
         "listenbrainzUsername": user["listenbrainz_username"] or "",
         "lastfmUsername": user["lastfm_username"] or "",
         "lastfmConfigured": bool(user["lastfm_username"] and user["lastfm_api_key"]),

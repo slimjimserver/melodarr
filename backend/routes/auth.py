@@ -6,6 +6,7 @@ import re
 import secrets
 import sqlite3
 import time
+from hmac import compare_digest
 
 import requests
 from flask import Blueprint, current_app, jsonify, request, session
@@ -95,7 +96,13 @@ def _load_flow(flow_token, purpose=None):
             return None, api_error("This Plex sign-in cannot be used here.", 400)
         if row["user_id"]:
             user = current_user()
-            if not user or user["id"] != row["user_id"] or user["role"] != "admin":
+            if not user:
+                return None, api_error("Sign in is required.", 401)
+            if user["id"] != row["user_id"]:
+                return None, api_error(
+                    "This Plex sign-in belongs to another Melodarr user.", 403
+                )
+            if row["purpose"] == "server" and user["role"] != "admin":
                 return None, api_error("Administrator access is required.", 403)
         elif row["purpose"] == "server":
             has_users = connection.execute("SELECT 1 FROM users LIMIT 1").fetchone()
@@ -213,6 +220,84 @@ def _finish_plex_login(account, resources):
     return start_session(user, remember=True)
 
 
+def _finish_plex_link(flow, account, resources):
+    """Attach a verified Plex identity to the user that started this flow."""
+    plex_config = get_service("plex")
+    if not plex_config:
+        return api_error("Plex is not configured on this Melodarr instance.", 403)
+    machine_identifier = str(plex_config.get("machineIdentifier", ""))
+    if not machine_identifier:
+        return api_error(
+            "The configured Plex server cannot be verified. Ask an administrator "
+            "to reconnect it.",
+            409,
+        )
+    if not any(
+        resource["clientIdentifier"] == machine_identifier for resource in resources
+    ):
+        return api_error(
+            "That Plex account does not have access to this server.", 403
+        )
+
+    try:
+        with db() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            duplicate = connection.execute(
+                "SELECT id FROM users WHERE plex_id = ? AND id != ?",
+                (account["id"], flow["user_id"]),
+            ).fetchone()
+            if duplicate:
+                return api_error(
+                    "That Plex account is already linked to another Melodarr user.",
+                    409,
+                )
+            existing = connection.execute(
+                "SELECT plex_id FROM users WHERE id = ?", (flow["user_id"],)
+            ).fetchone()
+            if not existing:
+                return api_error("Sign in is required.", 401)
+            if existing["plex_id"] and existing["plex_id"] != account["id"]:
+                return api_error(
+                    "This Melodarr account is already linked to a different Plex "
+                    "account.",
+                    409,
+                )
+            connection.execute(
+                "UPDATE users SET plex_id = ?, plex_username = ?, plex_email = ?, "
+                "plex_avatar = ? WHERE id = ?",
+                (
+                    account["id"],
+                    account.get("username") or account.get("title"),
+                    account.get("email") or None,
+                    account.get("thumb") or None,
+                    flow["user_id"],
+                ),
+            )
+            user = connection.execute(
+                f"SELECT {USER_COLUMNS} FROM users WHERE id = ?",
+                (flow["user_id"],),
+            ).fetchone()
+    except sqlite3.IntegrityError:
+        return api_error(
+            "That Plex account is already linked to another Melodarr user.", 409
+        )
+
+    payload = user_payload(user)
+    payload["message"] = (
+        "Plex account linked. You can now sign in with either your local "
+        "credentials or Plex."
+    )
+    return jsonify(payload)
+
+
+def _link_csrf_error():
+    expected = session.get("csrf_token", "")
+    received = request.headers.get("X-CSRF-Token", "")
+    if not expected or not compare_digest(expected, received):
+        return api_error("Invalid or missing CSRF token.", 403)
+    return None
+
+
 @blueprint.get("/api/auth/status")
 def auth_status():
     token = str(request.args.get("invite", ""))[:512]
@@ -301,14 +386,30 @@ def login():
 def start_plex_auth():
     values = request.get_json(silent=True) or {}
     purpose = str(values.get("purpose", "login"))
-    if purpose not in {"login", "server"}:
+    if purpose not in {"login", "server", "link"}:
         return api_error("Unknown Plex sign-in purpose.")
 
     with db() as connection:
         _purge_expired_plex_flows(connection)
 
     flow_user_id = None
-    if purpose == "server":
+    if purpose == "link":
+        user = current_user()
+        if not user:
+            return api_error("Sign in is required.", 401)
+        csrf_error = _link_csrf_error()
+        if csrf_error:
+            return csrf_error
+        if not get_service("plex"):
+            return api_error(
+                "Plex is not configured on this Melodarr instance.", 403
+            )
+        if user["plex_id"]:
+            return api_error(
+                "This Melodarr account is already linked to Plex.", 409
+            )
+        flow_user_id = user["id"]
+    elif purpose == "server":
         with db() as connection:
             has_users = connection.execute("SELECT 1 FROM users LIMIT 1").fetchone()
         if has_users:
@@ -360,6 +461,10 @@ def poll_plex_auth():
     flow, error = _load_flow(flow_token)
     if error:
         return error
+    if flow["purpose"] == "link":
+        csrf_error = _link_csrf_error()
+        if csrf_error:
+            return csrf_error
 
     if flow["auth_token"]:
         token = flow["auth_token"]
@@ -393,6 +498,10 @@ def poll_plex_auth():
         if isinstance(response, tuple):
             _discard_plex_flow(flow_token)
             return response
+        _discard_plex_flow(flow_token)
+        return response
+    if flow["purpose"] == "link":
+        response = _finish_plex_link(flow, account, resources)
         _discard_plex_flow(flow_token)
         return response
 

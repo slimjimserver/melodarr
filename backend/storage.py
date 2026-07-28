@@ -345,12 +345,20 @@ def init_db():
             "CREATE UNIQUE INDEX IF NOT EXISTS users_plex_id_unique "
             "ON users(plex_id) WHERE plex_id IS NOT NULL"
         )
+        plex_flow_schema = connection.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'plex_auth_flows'"
+        ).fetchone()
+        if plex_flow_schema and "'link'" not in (plex_flow_schema["sql"] or ""):
+            # PIN authorizations last at most fifteen minutes and are safe to
+            # invalidate while widening the purpose constraint on upgrade.
+            connection.execute("DROP TABLE plex_auth_flows")
         connection.execute("""
             CREATE TABLE IF NOT EXISTS plex_auth_flows (
                 flow_hash TEXT PRIMARY KEY,
                 pin_id INTEGER NOT NULL,
                 client_identifier TEXT NOT NULL,
-                purpose TEXT NOT NULL CHECK(purpose IN ('login', 'server')),
+                purpose TEXT NOT NULL CHECK(purpose IN ('login', 'server', 'link')),
                 user_id INTEGER REFERENCES users(id),
                 created_at REAL NOT NULL,
                 expires_at REAL NOT NULL,

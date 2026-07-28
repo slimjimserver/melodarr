@@ -13,6 +13,7 @@ from threading import Event, Thread
 from urllib.parse import parse_qs, urlparse
 from unittest.mock import Mock, patch
 
+from werkzeug.security import generate_password_hash
 
 # Application paths are resolved when backend.config is first imported. Keep
 # every test artifact outside the repository and disable daemon workers before
@@ -950,6 +951,9 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn('"#plex-current-connection"', typescript)
         self.assertIn("if (popup.closed)", typescript)
         self.assertIn('"/api/auth/plex/start"', typescript)
+        self.assertIn('id="account-link-plex"', typescript)
+        self.assertIn('startPlexAuthentication("link"', typescript)
+        self.assertIn(".linked-account-summary", stylesheet)
         self.assertIn(".service-card > .plex-current-connection", stylesheet)
         self.assertNotIn("#plex-settings-config { display: grid !important", stylesheet)
         self.assertNotIn('name="token"', frontend)
@@ -1350,6 +1354,28 @@ class DeploymentConfigTests(unittest.TestCase):
 
 
 class AuthenticationTests(DatabaseTestCase):
+    def login_non_admin(self, username="local-listener"):
+        admin_csrf = self.register()
+        with db() as connection:
+            connection.execute(
+                "INSERT INTO users (username, password_hash, role, created_at) "
+                "VALUES (?, ?, 'user', ?)",
+                (
+                    username,
+                    generate_password_hash("listener-password"),
+                    time.time(),
+                ),
+            )
+        self.client.post(
+            "/api/auth/logout", headers={"X-CSRF-Token": admin_csrf}
+        )
+        response = self.client.post(
+            "/api/auth/login",
+            json={"username": username, "password": "listener-password"},
+        )
+        self.assertEqual(response.status_code, 200)
+        return response.get_json()["csrfToken"]
+
     def test_empty_install_redirects_to_owner_setup(self):
         response = self.client.get("/", follow_redirects=False)
         self.assertEqual(response.status_code, 302)
@@ -1387,6 +1413,346 @@ class AuthenticationTests(DatabaseTestCase):
 
         self.assertEqual(response.status_code, 202)
         self.assertTrue(response.get_json()["pending"])
+
+    def test_non_admin_can_link_plex_and_use_both_login_methods(self):
+        csrf_token = self.login_non_admin()
+        original_settings = {
+            "url": "http://plex:32400",
+            "token": "server-owner-token",
+            "machineIdentifier": "server-1",
+            "libraries": [{"id": "1", "title": "Music"}],
+            "librarySectionIds": ["1"],
+        }
+        save_service("plex", original_settings)
+        account = {
+            "id": "linked-101",
+            "username": "plex-listener",
+            "title": "Plex Listener",
+            "email": "listener@example.com",
+            "thumb": "https://plex.tv/listener.png",
+        }
+        resources = [{"clientIdentifier": "server-1", "owned": False}]
+        with db() as connection:
+            before = connection.execute(
+                "SELECT id, password_hash FROM users WHERE username = 'local-listener'"
+            ).fetchone()
+
+        with (
+            patch("backend.routes.auth.plex_auth.create_pin") as create_pin,
+            patch(
+                "backend.routes.auth.plex_auth.poll_pin",
+                return_value="listener-token",
+            ),
+            patch(
+                "backend.routes.auth.plex_auth.get_account", return_value=account
+            ),
+            patch(
+                "backend.routes.auth.plex_auth.get_resources",
+                return_value=resources,
+            ),
+        ):
+            create_pin.return_value = {
+                "id": 501,
+                "authorizationUrl": "https://app.plex.tv/auth/#!?code=LINK",
+                "expiresAt": time.time() + 600,
+            }
+            started = self.client.post(
+                "/api/auth/plex/start",
+                json={"purpose": "link"},
+                headers={"X-CSRF-Token": csrf_token},
+            )
+            self.assertEqual(started.status_code, 201)
+            linked = self.client.post(
+                "/api/auth/plex/poll",
+                json={"flowToken": started.get_json()["flowToken"]},
+                headers={"X-CSRF-Token": csrf_token},
+            )
+
+        self.assertEqual(linked.status_code, 200)
+        self.assertTrue(linked.get_json()["plexLinked"])
+        self.assertEqual(linked.get_json()["plexUsername"], "plex-listener")
+        with db() as connection:
+            after = connection.execute(
+                "SELECT id, username, password_hash, plex_id FROM users "
+                "WHERE username = 'local-listener'"
+            ).fetchone()
+        self.assertEqual(after["id"], before["id"])
+        self.assertEqual(after["password_hash"], before["password_hash"])
+        self.assertEqual(after["plex_id"], "linked-101")
+        self.assertEqual(get_service("plex"), original_settings)
+
+        self.client.post(
+            "/api/auth/logout", headers={"X-CSRF-Token": csrf_token}
+        )
+        local_login = self.client.post(
+            "/api/auth/login",
+            json={
+                "username": "local-listener",
+                "password": "listener-password",
+            },
+        )
+        self.assertEqual(local_login.status_code, 200)
+        self.assertEqual(local_login.get_json()["username"], "local-listener")
+        self.client.post(
+            "/api/auth/logout",
+            headers={"X-CSRF-Token": local_login.get_json()["csrfToken"]},
+        )
+
+        with (
+            patch("backend.routes.auth.plex_auth.create_pin") as create_pin,
+            patch(
+                "backend.routes.auth.plex_auth.poll_pin",
+                return_value="listener-token",
+            ),
+            patch(
+                "backend.routes.auth.plex_auth.get_account", return_value=account
+            ),
+            patch(
+                "backend.routes.auth.plex_auth.get_resources",
+                return_value=resources,
+            ),
+        ):
+            create_pin.return_value = {
+                "id": 502,
+                "authorizationUrl": "https://app.plex.tv/auth/#!?code=LOGIN",
+                "expiresAt": time.time() + 600,
+            }
+            login_flow = self.client.post(
+                "/api/auth/plex/start", json={"purpose": "login"}
+            ).get_json()["flowToken"]
+            plex_login = self.client.post(
+                "/api/auth/plex/poll", json={"flowToken": login_flow}
+            )
+
+        self.assertEqual(plex_login.status_code, 200)
+        self.assertEqual(plex_login.get_json()["username"], "local-listener")
+
+    def test_linking_plex_requires_access_to_the_configured_server(self):
+        csrf_token = self.login_non_admin()
+        original_settings = {
+            "url": "http://plex:32400",
+            "token": "server-owner-token",
+            "machineIdentifier": "server-1",
+            "libraries": [{"id": "1", "title": "Music"}],
+            "librarySectionIds": ["1"],
+        }
+        save_service("plex", original_settings)
+        with (
+            patch("backend.routes.auth.plex_auth.create_pin") as create_pin,
+            patch(
+                "backend.routes.auth.plex_auth.poll_pin",
+                return_value="other-token",
+            ),
+            patch(
+                "backend.routes.auth.plex_auth.get_account",
+                return_value={
+                    "id": "no-access",
+                    "username": "outside-user",
+                    "email": "",
+                    "thumb": "",
+                },
+            ),
+            patch(
+                "backend.routes.auth.plex_auth.get_resources",
+                return_value=[{"clientIdentifier": "another-server"}],
+            ),
+        ):
+            create_pin.return_value = {
+                "id": 503,
+                "authorizationUrl": "https://app.plex.tv/auth/#!?code=DENY",
+                "expiresAt": time.time() + 600,
+            }
+            started = self.client.post(
+                "/api/auth/plex/start",
+                json={"purpose": "link"},
+                headers={"X-CSRF-Token": csrf_token},
+            )
+            response = self.client.post(
+                "/api/auth/plex/poll",
+                json={"flowToken": started.get_json()["flowToken"]},
+                headers={"X-CSRF-Token": csrf_token},
+            )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("does not have access", response.get_json()["error"])
+        with db() as connection:
+            saved = connection.execute(
+                "SELECT plex_id FROM users WHERE username = 'local-listener'"
+            ).fetchone()
+        self.assertIsNone(saved["plex_id"])
+        self.assertEqual(get_service("plex"), original_settings)
+
+    def test_linking_rejects_a_plex_identity_owned_by_another_user(self):
+        csrf_token = self.login_non_admin()
+        save_service("plex", {
+            "url": "http://plex:32400",
+            "token": "server-owner-token",
+            "machineIdentifier": "server-1",
+        })
+        with db() as connection:
+            connection.execute(
+                "INSERT INTO users "
+                "(username, password_hash, role, plex_id, created_at) "
+                "VALUES (?, ?, 'user', ?, ?)",
+                (
+                    "already-linked",
+                    generate_password_hash("another-password"),
+                    "duplicate-plex-id",
+                    time.time(),
+                ),
+            )
+        with (
+            patch("backend.routes.auth.plex_auth.create_pin") as create_pin,
+            patch(
+                "backend.routes.auth.plex_auth.poll_pin",
+                return_value="duplicate-token",
+            ),
+            patch(
+                "backend.routes.auth.plex_auth.get_account",
+                return_value={
+                    "id": "duplicate-plex-id",
+                    "username": "duplicate-plex",
+                    "email": "",
+                    "thumb": "",
+                },
+            ),
+            patch(
+                "backend.routes.auth.plex_auth.get_resources",
+                return_value=[{"clientIdentifier": "server-1"}],
+            ),
+        ):
+            create_pin.return_value = {
+                "id": 504,
+                "authorizationUrl": "https://app.plex.tv/auth/#!?code=DUPL",
+                "expiresAt": time.time() + 600,
+            }
+            started = self.client.post(
+                "/api/auth/plex/start",
+                json={"purpose": "link"},
+                headers={"X-CSRF-Token": csrf_token},
+            )
+            response = self.client.post(
+                "/api/auth/plex/poll",
+                json={"flowToken": started.get_json()["flowToken"]},
+                headers={"X-CSRF-Token": csrf_token},
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("another Melodarr user", response.get_json()["error"])
+        with db() as connection:
+            saved = connection.execute(
+                "SELECT plex_id FROM users WHERE username = 'local-listener'"
+            ).fetchone()
+        self.assertIsNone(saved["plex_id"])
+
+    def test_plex_link_flow_requires_csrf_and_stays_bound_to_its_user(self):
+        self.assertEqual(
+            self.client.post(
+                "/api/auth/plex/start", json={"purpose": "link"}
+            ).status_code,
+            401,
+        )
+        owner_csrf = self.register()
+        save_service("plex", {
+            "url": "http://plex:32400",
+            "token": "server-owner-token",
+            "machineIdentifier": "server-1",
+        })
+        self.assertEqual(
+            self.client.post(
+                "/api/auth/plex/start", json={"purpose": "link"}
+            ).status_code,
+            403,
+        )
+        with patch("backend.routes.auth.plex_auth.create_pin") as create_pin:
+            create_pin.return_value = {
+                "id": 505,
+                "authorizationUrl": "https://app.plex.tv/auth/#!?code=BOUND",
+                "expiresAt": time.time() + 600,
+            }
+            started = self.client.post(
+                "/api/auth/plex/start",
+                json={"purpose": "link"},
+                headers={"X-CSRF-Token": owner_csrf},
+            )
+        flow_token = started.get_json()["flowToken"]
+
+        with db() as connection:
+            connection.execute(
+                "INSERT INTO users (username, password_hash, role, created_at) "
+                "VALUES (?, ?, 'user', ?)",
+                (
+                    "other-local-user",
+                    generate_password_hash("other-local-password"),
+                    time.time(),
+                ),
+            )
+        other_client = self.app.test_client()
+        other_login = other_client.post(
+            "/api/auth/login",
+            json={
+                "username": "other-local-user",
+                "password": "other-local-password",
+            },
+        )
+        other_csrf = other_login.get_json()["csrfToken"]
+        wrong_user = other_client.post(
+            "/api/auth/plex/poll",
+            json={"flowToken": flow_token},
+            headers={"X-CSRF-Token": other_csrf},
+        )
+        self.assertEqual(wrong_user.status_code, 403)
+        self.assertIn("another Melodarr user", wrong_user.get_json()["error"])
+
+        with patch("backend.routes.auth.plex_auth.poll_pin", return_value=""):
+            owner_poll = self.client.post(
+                "/api/auth/plex/poll",
+                json={"flowToken": flow_token},
+                headers={"X-CSRF-Token": owner_csrf},
+            )
+        self.assertEqual(owner_poll.status_code, 202)
+
+    def test_plex_link_flow_cannot_change_server_configuration(self):
+        csrf_token = self.login_non_admin()
+        settings = {
+            "url": "http://plex:32400",
+            "token": "server-owner-token",
+            "machineIdentifier": "server-1",
+            "libraries": [{"id": "1", "title": "Music"}],
+            "librarySectionIds": ["1"],
+        }
+        save_service("plex", settings)
+        with patch("backend.routes.auth.plex_auth.create_pin") as create_pin:
+            create_pin.return_value = {
+                "id": 506,
+                "authorizationUrl": "https://app.plex.tv/auth/#!?code=LIMIT",
+                "expiresAt": time.time() + 600,
+            }
+            started = self.client.post(
+                "/api/auth/plex/start",
+                json={"purpose": "link"},
+                headers={"X-CSRF-Token": csrf_token},
+            )
+        flow_token = started.get_json()["flowToken"]
+
+        inspected = self.client.post(
+            "/api/auth/plex/inspect",
+            json={
+                "flowToken": flow_token,
+                "serverId": "other",
+                "connectionUri": "http://other:32400",
+            },
+            headers={"X-CSRF-Token": csrf_token},
+        )
+        completed = self.client.post(
+            "/api/auth/plex/complete",
+            json={"flowToken": flow_token, "librarySectionIds": ["999"]},
+            headers={"X-CSRF-Token": csrf_token},
+        )
+
+        self.assertEqual(inspected.status_code, 400)
+        self.assertEqual(completed.status_code, 400)
+        self.assertEqual(get_service("plex"), settings)
 
     def test_starting_plex_auth_purges_expired_flows(self):
         with db() as connection:
