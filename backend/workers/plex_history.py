@@ -32,7 +32,6 @@ logger = logging.getLogger(__name__)
 HISTORY_RETENTION = 365 * 24 * 60 * 60
 SYNC_INTERVAL = 5 * 60
 CURSOR_OVERLAP = 60 * 60
-INSERT_BATCH_SIZE = 500
 
 wake_requested = Event()
 request_lock = Lock()
@@ -159,14 +158,6 @@ def _incremental_since(server_id, retention_cutoff, *, full):
     return max(retention_cutoff, newest - CURSOR_OVERLAP)
 
 
-def _flush(batch):
-    if not batch:
-        return 0
-    inserted = insert_plex_listens(batch)
-    batch.clear()
-    return inserted
-
-
 def synchronize(config, *, full=False, now=None):
     """Import one stable Plex history window and then apply retention."""
     now = time.time() if now is None else float(now)
@@ -179,8 +170,7 @@ def synchronize(config, *, full=False, now=None):
 
     fetched = 0
     mapped = 0
-    inserted = 0
-    batch = []
+    listens = []
     diagnostics = {
         "pages": 0,
         "scanned": 0,
@@ -204,7 +194,7 @@ def synchronize(config, *, full=False, now=None):
         if user_id is None:
             continue
         mapped += 1
-        batch.append({
+        listens.append({
             "server_id": server_id,
             "history_key": event["history_key"],
             "user_id": user_id,
@@ -212,12 +202,10 @@ def synchronize(config, *, full=False, now=None):
             "album_rating_key": event["album_rating_key"],
             "played_at": event["played_at"],
         })
-        if len(batch) >= INSERT_BATCH_SIZE:
-            inserted += _flush(batch)
-    inserted += _flush(batch)
 
-    # Prune only after every selected section and page completed. A transient
-    # Plex or pagination failure therefore never mutates the retention edge.
+    # Do not advance the durable cursor with a partial backfill. Both insertion
+    # and retention happen only after every history page completed.
+    inserted = insert_plex_listens(listens) if listens else 0
     pruned = prune_plex_listens(retention_cutoff)
     stats = plex_listen_stats(server_id=server_id)
     return {

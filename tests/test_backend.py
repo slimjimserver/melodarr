@@ -7215,6 +7215,78 @@ class PlexHistoryClientTests(unittest.TestCase):
             "in-window",
         ])
 
+    @patch(
+        "backend.services.plex_history.plex.cached_library_index",
+        return_value={},
+    )
+    @patch("backend.services.plex_history.requests.get")
+    def test_mixed_age_page_does_not_end_global_pagination_early(
+        self, get, _cached_library_index
+    ):
+        get.side_effect = [
+            Response(payload={"MediaContainer": {
+                "totalSize": 3,
+                "offset": 0,
+                "size": 2,
+                "Metadata": [
+                    {
+                        "type": "track",
+                        "historyKey": "current-1",
+                        "grandparentRatingKey": "artist-1",
+                        "librarySectionID": "music",
+                        "viewedAt": 1_500,
+                        "accountID": 1,
+                    },
+                    {
+                        "type": "track",
+                        "historyKey": "old-outlier",
+                        "grandparentRatingKey": "artist-1",
+                        "librarySectionID": "music",
+                        "viewedAt": 400,
+                        "accountID": 1,
+                    },
+                ],
+            }}),
+            Response(payload={"MediaContainer": {
+                "totalSize": 3,
+                "offset": 2,
+                "size": 1,
+                "Metadata": [{
+                    "type": "track",
+                    "historyKey": "current-2",
+                    "grandparentRatingKey": "artist-1",
+                    "librarySectionID": "music",
+                    "viewedAt": 1_000,
+                    "accountID": 1,
+                }],
+            }}),
+        ]
+
+        events = list(plex_history.iter_history(
+            {"url": "http://plex:32400", "token": "token"},
+            since=500,
+            until=2_000,
+            section_ids=["music"],
+            page_size=2,
+        ))
+
+        self.assertEqual(
+            [event["history_key"] for event in events],
+            ["current-1", "current-2"],
+        )
+        self.assertEqual(get.call_count, 2)
+
+    def test_history_event_ignores_untyped_generic_children_as_accounts(self):
+        event = plex_history._history_event({
+            "type": "track",
+            "historyKey": "history-1",
+            "grandparentRatingKey": "artist-1",
+            "viewedAt": 1_000,
+            "_children": [{"id": 99, "title": "A media child"}],
+        })
+
+        self.assertIsNone(event)
+
     @patch("backend.services.plex_history.plex.cached_library_index")
     @patch("backend.services.plex_history.requests.get")
     def test_history_accepts_key_paths_legacy_children_and_missing_section(
@@ -7378,6 +7450,53 @@ class PlexHistoryWorkerTests(DatabaseTestCase):
             "album_rating_key",
             "played_at",
         })
+
+    @patch("backend.workers.plex_history.plex_history.iter_history")
+    @patch("backend.workers.plex_history.plex_history.accounts")
+    def test_failed_pagination_does_not_advance_durable_history_cursor(
+        self, accounts, iter_history
+    ):
+        self.register()
+        with db() as connection:
+            connection.execute(
+                "UPDATE users SET plex_username = ?, plex_id = ? "
+                "WHERE username = 'test-user'",
+                ("listener", "7"),
+            )
+        accounts.return_value = [{
+            "account_id": "7",
+            "aliases": ("listener",),
+        }]
+
+        def failing_history():
+            for history_id in range(500):
+                yield {
+                    "history_key": f"history-{history_id}",
+                    "account_id": "7",
+                    "artist_rating_key": "artist-1",
+                    "album_rating_key": "album-1",
+                    "played_at": 2_000.0 + history_id,
+                }
+            raise requests.ConnectionError("later page failed")
+
+        iter_history.return_value = failing_history()
+
+        with self.assertRaises(requests.ConnectionError):
+            plex_history_worker.synchronize(
+                {
+                    "url": "http://plex:32400",
+                    "token": "token",
+                    "machineIdentifier": "server-1",
+                    "librarySectionIds": ["music"],
+                },
+                full=True,
+                now=3_000.0,
+            )
+
+        self.assertEqual(
+            plex_listen_stats(server_id="server-1")["count"],
+            0,
+        )
 
     @patch("backend.workers.plex_history._linked_user_indexes")
     @patch("backend.workers.plex_history.plex_history.accounts")

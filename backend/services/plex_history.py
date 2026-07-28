@@ -105,15 +105,19 @@ def accounts(config):
             account_id = item.get("accountID", item.get("accountId"))
         if account_id is None:
             continue
+        account_id = str(account_id).strip()
+        if not account_id:
+            continue
         aliases = []
+        normalized_aliases = set()
         for key in ("name", "username", "title"):
             value = str(item.get(key) or "").strip()
-            if value and value.casefold() not in {
-                alias.casefold() for alias in aliases
-            }:
+            normalized = value.casefold()
+            if value and normalized not in normalized_aliases:
                 aliases.append(value)
+                normalized_aliases.add(normalized)
         records.append({
-            "account_id": str(account_id),
+            "account_id": account_id,
             "aliases": tuple(aliases),
         })
     return records
@@ -142,16 +146,54 @@ def _media_type(item):
     ).casefold()
 
 
-def _history_event(item):
-    if _media_type(item) not in TRACK_TYPES:
-        return None
-
-    history_key = str(
+def _history_key(item):
+    return str(
         item.get("historyKey")
         or item.get("history_key")
         or item.get("historyID")
         or ""
     ).strip()
+
+
+def _account_id(item):
+    """Return a normalized account ID without treating media children as users."""
+    account_id = item.get("accountID", item.get("accountId"))
+    if account_id is not None:
+        value = str(account_id).strip()
+        return value or None
+
+    for child in _as_list(item.get("User")):
+        if not isinstance(child, dict):
+            continue
+        account_id = child.get(
+            "id",
+            child.get("accountID", child.get("accountId")),
+        )
+        if account_id is not None:
+            value = str(account_id).strip()
+            if value:
+                return value
+
+    for key in ("children", "_children"):
+        for child in _as_list(item.get(key)):
+            if not isinstance(child, dict) or _media_type(child) != "user":
+                continue
+            account_id = child.get(
+                "id",
+                child.get("accountID", child.get("accountId")),
+            )
+            if account_id is not None:
+                value = str(account_id).strip()
+                if value:
+                    return value
+    return None
+
+
+def _history_event(item):
+    if _media_type(item) not in TRACK_TYPES:
+        return None
+
+    history_key = _history_key(item)
     # Unlike regular library metadata, Plex history commonly supplies only the
     # key paths. Their metadata IDs are the same server-local rating keys used
     # by the cached library snapshot.
@@ -162,25 +204,7 @@ def _history_event(item):
     if not history_key or not artist_rating_key or played_at is None:
         return None
 
-    account_id = item.get("accountID", item.get("accountId"))
-    if account_id is None:
-        children = (
-            _as_list(item.get("User"))
-            + _as_list(item.get("children"))
-            + _as_list(item.get("_children"))
-        )
-        for child in children:
-            if not isinstance(child, dict):
-                continue
-            child_type = str(
-                child.get("_elementType")
-                or child.get("type")
-                or "user"
-            ).casefold()
-            if child_type == "user":
-                account_id = child.get("id", child.get("accountID"))
-                if account_id is not None:
-                    break
+    account_id = _account_id(item)
     if account_id is None:
         return None
 
@@ -189,7 +213,7 @@ def _history_event(item):
     )
     return {
         "history_key": history_key,
-        "account_id": str(account_id),
+        "account_id": account_id,
         "artist_rating_key": artist_rating_key,
         "album_rating_key": album_rating_key or None,
         "played_at": played_at,
@@ -239,7 +263,7 @@ def _server_history(
         diagnostics["pages"] += 1
         diagnostics["scanned"] += len(items)
         page_identity = tuple(
-            str(item.get("historyKey") or item.get("historyID") or "")
+            _history_key(item)
             for item in items
         )
         if start and items and page_identity == previous_page_identity:
@@ -293,12 +317,12 @@ def _server_history(
             for item in items
             if (timestamp := _timestamp(item.get("viewedAt"))) is not None
         ]
-        crossed_retention_boundary = bool(
-            timestamps and min(timestamps) < float(since)
+        page_precedes_retention_window = bool(
+            timestamps and max(timestamps) < float(since)
         )
         if (
             returned == 0
-            or crossed_retention_boundary
+            or page_precedes_retention_window
             or (total is not None and next_start >= total)
             or (total is None and returned < page_size)
             or (response_size is not None and response_size == 0)
@@ -347,7 +371,7 @@ def iter_history(
         config,
         since=since,
         until=until,
-        section_ids=dict.fromkeys(section_ids),
+        section_ids=section_ids,
         page_size=page_size,
         artist_rating_keys=artist_rating_keys,
         album_rating_keys=album_rating_keys,
