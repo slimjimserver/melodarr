@@ -32,7 +32,7 @@ interface AppElement extends HTMLElement {
 }
 type AccountPage = "profile" | "general" | "linked-accounts" | "invitations";
 type AppView = "discover" | "detail" | "library" | "settings" | "account";
-type SettingsPage = "services" | "users" | "jobs";
+type SettingsPage = "services" | "requests" | "users" | "jobs";
 type ThemeName = "midnight" | "warm";
 
 interface CurrentUser {
@@ -49,20 +49,38 @@ interface CurrentUser {
   lastfmConfigured?: boolean;
 }
 
-interface AdminUser {
+interface AdminUserIdentity {
   id: number;
   username: string;
   localUsername?: string;
-  requestCount: number;
   userType: "plex" | "local";
   role: "admin" | "user";
-  joinedAt: number | string;
   plexUsername?: string;
   plexEmail?: string;
   plexAvatar?: string;
+}
+
+interface AdminUser extends AdminUserIdentity {
+  requestCount: number;
+  joinedAt: number | string;
   listenbrainzUsername?: string;
   lastfmUsername?: string;
   lastfmConfigured?: boolean;
+}
+
+interface AdminRequest {
+  id: number;
+  kind: "artist" | "release-group";
+  mbid: string;
+  name: string;
+  artist_name?: string;
+  release_type?: string;
+  release_date?: string;
+  created_at: number | string;
+  availableInPlex: boolean;
+  plexUrl?: string;
+  plexampUrl?: string;
+  requester: AdminUserIdentity;
 }
 
 type AdminUserForm = HTMLFormElement & {
@@ -141,6 +159,8 @@ let maintenanceRefreshInFlight = false;
 let adminUsers: AdminUser[] = [];
 let editingAdminUser: AdminUser | undefined;
 let adminUsersRequest = 0;
+let adminRequests: AdminRequest[] = [];
+let adminRequestsRequest = 0;
 let discoveryLoad: Promise<void> | undefined;
 // Plex holdings tell a requester what is already available, so the library is
 // readable by every account. Settings remains administrator-only.
@@ -642,6 +662,7 @@ async function refreshMaintenance() {
 function showSettingsPage(page: SettingsPage, updateHistory = true) {
   document.querySelectorAll<HTMLElement>("[data-settings-page]").forEach((button) => button.classList.toggle("active", button.dataset.settingsPage === page));
   $("#settings-services").hidden = page !== "services";
+  $("#settings-requests").hidden = page !== "requests";
   $("#settings-users").hidden = page !== "users";
   $("#settings-jobs").hidden = page !== "jobs";
   if (maintenanceRefreshTimer !== undefined) window.clearInterval(maintenanceRefreshTimer);
@@ -649,6 +670,8 @@ function showSettingsPage(page: SettingsPage, updateHistory = true) {
   if (page === "jobs") {
     refreshMaintenance();
     maintenanceRefreshTimer = window.setInterval(refreshMaintenance, 10_000);
+  } else if (page === "requests") {
+    refreshAdminRequests();
   } else if (page === "users") {
     refreshAdminUsers();
   }
@@ -984,11 +1007,13 @@ function setupNavigation() {
       showAccountPage?.((accountMatch[2] || "profile") as AccountPage, false);
       return;
     }
-    if (["/settings", "/settings/users", "/settings/jobs"].includes(window.location.pathname)) {
+    if (["/settings", "/settings/requests", "/settings/users", "/settings/jobs"].includes(window.location.pathname)) {
       showView("settings", false);
-      const page: SettingsPage = window.location.pathname.endsWith("/users")
-        ? "users"
-        : window.location.pathname.endsWith("/jobs") ? "jobs" : "services";
+      const page: SettingsPage = window.location.pathname.endsWith("/requests")
+        ? "requests"
+        : window.location.pathname.endsWith("/users")
+          ? "users"
+          : window.location.pathname.endsWith("/jobs") ? "jobs" : "services";
       showSettingsPage(page, false);
       return;
     }
@@ -997,7 +1022,7 @@ function setupNavigation() {
   });
 
   const initialView = window.location.pathname.slice(1) || "discover";
-  if (["settings/users", "settings/jobs"].includes(initialView)) showView("settings", false);
+  if (["settings/requests", "settings/users", "settings/jobs"].includes(initialView)) showView("settings", false);
   else if (["library", "settings"].includes(initialView)) showView(initialView as AppView, false);
 
   document.querySelectorAll<HTMLElement>(".tab-bar .nav-link").forEach((button) => button.addEventListener("click", () => {
@@ -1030,14 +1055,14 @@ async function applyCurrentUser(user: CurrentUser) {
   }
 }
 
-function adminUserDisplayName(user: AdminUser) {
+function adminUserDisplayName(user: AdminUserIdentity) {
   if (user.userType === "plex") {
     return user.plexUsername || user.username || user.plexEmail || "Plex user";
   }
   return user.localUsername || user.username || "Local user";
 }
 
-function createUserAvatar(user: AdminUser, large = false) {
+function createUserAvatar(user: AdminUserIdentity, large = false) {
   const avatar = document.createElement("span");
   avatar.className = `user-avatar${large ? " user-avatar-large" : ""}`;
   const displayName = adminUserDisplayName(user);
@@ -1060,6 +1085,185 @@ function joinedDate(value: number | string) {
     ? new Date(numeric * (numeric < 10_000_000_000 ? 1_000 : 1))
     : new Date(value);
   return Number.isNaN(date.getTime()) ? undefined : date;
+}
+
+function createAdminRequestPlexBadge(item: AdminRequest) {
+  if (!item.availableInPlex) return undefined;
+  const destination = mobilePlexDestination(
+    String(item.plexUrl || ""),
+    String(item.plexampUrl || ""),
+  );
+  const badge: HTMLElement = destination.url
+    ? document.createElement("a")
+    : document.createElement("span");
+  badge.className = "history-plex admin-request-plex";
+  badge.title = destination.url ? destination.label : "Available in Plex";
+  badge.setAttribute("aria-label", badge.title);
+  if (badge instanceof HTMLAnchorElement) {
+    badge.href = destination.url;
+    if (destination.openInNewTab) {
+      badge.target = "_blank";
+      badge.rel = "noreferrer";
+    }
+  }
+  const icon = document.createElement("img");
+  icon.src = "/icons/plex.svg";
+  icon.alt = "";
+  badge.append(icon);
+  return badge;
+}
+
+function createAdminRequestItem(item: AdminRequest) {
+  const row = document.createElement("article");
+  row.className = "admin-request-item";
+
+  const detail = document.createElement("a");
+  detail.className = "admin-request-detail";
+  const route = item.kind === "artist" ? "artists" : "albums";
+  detail.href = `/${route}/${encodeURIComponent(item.mbid)}`;
+
+  const kind = document.createElement("span");
+  kind.className = `admin-request-kind ${item.kind === "artist" ? "artist" : "release"}`;
+  kind.textContent = item.kind === "artist" ? "Artist" : "Release group";
+
+  const copy = document.createElement("span");
+  copy.className = "history-copy";
+  const title = document.createElement("strong");
+  title.className = "history-title";
+  title.textContent = item.name;
+  copy.append(title);
+  if (item.kind === "release-group") {
+    const releaseType = String(item.release_type || "");
+    const metadata = [
+      item.artist_name,
+      releaseType ? releaseType[0].toUpperCase() + releaseType.slice(1) : "",
+      item.release_date,
+    ].filter(Boolean);
+    if (metadata.length) {
+      const secondary = document.createElement("span");
+      secondary.className = "history-meta";
+      secondary.textContent = metadata.join(" · ");
+      copy.append(secondary);
+    }
+  }
+  detail.append(kind, copy);
+
+  const requester = document.createElement("div");
+  requester.className = "admin-request-requester";
+  const requesterCopy = document.createElement("span");
+  const requesterName = document.createElement("strong");
+  requesterName.textContent = adminUserDisplayName(item.requester);
+  const requesterMeta = document.createElement("small");
+  const requestedAtDate = joinedDate(item.created_at);
+  const accountType = item.requester.userType === "plex" ? "Plex user" : "Local account";
+  if (requestedAtDate) {
+    const requestedAt = document.createElement("time");
+    requestedAt.dateTime = requestedAtDate.toISOString();
+    requestedAt.title = requestedAtDate.toLocaleString();
+    requestedAt.textContent = requestedAtDate.toLocaleDateString();
+    requesterMeta.append(`${accountType} · `, requestedAt);
+  } else {
+    requesterMeta.textContent = accountType;
+  }
+  requesterCopy.append(requesterName, requesterMeta);
+  requester.append(createUserAvatar(item.requester), requesterCopy);
+
+  row.append(detail, requester);
+  const plexBadge = createAdminRequestPlexBadge(item);
+  if (plexBadge) row.append(plexBadge);
+  return row;
+}
+
+function setAdminRequestStats() {
+  $("#admin-requests-total").textContent = adminRequests.length.toLocaleString();
+  $("#admin-requests-artists").textContent = adminRequests
+    .filter((item) => item.kind === "artist").length.toLocaleString();
+  $("#admin-requests-releases").textContent = adminRequests
+    .filter((item) => item.kind === "release-group").length.toLocaleString();
+}
+
+function renderAdminRequests() {
+  const list = $("#admin-requests-list");
+  const search = $<HTMLInputElement>("#admin-requests-search");
+  const kind = $<HTMLSelectElement>("#admin-requests-type").value;
+  const query = normalizeSearch(search.value);
+  const visibleRequests = adminRequests.filter((item) => {
+    if (kind !== "all" && item.kind !== kind) return false;
+    if (!query) return true;
+    return normalizeSearch([
+      item.name,
+      item.artist_name,
+      item.release_type,
+      item.release_date,
+      adminUserDisplayName(item.requester),
+      item.requester.localUsername,
+      item.requester.plexEmail,
+    ].filter(Boolean).join(" ")).includes(query);
+  });
+  list.replaceChildren();
+
+  if (!visibleRequests.length) {
+    const empty = document.createElement("p");
+    empty.className = "message admin-request-empty";
+    empty.textContent = adminRequests.length
+      ? "No requests match the current filters."
+      : "No requests have been made yet.";
+    list.append(empty);
+  } else {
+    visibleRequests.forEach((item) => list.append(createAdminRequestItem(item)));
+  }
+
+  const filtered = query || kind !== "all";
+  setMessage(
+    $("#admin-requests-message"),
+    filtered
+      ? `${visibleRequests.length.toLocaleString()} of ${adminRequests.length.toLocaleString()} requests.`
+      : `${adminRequests.length.toLocaleString()} ${adminRequests.length === 1 ? "request" : "requests"}.`,
+  );
+}
+
+async function refreshAdminRequests() {
+  const request = ++adminRequestsRequest;
+  const list = $("#admin-requests-list");
+  list.replaceChildren(skeletonBlock("admin-request-item", 6));
+  setMessage($("#admin-requests-message"), "Loading requests…");
+  try {
+    const result = await api<{ requests: AdminRequest[] }>("/api/admin/requests");
+    if (request !== adminRequestsRequest) return;
+    adminRequests = result.requests || [];
+    setAdminRequestStats();
+    renderAdminRequests();
+  } catch (error) {
+    if (request !== adminRequestsRequest) return;
+    adminRequests = [];
+    setAdminRequestStats();
+    list.replaceChildren();
+    const errorState = document.createElement("div");
+    errorState.className = "admin-request-load-error";
+    const copy = document.createElement("p");
+    copy.className = "message error";
+    copy.textContent = error.message;
+    const retry = document.createElement("button");
+    retry.type = "button";
+    retry.className = "outline";
+    retry.textContent = "Try again";
+    retry.addEventListener("click", () => refreshAdminRequests());
+    errorState.append(copy, retry);
+    list.append(errorState);
+    setMessage($("#admin-requests-message"), "Requests could not be loaded.", true);
+  }
+}
+
+function setupAdminRequests() {
+  $("#refresh-admin-requests").addEventListener("click", () => refreshAdminRequests());
+  $<HTMLInputElement>("#admin-requests-search").addEventListener(
+    "input",
+    () => renderAdminRequests(),
+  );
+  $<HTMLSelectElement>("#admin-requests-type").addEventListener(
+    "change",
+    () => renderAdminRequests(),
+  );
 }
 
 function updateSessionChrome() {
@@ -2081,6 +2285,7 @@ function setupLibrary() {
 
 setupTheme();
 setupNavigation();
+setupAdminRequests();
 setupAdminUsers();
 setupStandalonePullToRefresh();
 setupLidarrSettings();

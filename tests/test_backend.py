@@ -154,8 +154,8 @@ class ApplicationFactoryTests(DatabaseTestCase):
             for method in rule.methods
             if method not in {"HEAD", "OPTIONS"}
         }
-        self.assertEqual(len(rules), 62)
-        self.assertEqual(len(route_methods), 62)
+        self.assertEqual(len(rules), 64)
+        self.assertEqual(len(route_methods), 64)
 
     def test_factory_applies_test_configuration(self):
         self.assertTrue(self.app.config["TESTING"])
@@ -2264,6 +2264,163 @@ class AdminUsersTests(DatabaseTestCase):
         self.assertNotIn("lastfmApiKey", plex_user)
         self.assertNotIn("passwordHash", plex_user)
         self.assertNotIn("plexId", plex_user)
+
+    @patch("backend.routes.admin._profile_plex_index")
+    def test_admin_request_list_includes_metadata_availability_and_requesters(
+        self, profile_plex_index
+    ):
+        self.register()
+        local_user_id = self.add_user(
+            "local-listener",
+            lastfm_api_key="never-return-this-local-key",
+        )
+        plex_user_id = self.add_user(
+            "generated-plex-name",
+            plex_id="never-return-this-plex-id",
+            plex_username="Plex Listener",
+            plex_email="plex@example.com",
+            plex_avatar="https://plex.example/avatar.jpg",
+            lastfm_api_key="never-return-this-plex-key",
+        )
+        with db() as connection:
+            connection.executemany(
+                "INSERT INTO request_history "
+                "(user_id, kind, mbid, name, artist_name, release_type, "
+                "release_date, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        local_user_id,
+                        "artist",
+                        "artist-1",
+                        "Artist One",
+                        None,
+                        None,
+                        None,
+                        100,
+                    ),
+                    (
+                        plex_user_id,
+                        "release-group",
+                        "release-1",
+                        "Album One",
+                        "Artist Two",
+                        "Album",
+                        "2024-02-03",
+                        300,
+                    ),
+                    (
+                        local_user_id,
+                        "release-group",
+                        "release-2",
+                        "Newest at Same Time",
+                        "Artist Three",
+                        "EP",
+                        "2025",
+                        300,
+                    ),
+                ],
+            )
+        profile_plex_index.return_value = {
+            "artistsByMbid": {
+                "artist-1": {
+                    "url": "https://app.plex.tv/artist",
+                    "plexampUrl": "https://listen.plex.tv/artist/example",
+                },
+            },
+            "releaseGroupsByMbid": {
+                "release-1": [{
+                    "artistName": "Artist Two",
+                    "releaseType": "Album",
+                    "year": 2024,
+                    "url": "https://app.plex.tv/album",
+                    "plexampUrl": "https://listen.plex.tv/album/example",
+                }],
+            },
+        }
+
+        response = self.client.get("/api/admin/requests")
+
+        self.assertEqual(response.status_code, 200)
+        requests_payload = response.get_json()["requests"]
+        self.assertEqual(
+            [item["name"] for item in requests_payload],
+            ["Newest at Same Time", "Album One", "Artist One"],
+        )
+        self.assertTrue(all(isinstance(item["id"], int) for item in requests_payload))
+        self.assertGreater(requests_payload[0]["id"], requests_payload[1]["id"])
+
+        release = requests_payload[1]
+        self.assertEqual(release["kind"], "release-group")
+        self.assertEqual(release["mbid"], "release-1")
+        self.assertEqual(release["artist_name"], "Artist Two")
+        self.assertEqual(release["release_type"], "Album")
+        self.assertEqual(release["release_date"], "2024-02-03")
+        self.assertEqual(release["created_at"], 300)
+        self.assertTrue(release["availableInPlex"])
+        self.assertEqual(release["plexUrl"], "https://app.plex.tv/album")
+        self.assertEqual(
+            release["plexampUrl"],
+            "https://listen.plex.tv/album/example",
+        )
+        self.assertEqual(release["requester"], {
+            "id": plex_user_id,
+            "username": "Plex Listener",
+            "localUsername": "generated-plex-name",
+            "userType": "plex",
+            "role": "user",
+            "plexUsername": "Plex Listener",
+            "plexEmail": "plex@example.com",
+            "plexAvatar": "https://plex.example/avatar.jpg",
+        })
+
+        artist = requests_payload[2]
+        self.assertTrue(artist["availableInPlex"])
+        self.assertEqual(artist["plexUrl"], "https://app.plex.tv/artist")
+        self.assertEqual(
+            artist["plexampUrl"],
+            "https://listen.plex.tv/artist/example",
+        )
+        self.assertEqual(artist["requester"], {
+            "id": local_user_id,
+            "username": "local-listener",
+            "localUsername": "local-listener",
+            "userType": "local",
+            "role": "user",
+            "plexUsername": "",
+            "plexEmail": "",
+            "plexAvatar": "",
+        })
+
+        serialized = response.get_data(as_text=True)
+        self.assertNotIn("never-return-this-local-key", serialized)
+        self.assertNotIn("never-return-this-plex-key", serialized)
+        self.assertNotIn("never-return-this-plex-id", serialized)
+        self.assertNotIn("password_hash", serialized)
+
+    def test_admin_request_list_requires_an_administrator(self):
+        self.assertEqual(
+            self.client.get("/api/admin/requests").status_code,
+            401,
+        )
+        admin_csrf = self.register()
+        self.add_user("ordinary-user")
+        self.client.post(
+            "/api/auth/logout",
+            headers={"X-CSRF-Token": admin_csrf},
+        )
+        login = self.client.post(
+            "/api/auth/login",
+            json={
+                "username": "ordinary-user",
+                "password": "listener-password",
+            },
+        )
+        self.assertEqual(login.status_code, 200)
+
+        response = self.client.get("/api/admin/requests")
+
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("Administrator", response.get_json()["error"])
 
     def test_user_list_edits_and_deletion_require_an_admin(self):
         self.assertEqual(self.client.get("/api/admin/users").status_code, 401)

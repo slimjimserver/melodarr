@@ -203,6 +203,7 @@
 
       <nav class="settings-tabs" aria-label="Settings sections">
         <button class="active" type="button" data-settings-page="services">Services</button>
+        <button type="button" data-settings-page="requests">Requests</button>
         <button type="button" data-settings-page="users">Users</button>
         <button type="button" data-settings-page="jobs">Jobs &amp; Cache</button>
       </nav>
@@ -274,6 +275,42 @@
             <div class="form-actions"><span></span><button>Save Lidarr settings</button></div>
           </fieldset>
         </form>
+        </section>
+      </div>
+
+      <div id="settings-requests" class="settings-stack settings-panel" hidden>
+        <section class="settings-section admin-requests-section">
+          <div class="admin-requests-heading">
+            <div>
+              <p class="eyebrow">REQUEST ACTIVITY</p>
+              <h2>Requests</h2>
+              <p>Review every artist and release-group request across Melodarr, including who requested it and whether it is available in Plex.</p>
+            </div>
+            <button id="refresh-admin-requests" class="outline" type="button">Refresh</button>
+          </div>
+          <div class="user-stats" aria-label="Request summary">
+            <div><strong id="admin-requests-total">—</strong><span>Total requests</span></div>
+            <div><strong id="admin-requests-artists">—</strong><span>Artists</span></div>
+            <div><strong id="admin-requests-releases">—</strong><span>Release groups</span></div>
+          </div>
+          <div class="admin-request-filters">
+            <label class="users-filter" for="admin-requests-search">
+              <span>Find a request</span>
+              <input id="admin-requests-search" type="search" placeholder="Search music or requester…" autocomplete="off">
+            </label>
+            <label class="users-filter" for="admin-requests-type">
+              <span>Request type</span>
+              <select id="admin-requests-type">
+                <option value="all">All requests</option>
+                <option value="artist">Artists</option>
+                <option value="release-group">Release groups</option>
+              </select>
+            </label>
+          </div>
+          <p id="admin-requests-message" class="form-message" aria-live="polite"></p>
+          <div id="admin-requests-list" class="admin-request-list" aria-label="Global request history">
+            <p class="message">Open Requests to load request history.</p>
+          </div>
         </section>
       </div>
 

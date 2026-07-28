@@ -7,11 +7,13 @@ from flask import Blueprint, jsonify, request
 from werkzeug.security import generate_password_hash
 
 if __package__ == "backend.routes":
+    from .account import _profile_history_item, _profile_plex_index
     from ..responses import api_error
     from ..security import admin_required, current_user
     from ..storage import db, delete_recommendation_cache
     from ..workers import recommendations as recommendation_worker
 else:  # Support the existing `python backend/app.py` entry point.
+    from routes.account import _profile_history_item, _profile_plex_index
     from responses import api_error
     from security import admin_required, current_user
     from storage import db, delete_recommendation_cache
@@ -54,6 +56,15 @@ USER_LIST_QUERY = """
     FROM users
     LEFT JOIN request_history ON request_history.user_id = users.id
 """
+REQUEST_HISTORY_FIELDS = (
+    "kind",
+    "mbid",
+    "name",
+    "artist_name",
+    "release_type",
+    "release_date",
+    "created_at",
+)
 
 
 def _user_payload(row):
@@ -93,6 +104,25 @@ def _get_user(connection, user_id):
     ).fetchone()
 
 
+def _requester_payload(row):
+    """Return the public account identity associated with an admin request."""
+    is_plex_user = bool(row["plex_id"])
+    return {
+        "id": row["user_id"],
+        "username": (
+            row["plex_username"] or row["local_username"]
+            if is_plex_user
+            else row["local_username"]
+        ),
+        "localUsername": row["local_username"],
+        "userType": "plex" if is_plex_user else "local",
+        "role": row["role"],
+        "plexUsername": row["plex_username"] or "",
+        "plexEmail": row["plex_email"] or "",
+        "plexAvatar": row["plex_avatar"] or "",
+    }
+
+
 @blueprint.get("/api/admin/users")
 @admin_required
 def users():
@@ -105,6 +135,50 @@ def users():
             """
         ).fetchall()
     return jsonify({"users": [_user_payload(row) for row in rows]})
+
+
+@blueprint.get("/api/admin/requests")
+@admin_required
+def requests():
+    """Return every user's request history to an administrator."""
+    with db() as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                request_history.id AS request_id,
+                request_history.user_id,
+                request_history.kind,
+                request_history.mbid,
+                request_history.name,
+                request_history.artist_name,
+                request_history.release_type,
+                request_history.release_date,
+                request_history.created_at,
+                users.username AS local_username,
+                users.role,
+                users.plex_id,
+                users.plex_username,
+                users.plex_email,
+                users.plex_avatar
+            FROM request_history
+            JOIN users ON users.id = request_history.user_id
+            ORDER BY request_history.created_at DESC, request_history.id DESC
+            """
+        ).fetchall()
+
+    plex_index = _profile_plex_index()
+    payload = []
+    for row in rows:
+        history_item = _profile_history_item(
+            {
+                "id": row["request_id"],
+                **{field: row[field] for field in REQUEST_HISTORY_FIELDS},
+            },
+            plex_index,
+        )
+        history_item["requester"] = _requester_payload(row)
+        payload.append(history_item)
+    return jsonify({"requests": payload})
 
 
 @blueprint.patch("/api/admin/users/<int:user_id>")
