@@ -32,10 +32,11 @@ interface AppElement extends HTMLElement {
 }
 type AccountPage = "profile" | "general" | "linked-accounts" | "invitations";
 type AppView = "discover" | "detail" | "library" | "settings" | "account";
-type SettingsPage = "services" | "jobs";
+type SettingsPage = "services" | "users" | "jobs";
 type ThemeName = "midnight" | "warm";
 
 interface CurrentUser {
+  id?: number;
   username: string;
   role: "admin" | "user";
   csrfToken?: string;
@@ -47,6 +48,31 @@ interface CurrentUser {
   lastfmUsername?: string;
   lastfmConfigured?: boolean;
 }
+
+interface AdminUser {
+  id: number;
+  username: string;
+  localUsername?: string;
+  requestCount: number;
+  userType: "plex" | "local";
+  role: "admin" | "user";
+  joinedAt: number | string;
+  plexUsername?: string;
+  plexEmail?: string;
+  plexAvatar?: string;
+  listenbrainzUsername?: string;
+  lastfmUsername?: string;
+  lastfmConfigured?: boolean;
+}
+
+type AdminUserForm = HTMLFormElement & {
+  role: HTMLSelectElement;
+  localUsername: HTMLInputElement;
+  password: HTMLInputElement;
+  listenbrainzUsername: HTMLInputElement;
+  lastfmUsername: HTMLInputElement;
+  lastfmApiKey: HTMLInputElement;
+};
 
 interface PlexConnection extends JsonObject {
   uri: string;
@@ -112,6 +138,9 @@ let settingsPlexFlowToken = "";
 let settingsPlexServers: PlexServer[] = [];
 let maintenanceRefreshTimer: number | undefined;
 let maintenanceRefreshInFlight = false;
+let adminUsers: AdminUser[] = [];
+let editingAdminUser: AdminUser | undefined;
+let adminUsersRequest = 0;
 let discoveryLoad: Promise<void> | undefined;
 // Plex holdings tell a requester what is already available, so the library is
 // readable by every account. Settings remains administrator-only.
@@ -613,15 +642,19 @@ async function refreshMaintenance() {
 function showSettingsPage(page: SettingsPage, updateHistory = true) {
   document.querySelectorAll<HTMLElement>("[data-settings-page]").forEach((button) => button.classList.toggle("active", button.dataset.settingsPage === page));
   $("#settings-services").hidden = page !== "services";
+  $("#settings-users").hidden = page !== "users";
   $("#settings-jobs").hidden = page !== "jobs";
   if (maintenanceRefreshTimer !== undefined) window.clearInterval(maintenanceRefreshTimer);
   maintenanceRefreshTimer = undefined;
   if (page === "jobs") {
     refreshMaintenance();
     maintenanceRefreshTimer = window.setInterval(refreshMaintenance, 10_000);
+  } else if (page === "users") {
+    refreshAdminUsers();
   }
   if (updateHistory) {
-    window.history.pushState({ view: "settings", settings: page }, "", page === "jobs" ? "/settings/jobs" : "/settings");
+    const path = page === "services" ? "/settings" : `/settings/${page}`;
+    window.history.pushState({ view: "settings", settings: page }, "", path);
     resetPageScroll();
   }
 }
@@ -951,9 +984,12 @@ function setupNavigation() {
       showAccountPage?.((accountMatch[2] || "profile") as AccountPage, false);
       return;
     }
-    if (window.location.pathname === "/settings" || window.location.pathname === "/settings/jobs") {
+    if (["/settings", "/settings/users", "/settings/jobs"].includes(window.location.pathname)) {
       showView("settings", false);
-      showSettingsPage(window.location.pathname.endsWith("/jobs") ? "jobs" : "services", false);
+      const page: SettingsPage = window.location.pathname.endsWith("/users")
+        ? "users"
+        : window.location.pathname.endsWith("/jobs") ? "jobs" : "services";
+      showSettingsPage(page, false);
       return;
     }
     const view = window.location.pathname.slice(1) || "discover";
@@ -961,7 +997,7 @@ function setupNavigation() {
   });
 
   const initialView = window.location.pathname.slice(1) || "discover";
-  if (initialView === "settings/jobs") showView("settings", false);
+  if (["settings/users", "settings/jobs"].includes(initialView)) showView("settings", false);
   else if (["library", "settings"].includes(initialView)) showView(initialView as AppView, false);
 
   document.querySelectorAll<HTMLElement>(".tab-bar .nav-link").forEach((button) => button.addEventListener("click", () => {
@@ -982,15 +1018,7 @@ function setupNavigation() {
 async function applyCurrentUser(user: CurrentUser) {
   currentUser = user;
   document.body.classList.add("authenticated");
-  const isAdmin = user.role === "admin";
-  document.querySelectorAll<HTMLElement>(".admin-only").forEach((element) => { element.hidden = !isAdmin; });
-  const status = $("#status");
-  status.textContent = `Signed in as ${user.username}${isAdmin ? " · Administrator" : ""}`;
-  status.className = "status ready";
-  const accountMenu = $<HTMLAnchorElement>("#account-menu");
-  accountMenu.textContent = user.username.slice(0, 1).toUpperCase();
-  accountMenu.href = `/${encodeURIComponent(user.username)}`;
-  accountMenu.setAttribute("aria-label", `Open settings for ${user.username}`);
+  updateSessionChrome();
   try {
     await loadDiscovery();
     window.dispatchEvent(new Event("melodarr-authenticated"));
@@ -1000,6 +1028,363 @@ async function applyCurrentUser(user: CurrentUser) {
   } catch (error) {
     showToast(error.message, true);
   }
+}
+
+function adminUserDisplayName(user: AdminUser) {
+  if (user.userType === "plex") {
+    return user.plexUsername || user.username || user.plexEmail || "Plex user";
+  }
+  return user.localUsername || user.username || "Local user";
+}
+
+function createUserAvatar(user: AdminUser, large = false) {
+  const avatar = document.createElement("span");
+  avatar.className = `user-avatar${large ? " user-avatar-large" : ""}`;
+  const displayName = adminUserDisplayName(user);
+  avatar.textContent = displayName.slice(0, 1).toLocaleUpperCase() || "?";
+  if (user.plexAvatar) {
+    const image = document.createElement("img");
+    image.src = user.plexAvatar;
+    image.alt = "";
+    image.loading = "lazy";
+    image.decoding = "async";
+    image.addEventListener("error", () => image.remove(), { once: true });
+    avatar.append(image);
+  }
+  return avatar;
+}
+
+function joinedDate(value: number | string) {
+  const numeric = Number(value);
+  const date = Number.isFinite(numeric)
+    ? new Date(numeric * (numeric < 10_000_000_000 ? 1_000 : 1))
+    : new Date(value);
+  return Number.isNaN(date.getTime()) ? undefined : date;
+}
+
+function updateSessionChrome() {
+  if (!currentUser) return;
+  const user = currentUser;
+  const isAdmin = user.role === "admin";
+  document.querySelectorAll<HTMLElement>(".admin-only").forEach((element) => {
+    element.hidden = !isAdmin;
+  });
+  const status = $("#status");
+  status.textContent = `Signed in as ${user.username}${isAdmin ? " · Administrator" : ""}`;
+  status.className = "status ready";
+  const accountMenu = $<HTMLAnchorElement>("#account-menu");
+  accountMenu.textContent = user.username.slice(0, 1).toUpperCase();
+  accountMenu.href = `/${encodeURIComponent(user.username)}`;
+  accountMenu.setAttribute("aria-label", `Open settings for ${user.username}`);
+}
+
+function isCurrentSessionUser(user: AdminUser) {
+  if (!currentUser) return false;
+  if (currentUser.id !== undefined) return currentUser.id === user.id;
+  const currentName = currentUser.username.toLocaleLowerCase();
+  return [user.username, user.localUsername, user.plexUsername]
+    .filter(Boolean)
+    .some((name) => name!.toLocaleLowerCase() === currentName);
+}
+
+function renderAdminUsers() {
+  const table = $<HTMLTableSectionElement>("#users-table");
+  const query = normalizeSearch($<HTMLInputElement>("#users-search").value);
+  const visibleUsers = adminUsers.filter((user) => normalizeSearch([
+    adminUserDisplayName(user),
+    user.localUsername,
+    user.plexEmail,
+    user.userType,
+    user.role,
+  ].filter(Boolean).join(" ")).includes(query));
+  table.replaceChildren();
+
+  if (!visibleUsers.length) {
+    const row = document.createElement("tr");
+    const empty = tableCell(
+      row,
+      adminUsers.length ? `No users match “${$<HTMLInputElement>("#users-search").value.trim()}”.` : "No users have joined Melodarr yet.",
+    );
+    empty.className = "table-empty";
+    empty.colSpan = 6;
+    table.append(row);
+    return;
+  }
+
+  visibleUsers.forEach((user) => {
+    const row = document.createElement("tr");
+    const identityCell = tableCell(row, "");
+    identityCell.dataset.label = "Username";
+    const identity = document.createElement("div");
+    identity.className = "user-identity";
+    const copy = document.createElement("span");
+    const name = document.createElement("strong");
+    name.textContent = adminUserDisplayName(user);
+    copy.append(name);
+    const secondaryParts = user.userType === "plex"
+      ? [user.localUsername ? `Local: ${user.localUsername}` : "", user.plexEmail]
+      : [];
+    const secondaryText = secondaryParts.filter(Boolean).join(" · ");
+    if (secondaryText) {
+      const secondary = document.createElement("small");
+      secondary.textContent = secondaryText;
+      copy.append(secondary);
+    }
+    identity.append(createUserAvatar(user), copy);
+    identityCell.append(identity);
+
+    const requests = tableCell(row, Number(user.requestCount || 0).toLocaleString());
+    requests.dataset.label = "Requests";
+    requests.className = "user-request-count";
+
+    const typeCell = tableCell(row, "");
+    typeCell.dataset.label = "User type";
+    const type = document.createElement("span");
+    type.className = `user-badge user-type ${user.userType}`;
+    type.textContent = user.userType === "plex" ? "Plex user" : "Local account";
+    typeCell.append(type);
+
+    const roleCell = tableCell(row, "");
+    roleCell.dataset.label = "Role";
+    const role = document.createElement("span");
+    role.className = `user-badge user-role ${user.role}`;
+    role.textContent = user.role === "admin" ? "Administrator" : "User";
+    roleCell.append(role);
+
+    const joinedCell = tableCell(row, "");
+    joinedCell.dataset.label = "Joined";
+    const date = joinedDate(user.joinedAt);
+    if (date) {
+      const time = document.createElement("time");
+      time.dateTime = date.toISOString();
+      time.textContent = date.toLocaleDateString(undefined, {
+        year: "numeric",
+        month: "short",
+        day: "numeric",
+      });
+      joinedCell.append(time);
+    } else {
+      joinedCell.textContent = "Unknown";
+    }
+
+    const actionCell = tableCell(row, "");
+    actionCell.className = "user-actions";
+    const actionButtons = document.createElement("div");
+    actionButtons.className = "user-action-buttons";
+    const edit = document.createElement("button");
+    edit.type = "button";
+    edit.className = "outline edit-user";
+    edit.textContent = "Edit";
+    edit.setAttribute("aria-label", `Edit settings for ${adminUserDisplayName(user)}`);
+    edit.addEventListener("click", () => openAdminUserDialog(user));
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "outline delete-user";
+    remove.textContent = "Delete";
+    remove.setAttribute("aria-label", `Delete ${adminUserDisplayName(user)}`);
+    const currentSession = isCurrentSessionUser(user);
+    remove.disabled = currentSession;
+    if (currentSession) {
+      remove.title = "You cannot delete your own account.";
+    }
+    remove.addEventListener("click", () => deleteAdminUser(user, remove));
+    actionButtons.append(edit, remove);
+    actionCell.append(actionButtons);
+    table.append(row);
+  });
+}
+
+function setAdminUserStats() {
+  $("#users-total").textContent = adminUsers.length.toLocaleString();
+  $("#users-plex").textContent = adminUsers.filter((user) => user.userType === "plex").length.toLocaleString();
+  $("#users-local").textContent = adminUsers.filter((user) => user.userType === "local").length.toLocaleString();
+}
+
+async function refreshAdminUsers() {
+  const request = ++adminUsersRequest;
+  const table = $<HTMLTableSectionElement>("#users-table");
+  const message = $("#users-message");
+  table.innerHTML = '<tr><td colspan="6" class="table-empty">Loading users…</td></tr>';
+  setMessage(message, "");
+  try {
+    const result = await api<{ users: AdminUser[] }>("/api/admin/users");
+    if (request !== adminUsersRequest) return;
+    adminUsers = result.users || [];
+    setAdminUserStats();
+    renderAdminUsers();
+    setMessage(
+      message,
+      `${adminUsers.length.toLocaleString()} ${adminUsers.length === 1 ? "user" : "users"}.`,
+    );
+  } catch (error) {
+    if (request !== adminUsersRequest) return;
+    adminUsers = [];
+    setAdminUserStats();
+    table.replaceChildren();
+    const row = document.createElement("tr");
+    const cell = tableCell(row, "");
+    cell.colSpan = 6;
+    cell.className = "table-empty user-load-error";
+    const copy = document.createElement("span");
+    copy.textContent = error.message;
+    const retry = document.createElement("button");
+    retry.type = "button";
+    retry.className = "outline";
+    retry.textContent = "Try again";
+    retry.addEventListener("click", () => refreshAdminUsers());
+    cell.append(copy, retry);
+    table.append(row);
+    setMessage(message, "Users could not be loaded.", true);
+  }
+}
+
+async function deleteAdminUser(user: AdminUser, button: HTMLButtonElement) {
+  const displayName = adminUserDisplayName(user);
+  if (!window.confirm(
+    `Delete ${displayName}? This permanently removes their account, request history, invitations, and queued work. This cannot be undone.`,
+  )) return;
+
+  const originalLabel = button.textContent;
+  button.disabled = true;
+  button.textContent = "Deleting…";
+  try {
+    await api(`/api/admin/users/${encodeURIComponent(String(user.id))}`, {
+      method: "DELETE",
+    });
+    adminUsers = adminUsers.filter((candidate) => candidate.id !== user.id);
+    setAdminUserStats();
+    renderAdminUsers();
+    const message = `Deleted ${displayName}.`;
+    setMessage($("#users-message"), message);
+    showToast(message);
+  } catch (error) {
+    setMessage($("#users-message"), error.message, true);
+    showToast(error.message, true);
+    if (button.isConnected) {
+      button.disabled = false;
+      button.textContent = originalLabel;
+    }
+  }
+}
+
+function openAdminUserDialog(user: AdminUser) {
+  editingAdminUser = user;
+  const dialog = $<HTMLDialogElement>("#user-dialog");
+  const form = $<AdminUserForm>("#user-form");
+  const currentSession = isCurrentSessionUser(user);
+  form.reset();
+  form.role.value = user.role;
+  form.role.disabled = currentSession;
+  form.localUsername.value = user.localUsername || (user.userType === "local" ? user.username : "");
+  form.listenbrainzUsername.value = user.listenbrainzUsername || "";
+  form.lastfmUsername.value = user.lastfmUsername || "";
+  $("#user-dialog-title").textContent = `Edit ${adminUserDisplayName(user)}`;
+  $("#user-dialog-name").textContent = adminUserDisplayName(user);
+  $("#user-dialog-account").textContent = user.userType === "plex"
+    ? [user.plexEmail, "Plex account"].filter(Boolean).join(" · ")
+    : "Local account";
+  $("#user-local-help").textContent = user.userType === "plex"
+    ? "Generated for this Plex account. You can change the username used for local sign-in."
+    : "Used for local sign-in.";
+  $("#user-password-help").textContent = user.userType === "plex"
+    ? "Set a password to enable or reset local sign-in. Leave blank to keep the current access."
+    : "Leave blank to keep the current password. Passwords must be at least 12 characters.";
+  $("#user-role-help").textContent = currentSession
+    ? "You cannot change your own role while signed in."
+    : "Controls access to administrative settings.";
+  const replacement = createUserAvatar(user, true);
+  replacement.id = "user-dialog-avatar";
+  $("#user-dialog-avatar").replaceWith(replacement);
+  setMessage($("#user-dialog-message"), "");
+  dialog.showModal();
+}
+
+function setupAdminUsers() {
+  const dialog = $<HTMLDialogElement>("#user-dialog");
+  const form = $<AdminUserForm>("#user-form");
+  const saveButton = $<HTMLButtonElement>("#save-user");
+  const dialogMessage = $("#user-dialog-message");
+
+  $("#refresh-users").addEventListener("click", () => refreshAdminUsers());
+  $<HTMLInputElement>("#users-search").addEventListener("input", () => renderAdminUsers());
+  document.querySelectorAll<HTMLElement>(".close-user-dialog").forEach((button) => {
+    button.addEventListener("click", () => dialog.close());
+  });
+  dialog.addEventListener("click", (event) => {
+    if (event.target === dialog) dialog.close();
+  });
+  dialog.addEventListener("close", () => {
+    editingAdminUser = undefined;
+    form.reset();
+    setMessage(dialogMessage, "");
+  });
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const user = editingAdminUser;
+    if (!user) return;
+    const wasCurrentSession = isCurrentSessionUser(user);
+    const payload = {
+      role: form.role.value,
+      localUsername: form.localUsername.value.trim(),
+      password: form.password.value,
+      listenbrainzUsername: form.listenbrainzUsername.value.trim(),
+      lastfmUsername: form.lastfmUsername.value.trim(),
+      lastfmApiKey: form.lastfmApiKey.value,
+    };
+    saveButton.disabled = true;
+    form.setAttribute("aria-busy", "true");
+    setMessage(dialogMessage, "Saving user settings…");
+    try {
+      const result = await api<{ user?: AdminUser; message?: string } & Partial<AdminUser>>(
+        `/api/admin/users/${encodeURIComponent(String(user.id))}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        },
+      );
+      const responseUser = result.user || result;
+      const updated: AdminUser = {
+        ...user,
+        role: payload.role as AdminUser["role"],
+        localUsername: payload.localUsername,
+        listenbrainzUsername: payload.listenbrainzUsername,
+        lastfmUsername: payload.lastfmUsername,
+        ...(responseUser as Partial<AdminUser>),
+      };
+      if (updated.userType === "local" && !responseUser.username && payload.localUsername) {
+        updated.username = payload.localUsername;
+      }
+      adminUsers = adminUsers.map((candidate) => candidate.id === updated.id ? updated : candidate);
+      setAdminUserStats();
+      renderAdminUsers();
+
+      if (wasCurrentSession && currentUser) {
+        currentUser.username = updated.localUsername || currentUser.username;
+        currentUser.plexUsername = updated.plexUsername;
+        currentUser.plexEmail = updated.plexEmail;
+        currentUser.listenbrainzUsername = updated.listenbrainzUsername;
+        currentUser.lastfmUsername = updated.lastfmUsername;
+        currentUser.lastfmConfigured = updated.lastfmConfigured;
+        updateSessionChrome();
+      }
+
+      dialog.close();
+      const successMessage = result.message || `Saved settings for ${adminUserDisplayName(updated)}.`;
+      setMessage($("#users-message"), successMessage);
+      showToast(successMessage);
+      if (wasCurrentSession && currentUser?.role !== "admin") {
+        window.history.replaceState({ view: "discover" }, "", "/");
+        window.dispatchEvent(new PopStateEvent("popstate"));
+      }
+    } catch (error) {
+      setMessage(dialogMessage, error.message, true);
+    } finally {
+      saveButton.disabled = false;
+      form.removeAttribute("aria-busy");
+    }
+  });
 }
 
 function showSetupPanel(
@@ -1696,6 +2081,7 @@ function setupLibrary() {
 
 setupTheme();
 setupNavigation();
+setupAdminUsers();
 setupStandalonePullToRefresh();
 setupLidarrSettings();
 setupPlexSettings();

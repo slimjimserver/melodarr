@@ -66,6 +66,7 @@ def frontend_index(**_route_values):
 blueprint.add_url_rule("/", view_func=frontend_index)
 blueprint.add_url_rule("/settings", view_func=frontend_index)
 blueprint.add_url_rule("/settings/jobs", view_func=frontend_index)
+blueprint.add_url_rule("/settings/users", view_func=frontend_index)
 blueprint.add_url_rule("/library", view_func=frontend_index)
 blueprint.add_url_rule("/<username>", view_func=frontend_index)
 blueprint.add_url_rule("/<username>/settings/<section>", view_func=frontend_index)

@@ -154,8 +154,8 @@ class ApplicationFactoryTests(DatabaseTestCase):
             for method in rule.methods
             if method not in {"HEAD", "OPTIONS"}
         }
-        self.assertEqual(len(rules), 58)
-        self.assertEqual(len(route_methods), 58)
+        self.assertEqual(len(rules), 62)
+        self.assertEqual(len(route_methods), 62)
 
     def test_factory_applies_test_configuration(self):
         self.assertTrue(self.app.config["TESTING"])
@@ -2178,6 +2178,343 @@ class AuthenticationTests(DatabaseTestCase):
 
         self.assertEqual(response.status_code, 200)
         get_user.assert_called_once()
+
+
+class AdminUsersTests(DatabaseTestCase):
+    def add_user(
+        self,
+        username,
+        *,
+        role="user",
+        created_at=1_700_000_000,
+        plex_id=None,
+        plex_username=None,
+        plex_email=None,
+        plex_avatar=None,
+        listenbrainz_username=None,
+        lastfm_username=None,
+        lastfm_api_key=None,
+        password="listener-password",
+    ):
+        with db() as connection:
+            cursor = connection.execute(
+                "INSERT INTO users "
+                "(username, password_hash, role, plex_id, plex_username, "
+                "plex_email, plex_avatar, listenbrainz_username, "
+                "lastfm_username, lastfm_api_key, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    username,
+                    generate_password_hash(password),
+                    role,
+                    plex_id,
+                    plex_username,
+                    plex_email,
+                    plex_avatar,
+                    listenbrainz_username,
+                    lastfm_username,
+                    lastfm_api_key,
+                    created_at,
+                ),
+            )
+            return cursor.lastrowid
+
+    def test_admin_list_uses_plex_display_name_and_counts_requests(self):
+        self.register()
+        user_id = self.add_user(
+            "generated-plex-name",
+            plex_id="plex-42",
+            plex_username="Plex Listener",
+            plex_email="plex@example.com",
+            plex_avatar="https://plex.example/avatar.jpg",
+            listenbrainz_username="listener",
+            lastfm_username="last-listener",
+            lastfm_api_key="never-return-this",
+        )
+        with db() as connection:
+            connection.executemany(
+                "INSERT INTO request_history "
+                "(user_id, kind, mbid, name, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [
+                    (user_id, "artist", "artist-1", "Artist One", 10),
+                    (
+                        user_id,
+                        "release-group",
+                        "release-1",
+                        "Album One",
+                        20,
+                    ),
+                ],
+            )
+
+        response = self.client.get("/api/admin/users")
+
+        self.assertEqual(response.status_code, 200)
+        users = response.get_json()["users"]
+        plex_user = next(user for user in users if user["id"] == user_id)
+        self.assertEqual(plex_user["username"], "Plex Listener")
+        self.assertEqual(plex_user["localUsername"], "generated-plex-name")
+        self.assertEqual(plex_user["requestCount"], 2)
+        self.assertEqual(plex_user["userType"], "plex")
+        self.assertEqual(plex_user["role"], "user")
+        self.assertEqual(plex_user["joinedAt"], 1_700_000_000)
+        self.assertEqual(plex_user["plexEmail"], "plex@example.com")
+        self.assertTrue(plex_user["lastfmConfigured"])
+        self.assertNotIn("lastfmApiKey", plex_user)
+        self.assertNotIn("passwordHash", plex_user)
+        self.assertNotIn("plexId", plex_user)
+
+    def test_user_list_edits_and_deletion_require_an_admin(self):
+        self.assertEqual(self.client.get("/api/admin/users").status_code, 401)
+        admin_csrf = self.register()
+        user_id = self.add_user("ordinary-user")
+        self.assertEqual(
+            self.client.delete(f"/api/admin/users/{user_id}").status_code,
+            403,
+        )
+        self.client.post(
+            "/api/auth/logout", headers={"X-CSRF-Token": admin_csrf}
+        )
+        login = self.client.post(
+            "/api/auth/login",
+            json={
+                "username": "ordinary-user",
+                "password": "listener-password",
+            },
+        )
+        csrf_token = login.get_json()["csrfToken"]
+
+        self.assertEqual(self.client.get("/api/admin/users").status_code, 403)
+        self.assertEqual(
+            self.client.patch(
+                f"/api/admin/users/{user_id}",
+                json={"role": "admin"},
+                headers={"X-CSRF-Token": csrf_token},
+            ).status_code,
+            403,
+        )
+        self.assertEqual(
+            self.client.delete(
+                f"/api/admin/users/{user_id}",
+                headers={"X-CSRF-Token": csrf_token},
+            ).status_code,
+            403,
+        )
+
+    @patch("backend.routes.admin.recommendation_worker.request_refresh")
+    def test_admin_can_edit_account_and_recommendation_settings(
+        self, request_refresh
+    ):
+        csrf_token = self.register()
+        original_hash = generate_password_hash("original-password")
+        user_id = self.add_user(
+            "old-name",
+            lastfm_username="old-lastfm",
+            lastfm_api_key="existing-api-key",
+        )
+        with db() as connection:
+            connection.execute(
+                "UPDATE users SET password_hash = ? WHERE id = ?",
+                (original_hash, user_id),
+            )
+            connection.execute(
+                "INSERT INTO recommendation_cache "
+                "(user_id, value, refreshed_at) VALUES (?, '{}', ?)",
+                (user_id, time.time()),
+            )
+
+        response = self.client.patch(
+            f"/api/admin/users/{user_id}",
+            json={
+                "role": "admin",
+                "localUsername": "new-name",
+                "password": "",
+                "listenbrainzUsername": "new-listens",
+                "lastfmUsername": "new-lastfm",
+                "lastfmApiKey": "",
+            },
+            headers={"X-CSRF-Token": csrf_token},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        user = response.get_json()["user"]
+        self.assertEqual(user["localUsername"], "new-name")
+        self.assertEqual(user["role"], "admin")
+        self.assertEqual(user["listenbrainzUsername"], "new-listens")
+        self.assertEqual(user["lastfmUsername"], "new-lastfm")
+        self.assertTrue(user["lastfmConfigured"])
+        self.assertNotIn("lastfmApiKey", user)
+        with db() as connection:
+            saved = connection.execute(
+                "SELECT password_hash, lastfm_api_key FROM users WHERE id = ?",
+                (user_id,),
+            ).fetchone()
+            cached = connection.execute(
+                "SELECT 1 FROM recommendation_cache WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+        self.assertEqual(saved["password_hash"], original_hash)
+        self.assertEqual(saved["lastfm_api_key"], "existing-api-key")
+        self.assertIsNone(cached)
+        request_refresh.assert_called_once_with()
+
+    def test_admin_edit_validation_protects_roles_and_plex_identity(self):
+        csrf_token = self.register()
+        with db() as connection:
+            admin_id = connection.execute(
+                "SELECT id FROM users WHERE username = 'test-user'"
+            ).fetchone()["id"]
+        self.assertEqual(
+            self.client.patch(
+                f"/api/admin/users/{admin_id}",
+                json={"role": "user"},
+                headers={"X-CSRF-Token": csrf_token},
+            ).status_code,
+            409,
+        )
+
+        second_admin_id = self.add_user("second-admin", role="admin")
+        self.assertEqual(
+            self.client.patch(
+                f"/api/admin/users/{admin_id}",
+                json={"role": "user"},
+                headers={"X-CSRF-Token": csrf_token},
+            ).status_code,
+            409,
+        )
+        readonly = self.client.patch(
+            f"/api/admin/users/{second_admin_id}",
+            json={"plexUsername": "impersonated"},
+            headers={"X-CSRF-Token": csrf_token},
+        )
+        self.assertEqual(readonly.status_code, 400)
+        self.assertIn("managed by Plex", readonly.get_json()["error"])
+
+    def test_admin_edit_validates_local_credentials_and_duplicates(self):
+        csrf_token = self.register()
+        user_id = self.add_user("ordinary-user")
+        duplicate = self.client.patch(
+            f"/api/admin/users/{user_id}",
+            json={"localUsername": "test-user"},
+            headers={"X-CSRF-Token": csrf_token},
+        )
+        short_password = self.client.patch(
+            f"/api/admin/users/{user_id}",
+            json={"password": "too-short"},
+            headers={"X-CSRF-Token": csrf_token},
+        )
+        missing = self.client.patch(
+            "/api/admin/users/999999",
+            json={"role": "user"},
+            headers={"X-CSRF-Token": csrf_token},
+        )
+
+        self.assertEqual(duplicate.status_code, 409)
+        self.assertEqual(short_password.status_code, 400)
+        self.assertEqual(missing.status_code, 404)
+
+    def test_admin_can_delete_a_user_and_all_owned_data(self):
+        csrf_token = self.register()
+        user_id = self.add_user(
+            "departing-user",
+            plex_id="deleted-plex-id",
+            plex_username="Departing Plex User",
+        )
+        now = time.time()
+        with db() as connection:
+            connection.execute(
+                "INSERT INTO plex_auth_flows "
+                "(flow_hash, pin_id, client_identifier, purpose, user_id, "
+                "created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "departing-flow",
+                    123,
+                    "client-id",
+                    "link",
+                    user_id,
+                    now,
+                    now + 600,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO request_history "
+                "(user_id, kind, mbid, name, created_at) "
+                "VALUES (?, 'artist', ?, ?, ?)",
+                (user_id, "departing-artist", "Departing Artist", now),
+            )
+            connection.execute(
+                "INSERT INTO recommendation_cache "
+                "(user_id, value, refreshed_at) VALUES (?, '{}', ?)",
+                (user_id, now),
+            )
+            connection.execute(
+                "INSERT INTO account_invitations "
+                "(token_hash, created_by, created_at, expires_at) "
+                "VALUES (?, ?, ?, ?)",
+                ("departing-invite", user_id, now, now + 600),
+            )
+            connection.execute(
+                "INSERT INTO pending_lidarr_searches "
+                "(user_id, mbid, album_id, artist_id, name, "
+                "next_attempt_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    user_id,
+                    "departing-release",
+                    41,
+                    42,
+                    "Departing Album",
+                    now,
+                    now,
+                ),
+            )
+
+        response = self.client.delete(
+            f"/api/admin/users/{user_id}",
+            headers={"X-CSRF-Token": csrf_token},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["message"], "User deleted.")
+        with db() as connection:
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM users WHERE id = ?", (user_id,)
+                ).fetchone()
+            )
+            for table, column in (
+                ("plex_auth_flows", "user_id"),
+                ("pending_lidarr_searches", "user_id"),
+                ("recommendation_cache", "user_id"),
+                ("request_history", "user_id"),
+                ("account_invitations", "created_by"),
+            ):
+                self.assertIsNone(
+                    connection.execute(
+                        f"SELECT 1 FROM {table} WHERE {column} = ?",
+                        (user_id,),
+                    ).fetchone()
+                )
+
+    def test_admin_cannot_delete_self_and_missing_user_returns_not_found(self):
+        csrf_token = self.register()
+        with db() as connection:
+            admin_id = connection.execute(
+                "SELECT id FROM users WHERE username = 'test-user'"
+            ).fetchone()["id"]
+
+        self_delete = self.client.delete(
+            f"/api/admin/users/{admin_id}",
+            headers={"X-CSRF-Token": csrf_token},
+        )
+        missing = self.client.delete(
+            "/api/admin/users/999999",
+            headers={"X-CSRF-Token": csrf_token},
+        )
+
+        self.assertEqual(self_delete.status_code, 409)
+        self.assertIn("own account", self_delete.get_json()["error"])
+        self.assertEqual(missing.status_code, 404)
 
 
 class SettingsMaintenanceTests(DatabaseTestCase):

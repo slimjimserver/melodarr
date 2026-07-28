@@ -294,6 +294,50 @@ h1 em { font-style: normal; }
 .settings-tabs button.active { border-bottom-color: var(--accent-bright); color: var(--foreground); background: rgba(168, 68, 45, .07); }
 .settings-panel[hidden] { display: none; }
 .settings-section { max-width: none; border-top: 1px solid var(--border); padding: 28px 0 34px; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; margin: -1px; clip: rect(0 0 0 0); white-space: nowrap; }
+.users-section:first-child { border-top: 0; padding-top: 0; }
+.users-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; margin-bottom: 20px; }
+.users-heading .eyebrow { margin-bottom: 8px; }
+.users-heading h2 { margin: 0 0 7px; font-size: 25px; letter-spacing: -.04em; }
+.users-heading p:last-child { max-width: 600px; margin: 0; color: var(--foreground-muted); font-size: 13px; line-height: 1.55; }
+.user-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-bottom: 20px; }
+.user-stats > div { display: grid; gap: 3px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); padding: 15px 17px; }
+.user-stats strong { color: var(--foreground); font-size: 22px; letter-spacing: -.04em; font-variant-numeric: tabular-nums; }
+.user-stats span { color: var(--foreground-muted); font-size: 11px; font-weight: 650; }
+.users-filter { max-width: 410px; margin-bottom: 9px; }
+.users-filter input { width: 100%; }
+#users-message { min-height: 18px; margin-bottom: 10px; }
+.users-table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 14px; background: rgba(255, 250, 243, .7); }
+.users-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.users-table th, .users-table td { border-bottom: 1px solid var(--border); padding: 13px 12px; text-align: left; vertical-align: middle; white-space: nowrap; }
+.users-table tr:last-child td { border-bottom: 0; }
+.users-table th { color: var(--foreground-muted); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
+.users-table th:last-child, .user-actions { text-align: right; }
+.user-identity { display: flex; min-width: 220px; align-items: center; gap: 11px; }
+.user-identity > span:last-child { display: grid; min-width: 0; gap: 3px; }
+.user-identity strong { max-width: 240px; overflow: hidden; color: var(--foreground); text-overflow: ellipsis; font-size: 13px; }
+.user-identity small { max-width: 240px; overflow: hidden; text-overflow: ellipsis; }
+.user-avatar { display: grid; position: relative; flex: 0 0 38px; width: 38px; height: 38px; overflow: hidden; place-items: center; border: 1px solid var(--border-hover); border-radius: 50%; background: linear-gradient(135deg, rgba(168, 68, 45, .25), rgba(131, 117, 168, .3)); color: var(--foreground); font-size: 13px; font-weight: 750; }
+.user-avatar img { position: absolute; inset: 0; display: block; width: 100%; height: 100%; object-fit: cover; }
+.user-avatar-large { flex-basis: 50px; width: 50px; height: 50px; font-size: 16px; }
+.user-request-count { color: var(--foreground-subtle); font-variant-numeric: tabular-nums; }
+.user-badge { display: inline-flex; align-items: center; min-height: 26px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); color: var(--foreground-subtle); padding: 4px 8px; font-size: 10px; font-weight: 700; }
+.user-type.plex { border-color: rgba(204, 123, 25, .34); background: rgba(204, 123, 25, .1); color: #9b5a0a; }
+.user-role.admin { border-color: rgba(168, 68, 45, .38); background: rgba(168, 68, 45, .1); color: var(--accent-bright); }
+.user-action-buttons { display: flex; justify-content: flex-end; gap: 7px; }
+.edit-user, .delete-user { min-width: 64px; }
+.delete-user { border-color: rgba(164, 52, 52, .3); color: var(--danger); }
+.delete-user:disabled { cursor: not-allowed; opacity: .45; }
+.user-load-error > span { display: inline-block; margin-right: 12px; }
+#user-dialog { width: min(700px, calc(100% - 28px)); }
+#user-form { padding: 27px; }
+#user-form fieldset { display: grid; gap: 16px; margin: 24px 0 0; border: 0; border-top: 1px solid var(--border); padding: 20px 0 0; }
+#user-form legend { color: var(--foreground); padding: 0 10px 0 0; font-size: 14px; font-weight: 700; }
+.user-dialog-summary { display: flex; align-items: center; gap: 13px; margin-top: 17px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); padding: 13px; }
+.user-dialog-summary > div { display: grid; min-width: 0; gap: 4px; }
+.user-dialog-summary strong { overflow: hidden; text-overflow: ellipsis; font-size: 14px; white-space: nowrap; }
+.user-dialog-summary span:last-child { overflow: hidden; color: var(--foreground-muted); text-overflow: ellipsis; font-size: 11px; white-space: nowrap; }
+#user-dialog-message { min-height: 18px; margin-top: 18px; }
 .maintenance-section:first-child { border-top: 0; padding-top: 0; }
 .maintenance-heading { display: flex; align-items: center; justify-content: space-between; gap: 22px; margin-bottom: 16px; }
 .maintenance-heading h2 { margin: 0 0 5px; font-size: 21px; letter-spacing: -.03em; }
@@ -429,6 +473,7 @@ details summary { margin-bottom: 17px; color: var(--accent-bright); cursor: poin
   .account-nav a:hover { background: rgba(168, 68, 45, .08); color: var(--foreground); }
   .history-item:hover { border-color: var(--border-hover); background: var(--surface-hover); }
   .history-plex:hover { background: rgba(229, 160, 13, .15); }
+  .delete-user:not(:disabled):hover { border-color: rgba(164, 52, 52, .58); background: rgba(164, 52, 52, .09); color: var(--danger); }
   .maintenance-table button:disabled:hover { transform: none; }
 }
 
@@ -465,6 +510,31 @@ details summary { margin-bottom: 17px; color: var(--accent-bright); cursor: poin
   .settings-hero { gap: 18px; margin-bottom: 38px; }
   .settings-tabs { margin-top: -14px; }
   .maintenance-heading { align-items: flex-start; flex-direction: column; }
+  .users-heading { align-items: stretch; flex-direction: column; }
+  .users-heading .outline { width: 100%; }
+  .user-stats { gap: 7px; }
+  .user-stats > div { padding: 12px; }
+  .user-stats strong { font-size: 19px; }
+  .users-filter { max-width: none; }
+  .users-table-wrap { overflow: visible; border: 0; background: transparent; }
+  .users-table, .users-table tbody { display: block; }
+  .users-table thead { display: none; }
+  .users-table tbody { display: grid; gap: 11px; }
+  .users-table tr { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); overflow: hidden; border: 1px solid var(--border); border-radius: 13px; background: var(--surface); }
+  .users-table td { display: grid; min-width: 0; gap: 5px; border-bottom: 0; padding: 10px 13px; white-space: normal; }
+  .users-table td::before { color: var(--foreground-muted); content: attr(data-label); font-size: 9px; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; }
+  .users-table td:first-child { grid-column: 1 / -1; border-bottom: 1px solid var(--border); padding-top: 13px; padding-bottom: 13px; }
+  .users-table td:first-child::before, .users-table .user-actions::before, .users-table .table-empty::before { display: none; }
+  .users-table .user-actions { grid-column: 1 / -1; padding-top: 3px; padding-bottom: 13px; text-align: left; }
+  .user-action-buttons { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .users-table .user-actions button { width: 100%; }
+  .users-table .table-empty { grid-column: 1 / -1; padding: 24px 16px; text-align: center; }
+  .user-identity { min-width: 0; }
+  .user-identity strong, .user-identity small { max-width: min(72vw, 380px); }
+  .user-load-error > span { display: block; margin: 0 0 12px; }
+  #user-form { padding: 22px 20px 20px; }
+  #user-form .settings-fields { grid-template-columns: 1fr; }
+  #user-form .wide-field { grid-column: auto; }
   .recommendations-heading { align-items: start; flex-direction: column; }
 
   /* Carousels run to the viewport edge so the last card is not clipped by the
@@ -770,7 +840,18 @@ button,
 :root[data-theme="midnight"] .maintenance-table-wrap,
 :root[data-theme="midnight"] .option-picker,
 :root[data-theme="midnight"] .account-nav,
-:root[data-theme="midnight"] .history-item { background: var(--surface); }
+:root[data-theme="midnight"] .history-item,
+:root[data-theme="midnight"] .users-table-wrap { background: var(--surface); }
+:root[data-theme="midnight"] .user-type.plex {
+  border-color: rgba(229, 174, 61, .42);
+  background: rgba(229, 174, 61, .1);
+  color: #f1c45f;
+}
+:root[data-theme="midnight"] .user-role.admin {
+  border-color: rgba(125, 137, 246, .5);
+  background: rgba(94, 106, 210, .16);
+  color: #aeb7ff;
+}
 :root[data-theme="midnight"] .maintenance-table .run-job {
   border-color: rgba(125, 137, 246, .55);
   color: #fff;

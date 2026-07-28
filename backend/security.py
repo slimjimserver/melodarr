@@ -47,6 +47,7 @@ def current_user():
 
 def user_payload(user, include_csrf=False):
     payload = {
+        "id": user["id"],
         "username": user["username"],
         "role": user["role"],
         "authProvider": "plex" if user["plex_id"] else "local",

@@ -203,6 +203,7 @@
 
       <nav class="settings-tabs" aria-label="Settings sections">
         <button class="active" type="button" data-settings-page="services">Services</button>
+        <button type="button" data-settings-page="users">Users</button>
         <button type="button" data-settings-page="jobs">Jobs &amp; Cache</button>
       </nav>
 
@@ -276,6 +277,47 @@
         </section>
       </div>
 
+      <div id="settings-users" class="settings-stack settings-panel" hidden>
+        <section class="settings-section users-section">
+          <div class="users-heading">
+            <div>
+              <p class="eyebrow">ACCESS &amp; ACCOUNTS</p>
+              <h2>Users</h2>
+              <p>Manage who can use Melodarr, how they sign in, and the accounts that shape their recommendations.</p>
+            </div>
+            <button id="refresh-users" class="outline" type="button">Refresh</button>
+          </div>
+          <div class="user-stats" aria-label="User summary">
+            <div><strong id="users-total">—</strong><span>Total users</span></div>
+            <div><strong id="users-plex">—</strong><span>Plex users</span></div>
+            <div><strong id="users-local">—</strong><span>Local users</span></div>
+          </div>
+          <label class="users-filter" for="users-search">
+            <span>Find a user</span>
+            <input id="users-search" type="search" placeholder="Search by username or account type…" autocomplete="off">
+          </label>
+          <p id="users-message" class="form-message" aria-live="polite"></p>
+          <div class="users-table-wrap">
+            <table class="users-table">
+              <caption class="sr-only">Melodarr users</caption>
+              <thead>
+                <tr>
+                  <th scope="col">Username</th>
+                  <th scope="col">Requests</th>
+                  <th scope="col">User type</th>
+                  <th scope="col">Role</th>
+                  <th scope="col">Joined</th>
+                  <th scope="col"><span class="sr-only">Actions</span></th>
+                </tr>
+              </thead>
+              <tbody id="users-table">
+                <tr><td colspan="6" class="table-empty">Open Users to load accounts.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+
       <div id="settings-jobs" class="settings-stack settings-panel" hidden>
         <section class="settings-section maintenance-section">
           <div class="maintenance-heading">
@@ -342,6 +384,64 @@
       <div class="dialog-actions">
         <button type="button" class="close-dialog">Cancel</button>
         <button>Add artist</button>
+      </div>
+    </form>
+  </dialog>
+  <dialog id="user-dialog" aria-labelledby="user-dialog-title">
+    <form id="user-form">
+      <div class="dialog-title">
+        <div>
+          <p class="eyebrow">EDIT USER</p>
+          <h2 id="user-dialog-title">User settings</h2>
+        </div>
+        <button type="button" class="close-dialog close-user-dialog" aria-label="Close user settings">×</button>
+      </div>
+      <div class="user-dialog-summary">
+        <span id="user-dialog-avatar" class="user-avatar user-avatar-large" aria-hidden="true"></span>
+        <div>
+          <strong id="user-dialog-name"></strong>
+          <span id="user-dialog-account"></span>
+        </div>
+      </div>
+      <fieldset>
+        <legend>Account access</legend>
+        <div class="settings-fields">
+          <label>Role
+            <small id="user-role-help">Controls access to administrative settings.</small>
+            <select name="role">
+              <option value="user">User</option>
+              <option value="admin">Administrator</option>
+            </select>
+          </label>
+          <label>Local username
+            <small id="user-local-help">Used for local sign-in.</small>
+            <input name="localUsername" autocomplete="username" minlength="3" maxlength="32" required>
+          </label>
+          <label class="wide-field">New password
+            <small id="user-password-help">Leave blank to keep the current password. Passwords must be at least 12 characters.</small>
+            <input name="password" type="password" autocomplete="new-password" minlength="12">
+          </label>
+        </div>
+      </fieldset>
+      <fieldset>
+        <legend>Recommendation accounts</legend>
+        <div class="settings-fields">
+          <label>ListenBrainz username
+            <input name="listenbrainzUsername" autocomplete="off" placeholder="listenbrainz-name">
+          </label>
+          <label>Last.fm username
+            <input name="lastfmUsername" autocomplete="off" placeholder="lastfm-name">
+          </label>
+          <label class="wide-field">Last.fm API key
+            <small>Leave blank to keep the saved key.</small>
+            <input name="lastfmApiKey" type="password" autocomplete="off" placeholder="Saved key remains unchanged">
+          </label>
+        </div>
+      </fieldset>
+      <p id="user-dialog-message" class="form-message" aria-live="polite"></p>
+      <div class="dialog-actions">
+        <button type="button" class="close-dialog close-user-dialog">Cancel</button>
+        <button id="save-user" type="submit">Save user</button>
       </div>
     </form>
   </dialog>
