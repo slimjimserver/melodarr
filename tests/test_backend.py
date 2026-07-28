@@ -142,6 +142,14 @@ class DatabaseTestCase(unittest.TestCase):
             lastSuccessfulAt=None,
             nextExecutionAt=None,
             lastError=None,
+            pages=0,
+            scanned=0,
+            tracks=0,
+            normalized=0,
+            selected=0,
+            sections=0,
+            cachedArtists=0,
+            cachedAlbums=0,
             fetched=0,
             mapped=0,
             inserted=0,
@@ -7073,8 +7081,14 @@ class PlexHistoryClientTests(unittest.TestCase):
             "server-token",
         )
 
+    @patch(
+        "backend.services.plex_history.plex.cached_library_index",
+        return_value={},
+    )
     @patch("backend.services.plex_history.requests.get")
-    def test_history_is_paginated_and_normalized_without_track_metadata(self, get):
+    def test_history_is_paginated_and_normalized_without_track_metadata(
+        self, get, _cached_library_index
+    ):
         get.side_effect = [
             Response(payload={"MediaContainer": {
                 "totalSize": 2,
@@ -7085,6 +7099,7 @@ class PlexHistoryClientTests(unittest.TestCase):
                     "historyKey": "/status/sessions/history/100",
                     "grandparentRatingKey": "artist-10",
                     "parentRatingKey": "album-20",
+                    "librarySectionID": "music",
                     "viewedAt": 1_000,
                     "User": {"id": 1, "title": "Listener"},
                     "title": "Intentionally not persisted",
@@ -7098,6 +7113,7 @@ class PlexHistoryClientTests(unittest.TestCase):
                     "type": "track",
                     "historyKey": "/status/sessions/history/101",
                     "grandparentRatingKey": "artist-11",
+                    "librarySectionID": "music",
                     "viewedAt": 2_000,
                     "accountID": 2,
                 }],
@@ -7132,13 +7148,176 @@ class PlexHistoryClientTests(unittest.TestCase):
             get.call_args_list[1].kwargs["params"]["X-Plex-Container-Start"],
             1,
         )
-        self.assertEqual(
-            get.call_args_list[0].kwargs["params"]["librarySectionID"],
-            "music",
-        )
+        history_params = get.call_args_list[0].kwargs["params"]
+        self.assertEqual(history_params["sort"], "viewedAt:desc")
+        self.assertNotIn("librarySectionID", history_params)
+        self.assertNotIn("viewedAt>", history_params)
+        self.assertNotIn("type", history_params)
+        self.assertNotIn("viewedAt>=", history_params)
+        self.assertNotIn("viewedAt<=", history_params)
+
+    @patch(
+        "backend.services.plex_history.plex.cached_library_index",
+        return_value={},
+    )
+    @patch("backend.services.plex_history.requests.get")
+    def test_history_enforces_exact_window_and_track_type_client_side(
+        self, get, _cached_library_index
+    ):
+        get.return_value = Response(payload={"MediaContainer": {
+            "totalSize": 4,
+            "offset": 0,
+            "size": 4,
+            "Metadata": [
+                {
+                    "type": "track",
+                    "historyKey": "too-old",
+                    "grandparentRatingKey": "artist-1",
+                    "librarySectionID": "music",
+                    "viewedAt": 499,
+                    "accountID": 1,
+                },
+                {
+                    "type": "movie",
+                    "historyKey": "movie",
+                    "grandparentRatingKey": "artist-1",
+                    "librarySectionID": "music",
+                    "viewedAt": 1_000,
+                    "accountID": 1,
+                },
+                {
+                    "type": "track",
+                    "historyKey": "in-window",
+                    "grandparentRatingKey": "artist-1",
+                    "librarySectionID": "music",
+                    "viewedAt": 1_500,
+                    "accountID": 1,
+                },
+                {
+                    "type": "track",
+                    "historyKey": "other-section",
+                    "grandparentRatingKey": "artist-1",
+                    "librarySectionID": "other-music",
+                    "viewedAt": 1_600,
+                    "accountID": 1,
+                },
+            ],
+        }})
+
+        events = list(plex_history.iter_history(
+            {"url": "http://plex:32400", "token": "token"},
+            since=500,
+            until=2_000,
+            section_ids=["music"],
+        ))
+
+        self.assertEqual([event["history_key"] for event in events], [
+            "in-window",
+        ])
+
+    @patch("backend.services.plex_history.plex.cached_library_index")
+    @patch("backend.services.plex_history.requests.get")
+    def test_history_accepts_key_paths_legacy_children_and_missing_section(
+        self, get, cached_library_index
+    ):
+        cached_library_index.return_value = {
+            "artistsByRatingKey": {"artist-42": {"ratingKey": "artist-42"}},
+            "releaseGroupsByRatingKey": {
+                "album-84": {"ratingKey": "album-84"},
+            },
+        }
+        get.return_value = Response(payload={
+            "size": 1,
+            "_children": [{
+                "type": "track",
+                "historyKey": "/status/sessions/history/200",
+                "grandparentKey": "/library/metadata/artist-42",
+                "parentKey": "/library/metadata/album-84",
+                "viewedAt": 1_500,
+                "_children": [{
+                    "_elementType": "User",
+                    "id": 7,
+                    "title": "Listener",
+                }],
+            }],
+        })
+        diagnostics = {}
+
+        events = list(plex_history.iter_history(
+            {"url": "http://plex:32400", "token": "token"},
+            since=500,
+            until=2_000,
+            section_ids=["music"],
+            diagnostics=diagnostics,
+        ))
+
+        self.assertEqual(events, [{
+            "history_key": "/status/sessions/history/200",
+            "account_id": "7",
+            "artist_rating_key": "artist-42",
+            "album_rating_key": "album-84",
+            "played_at": 1_500.0,
+        }])
+        self.assertEqual(diagnostics, {
+            "pages": 1,
+            "scanned": 1,
+            "tracks": 1,
+            "normalized": 1,
+            "selected": 1,
+            "sections": 1,
+            "cachedArtists": 1,
+            "cachedAlbums": 1,
+        })
 
 
 class PlexHistoryWorkerTests(DatabaseTestCase):
+    @patch("backend.workers.plex_history.plex_history.iter_history")
+    @patch("backend.workers.plex_history.plex_history.accounts")
+    def test_sync_maps_exact_plex_id_when_server_alias_differs(
+        self, accounts, iter_history
+    ):
+        self.register()
+        with db() as connection:
+            connection.execute(
+                "UPDATE users SET plex_username = ?, plex_id = ? "
+                "WHERE username = 'test-user'",
+                ("bitemyear", "50651486"),
+            )
+            user_id = connection.execute(
+                "SELECT id FROM users WHERE username = 'test-user'"
+            ).fetchone()["id"]
+        accounts.return_value = [{
+            "account_id": "50651486",
+            "aliases": ("Family Account",),
+        }]
+        iter_history.return_value = iter([{
+            "history_key": "family-history-1",
+            "account_id": "50651486",
+            "artist_rating_key": "artist-1",
+            "album_rating_key": "album-1",
+            "played_at": 2_000.0,
+        }])
+
+        result = plex_history_worker.synchronize(
+            {
+                "url": "http://plex:32400",
+                "token": "token",
+                "machineIdentifier": "server-1",
+                "librarySectionIds": ["music"],
+            },
+            full=True,
+            now=3_000.0,
+        )
+
+        self.assertEqual(result["fetched"], 1)
+        self.assertEqual(result["mapped"], 1)
+        self.assertEqual(result["inserted"], 1)
+        rows = get_plex_listens(user_id, 0, server_id="server-1")
+        self.assertEqual(
+            [row["history_key"] for row in rows],
+            ["family-history-1"],
+        )
+
     @patch("backend.workers.plex_history.plex_history.iter_history")
     @patch("backend.workers.plex_history.plex_history.accounts")
     def test_sync_maps_accounts_case_insensitively_and_stores_only_play_keys(
@@ -7199,6 +7378,34 @@ class PlexHistoryWorkerTests(DatabaseTestCase):
             "album_rating_key",
             "played_at",
         })
+
+    @patch("backend.workers.plex_history._linked_user_indexes")
+    @patch("backend.workers.plex_history.plex_history.accounts")
+    def test_account_map_rejects_conflicting_id_and_alias_matches(
+        self, accounts, linked_user_indexes
+    ):
+        accounts.return_value = [{
+            "account_id": "50651486",
+            "aliases": ("Family Account",),
+        }]
+        linked_user_indexes.return_value = (
+            {"50651486": {8}},
+            {"family account": {9}},
+        )
+
+        with self.assertLogs(
+            "backend.workers.plex_history", level="WARNING"
+        ) as logs:
+            result = plex_history_worker._account_user_map({
+                "url": "http://plex:32400",
+                "token": "token",
+            })
+
+        self.assertEqual(result, {})
+        self.assertIn(
+            "account ID and aliases match different linked users",
+            "\n".join(logs.output),
+        )
 
 
 class PlexAuthenticationClientTests(unittest.TestCase):

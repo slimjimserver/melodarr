@@ -44,6 +44,14 @@ job_state = {
     "lastSuccessfulAt": None,
     "nextExecutionAt": None,
     "lastError": None,
+    "pages": 0,
+    "scanned": 0,
+    "tracks": 0,
+    "normalized": 0,
+    "selected": 0,
+    "sections": 0,
+    "cachedArtists": 0,
+    "cachedAlbums": 0,
     "fetched": 0,
     "mapped": 0,
     "inserted": 0,
@@ -73,50 +81,64 @@ def status():
     return dict(job_state)
 
 
-def _linked_users_by_username():
-    """Return only unambiguous case-insensitive Plex username mappings."""
+def _linked_user_indexes():
+    """Index linked users by global Plex ID and username-like aliases."""
     with db() as connection:
         rows = connection.execute(
-            "SELECT id, plex_username FROM users "
-            "WHERE plex_id IS NOT NULL "
-            "AND NULLIF(TRIM(plex_username), '') IS NOT NULL"
+            "SELECT id, plex_id, plex_username FROM users "
+            "WHERE plex_id IS NOT NULL"
         ).fetchall()
+    users_by_plex_id = {}
     users_by_name = {}
-    ambiguous = set()
     for row in rows:
+        plex_id = str(row["plex_id"] or "").strip()
+        if plex_id:
+            users_by_plex_id.setdefault(plex_id, set()).add(row["id"])
         username = str(row["plex_username"] or "").strip().casefold()
-        if not username:
-            continue
-        previous = users_by_name.get(username)
-        if previous is not None and previous != row["id"]:
-            ambiguous.add(username)
-        else:
-            users_by_name[username] = row["id"]
-    for username in ambiguous:
-        users_by_name.pop(username, None)
-    if ambiguous:
-        logger.warning(
-            "Ignoring ambiguous linked Plex usernames: %s",
-            ", ".join(sorted(ambiguous)),
-        )
-    return users_by_name
+        if username:
+            users_by_name.setdefault(username, set()).add(row["id"])
+    return users_by_plex_id, users_by_name
 
 
 def _account_user_map(config):
-    users_by_name = _linked_users_by_username()
+    users_by_plex_id, users_by_name = _linked_user_indexes()
     result = {}
     for account in plex_history.accounts(config):
-        user_ids = {
-            users_by_name[alias.strip().casefold()]
+        account_id = str(account["account_id"]).strip()
+        direct_user_ids = users_by_plex_id.get(account_id, set())
+        alias_user_ids = {
+            user_id
             for alias in account["aliases"]
-            if alias.strip().casefold() in users_by_name
+            for user_id in users_by_name.get(
+                alias.strip().casefold(), set()
+            )
         }
-        if len(user_ids) == 1:
-            result[account["account_id"]] = next(iter(user_ids))
-        elif len(user_ids) > 1:
+        if len(direct_user_ids) > 1:
+            logger.warning(
+                "Ignoring Plex account %s because its account ID matches "
+                "multiple linked users",
+                account_id,
+            )
+            continue
+        if (
+            direct_user_ids
+            and alias_user_ids
+            and direct_user_ids != alias_user_ids
+        ):
+            logger.warning(
+                "Ignoring Plex account %s because its account ID and aliases "
+                "match different linked users",
+                account_id,
+            )
+            continue
+        if len(direct_user_ids) == 1:
+            result[account_id] = next(iter(direct_user_ids))
+        elif len(alias_user_ids) == 1:
+            result[account_id] = next(iter(alias_user_ids))
+        elif len(alias_user_ids) > 1:
             logger.warning(
                 "Ignoring Plex account %s because its aliases match multiple users",
-                account["account_id"],
+                account_id,
             )
     return result
 
@@ -159,10 +181,21 @@ def synchronize(config, *, full=False, now=None):
     mapped = 0
     inserted = 0
     batch = []
+    diagnostics = {
+        "pages": 0,
+        "scanned": 0,
+        "tracks": 0,
+        "normalized": 0,
+        "selected": 0,
+        "sections": 0,
+        "cachedArtists": 0,
+        "cachedAlbums": 0,
+    }
     for event in plex_history.iter_history(
         config,
         since=since,
         until=now,
+        diagnostics=diagnostics,
     ):
         fetched += 1
         if event["played_at"] < since or event["played_at"] > now:
@@ -188,6 +221,7 @@ def synchronize(config, *, full=False, now=None):
     pruned = prune_plex_listens(retention_cutoff)
     stats = plex_listen_stats(server_id=server_id)
     return {
+        **diagnostics,
         "fetched": fetched,
         "mapped": mapped,
         "inserted": inserted,
@@ -204,6 +238,14 @@ def _run_sync(*, full=False):
     job_state.update(
         running=True,
         lastError=None,
+        pages=0,
+        scanned=0,
+        tracks=0,
+        normalized=0,
+        selected=0,
+        sections=0,
+        cachedArtists=0,
+        cachedAlbums=0,
         fetched=0,
         mapped=0,
         inserted=0,
