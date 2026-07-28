@@ -8,6 +8,7 @@ if __package__:
     from .workers import lidarr_searches as lidarr_search_worker
     from .workers import lidarr_library as lidarr_library_worker
     from .workers import plex as plex_worker
+    from .workers import plex_history as plex_history_worker
     from .workers import plex_metadata as plex_metadata_worker
     from .workers import recommendations as recommendation_worker
 else:  # Support `python backend/worker.py` for local development.
@@ -16,6 +17,7 @@ else:  # Support `python backend/worker.py` for local development.
     from workers import lidarr_searches as lidarr_search_worker
     from workers import lidarr_library as lidarr_library_worker
     from workers import plex as plex_worker
+    from workers import plex_history as plex_history_worker
     from workers import plex_metadata as plex_metadata_worker
     from workers import recommendations as recommendation_worker
 
@@ -53,6 +55,12 @@ def main():
         daemon=True,
     )
     plex_metadata_thread.start()
+    plex_history_thread = Thread(
+        target=plex_history_worker.run,
+        name="plex-listening-history",
+        daemon=True,
+    )
+    plex_history_thread.start()
     recommendation_worker.run()
 
 

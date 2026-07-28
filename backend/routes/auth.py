@@ -26,6 +26,7 @@ if __package__ == "backend.routes":
     from ..services import plex, plex_auth
     from ..storage import db, get_service, save_service
     from ..workers import plex as plex_worker
+    from ..workers import plex_history as plex_history_worker
 else:  # Support the existing `python backend/app.py` entry point.
     from api_cache import clear_cache
     from detail_cache import invalidate_all as invalidate_detail_payloads
@@ -40,6 +41,7 @@ else:  # Support the existing `python backend/app.py` entry point.
     from services import plex, plex_auth
     from storage import db, get_service, save_service
     from workers import plex as plex_worker
+    from workers import plex_history as plex_history_worker
 
 
 blueprint = Blueprint("auth", __name__)
@@ -195,6 +197,7 @@ def _finish_plex_login(account, resources):
     if not has_access:
         return api_error("Your Plex account does not have access to this server.", 403)
 
+    created = False
     try:
         with db() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -219,6 +222,7 @@ def _finish_plex_login(account, resources):
                         409,
                     )
                 user = _create_plex_user(connection, account, "user")
+                created = True
             else:
                 connection.execute(
                     "UPDATE users SET plex_username = ?, plex_email = ?, plex_avatar = ? "
@@ -235,6 +239,8 @@ def _finish_plex_login(account, resources):
                 ).fetchone()
     except sqlite3.IntegrityError:
         return api_error("That Plex account is already linked to another user.", 409)
+    if created:
+        plex_history_worker.request_full_sync()
     return start_session(user, remember=True)
 
 
@@ -305,6 +311,7 @@ def _finish_plex_link(flow, account, resources):
         "Plex account linked. You can now sign in with either your local "
         "credentials or Plex."
     )
+    plex_history_worker.request_full_sync()
     return jsonify(payload)
 
 
@@ -687,6 +694,7 @@ def complete_plex_server():
     clear_cache("plex-guid")
     invalidate_detail_payloads()
     plex_worker.request_full_scan()
+    plex_history_worker.request_full_sync()
     return start_session(user, remember=True)
 
 

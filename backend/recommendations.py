@@ -2,6 +2,7 @@
 
 import logging
 import math
+import time
 from datetime import datetime, timezone
 
 import requests
@@ -12,6 +13,7 @@ if __package__:
     from .storage import (
         get_request_history,
         get_lastfm_api_key,
+        get_plex_listens,
         get_service,
         recommendation_users,
         save_recommendation_cache,
@@ -22,6 +24,7 @@ else:  # Support the existing `python backend/app.py` entry point.
     from storage import (
         get_request_history,
         get_lastfm_api_key,
+        get_plex_listens,
         get_service,
         recommendation_users,
         save_recommendation_cache,
@@ -250,6 +253,12 @@ def _release_recency_score(first_release_date):
     return max(0.72, 1.24 - age * 0.02)
 
 
+def _lastfm_provider_get(method, username, api_key, **extra):
+    if username:
+        return lastfm.get(method, username, api_key, **extra)
+    return lastfm.get_public(method, api_key, **extra)
+
+
 def _artist_tags(artist, username, api_key):
     identifier = {"mbid": artist["id"]} if artist.get("id") else {
         "artist": artist.get("name", "")
@@ -257,7 +266,7 @@ def _artist_tags(artist, username, api_key):
     if not next(iter(identifier.values())):
         return []
     try:
-        tags = lastfm.get(
+        tags = _lastfm_provider_get(
             "artist.gettoptags", username, api_key, **identifier
         ).get("toptags", {}).get("tag", [])
     except (ValueError, requests.RequestException):
@@ -269,16 +278,47 @@ def _artist_tags(artist, username, api_key):
     ]
 
 
-def lastfm_recommendations(
-    username,
+def _expanded_tag_weights(tag_weights, api_key, limit=5):
+    """Expand high-signal Plex labels without turning them into global charts."""
+    expanded = {
+        str(name).strip().casefold(): float(weight)
+        for name, weight in (tag_weights or {}).items()
+        if str(name).strip() and float(weight or 0) > 0
+    }
+    for name, weight in sorted(
+        expanded.items(), key=lambda item: item[1], reverse=True
+    )[:limit]:
+        try:
+            response = lastfm.get_public("tag.getsimilar", api_key, tag=name)
+        except (ValueError, requests.RequestException):
+            continue
+        similar = response.get("similartags", {}).get("tag", [])
+        for rank, item in enumerate(similar[:limit]):
+            similar_name = str(item.get("name", "")).strip().casefold()
+            if not similar_name:
+                continue
+            inferred_weight = weight * 0.35 / math.sqrt(rank + 1)
+            expanded[similar_name] = max(
+                expanded.get(similar_name, 0),
+                inferred_weight,
+            )
+    return expanded
+
+
+def seeded_lastfm_recommendations(
+    seeds,
     api_key,
     *,
+    username=None,
+    taste_tag_weights=None,
+    listened_album_names=None,
+    expand_similar_tags=False,
     excluded_artist_ids=None,
     excluded_artist_names=None,
     excluded_album_ids=None,
     excluded_album_names=None,
 ):
-    """Build weighted, novelty-aware suggestions from a user's listening history."""
+    """Build novelty-aware suggestions from weighted artists and taste labels."""
     excluded_artist_ids = set(excluded_artist_ids or ())
     excluded_artist_names = {
         str(name).casefold() for name in (excluded_artist_names or ()) if name
@@ -289,16 +329,14 @@ def lastfm_recommendations(
         for artist, title in (excluded_album_names or ())
         if artist and title
     }
-    seeds = _lastfm_taste_artists(username, api_key)
-    try:
-        profile_tags = lastfm_top_tags(username, api_key, limit=10)
-    except (ValueError, requests.RequestException):
-        profile_tags = []
+    listened_album_names = set(listened_album_names or ())
     taste_tag_weights = {
-        str(tag.get("name", "")).strip().casefold(): 1 / math.sqrt(rank + 1)
-        for rank, tag in enumerate(profile_tags)
-        if str(tag.get("name", "")).strip()
+        str(name).strip().casefold(): float(weight)
+        for name, weight in (taste_tag_weights or {}).items()
+        if str(name).strip()
     }
+    if expand_similar_tags:
+        taste_tag_weights = _expanded_tag_weights(taste_tag_weights, api_key)
     seed_ids = {seed["id"] for seed in seeds if seed.get("id")}
     seed_names = {seed["name"].casefold() for seed in seeds if seed.get("name")}
 
@@ -310,7 +348,7 @@ def lastfm_recommendations(
             "artist": seed.get("name", "")
         }
         try:
-            similar = lastfm.get(
+            similar = _lastfm_provider_get(
                 "artist.getsimilar", username, api_key, limit=12, **identifier
             ).get("similarartists", {}).get("artist", [])
             successful_similarity_requests += 1
@@ -349,6 +387,17 @@ def lastfm_recommendations(
     ranked_candidates = sorted(
         candidates.values(), key=lambda item: item["score"], reverse=True
     )
+    candidate_tags = {}
+    if expand_similar_tags and taste_tag_weights:
+        for candidate in ranked_candidates[:20]:
+            tags = _artist_tags(candidate, username, api_key)
+            candidate_tags[candidate["id"]] = tags
+            affinity = sum(
+                taste_tag_weights.get(tag.casefold(), 0) for tag in tags
+            )
+            candidate["score"] *= 1 + min(0.3, affinity * 0.08)
+        ranked_candidates.sort(key=lambda item: item["score"], reverse=True)
+
     artists = []
     for candidate in ranked_candidates[:20]:
         seed_names_text = ", ".join(sorted(candidate["seedNames"])[:2])
@@ -364,12 +413,13 @@ def lastfm_recommendations(
             "coverArt": artist_cover_art(candidate["id"]),
         })
 
-    listened_albums = _lastfm_listened_albums(username, api_key)
     albums = {}
     for artist_rank, artist in enumerate(artists[:LASTFM_ALBUM_ARTIST_LIMIT]):
-        taste_tags = _artist_tags(artist, username, api_key)
+        taste_tags = candidate_tags.get(artist["id"])
+        if taste_tags is None:
+            taste_tags = _artist_tags(artist, username, api_key)
         try:
-            top_albums = lastfm.get(
+            top_albums = _lastfm_provider_get(
                 "artist.gettopalbums",
                 username,
                 api_key,
@@ -389,7 +439,7 @@ def lastfm_recommendations(
             album_key = (artist_name.casefold(), name.casefold())
             if (
                 not name
-                or album_key in listened_albums
+                or album_key in listened_album_names
                 or album_key in excluded_album_names
             ):
                 continue
@@ -434,6 +484,39 @@ def lastfm_recommendations(
     return artists, sorted(
         albums.values(), key=lambda item: item["score"], reverse=True
     )[: LASTFM_ALBUM_ARTIST_LIMIT * LASTFM_ALBUMS_PER_ARTIST]
+
+
+def lastfm_recommendations(
+    username,
+    api_key,
+    *,
+    excluded_artist_ids=None,
+    excluded_artist_names=None,
+    excluded_album_ids=None,
+    excluded_album_names=None,
+):
+    """Build weighted suggestions from one linked Last.fm profile."""
+    seeds = _lastfm_taste_artists(username, api_key)
+    try:
+        profile_tags = lastfm_top_tags(username, api_key, limit=10)
+    except (ValueError, requests.RequestException):
+        profile_tags = []
+    taste_tag_weights = {
+        str(tag.get("name", "")).strip().casefold(): 1 / math.sqrt(rank + 1)
+        for rank, tag in enumerate(profile_tags)
+        if str(tag.get("name", "")).strip()
+    }
+    return seeded_lastfm_recommendations(
+        seeds,
+        api_key,
+        username=username,
+        taste_tag_weights=taste_tag_weights,
+        listened_album_names=_lastfm_listened_albums(username, api_key),
+        excluded_artist_ids=excluded_artist_ids,
+        excluded_artist_names=excluded_artist_names,
+        excluded_album_ids=excluded_album_ids,
+        excluded_album_names=excluded_album_names,
+    )
 
 
 def lastfm_album_mbid(album, username, api_key):
@@ -561,6 +644,110 @@ def lastfm_top_tags(username, api_key, limit=10):
     return sorted(aggregated.values(), key=lambda tag: tag["count"], reverse=True)[:limit]
 
 
+PLEX_HISTORY_DAYS = 365
+PLEX_HISTORY_ARTIST_LIMIT = 12
+PLEX_TAG_KIND_WEIGHTS = {
+    "genres": 1.0,
+    "styles": 0.8,
+    "moods": 0.45,
+}
+
+
+def _plex_play_weight(played_at, now):
+    age_days = max(0, (now - float(played_at or 0)) / (24 * 60 * 60))
+    if age_days <= 30:
+        return 1.0
+    if age_days <= 180:
+        return 0.65
+    return 0.35
+
+
+def plex_taste_profile(user_id, config, *, now=None):
+    """Build weighted artist and tag seeds from normalized Plex play events."""
+    now = time.time() if now is None else now
+    server_id = str(config.get("machineIdentifier") or config.get("url") or "")
+    listens = get_plex_listens(
+        user_id,
+        now - PLEX_HISTORY_DAYS * 24 * 60 * 60,
+        server_id=server_id,
+    )
+    index = plex.cached_library_index(config)
+    artists_by_rating_key = index.get("artistsByRatingKey", {})
+    albums_by_rating_key = index.get("releaseGroupsByRatingKey", {})
+    artists = {}
+    tag_scores = {}
+
+    for listen in listens:
+        artist = artists_by_rating_key.get(str(listen["artist_rating_key"]))
+        artist_id = str((artist or {}).get("musicbrainzId") or "")
+        artist_name = str((artist or {}).get("name") or "").strip()
+        if not artist_id or not artist_name:
+            continue
+        play_weight = _plex_play_weight(listen["played_at"], now)
+        entry = artists.setdefault(artist_id, {
+            "id": artist_id,
+            "name": artist_name,
+            "score": 0.0,
+            "playCount": 0,
+        })
+        entry["score"] += play_weight
+        entry["playCount"] += 1
+
+        album_key = str(listen["album_rating_key"] or "")
+        album = albums_by_rating_key.get(album_key) if album_key else None
+        for kind, kind_weight in PLEX_TAG_KIND_WEIGHTS.items():
+            play_tags = {
+                str(value).strip().casefold()
+                for item in (artist, album)
+                if item
+                for value in item.get(kind, [])
+                if str(value).strip()
+            }
+            for tag in play_tags:
+                tag_scores[tag] = (
+                    tag_scores.get(tag, 0.0) + play_weight * kind_weight
+                )
+
+    seeds = sorted(
+        artists.values(),
+        key=lambda item: (item["score"], item["playCount"]),
+        reverse=True,
+    )[:PLEX_HISTORY_ARTIST_LIMIT]
+    maximum_tag_score = max(tag_scores.values(), default=0)
+    normalized_tags = {
+        tag: score / maximum_tag_score
+        for tag, score in tag_scores.items()
+        if maximum_tag_score
+    }
+    return seeds, normalized_tags
+
+
+def plex_history_recommendations(
+    user_id,
+    config,
+    api_key,
+    *,
+    excluded_artist_ids=None,
+    excluded_artist_names=None,
+    excluded_album_ids=None,
+    excluded_album_names=None,
+):
+    """Recommend from Plex plays while resolving all music through its snapshot."""
+    seeds, taste_tag_weights = plex_taste_profile(user_id, config)
+    if not seeds:
+        return [], []
+    return seeded_lastfm_recommendations(
+        seeds,
+        api_key,
+        taste_tag_weights=taste_tag_weights,
+        expand_similar_tags=True,
+        excluded_artist_ids=excluded_artist_ids,
+        excluded_artist_names=excluded_artist_names,
+        excluded_album_ids=excluded_album_ids,
+        excluded_album_names=excluded_album_names,
+    )
+
+
 def _user_value(user, key, default=None):
     try:
         return user[key]
@@ -647,6 +834,59 @@ def _recommendation_exclusions(user, shared_exclusions=None):
     return excluded
 
 
+def _deduplicate_recommendations(items):
+    """Merge provider results by MusicBrainz entity while retaining provenance."""
+    merged = {}
+    ordered_ids = []
+    for item in items:
+        item_id = str(item.get("id") or "")
+        if not item_id:
+            continue
+        if item_id not in merged:
+            merged[item_id] = dict(item)
+            ordered_ids.append(item_id)
+            continue
+        existing = merged[item_id]
+        for key, value in item.items():
+            if key not in existing or existing[key] in (None, "", []):
+                existing[key] = value
+        sources = []
+        for source in (
+            existing.get("recommendationSource"),
+            item.get("recommendationSource"),
+        ):
+            if source and source not in sources:
+                sources.append(source)
+        if sources:
+            existing["recommendationSource"] = " + ".join(sources)
+        try:
+            existing["score"] = max(
+                float(existing.get("score") or 0),
+                float(item.get("score") or 0),
+            )
+        except (TypeError, ValueError):
+            pass
+    return [merged[item_id] for item_id in ordered_ids]
+
+
+def _deduplicate_tag_rows(payload):
+    seen_album_ids = {
+        str(album.get("id") or "") for album in payload.get("albums", [])
+    }
+    rows = []
+    for row in payload.get("tagRows", []):
+        albums = []
+        for album in row.get("albums", []):
+            album_id = str(album.get("id") or "")
+            if not album_id or album_id in seen_album_ids:
+                continue
+            seen_album_ids.add(album_id)
+            albums.append(album)
+        if albums:
+            rows.append({**row, "albums": albums})
+    payload["tagRows"] = rows
+
+
 def build_recommendation_cache(user, *, shared_exclusions=None):
     payload = {
         "artists": [],
@@ -656,15 +896,22 @@ def build_recommendation_cache(user, *, shared_exclusions=None):
         "providerStatus": {
             "listenbrainz": "disabled",
             "lastfm": "disabled",
+            "plexHistory": "disabled",
         },
     }
     has_listenbrainz = bool(_user_value(user, "listenbrainz_username"))
     lastfm_api_key = get_lastfm_api_key()
+    plex_config = get_service("plex")
     has_lastfm = bool(
         _user_value(user, "lastfm_username")
         and lastfm_api_key
     )
-    if not has_listenbrainz and not has_lastfm:
+    has_plex_history = bool(
+        _user_value(user, "plex_id")
+        and plex_config
+        and lastfm_api_key
+    )
+    if not has_listenbrainz and not has_lastfm and not has_plex_history:
         return payload
 
     exclusions = _recommendation_exclusions(user, shared_exclusions)
@@ -689,6 +936,38 @@ def build_recommendation_cache(user, *, shared_exclusions=None):
             logger.warning(
                 "ListenBrainz recommendations unavailable for %s: %s",
                 user["listenbrainz_username"],
+                exc,
+            )
+    if has_plex_history:
+        try:
+            artists, albums = plex_history_recommendations(
+                user["id"],
+                plex_config,
+                lastfm_api_key,
+                excluded_artist_ids=exclusions["artist_ids"],
+                excluded_artist_names=exclusions["artist_names"],
+                excluded_album_ids=exclusions["album_ids"],
+                excluded_album_names=exclusions["album_names"],
+            )
+            payload["artists"].extend(
+                {**item, "recommendationSource": "Plex history · Last.fm"}
+                for item in artists
+            )
+            payload["albums"].extend(
+                {
+                    **{key: value for key, value in item.items() if key != "tasteTags"},
+                    "recommendationSource": "Plex history · Last.fm",
+                }
+                for item in albums[:LASTFM_PRIMARY_ALBUM_LIMIT]
+            )
+            payload["providerStatus"]["plexHistory"] = (
+                "ok" if artists or albums else "empty"
+            )
+        except (ValueError, requests.RequestException) as exc:
+            payload["providerStatus"]["plexHistory"] = "unavailable"
+            logger.warning(
+                "Plex-history recommendations unavailable for %s: %s",
+                user["username"],
                 exc,
             )
     if user["lastfm_username"] and lastfm_api_key:
@@ -831,6 +1110,9 @@ def build_recommendation_cache(user, *, shared_exclusions=None):
             if mapped:
                 payload["tagRows"].append({"tag": tag_name, "albums": mapped})
         payload["providerStatus"]["lastfm"] = "partial" if lastfm_failed else "ok"
+    payload["artists"] = _deduplicate_recommendations(payload["artists"])
+    payload["albums"] = _deduplicate_recommendations(payload["albums"])
+    _deduplicate_tag_rows(payload)
     return payload
 
 
@@ -844,6 +1126,11 @@ def refresh_recommendation_cache():
                 _user_value(user, "listenbrainz_username")
                 or (
                     _user_value(user, "lastfm_username")
+                    and lastfm_api_key
+                )
+                or (
+                    _user_value(user, "plex_id")
+                    and get_service("plex")
                     and lastfm_api_key
                 )
             )

@@ -33,7 +33,12 @@ else:  # Support the existing `python backend/app.py` entry point.
 
 
 scan_lock = RLock()
-SNAPSHOT_VERSION = 4
+SNAPSHOT_VERSION = 5
+METADATA_TAG_FIELDS = {
+    "genres": "Genre",
+    "styles": "Style",
+    "moods": "Mood",
+}
 
 
 def _index_key(snapshot_id):
@@ -177,6 +182,36 @@ def _plex_metadata_guid(guids, media_type):
     ), "")
 
 
+def _metadata_tags(item, child_name):
+    """Normalize Plex metadata tags while preserving their display spelling."""
+    children = item.get(child_name, [])
+    if isinstance(children, (dict, str)):
+        children = [children]
+    elif not isinstance(children, (list, tuple)):
+        return []
+
+    tags = []
+    seen = set()
+    for child in children:
+        value = child.get("tag") if isinstance(child, dict) else child
+        if not isinstance(value, str):
+            continue
+        value = " ".join(value.split())
+        identity = value.casefold()
+        if not value or identity in seen:
+            continue
+        seen.add(identity)
+        tags.append(value)
+    return tags
+
+
+def _metadata_tag_fields(item):
+    return {
+        field_name: _metadata_tags(item, child_name)
+        for field_name, child_name in METADATA_TAG_FIELDS.items()
+    }
+
+
 def _normalize_artist(config, section, item):
     guids = _guids(item)
     rating_key = str(item.get("ratingKey", ""))
@@ -192,6 +227,7 @@ def _normalize_artist(config, section, item):
         "plexGuid": plex_guid,
         "guids": guids,
         "musicbrainzId": _musicbrainz_id(guids),
+        **_metadata_tag_fields(item),
         "url": _plex_url(config, item.get("key", "")),
         "plexampUrl": _plexamp_url(config, item.get("key", ""), plex_guid),
     }
@@ -235,6 +271,7 @@ def _normalize_release_group(config, section, item):
         # Plex album matches use MusicBrainz release IDs, while Melodarr's
         # album entities use release-group IDs. Keep the entity type explicit.
         "musicbrainzReleaseId": _musicbrainz_id(guids),
+        **_metadata_tag_fields(item),
         "url": _plex_url(config, item.get("key", "")),
         "plexampUrl": _plexamp_url(config, item.get("key", ""), plex_guid),
     }
@@ -274,6 +311,9 @@ def _parent_artist(config, section, release_group, headers):
         "plexGuid": plex_guid,
         "guids": [plex_guid] if plex_guid else [],
         "musicbrainzId": "",
+        "genres": [],
+        "styles": [],
+        "moods": [],
         "url": _plex_url(config, key),
         "plexampUrl": _plexamp_url(config, key, plex_guid),
     }
@@ -501,6 +541,12 @@ def recently_added_scan(config):
                     identity = _item_identity(item)
                     previous_item = merged.get(identity, {})
                     updated_item = {**previous_item, **item}
+                    # Recently-added responses can omit metadata children that
+                    # were present in the full scan. Only a full scan should
+                    # clear previously known tags.
+                    for field_name in METADATA_TAG_FIELDS:
+                        if not item.get(field_name) and previous_item.get(field_name):
+                            updated_item[field_name] = previous_item[field_name]
                     if previous_item.get("releaseGroupResolved"):
                         updated_item.update({
                             "musicbrainzReleaseGroupId": previous_item.get(
@@ -580,6 +626,11 @@ def _build_library_index(config):
             artist["ratingKey"]: artist
             for artist in snapshot.get("artists", [])
             if artist.get("ratingKey")
+        },
+        "releaseGroupsByRatingKey": {
+            release_group["ratingKey"]: release_group
+            for release_group in snapshot.get("releaseGroups", [])
+            if release_group.get("ratingKey")
         },
         "releaseGroupsByMbid": release_groups,
     }

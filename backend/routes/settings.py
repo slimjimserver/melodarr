@@ -14,12 +14,14 @@ if __package__ == "backend.routes":
         clear_recommendation_cache,
         get_service,
         pending_lidarr_search_stats,
+        plex_listen_stats,
         recommendation_cache_stats,
         save_service,
     )
     from ..workers import lidarr_searches as lidarr_search_worker
     from ..workers import lidarr_library as lidarr_library_worker
     from ..workers import plex as plex_worker
+    from ..workers import plex_history as plex_history_worker
     from ..workers import plex_metadata as plex_metadata_worker
     from ..workers import recommendations as recommendation_worker
 else:  # Support the existing `python backend/app.py` entry point.
@@ -33,12 +35,14 @@ else:  # Support the existing `python backend/app.py` entry point.
         clear_recommendation_cache,
         get_service,
         pending_lidarr_search_stats,
+        plex_listen_stats,
         recommendation_cache_stats,
         save_service,
     )
     from workers import lidarr_searches as lidarr_search_worker
     from workers import lidarr_library as lidarr_library_worker
     from workers import plex as plex_worker
+    from workers import plex_history as plex_history_worker
     from workers import plex_metadata as plex_metadata_worker
     from workers import recommendations as recommendation_worker
 
@@ -129,6 +133,7 @@ def maintenance():
     lidarr_library_status = lidarr_library_worker.status()
     plex_recent_status = plex_worker.status("recent")
     plex_full_status = plex_worker.status("full")
+    plex_history_status = plex_history_worker.status()
     plex_metadata_status = plex_metadata_worker.status()
     lidarr_queue = pending_lidarr_search_stats()
     recommendations = recommendation_cache_stats()
@@ -179,6 +184,14 @@ def maintenance():
                 "schedule": "After Plex library changes",
                 **plex_metadata_status,
             },
+            {
+                "id": "plex-history",
+                "name": "Plex Listening History",
+                "type": "process",
+                "schedule": "Every 5 minutes",
+                **plex_listen_stats(),
+                **plex_history_status,
+            },
         ],
         "caches": [
             *api_caches,
@@ -224,6 +237,9 @@ def run_job(job_id):
     if job_id == "plex-metadata":
         plex_metadata_worker.request_enrichment()
         return jsonify({"message": "Plex MusicBrainz enrichment queued."})
+    if job_id == "plex-history":
+        plex_history_worker.request_full_sync()
+        return jsonify({"message": "Plex listening-history backfill queued."})
     return api_error("Unknown maintenance job.", 404)
 
 

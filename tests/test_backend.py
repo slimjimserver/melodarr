@@ -48,13 +48,17 @@ from backend.api_cache import (
 )
 from backend.application import create_app
 from backend.config import ARTWORK_CACHE_DIRECTORY
-from backend.services import lidarr, musicbrainz, plex, plex_auth
+from backend.services import lidarr, musicbrainz, plex, plex_auth, plex_history
 from backend.storage import (
     db,
     enqueue_lidarr_search,
     get_lastfm_api_key,
+    get_plex_listens,
     get_service,
     init_db,
+    insert_plex_listens,
+    plex_listen_stats,
+    prune_plex_listens,
     save_service,
     set_lidarr_refresh_command,
     write_settings_file,
@@ -64,6 +68,7 @@ from backend.workers import artist_metadata as artist_metadata_worker
 from backend.workers import lidarr_searches as lidarr_search_worker
 from backend.workers import lidarr_library as lidarr_library_worker
 from backend.workers import plex as plex_worker
+from backend.workers import plex_history as plex_history_worker
 from backend.workers import plex_metadata as plex_metadata_worker
 from backend.workers import recommendations as recommendation_worker
 
@@ -127,10 +132,30 @@ class DatabaseTestCase(unittest.TestCase):
                 lastCompletedAt=None,
             )
         artist_metadata_worker.wake_requested.clear()
+        with plex_history_worker.request_lock:
+            plex_history_worker.sync_requested = False
+            plex_history_worker.full_sync_requested = False
+        plex_history_worker.wake_requested.clear()
+        plex_history_worker.job_state.update(
+            running=False,
+            lastCompletedAt=None,
+            lastSuccessfulAt=None,
+            nextExecutionAt=None,
+            lastError=None,
+            fetched=0,
+            mapped=0,
+            inserted=0,
+            pruned=0,
+            stored=0,
+            users=0,
+            oldestPlayedAt=None,
+            newestPlayedAt=None,
+        )
         with db() as connection:
             connection.execute("DELETE FROM plex_auth_flows")
             connection.execute("DELETE FROM pending_lidarr_searches")
             connection.execute("DELETE FROM recommendation_cache")
+            connection.execute("DELETE FROM plex_listens")
             connection.execute("DELETE FROM request_history")
             connection.execute("DELETE FROM account_invitations")
             connection.execute("DELETE FROM users")
@@ -164,6 +189,41 @@ class ApplicationFactoryTests(DatabaseTestCase):
         self.assertEqual(self.app.config["SECRET_KEY"], "test-secret")
 
 
+class PlexListenStorageTests(DatabaseTestCase):
+    def test_listens_are_deduplicated_scoped_and_pruned(self):
+        self.register()
+        with db() as connection:
+            user_id = connection.execute(
+                "SELECT id FROM users WHERE username = 'test-user'"
+            ).fetchone()["id"]
+        listens = [
+            {
+                "server_id": "server-1",
+                "history_key": "history-1",
+                "user_id": user_id,
+                "artist_rating_key": "artist-1",
+                "album_rating_key": "album-1",
+                "played_at": 1_000.0,
+            },
+            {
+                "server_id": "server-1",
+                "history_key": "history-2",
+                "user_id": user_id,
+                "artist_rating_key": "artist-2",
+                "album_rating_key": None,
+                "played_at": 2_000.0,
+            },
+        ]
+
+        self.assertEqual(insert_plex_listens(listens), 2)
+        self.assertEqual(insert_plex_listens(listens), 0)
+        rows = get_plex_listens(user_id, 1_500, server_id="server-1")
+        self.assertEqual([row["history_key"] for row in rows], ["history-2"])
+        self.assertEqual(plex_listen_stats(user_id=user_id)["count"], 2)
+        self.assertEqual(prune_plex_listens(1_500), 1)
+        self.assertEqual(plex_listen_stats(user_id=user_id)["count"], 1)
+
+
 class WorkerEntrypointTests(unittest.TestCase):
     def test_refresh_request_wakes_sleeping_worker(self):
         recommendation_worker.refresh_requested.clear()
@@ -180,6 +240,7 @@ class WorkerEntrypointTests(unittest.TestCase):
         lidarr_thread = Mock()
         plex_thread = Mock()
         plex_metadata_thread = Mock()
+        plex_history_thread = Mock()
         lidarr_library_thread = Mock()
         thread_class.side_effect = [
             artist_metadata_thread,
@@ -187,12 +248,13 @@ class WorkerEntrypointTests(unittest.TestCase):
             lidarr_library_thread,
             plex_thread,
             plex_metadata_thread,
+            plex_history_thread,
         ]
         init_db.side_effect = lambda: calls.append("database")
         run.side_effect = lambda: calls.append("recommendations")
         worker.main()
         self.assertEqual(calls, ["database", "recommendations"])
-        self.assertEqual(thread_class.call_count, 5)
+        self.assertEqual(thread_class.call_count, 6)
         thread_class.assert_any_call(
             target=artist_metadata_worker.run,
             name="musicbrainz-artist-revalidation",
@@ -212,10 +274,16 @@ class WorkerEntrypointTests(unittest.TestCase):
             name="plex-musicbrainz-enrichment",
             daemon=True,
         )
+        thread_class.assert_any_call(
+            target=plex_history_worker.run,
+            name="plex-listening-history",
+            daemon=True,
+        )
         lidarr_thread.start.assert_called_once_with()
         lidarr_library_thread.start.assert_called_once_with()
         plex_thread.start.assert_called_once_with()
         plex_metadata_thread.start.assert_called_once_with()
+        plex_history_thread.start.assert_called_once_with()
         artist_metadata_thread.start.assert_called_once_with()
 
     @patch("backend.worker.Thread")
@@ -2768,6 +2836,12 @@ class AdminUsersTests(DatabaseTestCase):
                 (user_id, now),
             )
             connection.execute(
+                "INSERT INTO plex_listens "
+                "(server_id, history_key, user_id, artist_rating_key, played_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("server-1", "departing-history", user_id, "artist-1", now),
+            )
+            connection.execute(
                 "INSERT INTO account_invitations "
                 "(token_hash, created_by, created_at, expires_at) "
                 "VALUES (?, ?, ?, ?)",
@@ -2805,6 +2879,7 @@ class AdminUsersTests(DatabaseTestCase):
                 ("plex_auth_flows", "user_id"),
                 ("pending_lidarr_searches", "user_id"),
                 ("recommendation_cache", "user_id"),
+                ("plex_listens", "user_id"),
                 ("request_history", "user_id"),
                 ("account_invitations", "created_by"),
             ):
@@ -3002,6 +3077,7 @@ class SettingsMaintenanceTests(DatabaseTestCase):
         self.assertEqual(response.status_code, 403)
         self.assertFalse(get_service("lastfm"))
 
+    @patch("backend.routes.settings.plex_history_worker.request_full_sync")
     @patch("backend.routes.settings.lidarr_library_worker.request_scan")
     @patch("backend.routes.settings.plex_metadata_worker.request_enrichment")
     @patch("backend.routes.settings.plex_worker.request_full_scan")
@@ -3010,7 +3086,7 @@ class SettingsMaintenanceTests(DatabaseTestCase):
     @patch("backend.routes.settings.recommendation_worker.request_refresh")
     def test_jobs_are_listed_and_can_be_manually_queued(
         self, request_refresh, request_work, request_recent, request_full,
-        request_enrichment, request_lidarr_scan,
+        request_enrichment, request_lidarr_scan, request_history,
     ):
         token = self.register()
         response = self.client.get("/api/settings/maintenance")
@@ -3024,6 +3100,7 @@ class SettingsMaintenanceTests(DatabaseTestCase):
                 "plex-recent",
                 "plex-full",
                 "plex-metadata",
+                "plex-history",
             ],
         )
         job_rows = response.get_json()["jobs"]
@@ -3036,6 +3113,7 @@ class SettingsMaintenanceTests(DatabaseTestCase):
                 "Plex Recently Added Scan",
                 "Plex Full Library Scan",
                 "Plex MusicBrainz Enrichment",
+                "Plex Listening History",
             ],
         )
         jobs = {job["id"]: job for job in job_rows}
@@ -3065,18 +3143,24 @@ class SettingsMaintenanceTests(DatabaseTestCase):
             "/api/settings/jobs/plex-metadata/run",
             headers={"X-CSRF-Token": token},
         )
+        history = self.client.post(
+            "/api/settings/jobs/plex-history/run",
+            headers={"X-CSRF-Token": token},
+        )
         self.assertEqual(recommendation.status_code, 200)
         self.assertEqual(lidarr.status_code, 200)
         self.assertEqual(lidarr_library.status_code, 200)
         self.assertEqual(recent.status_code, 200)
         self.assertEqual(full.status_code, 200)
         self.assertEqual(enrichment.status_code, 200)
+        self.assertEqual(history.status_code, 200)
         request_refresh.assert_called_once_with()
         request_work.assert_called_once_with()
         request_lidarr_scan.assert_called_once_with()
         request_recent.assert_called_once_with()
         request_full.assert_called_once_with()
         request_enrichment.assert_called_once_with()
+        request_history.assert_called_once_with()
 
     def test_raw_plex_tokens_are_not_accepted_by_settings(self):
         token = self.register()
@@ -5679,6 +5763,179 @@ class MusicRoutesTests(DatabaseTestCase):
 
 
 class RecommendationAssemblyTests(unittest.TestCase):
+    @patch("backend.recommendations.plex.cached_library_index")
+    @patch("backend.recommendations.get_plex_listens")
+    def test_plex_profile_applies_recency_play_counts_and_snapshot_tags(
+        self, get_listens, cached_index
+    ):
+        now = 400 * 24 * 60 * 60
+        get_listens.return_value = [
+            {
+                "artist_rating_key": "artist-1",
+                "album_rating_key": "album-1",
+                "played_at": now - 10 * 24 * 60 * 60,
+            },
+            {
+                "artist_rating_key": "artist-1",
+                "album_rating_key": "album-1",
+                "played_at": now - 200 * 24 * 60 * 60,
+            },
+            {
+                "artist_rating_key": "missing",
+                "album_rating_key": None,
+                "played_at": now,
+            },
+        ]
+        cached_index.return_value = {
+            "artistsByRatingKey": {
+                "artist-1": {
+                    "musicbrainzId": "artist-mbid",
+                    "name": "Known Artist",
+                    "genres": ["Alternative"],
+                    "styles": ["Indie Rock"],
+                    "moods": ["Energetic"],
+                },
+            },
+            "releaseGroupsByRatingKey": {
+                "album-1": {
+                    "genres": ["Alternative"],
+                    "styles": ["Garage Rock"],
+                    "moods": ["Reflective"],
+                },
+            },
+        }
+
+        seeds, tags = recommendation_engine.plex_taste_profile(
+            7,
+            {
+                "url": "http://plex:32400",
+                "machineIdentifier": "server-1",
+            },
+            now=now,
+        )
+
+        self.assertEqual(len(seeds), 1)
+        self.assertEqual(seeds[0]["id"], "artist-mbid")
+        self.assertEqual(seeds[0]["playCount"], 2)
+        self.assertAlmostEqual(seeds[0]["score"], 1.35)
+        self.assertEqual(tags["alternative"], 1.0)
+        self.assertGreater(tags["indie rock"], tags["energetic"])
+        get_listens.assert_called_once_with(
+            7,
+            now - 365 * 24 * 60 * 60,
+            server_id="server-1",
+        )
+
+    @patch("backend.recommendations._musicbrainz_lookup")
+    @patch("backend.recommendations.resolve_lastfm_album_mbid")
+    @patch("backend.recommendations.lastfm.get_public")
+    @patch("backend.recommendations.plex_taste_profile")
+    def test_plex_recommendations_use_similar_tags_and_existing_album_path(
+        self, taste_profile, get_public, resolve_album, musicbrainz_lookup
+    ):
+        taste_profile.return_value = (
+            [{"id": "seed-mbid", "name": "Seed", "score": 3.0}],
+            {"alternative": 1.0},
+        )
+
+        def public(method, _api_key, **_kwargs):
+            if method == "tag.getsimilar":
+                return {"similartags": {"tag": [{"name": "indie"}]}}
+            if method == "artist.getsimilar":
+                return {"similarartists": {"artist": [{
+                    "mbid": "candidate-mbid",
+                    "name": "Candidate",
+                    "match": "0.8",
+                }]}}
+            if method == "artist.gettoptags":
+                return {"toptags": {"tag": [{"name": "indie"}]}}
+            if method == "artist.gettopalbums":
+                return {"topalbums": {"album": [{
+                    "mbid": "album-mbid",
+                    "name": "Candidate Album",
+                    "artist": {"name": "Candidate"},
+                }]}}
+            self.fail(f"Unexpected Last.fm method {method}")
+
+        get_public.side_effect = public
+        resolve_album.return_value = "release-group-mbid"
+        musicbrainz_lookup.return_value = {
+            "title": "Candidate Album",
+            "first-release-date": "2025",
+            "primary-type": "Album",
+        }
+
+        artists, albums = recommendation_engine.plex_history_recommendations(
+            7,
+            {"url": "http://plex"},
+            "shared-key",
+        )
+
+        self.assertEqual([artist["id"] for artist in artists], ["candidate-mbid"])
+        self.assertEqual([album["id"] for album in albums], ["release-group-mbid"])
+        methods = [call.args[0] for call in get_public.call_args_list]
+        self.assertIn("tag.getsimilar", methods)
+        self.assertIn("artist.getsimilar", methods)
+        self.assertIn("artist.gettopalbums", methods)
+        self.assertNotIn("tag.gettopartists", methods)
+        self.assertNotIn("tag.gettopalbums", methods)
+
+    @patch("backend.recommendations._recommendation_exclusions")
+    @patch("backend.recommendations.lastfm_top_tags")
+    @patch("backend.recommendations.lastfm.get")
+    @patch("backend.recommendations.lastfm_recommendations")
+    @patch("backend.recommendations.plex_history_recommendations")
+    @patch("backend.recommendations.get_lastfm_api_key")
+    @patch("backend.recommendations.get_service")
+    def test_linked_lastfm_and_plex_results_are_blended_then_deduplicated(
+        self,
+        get_service,
+        get_api_key,
+        plex_recommendations,
+        lastfm_recommendations,
+        lastfm_get,
+        lastfm_top_tags,
+        exclusions,
+    ):
+        get_service.side_effect = lambda name: (
+            {"url": "http://plex", "machineIdentifier": "server-1"}
+            if name == "plex"
+            else None
+        )
+        get_api_key.return_value = "shared-key"
+        exclusions.return_value = recommendation_engine._empty_exclusions()
+        plex_recommendations.return_value = (
+            [{"id": "same-artist", "name": "Shared Artist", "score": 0.8}],
+            [{"id": "same-album", "name": "Shared Album", "score": 0.7}],
+        )
+        lastfm_recommendations.return_value = (
+            [{"id": "same-artist", "name": "Shared Artist", "score": 0.9}],
+            [{"id": "same-album", "name": "Shared Album", "score": 0.6}],
+        )
+        lastfm_get.return_value = {"artists": {"artist": []}}
+        lastfm_top_tags.return_value = []
+
+        payload = recommendation_engine.build_recommendation_cache({
+            "id": 7,
+            "username": "listener",
+            "plex_id": "global-plex-id",
+            "listenbrainz_username": None,
+            "lastfm_username": "lastfm-listener",
+        })
+
+        self.assertEqual(len(payload["artists"]), 1)
+        self.assertEqual(len(payload["albums"]), 1)
+        self.assertEqual(payload["artists"][0]["score"], 0.9)
+        self.assertEqual(
+            payload["artists"][0]["recommendationSource"],
+            "Plex history · Last.fm + Last.fm",
+        )
+        self.assertEqual(payload["providerStatus"], {
+            "listenbrainz": "disabled",
+            "lastfm": "ok",
+            "plexHistory": "ok",
+        })
+
     @patch("backend.recommendations.listenbrainz.recording_metadata")
     @patch("backend.recommendations.listenbrainz.recording_recommendations")
     def test_listenbrainz_deduplicates_using_highest_recording_score(
@@ -6049,6 +6306,7 @@ class RecommendationAssemblyTests(unittest.TestCase):
         self.assertEqual(payload["providerStatus"], {
             "listenbrainz": "ok",
             "lastfm": "ok",
+            "plexHistory": "disabled",
         })
 
     @patch("backend.recommendations.lastfm_top_tags")
@@ -6083,6 +6341,7 @@ class RecommendationAssemblyTests(unittest.TestCase):
         self.assertEqual(payload["providerStatus"], {
             "listenbrainz": "unavailable",
             "lastfm": "ok",
+            "plexHistory": "disabled",
         })
         self.assertIn("ListenBrainz recommendations unavailable", logs.output[0])
 
@@ -6760,6 +7019,7 @@ class LibraryIndexMemoizationTests(DatabaseTestCase):
             }],
             "releaseGroups": [{
                 "name": "An album",
+                "ratingKey": "20",
                 "musicbrainzReleaseGroupId": "22222222-2222-2222-2222-222222222222",
             }],
         }
@@ -6780,6 +7040,165 @@ class LibraryIndexMemoizationTests(DatabaseTestCase):
             {"22222222-2222-2222-2222-222222222222"},
         )
         self.assertEqual(set(first["artistsByRatingKey"]), {"10"})
+        self.assertEqual(set(first["releaseGroupsByRatingKey"]), {"20"})
+
+
+class PlexHistoryClientTests(unittest.TestCase):
+    @patch("backend.services.plex_history.requests.get")
+    def test_accounts_normalize_server_local_ids_and_aliases(self, get):
+        get.return_value = Response(payload={"MediaContainer": {
+            "Account": [
+                {"id": 1, "name": "JRamperSaud123", "title": "Jeremy"},
+                {"id": 2, "name": "Managed Listener"},
+            ],
+        }})
+
+        result = plex_history.accounts({
+            "url": "http://plex:32400",
+            "token": "server-token",
+        })
+
+        self.assertEqual(result, [
+            {
+                "account_id": "1",
+                "aliases": ("JRamperSaud123", "Jeremy"),
+            },
+            {
+                "account_id": "2",
+                "aliases": ("Managed Listener",),
+            },
+        ])
+        self.assertEqual(
+            get.call_args.kwargs["headers"]["X-Plex-Token"],
+            "server-token",
+        )
+
+    @patch("backend.services.plex_history.requests.get")
+    def test_history_is_paginated_and_normalized_without_track_metadata(self, get):
+        get.side_effect = [
+            Response(payload={"MediaContainer": {
+                "totalSize": 2,
+                "offset": 0,
+                "size": 1,
+                "Metadata": [{
+                    "type": "track",
+                    "historyKey": "/status/sessions/history/100",
+                    "grandparentRatingKey": "artist-10",
+                    "parentRatingKey": "album-20",
+                    "viewedAt": 1_000,
+                    "User": {"id": 1, "title": "Listener"},
+                    "title": "Intentionally not persisted",
+                }],
+            }}),
+            Response(payload={"MediaContainer": {
+                "totalSize": 2,
+                "offset": 1,
+                "size": 1,
+                "Metadata": [{
+                    "type": "track",
+                    "historyKey": "/status/sessions/history/101",
+                    "grandparentRatingKey": "artist-11",
+                    "viewedAt": 2_000,
+                    "accountID": 2,
+                }],
+            }}),
+        ]
+
+        events = list(plex_history.iter_history(
+            {"url": "http://plex:32400", "token": "token"},
+            since=500,
+            until=2_500,
+            section_ids=["music"],
+            page_size=1,
+        ))
+
+        self.assertEqual(events, [
+            {
+                "history_key": "/status/sessions/history/100",
+                "account_id": "1",
+                "artist_rating_key": "artist-10",
+                "album_rating_key": "album-20",
+                "played_at": 1_000.0,
+            },
+            {
+                "history_key": "/status/sessions/history/101",
+                "account_id": "2",
+                "artist_rating_key": "artist-11",
+                "album_rating_key": None,
+                "played_at": 2_000.0,
+            },
+        ])
+        self.assertEqual(
+            get.call_args_list[1].kwargs["params"]["X-Plex-Container-Start"],
+            1,
+        )
+        self.assertEqual(
+            get.call_args_list[0].kwargs["params"]["librarySectionID"],
+            "music",
+        )
+
+
+class PlexHistoryWorkerTests(DatabaseTestCase):
+    @patch("backend.workers.plex_history.plex_history.iter_history")
+    @patch("backend.workers.plex_history.plex_history.accounts")
+    def test_sync_maps_accounts_case_insensitively_and_stores_only_play_keys(
+        self, accounts, iter_history
+    ):
+        self.register()
+        with db() as connection:
+            connection.execute(
+                "UPDATE users SET plex_username = ?, plex_id = ? "
+                "WHERE username = 'test-user'",
+                ("JRamperSaud123", "global-plex-id"),
+            )
+            user_id = connection.execute(
+                "SELECT id FROM users WHERE username = 'test-user'"
+            ).fetchone()["id"]
+        accounts.return_value = [{
+            "account_id": "7",
+            "aliases": ("jrampersaud123",),
+        }]
+        iter_history.return_value = iter([
+            {
+                "history_key": "history-1",
+                "account_id": "7",
+                "artist_rating_key": "artist-1",
+                "album_rating_key": "album-1",
+                "played_at": 2_000.0,
+            },
+            {
+                "history_key": "history-unmapped",
+                "account_id": "8",
+                "artist_rating_key": "artist-2",
+                "album_rating_key": "album-2",
+                "played_at": 2_100.0,
+            },
+        ])
+
+        result = plex_history_worker.synchronize(
+            {
+                "url": "http://plex:32400",
+                "token": "token",
+                "machineIdentifier": "server-1",
+                "librarySectionIds": ["music"],
+            },
+            full=True,
+            now=3_000.0,
+        )
+
+        self.assertEqual(result["fetched"], 2)
+        self.assertEqual(result["mapped"], 1)
+        self.assertEqual(result["inserted"], 1)
+        rows = get_plex_listens(user_id, 0, server_id="server-1")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(set(rows[0].keys()), {
+            "server_id",
+            "history_key",
+            "user_id",
+            "artist_rating_key",
+            "album_rating_key",
+            "played_at",
+        })
 
 
 class PlexAuthenticationClientTests(unittest.TestCase):
@@ -6876,6 +7295,12 @@ class PlexClientTests(unittest.TestCase):
                             "key": "/library/metadata/1/children",
                             "thumb": "/a",
                             "guid": "plex://artist/artist-1",
+                            "Genre": [
+                                {"tag": "Alternative"},
+                                {"tag": " alternative "},
+                            ],
+                            "Style": {"tag": "Indie Rock"},
+                            "Mood": [{"tag": "Energetic"}],
                         },
                     ]
                 }
@@ -6891,6 +7316,9 @@ class PlexClientTests(unittest.TestCase):
                         "Guid": [{
                             "id": "mbid://11111111-1111-1111-1111-111111111111"
                         }],
+                        "Genre": [{"tag": "Rock"}],
+                        "Style": [{"tag": "Garage Rock"}],
+                        "Mood": [{"tag": "Rowdy"}],
                     }]
                 }
             }),
@@ -6904,6 +7332,9 @@ class PlexClientTests(unittest.TestCase):
         releases = plex.library_release_groups(config)
         self.assertEqual([artist["name"] for artist in artists], ["alpha", "Zulu"])
         self.assertEqual(artists[0]["sortName"], "The Alpha")
+        self.assertEqual(artists[0]["genres"], ["Alternative"])
+        self.assertEqual(artists[0]["styles"], ["Indie Rock"])
+        self.assertEqual(artists[0]["moods"], ["Energetic"])
         self.assertIn("key=%2Flibrary%2Fmetadata%2F1", artists[0]["url"])
         self.assertNotIn("%2Fchildren", artists[0]["url"])
         self.assertEqual(
@@ -6913,6 +7344,9 @@ class PlexClientTests(unittest.TestCase):
         )
         self.assertEqual([release["name"] for release in releases], ["An EP"])
         self.assertEqual(releases[0]["releaseType"], "ep")
+        self.assertEqual(releases[0]["genres"], ["Rock"])
+        self.assertEqual(releases[0]["styles"], ["Garage Rock"])
+        self.assertEqual(releases[0]["moods"], ["Rowdy"])
         self.assertEqual(
             releases[0]["plexampUrl"],
             "https://listen.plex.tv/album/album-3?"

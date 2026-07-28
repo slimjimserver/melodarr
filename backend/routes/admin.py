@@ -366,6 +366,9 @@ def delete_user(user_id):
             "DELETE FROM recommendation_cache WHERE user_id = ?", (user_id,)
         )
         connection.execute(
+            "DELETE FROM plex_listens WHERE user_id = ?", (user_id,)
+        )
+        connection.execute(
             "DELETE FROM request_history WHERE user_id = ?", (user_id,)
         )
         connection.execute(

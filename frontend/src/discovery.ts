@@ -1054,6 +1054,9 @@
     if (/last\.fm/i.test(sourceName)) {
       sourceIcons.push(["/icons/last-fm.svg", ""]);
     }
+    if (/plex/i.test(sourceName)) {
+      sourceIcons.unshift(["/icons/plex.svg", ""]);
+    }
     sourceIcons.forEach(([iconPath, alt]) => {
       const icon = document.createElement("img");
       icon.src = iconPath;
@@ -1651,6 +1654,7 @@
       const unavailableProviders = [];
       if (["partial", "unavailable"].includes(providerStatus.listenbrainz)) unavailableProviders.push("ListenBrainz");
       if (["partial", "unavailable"].includes(providerStatus.lastfm)) unavailableProviders.push("Last.fm");
+      if (["partial", "unavailable"].includes(providerStatus.plexHistory)) unavailableProviders.push("Plex history");
       const retryNotice = unavailableProviders.length
         ? ` ${unavailableProviders.join(" and ")} was temporarily unavailable; available results are shown and a retry is scheduled.`
         : "";

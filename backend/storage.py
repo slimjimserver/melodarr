@@ -257,7 +257,8 @@ def recommendation_users():
     """Return the user fields needed to assemble recommendation caches."""
     with db() as connection:
         return connection.execute(
-            "SELECT id, username, listenbrainz_username, lastfm_username FROM users"
+            "SELECT id, username, listenbrainz_username, lastfm_username, plex_id "
+            "FROM users"
         ).fetchall()
 
 
@@ -321,6 +322,89 @@ def pending_lidarr_search_stats():
             "AS retrying FROM pending_lidarr_searches"
         ).fetchone()
     return dict(row)
+
+
+def insert_plex_listens(listens):
+    """Insert normalized Plex play events, ignoring previously imported history."""
+    values = [
+        (
+            listen["server_id"],
+            listen["history_key"],
+            listen["user_id"],
+            listen["artist_rating_key"],
+            listen.get("album_rating_key"),
+            listen["played_at"],
+        )
+        for listen in listens
+    ]
+    if not values:
+        return 0
+    with db() as connection:
+        cursor = connection.executemany(
+            "INSERT OR IGNORE INTO plex_listens "
+            "(server_id, history_key, user_id, artist_rating_key, "
+            "album_rating_key, played_at) VALUES (?, ?, ?, ?, ?, ?)",
+            values,
+        )
+        return cursor.rowcount
+
+
+def get_plex_listens(user_id, since, *, server_id=None):
+    """Return one user's resolvable Plex play keys within a rolling window."""
+    query = (
+        "SELECT server_id, history_key, user_id, artist_rating_key, "
+        "album_rating_key, played_at FROM plex_listens "
+        "WHERE user_id = ? AND played_at >= ?"
+    )
+    parameters = [user_id, since]
+    if server_id is not None:
+        query += " AND server_id = ?"
+        parameters.append(server_id)
+    query += " ORDER BY played_at DESC, id DESC"
+    with db() as connection:
+        return connection.execute(query, parameters).fetchall()
+
+
+def prune_plex_listens(before):
+    """Delete Plex play events older than the rolling retention cutoff."""
+    with db() as connection:
+        cursor = connection.execute(
+            "DELETE FROM plex_listens WHERE played_at < ?",
+            (before,),
+        )
+        return cursor.rowcount
+
+
+def plex_listen_stats(*, user_id=None, server_id=None):
+    """Summarize stored Plex play events for jobs and diagnostics."""
+    conditions = []
+    parameters = []
+    if user_id is not None:
+        conditions.append("user_id = ?")
+        parameters.append(user_id)
+    if server_id is not None:
+        conditions.append("server_id = ?")
+        parameters.append(server_id)
+    where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+    with db() as connection:
+        row = connection.execute(
+            "SELECT COUNT(*) AS count, COUNT(DISTINCT user_id) AS users, "
+            "MIN(played_at) AS oldest_played_at, "
+            "MAX(played_at) AS newest_played_at "
+            f"FROM plex_listens{where}",
+            parameters,
+        ).fetchone()
+    return dict(row)
+
+
+def delete_plex_listens(user_id):
+    """Delete all imported Plex listening history owned by one user."""
+    with db() as connection:
+        cursor = connection.execute(
+            "DELETE FROM plex_listens WHERE user_id = ?",
+            (user_id,),
+        )
+        return cursor.rowcount
 
 
 def init_db():
@@ -430,6 +514,26 @@ def init_db():
                 refreshed_at REAL NOT NULL
             )
         """)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS plex_listens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                server_id TEXT NOT NULL,
+                history_key TEXT NOT NULL,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                artist_rating_key TEXT NOT NULL,
+                album_rating_key TEXT,
+                played_at REAL NOT NULL,
+                UNIQUE(server_id, history_key)
+            )
+        """)
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS plex_listens_user_played "
+            "ON plex_listens(user_id, played_at)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS plex_listens_server_played "
+            "ON plex_listens(server_id, played_at)"
+        )
         connection.execute("""
             CREATE TABLE IF NOT EXISTS account_invitations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
