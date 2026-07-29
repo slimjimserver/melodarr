@@ -15,6 +15,7 @@ node_modules/
 # Generated frontend
 frontend/static/*.js
 frontend/static/*.js.map
+frontend/static/style.css
 frontend/static/*.gz
 frontend/static/*.br
 
