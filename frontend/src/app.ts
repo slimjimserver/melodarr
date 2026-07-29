@@ -89,14 +89,6 @@ interface AdminRequestPagination {
   totalPages: number;
 }
 
-type AdminUserForm = HTMLFormElement & {
-  role: HTMLSelectElement;
-  localUsername: HTMLInputElement;
-  password: HTMLInputElement;
-  listenbrainzUsername: HTMLInputElement;
-  lastfmUsername: HTMLInputElement;
-};
-
 type LastfmSettingsForm = HTMLFormElement & {
   apiKey: HTMLInputElement;
 };
@@ -171,7 +163,6 @@ let settingsPlexServers: PlexServer[] = [];
 let maintenanceRefreshTimer: number | undefined;
 let maintenanceRefreshInFlight = false;
 let adminUsers: AdminUser[] = [];
-let editingAdminUser: AdminUser | undefined;
 let adminUsersRequest = 0;
 let adminRequests: AdminRequest[] = [];
 let adminRequestsRequest = 0;
@@ -1784,123 +1775,9 @@ async function deleteAdminUser(user: AdminUser, button: HTMLButtonElement) {
   }
 }
 
-function openAdminUserDialog(user: AdminUser) {
-  editingAdminUser = user;
-  const dialog = $<HTMLDialogElement>("#user-dialog");
-  const form = $<AdminUserForm>("#user-form");
-  const currentSession = isCurrentSessionUser(user);
-  form.reset();
-  form.role.value = user.role;
-  form.role.disabled = currentSession;
-  form.localUsername.value = user.localUsername || (user.userType === "local" ? user.username : "");
-  form.listenbrainzUsername.value = user.listenbrainzUsername || "";
-  form.lastfmUsername.value = user.lastfmUsername || "";
-  $("#user-dialog-title").textContent = `Edit ${adminUserDisplayName(user)}`;
-  $("#user-dialog-name").textContent = adminUserDisplayName(user);
-  $("#user-dialog-account").textContent = user.userType === "plex"
-    ? [user.plexEmail, "Plex account"].filter(Boolean).join(" · ")
-    : "Local account";
-  $("#user-local-help").textContent = user.userType === "plex"
-    ? "Generated for this Plex account. You can change the username used for local sign-in."
-    : "Used for local sign-in.";
-  $("#user-password-help").textContent = user.userType === "plex"
-    ? "Set a password to enable or reset local sign-in. Leave blank to keep the current access."
-    : "Leave blank to keep the current password. Passwords must be at least 12 characters.";
-  $("#user-role-help").textContent = currentSession
-    ? "You cannot change your own role while signed in."
-    : "Controls access to administrative settings.";
-  const replacement = createUserAvatar(user, true);
-  replacement.id = "user-dialog-avatar";
-  $("#user-dialog-avatar").replaceWith(replacement);
-  setMessage($("#user-dialog-message"), "");
-  dialog.showModal();
-}
-
 function setupAdminUsers() {
-  const dialog = $<HTMLDialogElement>("#user-dialog");
-  const form = $<AdminUserForm>("#user-form");
-  const saveButton = $<HTMLButtonElement>("#save-user");
-  const dialogMessage = $("#user-dialog-message");
-
   $("#refresh-users").addEventListener("click", () => refreshAdminUsers());
   $<HTMLInputElement>("#users-search").addEventListener("input", () => renderAdminUsers());
-  document.querySelectorAll<HTMLElement>(".close-user-dialog").forEach((button) => {
-    button.addEventListener("click", () => dialog.close());
-  });
-  dialog.addEventListener("click", (event) => {
-    if (event.target === dialog) dialog.close();
-  });
-  dialog.addEventListener("close", () => {
-    editingAdminUser = undefined;
-    form.reset();
-    setMessage(dialogMessage, "");
-  });
-
-  form.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const user = editingAdminUser;
-    if (!user) return;
-    const wasCurrentSession = isCurrentSessionUser(user);
-    const payload = {
-      role: form.role.value,
-      localUsername: form.localUsername.value.trim(),
-      password: form.password.value,
-      listenbrainzUsername: form.listenbrainzUsername.value.trim(),
-      lastfmUsername: form.lastfmUsername.value.trim(),
-    };
-    saveButton.disabled = true;
-    form.setAttribute("aria-busy", "true");
-    setMessage(dialogMessage, "Saving user settings…");
-    try {
-      const result = await api<{ user?: AdminUser; message?: string } & Partial<AdminUser>>(
-        `/api/admin/users/${encodeURIComponent(String(user.id))}`,
-        {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        },
-      );
-      const responseUser = result.user || result;
-      const updated: AdminUser = {
-        ...user,
-        role: payload.role as AdminUser["role"],
-        localUsername: payload.localUsername,
-        listenbrainzUsername: payload.listenbrainzUsername,
-        lastfmUsername: payload.lastfmUsername,
-        ...(responseUser as Partial<AdminUser>),
-      };
-      if (updated.userType === "local" && !responseUser.username && payload.localUsername) {
-        updated.username = payload.localUsername;
-      }
-      adminUsers = adminUsers.map((candidate) => candidate.id === updated.id ? updated : candidate);
-      setAdminUserStats();
-      renderAdminUsers();
-
-      if (wasCurrentSession && currentUser) {
-        currentUser.username = updated.localUsername || currentUser.username;
-        currentUser.plexUsername = updated.plexUsername;
-        currentUser.plexEmail = updated.plexEmail;
-        currentUser.listenbrainzUsername = updated.listenbrainzUsername;
-        currentUser.lastfmUsername = updated.lastfmUsername;
-        currentUser.lastfmConfigured = updated.lastfmConfigured;
-        updateSessionChrome();
-      }
-
-      dialog.close();
-      const successMessage = result.message || `Saved settings for ${adminUserDisplayName(updated)}.`;
-      setMessage($("#users-message"), successMessage);
-      showToast(successMessage);
-      if (wasCurrentSession && currentUser?.role !== "admin") {
-        window.history.replaceState({ view: "discover" }, "", "/");
-        window.dispatchEvent(new PopStateEvent("popstate"));
-      }
-    } catch (error) {
-      setMessage(dialogMessage, error.message, true);
-    } finally {
-      saveButton.disabled = false;
-      form.removeAttribute("aria-busy");
-    }
-  });
 }
 
 function showSetupPanel(

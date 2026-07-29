@@ -447,61 +447,6 @@
       </div>
     </form>
   </dialog>
-  <dialog id="user-dialog" aria-labelledby="user-dialog-title">
-    <form id="user-form">
-      <div class="dialog-title">
-        <div>
-          <p class="eyebrow">EDIT USER</p>
-          <h2 id="user-dialog-title">User settings</h2>
-        </div>
-        <button type="button" class="close-dialog close-user-dialog" aria-label="Close user settings">×</button>
-      </div>
-      <div class="user-dialog-summary">
-        <span id="user-dialog-avatar" class="user-avatar user-avatar-large" aria-hidden="true"></span>
-        <div>
-          <strong id="user-dialog-name"></strong>
-          <span id="user-dialog-account"></span>
-        </div>
-      </div>
-      <fieldset>
-        <legend>Account access</legend>
-        <div class="settings-fields">
-          <label>Role
-            <small id="user-role-help">Controls access to administrative settings.</small>
-            <select name="role">
-              <option value="user">User</option>
-              <option value="admin">Administrator</option>
-            </select>
-          </label>
-          <label>Local username
-            <small id="user-local-help">Used for local sign-in.</small>
-            <input name="localUsername" autocomplete="username" minlength="3" maxlength="32" required>
-          </label>
-          <label class="wide-field">New password
-            <small id="user-password-help">Leave blank to keep the current password. Passwords must be at least 12 characters.</small>
-            <input name="password" type="password" autocomplete="new-password" minlength="12">
-          </label>
-        </div>
-      </fieldset>
-      <fieldset>
-        <legend>Recommendation accounts</legend>
-        <div class="settings-fields">
-          <label>ListenBrainz username
-            <input name="listenbrainzUsername" autocomplete="off" placeholder="listenbrainz-name">
-          </label>
-          <label>Last.fm username
-            <small>Uses the shared API key configured by an administrator.</small>
-            <input name="lastfmUsername" autocomplete="off" placeholder="lastfm-name">
-          </label>
-        </div>
-      </fieldset>
-      <p id="user-dialog-message" class="form-message" aria-live="polite"></p>
-      <div class="dialog-actions">
-        <button type="button" class="close-dialog close-user-dialog">Cancel</button>
-        <button id="save-user" type="submit">Save user</button>
-      </div>
-    </form>
-  </dialog>
   <nav class="tab-bar" aria-label="Primary">
     <button class="nav-link active" type="button" data-view="discover" aria-current="page"><span class="tab-icon" aria-hidden="true">◎</span>Discover</button>
     <button class="nav-link" type="button" data-view="library"><span class="tab-icon" aria-hidden="true">▤</span>Library</button>

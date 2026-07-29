@@ -327,15 +327,6 @@ h1 em { font-style: normal; }
 .delete-user { border-color: rgba(164, 52, 52, .3); color: var(--danger); }
 .delete-user:disabled { cursor: not-allowed; opacity: .45; }
 .user-load-error > span { display: inline-block; margin-right: 12px; }
-#user-dialog { width: min(700px, calc(100% - 28px)); }
-#user-form { padding: 27px; }
-#user-form fieldset { display: grid; gap: 16px; margin: 24px 0 0; border: 0; border-top: 1px solid var(--border); padding: 20px 0 0; }
-#user-form legend { color: var(--foreground); padding: 0 10px 0 0; font-size: 14px; font-weight: 700; }
-.user-dialog-summary { display: flex; align-items: center; gap: 13px; margin-top: 17px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); padding: 13px; }
-.user-dialog-summary > div { display: grid; min-width: 0; gap: 4px; }
-.user-dialog-summary strong { overflow: hidden; text-overflow: ellipsis; font-size: 14px; white-space: nowrap; }
-.user-dialog-summary span:last-child { overflow: hidden; color: var(--foreground-muted); text-overflow: ellipsis; font-size: 11px; white-space: nowrap; }
-#user-dialog-message { min-height: 18px; margin-top: 18px; }
 .admin-requests-section:first-child { border-top: 0; padding-top: 0; }
 .admin-requests-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; margin-bottom: 20px; }
 .admin-requests-heading .eyebrow { margin-bottom: 8px; }
@@ -574,9 +565,6 @@ details summary { margin-bottom: 17px; color: var(--accent-bright); cursor: poin
   .admin-request-requester { grid-column: 1; border-left: 0; padding: 10px 13px 12px; }
   .admin-request-plex { grid-column: 2; grid-row: 2; justify-self: end; margin-right: 12px; }
   .admin-request-load-error { align-items: stretch; flex-direction: column; text-align: center; }
-  #user-form { padding: 22px 20px 20px; }
-  #user-form .settings-fields { grid-template-columns: 1fr; }
-  #user-form .wide-field { grid-column: auto; }
   .recommendations-heading { align-items: start; flex-direction: column; }
 
   /* Carousels run to the viewport edge so the last card is not clipped by the
