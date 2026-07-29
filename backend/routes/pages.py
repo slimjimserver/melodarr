@@ -17,6 +17,7 @@ else:  # Support the existing `python backend/app.py` entry point.
 blueprint = Blueprint("pages", __name__)
 
 STATIC_ROOT = os.path.join(FRONTEND_ROOT, "static")
+ICON_ROOT = os.path.join(FRONTEND_ROOT, "icons")
 FINGERPRINTED_ASSETS = ("theme.js", "app.js", "discovery.js", "style.css")
 _document_cache = {}
 
@@ -79,7 +80,7 @@ blueprint.add_url_rule("/releases/<mbid>", view_func=frontend_index)
 
 @blueprint.get("/icons/<path:filename>")
 def icons(filename):
-    return send_from_directory(os.path.join(FRONTEND_ROOT, "icons"), filename)
+    return send_from_directory(ICON_ROOT, filename)
 
 
 @blueprint.get("/manifest.webmanifest")
@@ -89,9 +90,9 @@ def manifest():
 
 @blueprint.get("/favicon.ico")
 def favicon():
-    return send_from_directory(STATIC_ROOT, "favicon.svg", mimetype="image/svg+xml")
+    return send_from_directory(ICON_ROOT, "melodarr.svg", mimetype="image/svg+xml")
 
 
 @blueprint.get("/apple-touch-icon.png")
 def apple_touch_icon():
-    return send_from_directory(STATIC_ROOT, "apple-touch-icon.png")
+    return send_from_directory(ICON_ROOT, "melodarr-180.png")

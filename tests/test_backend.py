@@ -202,6 +202,25 @@ class ApplicationFactoryTests(DatabaseTestCase):
         self.assertEqual(response.status_code, 302)
         self.assertEqual(response.headers["Location"], "/static/site.webmanifest")
 
+    def test_conventional_icon_urls_serve_canonical_brand_assets(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        cases = (
+            ("/favicon.ico", "melodarr.svg"),
+            ("/apple-touch-icon.png", "melodarr-180.png"),
+        )
+
+        for url, filename in cases:
+            with self.subTest(url=url):
+                with self.client.get(url) as response:
+                    with open(
+                        os.path.join(project_root, "frontend", "icons", filename),
+                        "rb",
+                    ) as file:
+                        expected = file.read()
+
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.data, expected)
+
 
 class PlexListenStorageTests(DatabaseTestCase):
     def test_listens_are_deduplicated_scoped_and_pruned(self):
