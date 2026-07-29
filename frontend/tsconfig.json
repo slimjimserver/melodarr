@@ -7,11 +7,7 @@
     "useUnknownInCatchVariables": false,
     "noImplicitOverride": true,
     "noFallthroughCasesInSwitch": true,
-    "noEmitOnError": true,
     "rootDir": "src",
-    "outDir": "static",
-    "removeComments": false,
-    "sourceMap": true,
     "types": []
   },
   "include": ["src/**/*.ts"]
