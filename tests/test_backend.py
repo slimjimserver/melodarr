@@ -196,6 +196,12 @@ class ApplicationFactoryTests(DatabaseTestCase):
         self.assertTrue(self.app.config["TESTING"])
         self.assertEqual(self.app.config["SECRET_KEY"], "test-secret")
 
+    def test_legacy_manifest_url_redirects_to_the_active_manifest(self):
+        response = self.client.get("/manifest.webmanifest")
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers["Location"], "/static/site.webmanifest")
+
 
 class PlexListenStorageTests(DatabaseTestCase):
     def test_listens_are_deduplicated_scoped_and_pruned(self):

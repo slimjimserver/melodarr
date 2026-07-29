@@ -84,9 +84,7 @@ def icons(filename):
 
 @blueprint.get("/manifest.webmanifest")
 def manifest():
-    return send_from_directory(
-        STATIC_ROOT, "manifest.webmanifest", mimetype="application/manifest+json"
-    )
+    return redirect("/static/site.webmanifest")
 
 
 @blueprint.get("/favicon.ico")
