@@ -162,7 +162,7 @@ main { max-width: 1050px; margin: auto; padding: clamp(70px, 10vw, 120px) 28px; 
 .eyebrow { margin: 0 0 17px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; font-weight: 700; letter-spacing: .15em; }
 h1 { margin: 0; max-width: 800px; color: var(--foreground); font-size: clamp(46px, 7vw, 78px); font-weight: 690; letter-spacing: -.055em; line-height: .96; }
 h1 em { font-style: normal; }
-.intro, .section-heading > p { max-width: 590px; margin: 26px 0 32px; color: var(--foreground-muted); font-size: 16px; line-height: 1.65; }
+.intro { max-width: 590px; margin: 26px 0 32px; color: var(--foreground-muted); font-size: 16px; line-height: 1.65; }
 .artist-detail-link { color: var(--foreground); font-weight: 650; text-decoration-color: var(--accent); text-underline-offset: 3px; }
 
 .search { display: flex; height: 60px; max-width: 740px; overflow: hidden; border: 1px solid var(--border-hover); border-radius: 16px; background: rgba(255, 252, 247, .93); box-shadow: 0 12px 30px rgba(68, 50, 38, .08); }
@@ -178,7 +178,6 @@ h1 em { font-style: normal; }
 .results { display: grid; max-width: 740px; gap: 10px; }
 .recommendations { width: min(1400px, calc(100vw - 56px)); max-width: none; margin-top: 56px; margin-left: 50%; border-top: 1px solid var(--border); padding-top: 28px; transform: translateX(-50%); }
 .recommendations-heading { display: flex; align-items: end; justify-content: space-between; gap: 20px; }
-.recommendation-actions { display: flex; gap: 8px; }
 .recommendations-heading .eyebrow { margin-bottom: 8px; }
 .recommendations-heading h2 { margin: 0; font-size: 27px; letter-spacing: -.04em; }
 .recommendation-row { margin-top: 30px; content-visibility: auto; contain-intrinsic-size: auto 270px; }
@@ -272,9 +271,6 @@ h1 em { font-style: normal; }
 @keyframes skeleton-sweep { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
 .skeleton-card { height: 74px; }
 .skeleton-art { width: 154px; height: 154px; flex: 0 0 154px; border-radius: 12px; }
-.skeleton-line { height: 13px; margin-top: 8px; border-radius: 6px; }
-.skeleton-line.short { width: 60%; }
-.skeleton-cover { width: 280px; aspect-ratio: 1; border-radius: 16px; }
 
 /* Toasts. Request results appear next to the thumb rather than at the top of a
    page the reader may have scrolled hundreds of rows past. */
@@ -393,7 +389,6 @@ h1 em { font-style: normal; }
 .service-intro h2 { margin: 0 0 4px; font-size: 20px; letter-spacing: -.03em; }
 .service-intro p { margin: 0; color: var(--foreground-muted); font-size: 13px; line-height: 1.4; }
 .service-icon { display: block; width: 42px; height: 42px; padding: 7px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
-.service-mark { display: grid; place-items: center; padding: 0; color: var(--accent-bright); font-size: 12px; font-weight: 800; letter-spacing: -.05em; }
 .service-state { border: 1px solid var(--border); border-radius: 999px; background: var(--surface); color: var(--foreground-subtle); padding: 6px 10px; font-size: 12px; white-space: nowrap; }
 .service-card { display: grid; gap: 20px; border-radius: 16px; padding: 24px; }
 .service-card > div { display: block; }
@@ -449,7 +444,6 @@ dialog::backdrop { background: rgba(48, 39, 32, .52); }
 .account-nav p { margin: 14px 8px 3px; color: var(--foreground-muted); font-size: 11px; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
 .account-nav a { border-radius: 7px; color: var(--foreground-subtle); padding: 10px 8px; text-decoration: none; font-size: 13px; }
 .account-nav a.active { background: rgba(168, 68, 45, .1); color: var(--foreground); }
-.account-nav-action { margin-top: 10px; border: 1px solid var(--border); border-radius: 7px; background: rgba(255, 255, 255, .035); color: var(--foreground-muted); cursor: pointer; padding: 10px 8px; text-align: left; font: 600 13px inherit; transition: border-color .2s var(--ease-out), background .2s var(--ease-out), color .2s var(--ease-out); }
 .account-content { min-width: 0; }
 .account-section + .account-section { margin-top: 34px; }
 .account-section h2, .account-form h2 { margin: 0 0 14px; font-size: 20px; letter-spacing: -.03em; }
@@ -494,7 +488,7 @@ details summary { margin-bottom: 17px; color: var(--accent-bright); cursor: poin
    state is gated behind a real pointer. */
 @media (hover: hover) {
   .nav-link:hover { border-color: var(--accent); color: var(--foreground); }
-  .logout:hover, .outline:hover, .secondary-action:hover, .account-menu:hover, .account-nav-action:hover { border-color: var(--border-hover); background: var(--surface-hover); color: var(--foreground); transform: translateY(-1px); }
+  .logout:hover, .outline:hover, .secondary-action:hover, .account-menu:hover { border-color: var(--border-hover); background: var(--surface-hover); color: var(--foreground); transform: translateY(-1px); }
   .auth-form button:hover, .search button:hover, .request:hover, .request-artist:hover, .service-card button:hover, .dialog-actions button:last-child:hover { background: var(--accent-bright); box-shadow: 0 7px 18px rgba(132, 49, 33, .2); transform: translateY(-1px); }
   .artist-detail-link:hover { color: var(--accent-bright); }
   .recommendation-card:hover .recommendation-art { border-color: var(--accent-bright); box-shadow: 0 10px 25px rgba(0, 0, 0, .35), 0 0 0 2px rgba(94, 106, 210, .22); transform: translateY(-2px); }
@@ -593,7 +587,7 @@ details summary { margin-bottom: 17px; color: var(--accent-bright); cursor: poin
   .recommendation-art, .skeleton-art { width: 132px; flex-basis: 132px; height: 132px; }
 
   .detail-heading { gap: 22px; }
-  .detail-cover, .skeleton-cover { width: min(280px, 100%); }
+  .detail-cover { width: min(280px, 100%); }
   .service-intro { grid-template-columns: 42px minmax(0, 1fr); }
   .service-state { grid-column: 2; justify-self: start; }
   #detail-title { font-size: clamp(32px, 11vw, 50px); }
@@ -603,7 +597,6 @@ details summary { margin-bottom: 17px; color: var(--accent-bright); cursor: poin
   .discography-nav { position: static; grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .account-nav { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .account-nav p { grid-column: 1 / -1; }
-  .account-nav-action { grid-column: 1 / -1; }
   .history-detail { align-items: flex-start; }
   .request-pagination { grid-template-columns: 1fr 1fr; }
   .request-pagination span { grid-column: 1 / -1; grid-row: 1; }
