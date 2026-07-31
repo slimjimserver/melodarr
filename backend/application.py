@@ -13,6 +13,7 @@ if __package__:
     from .config import FRONTEND_ROOT, load_session_secret
     from .routes.account import blueprint as account_blueprint
     from .routes.admin import blueprint as admin_blueprint
+    from .routes.ai import blueprint as ai_blueprint
     from .routes.artwork import blueprint as artwork_blueprint
     from .routes.auth import blueprint as auth_blueprint
     from .routes.discovery import blueprint as discovery_blueprint
@@ -28,6 +29,7 @@ else:  # Support the existing `python backend/app.py` entry point.
     from config import FRONTEND_ROOT, load_session_secret
     from routes.account import blueprint as account_blueprint
     from routes.admin import blueprint as admin_blueprint
+    from routes.ai import blueprint as ai_blueprint
     from routes.artwork import blueprint as artwork_blueprint
     from routes.auth import blueprint as auth_blueprint
     from routes.discovery import blueprint as discovery_blueprint
@@ -127,6 +129,7 @@ def cache_static_assets(response):
 BLUEPRINTS = (
     account_blueprint,
     admin_blueprint,
+    ai_blueprint,
     artwork_blueprint,
     auth_blueprint,
     discovery_blueprint,

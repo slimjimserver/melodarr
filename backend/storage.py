@@ -6,6 +6,7 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from tempfile import NamedTemporaryFile
+from threading import Lock
 
 if __package__:
     from .config import DATABASE, SETTINGS_FILE
@@ -14,6 +15,7 @@ else:  # Support the existing `python backend/app.py` entry point.
 
 
 DATABASE_BUSY_TIMEOUT_MS = 5000
+_settings_lock = Lock()
 
 
 @contextmanager
@@ -85,9 +87,13 @@ def get_lastfm_api_key():
 
 def save_service(service, values):
     """Persist settings for one external service."""
-    settings = load_settings_file() or {}
-    settings[service] = values
-    write_settings_file(settings)
+    # The production server handles requests on multiple threads. Serialize
+    # the read-modify-write sequence so two unrelated service updates cannot
+    # each replace the file with a snapshot that omits the other update.
+    with _settings_lock:
+        settings = load_settings_file() or {}
+        settings[service] = values
+        write_settings_file(settings)
 
 
 def get_request_history(user_id, limit=100, offset=0):
@@ -161,22 +167,24 @@ def enqueue_lidarr_search(
             # before the background worker begins processing them.
             (user_id, mbid, album_id, artist_id, name, "album", now + 1, now),
         )
-        if cursor.rowcount:
-            connection.execute(
-                "INSERT INTO request_history "
-                "(user_id, kind, mbid, name, artist_name, release_type, "
-                "release_date, created_at) "
-                "VALUES (?, 'release-group', ?, ?, ?, ?, ?, ?)",
-                (
-                    user_id,
-                    mbid,
-                    name,
-                    artist_name or None,
-                    release_type or None,
-                    release_date or None,
-                    now,
-                ),
-            )
+        # The queue is shared across users by release-group MBID, while
+        # request history is private per user. Even when another request
+        # already created the shared job, retain this user's action.
+        connection.execute(
+            "INSERT INTO request_history "
+            "(user_id, kind, mbid, name, artist_name, release_type, "
+            "release_date, created_at) "
+            "VALUES (?, 'release-group', ?, ?, ?, ?, ?, ?)",
+            (
+                user_id,
+                mbid,
+                name,
+                artist_name or None,
+                release_type or None,
+                release_date or None,
+                now,
+            ),
+        )
         return bool(cursor.rowcount)
 
 
@@ -302,6 +310,98 @@ def recommendation_cache_stats():
             "COALESCE(SUM(LENGTH(CAST(value AS BLOB))), 0) AS value_bytes, "
             "MIN(refreshed_at) AS oldest_refresh, MAX(refreshed_at) AS newest_refresh "
             "FROM recommendation_cache"
+        ).fetchone()
+    return dict(row)
+
+
+def listening_profile_users():
+    """Return only the fields needed by the private profile refresh worker."""
+    with db() as connection:
+        return connection.execute(
+            "SELECT id, listenbrainz_username, lastfm_username, plex_id "
+            "FROM users ORDER BY id"
+        ).fetchall()
+
+
+def get_listening_profile(user_id):
+    """Return one user's durable listening profile without exposing another."""
+    with db() as connection:
+        return connection.execute(
+            "SELECT value, refreshed_at, last_attempted_at, last_error "
+            "FROM listening_profiles WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+
+
+def save_listening_profile(
+    user_id,
+    value,
+    *,
+    refreshed_at=None,
+    last_attempted_at=None,
+    last_error=None,
+):
+    """Atomically replace one user's profile after a complete build pass."""
+    refreshed_at = time.time() if refreshed_at is None else float(refreshed_at)
+    last_attempted_at = (
+        refreshed_at if last_attempted_at is None else float(last_attempted_at)
+    )
+    with db() as connection:
+        connection.execute(
+            "INSERT OR REPLACE INTO listening_profiles "
+            "(user_id, value, refreshed_at, last_attempted_at, last_error) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                user_id,
+                json.dumps(value, ensure_ascii=False, separators=(",", ":")),
+                refreshed_at,
+                last_attempted_at,
+                str(last_error)[:500] if last_error else None,
+            ),
+        )
+
+
+def record_listening_profile_failure(user_id, error, *, attempted_at=None):
+    """Record a failed pass while retaining the last known-good profile value."""
+    with db() as connection:
+        connection.execute(
+            "UPDATE listening_profiles SET last_attempted_at = ?, last_error = ? "
+            "WHERE user_id = ?",
+            (
+                time.time() if attempted_at is None else float(attempted_at),
+                str(error)[:500],
+                user_id,
+            ),
+        )
+
+
+def delete_listening_profile(user_id):
+    """Remove profile data when a user is removed or explicitly invalidated."""
+    with db() as connection:
+        cursor = connection.execute(
+            "DELETE FROM listening_profiles WHERE user_id = ?",
+            (user_id,),
+        )
+        return cursor.rowcount
+
+
+def clear_listening_profiles():
+    """Remove all profiles after a deliberate shared-provider reconfiguration."""
+    with db() as connection:
+        cursor = connection.execute("DELETE FROM listening_profiles")
+        return cursor.rowcount
+
+
+def listening_profile_stats():
+    """Summarize durable profiles without returning any private taste data."""
+    with db() as connection:
+        row = connection.execute(
+            "SELECT COUNT(*) AS entries, "
+            "COALESCE(SUM(LENGTH(CAST(value AS BLOB))), 0) AS value_bytes, "
+            "MIN(refreshed_at) AS oldest_refresh, "
+            "MAX(refreshed_at) AS newest_refresh, "
+            "COALESCE(SUM(CASE WHEN last_error IS NOT NULL THEN 1 ELSE 0 END), 0) "
+            "AS errors FROM listening_profiles"
         ).fetchone()
     return dict(row)
 
@@ -512,6 +612,15 @@ def init_db():
                 user_id INTEGER PRIMARY KEY REFERENCES users(id),
                 value TEXT NOT NULL,
                 refreshed_at REAL NOT NULL
+            )
+        """)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS listening_profiles (
+                user_id INTEGER PRIMARY KEY REFERENCES users(id),
+                value TEXT NOT NULL,
+                refreshed_at REAL NOT NULL,
+                last_attempted_at REAL NOT NULL,
+                last_error TEXT
             )
         """)
         connection.execute("""

@@ -7,17 +7,37 @@ from flask import Blueprint, jsonify, request
 from werkzeug.security import generate_password_hash
 
 if __package__ == "backend.routes":
-    from .account import _profile_history_item, _profile_plex_index
+    from .account import (
+        _profile_history_item,
+        _profile_plex_index,
+        _requested_page,
+    )
     from ..responses import api_error
     from ..security import admin_required, current_user
-    from ..storage import db, delete_recommendation_cache, get_lastfm_api_key
+    from ..storage import (
+        db,
+        delete_listening_profile,
+        delete_recommendation_cache,
+        get_lastfm_api_key,
+    )
     from ..workers import recommendations as recommendation_worker
+    from ..workers import listening_profiles as listening_profile_worker
 else:  # Support the existing `python backend/app.py` entry point.
-    from routes.account import _profile_history_item, _profile_plex_index
+    from routes.account import (
+        _profile_history_item,
+        _profile_plex_index,
+        _requested_page,
+    )
     from responses import api_error
     from security import admin_required, current_user
-    from storage import db, delete_recommendation_cache, get_lastfm_api_key
+    from storage import (
+        db,
+        delete_listening_profile,
+        delete_recommendation_cache,
+        get_lastfm_api_key,
+    )
     from workers import recommendations as recommendation_worker
+    from workers import listening_profiles as listening_profile_worker
 
 
 blueprint = Blueprint("admin", __name__)
@@ -140,12 +160,8 @@ def users():
 @admin_required
 def requests():
     """Return one page of every user's request history to an administrator."""
-    raw_page = request.args.get("page", "1")
-    try:
-        page = int(raw_page)
-    except (TypeError, ValueError):
-        return api_error("Page must be a positive integer.")
-    if page < 1:
+    page = _requested_page()
+    if page is None:
         return api_error("Page must be a positive integer.")
 
     with db() as connection:
@@ -321,7 +337,9 @@ def update_user(user_id):
 
     if recommendation_inputs_changed:
         delete_recommendation_cache(user_id)
+        delete_listening_profile(user_id)
         recommendation_worker.request_refresh()
+        listening_profile_worker.request_refresh()
 
     return jsonify({
         "message": "User settings saved.",
@@ -364,6 +382,9 @@ def delete_user(user_id):
         )
         connection.execute(
             "DELETE FROM recommendation_cache WHERE user_id = ?", (user_id,)
+        )
+        connection.execute(
+            "DELETE FROM listening_profiles WHERE user_id = ?", (user_id,)
         )
         connection.execute(
             "DELETE FROM plex_listens WHERE user_id = ?", (user_id,)

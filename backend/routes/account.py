@@ -12,7 +12,7 @@ from flask import Blueprint, current_app, jsonify, request
 from werkzeug.security import generate_password_hash
 
 if __package__ == "backend.routes":
-    from ..responses import api_error
+    from ..responses import api_error, request_json_object
     from ..security import (
         admin_required,
         current_user,
@@ -23,14 +23,16 @@ if __package__ == "backend.routes":
     from ..storage import (
         db,
         count_request_history,
+        delete_listening_profile,
         delete_recommendation_cache,
         get_lastfm_api_key,
         get_request_history,
         get_service,
     )
     from ..workers import recommendations as recommendation_worker
+    from ..workers import listening_profiles as listening_profile_worker
 else:  # Support the existing `python backend/app.py` entry point.
-    from responses import api_error
+    from responses import api_error, request_json_object
     from security import (
         admin_required,
         current_user,
@@ -41,16 +43,19 @@ else:  # Support the existing `python backend/app.py` entry point.
     from storage import (
         db,
         count_request_history,
+        delete_listening_profile,
         delete_recommendation_cache,
         get_lastfm_api_key,
         get_request_history,
         get_service,
     )
     from workers import recommendations as recommendation_worker
+    from workers import listening_profiles as listening_profile_worker
 
 
 blueprint = Blueprint("account", __name__)
 REQUESTS_PAGE_SIZE = 100
+SQLITE_MAX_INTEGER = (2 ** 63) - 1
 
 
 def _requested_page():
@@ -59,12 +64,21 @@ def _requested_page():
         page = int(raw_page)
     except (TypeError, ValueError):
         return None
-    return page if page > 0 else None
+    if (
+        page < 1
+        or page - 1 > SQLITE_MAX_INTEGER // REQUESTS_PAGE_SIZE
+    ):
+        return None
+    return page
 
 
 def _recommendation_inputs_changed(user_id):
     delete_recommendation_cache(user_id)
+    # A deliberate unlink must stop the old provider slice from reaching AI
+    # immediately; stale preservation is reserved for transient outages.
+    delete_listening_profile(user_id)
     recommendation_worker.request_refresh()
+    listening_profile_worker.request_refresh()
 
 
 def _profile_plex_index():
@@ -258,7 +272,9 @@ def account_general():
     )
     if error:
         return error
-    values = request.get_json(silent=True) or {}
+    values = request_json_object()
+    if values is None:
+        return api_error("Request body must be a JSON object.")
     username = str(values.get("username", "")).strip()
     password = str(values.get("password", ""))
     if not re.fullmatch(r"[A-Za-z0-9_.-]{3,32}", username):
@@ -292,7 +308,9 @@ def configure_listenbrainz():
     if error:
         return error
     user_id = user["id"]
-    values = request.get_json(silent=True) or {}
+    values = request_json_object()
+    if values is None:
+        return api_error("Request body must be a JSON object.")
     username = str(values.get("username", "")).strip()
     if not username:
         with db() as connection:
@@ -346,7 +364,9 @@ def configure_lastfm():
     )
     if error:
         return error
-    values = request.get_json(silent=True) or {}
+    values = request_json_object()
+    if values is None:
+        return api_error("Request body must be a JSON object.")
     username = str(values.get("username", "")).strip()
     if not username:
         with db() as connection:

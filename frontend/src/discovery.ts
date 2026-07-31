@@ -40,6 +40,10 @@
   let recommendationPoll: ReturnType<typeof setTimeout> | undefined;
   let recommendationRequestVersion = 0;
   let recommendationAbort: AbortController | undefined;
+  let aiRequestVersion = 0;
+  let aiAbort: AbortController | undefined;
+  let aiConfigured = false;
+  let aiProviderLabel = "AI";
   let searchRequestVersion = 0;
   let searchDebounce: ReturnType<typeof setTimeout>;
   let searchAbort: AbortController | undefined;
@@ -1526,10 +1530,47 @@
     artist: { placeholder: "Search artists…", noun: "artist" },
     album: { placeholder: "Search albums…", noun: "album" },
     track: { placeholder: "Search tracks…", noun: "release group" },
+    ai: {
+      placeholder: "Ask for music based on your listening history…",
+      noun: "recommendation",
+    },
   } as const;
 
   function copyForSearchType(type: string) {
     return searchTypeCopy[type as keyof typeof searchTypeCopy] || searchTypeCopy.artist;
+  }
+
+  const searchType = $<HTMLSelectElement>("#search-type");
+  const searchInput = $<HTMLInputElement>("#search-input");
+  const searchSubmit = $<HTMLButtonElement>("#search-submit");
+  let activeSearchType = searchType.value;
+
+  function isAISearchMode() {
+    return searchType.value === "ai";
+  }
+
+  function updateSearchSubmitState() {
+    searchSubmit.disabled = isAISearchMode()
+      ? !aiConfigured || !searchInput.value.trim() || Boolean(aiAbort)
+      : false;
+  }
+
+  function applySearchMode(type: string) {
+    const aiMode = type === "ai";
+    $("#ai-recommendations").hidden = !aiMode;
+    searchInput.placeholder = copyForSearchType(type).placeholder;
+    searchInput.setAttribute(
+      "aria-label",
+      aiMode ? "Ask for personalized music recommendations" : `Search ${type}s`,
+    );
+    if (aiMode) {
+      searchInput.maxLength = 500;
+      searchSubmit.textContent = "Ask AI";
+    } else {
+      searchInput.removeAttribute("maxlength");
+      searchSubmit.textContent = "Search";
+    }
+    updateSearchSubmitState();
   }
 
   function searchResultMessage(type: string, count: number) {
@@ -1538,18 +1579,47 @@
     return type === "track" ? `${summary} for matching tracks` : summary;
   }
 
-  $("#search-type").addEventListener("change", (event) => {
+  searchType.addEventListener("change", (event) => {
     const type = (event.target as HTMLSelectElement).value;
-    $("#search-input").placeholder = copyForSearchType(type).placeholder;
-    if ($("#search-input").value.trim().length >= 2) runSearch();
+    const crossedAIBoundary = type === "ai" || activeSearchType === "ai";
+    activeSearchType = type;
+    searchRequestVersion += 1;
+    searchAbort?.abort();
+    searchAbort = undefined;
+    clearTimeout(searchDebounce);
+    if (crossedAIBoundary) {
+      aiRequestVersion += 1;
+      aiAbort?.abort();
+      aiAbort = undefined;
+      searchInput.value = "";
+      const results = $("#results");
+      results.replaceChildren();
+      results.classList.remove("ai-result-list");
+      results.removeAttribute("aria-busy");
+      results.setAttribute("aria-label", "Search results");
+      $("#search-message").textContent = "";
+      $("#ai-message").textContent = "";
+    }
+    applySearchMode(type);
+    if (type === "ai") {
+      refreshAIStatus();
+    } else if (searchInput.value.trim().length >= 2) {
+      runSearch();
+    }
   });
 
   async function runSearch() {
+    if (isAISearchMode()) {
+      await askAI();
+      return;
+    }
     const requestVersion = ++searchRequestVersion;
     searchAbort?.abort();
-    const query = $("#search-input").value.trim();
-    const type = $("#search-type").value;
+    const query = searchInput.value.trim();
+    const type = searchType.value;
     const results = $("#results");
+    results.classList.remove("ai-result-list");
+    results.setAttribute("aria-label", "Search results");
 
     if (query.length < 2) {
       searchAbort = undefined;
@@ -1611,15 +1681,333 @@
   // MusicBrainz requests are serialized at roughly one per second upstream, so
   // this waits for a genuine pause in typing rather than firing per keystroke.
   const searchDebounceMilliseconds = 450;
-  $("#search-input").addEventListener("input", () => {
+  searchInput.addEventListener("input", () => {
     clearTimeout(searchDebounce);
+    if (isAISearchMode()) {
+      updateSearchSubmitState();
+      return;
+    }
     searchDebounce = setTimeout(runSearch, searchDebounceMilliseconds);
   });
 
   $("#search-form").addEventListener("submit", (event) => {
     event.preventDefault();
     clearTimeout(searchDebounce);
-    runSearch();
+    if (isAISearchMode()) askAI();
+    else runSearch();
+  });
+
+  function aiProviderName(status: JsonObject) {
+    const provider = (status.providers || [])
+      .find((option: JsonObject) => String(option.id) === String(status.provider));
+    const names: Record<string, string> = {
+      openai: "OpenAI",
+      anthropic: "Claude",
+      gemini: "Gemini",
+      lmstudio: "LM Studio",
+      ollama: "Ollama",
+    };
+    return String(provider?.name || names[String(status.provider)] || aiProviderLabel);
+  }
+
+  async function refreshAIStatus() {
+    const readiness = $("#ai-readiness");
+    const readinessCopy = $("#ai-readiness-copy");
+    const settingsLink = $("#ai-settings-link");
+    settingsLink.hidden = true;
+    readiness.className = "ai-readiness";
+    readinessCopy.textContent = "Checking your private recommendation setup…";
+    try {
+      const status = await getJson("/api/ai/status", 15_000);
+      aiConfigured = Boolean(status.configured);
+      const provider = aiProviderName(status);
+      aiProviderLabel = provider;
+      $("#ai-provider-badge").textContent = aiConfigured
+        ? `${provider} · ${status.model || "configured"}`
+        : "Setup needed";
+      readiness.classList.toggle("ready", aiConfigured);
+      readiness.classList.toggle("error", !aiConfigured);
+      readinessCopy.textContent = aiConfigured
+        ? ["lmstudio", "ollama"].includes(String(status.provider))
+          ? `Your prompt, compact taste profile, and query-matched catalog candidates stay on your configured ${provider} server.`
+          : `Submitting sends your prompt, a compact taste profile, and query-matched catalog candidates to ${provider}. API keys stay on the server.`
+        : currentUser?.role === "admin"
+          ? "Choose an AI provider to start private, listening-history-grounded discovery."
+          : "An administrator needs to configure an AI provider before you can ask for recommendations.";
+      settingsLink.hidden = aiConfigured || currentUser?.role !== "admin";
+      updateSearchSubmitState();
+    } catch {
+      aiConfigured = false;
+      $("#ai-provider-badge").textContent = "Unavailable";
+      readiness.classList.add("error");
+      readinessCopy.textContent = "We couldn’t check the AI provider just now. Try again in a moment.";
+      updateSearchSubmitState();
+    }
+  }
+
+  function aiRecommendationKind(item: JsonObject): "artist" | "release-group" {
+    return item.kind === "artist" ? "artist" : "release-group";
+  }
+
+  function aiRecommendationId(item: JsonObject) {
+    return String(item.id || item.mbid || "");
+  }
+
+  function aiEvidence(item: JsonObject) {
+    const evidence: string[] = [];
+    if (item.unheard === true) evidence.push("Not in listen history");
+    if (item.availableInPlex === false) evidence.push("New to your library");
+    if (item.recommendationSource) evidence.push(String(item.recommendationSource));
+    const supplied = Array.isArray(item.evidence)
+      ? item.evidence
+      : Array.isArray(item.basedOn) ? item.basedOn : [];
+    supplied.forEach((entry: unknown) => {
+      const value = typeof entry === "string"
+        ? entry
+        : typeof entry === "object" && entry
+          ? String((entry as JsonObject).label || (entry as JsonObject).name || "")
+          : "";
+      if (value && !evidence.includes(value)) evidence.push(value);
+    });
+    return evidence.slice(0, 3);
+  }
+
+  function createAIRecommendationCard(item: JsonObject, index: number) {
+    const kind = aiRecommendationKind(item);
+    const id = aiRecommendationId(item);
+    const titleText = String(item.name || item.title || "Untitled recommendation");
+    const card = document.createElement("article");
+    card.className = "ai-recommendation-card";
+
+    const fallback = document.createElement("div");
+    fallback.className = "ai-result-art";
+    const art = id ? document.createElement("button") : fallback;
+    if (id) {
+      art.className = "ai-result-art";
+      (art as HTMLButtonElement).type = "button";
+      art.setAttribute("aria-label", `Open details for ${titleText}`);
+      if (item.coverArt) {
+        const image = document.createElement("img");
+        image.alt = "";
+        image.loading = "lazy";
+        image.decoding = "async";
+        loadArtworkWhenNear(image, String(item.coverArt), fallback);
+        art.append(image);
+      }
+      art.addEventListener("click", () => showDetail(kind, id));
+      addDetailPrefetch(art, kind, id);
+    }
+
+    const body = document.createElement("div");
+    body.className = "ai-result-body";
+    const top = document.createElement("div");
+    top.className = "ai-result-topline";
+    const title = document.createElement("h4");
+    title.textContent = titleText;
+    top.append(title);
+
+    const meta = document.createElement("p");
+    meta.className = "ai-result-meta";
+    meta.textContent = [
+      item.artist,
+      kind === "artist" ? item.type || "Artist" : item.type || "Album",
+      item.date,
+    ].filter(Boolean).join(" · ");
+    const reason = document.createElement("p");
+    reason.className = "ai-reason";
+    reason.textContent = String(item.reason || "Selected as a grounded match for this request.");
+    body.append(top, meta, reason);
+
+    const evidence = aiEvidence(item);
+    if (evidence.length) {
+      const evidenceRow = document.createElement("div");
+      evidenceRow.className = "ai-evidence";
+      evidence.forEach((value) => {
+        const tag = document.createElement("span");
+        tag.textContent = value;
+        evidenceRow.append(tag);
+      });
+      body.append(evidenceRow);
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "ai-result-actions";
+    if (id) {
+      const details = document.createElement("button");
+      details.type = "button";
+      details.textContent = "View details";
+      details.addEventListener("click", () => showDetail(kind, id));
+      actions.append(details);
+    }
+
+    const plexUrl = String(item.plexUrl || item.plex?.url || "");
+    if (item.availableInPlex && plexUrl) {
+      const destination = mobilePlexDestination(
+        plexUrl,
+        String(item.plexampUrl || item.plex?.plexampUrl || ""),
+      );
+      const plex = document.createElement("a");
+      plex.href = destination.url;
+      plex.textContent = destination.label;
+      if (destination.openInNewTab) {
+        plex.target = "_blank";
+        plex.rel = "noopener noreferrer";
+      }
+      actions.append(plex);
+    } else if (id) {
+      const request = document.createElement("button");
+      request.type = "button";
+      request.className = "ai-request-action";
+      if (item.availableInLidarr) {
+        request.textContent = "In Lidarr";
+        request.disabled = true;
+      } else if (item.requested) {
+        request.textContent = "Requested";
+        request.disabled = true;
+      } else {
+        request.textContent = "Add to Lidarr";
+        request.addEventListener("click", () => {
+          if (kind === "artist") {
+            openRequestDialog({ ...item, id, name: titleText }, $("#ai-message"));
+          } else {
+            requestReleaseGroup({ id, button: request });
+          }
+        });
+      }
+      actions.append(request);
+    }
+    card.style.setProperty("--ai-result-index", String(index));
+    card.append(art, body, actions);
+    return card;
+  }
+
+  function renderAIRecommendations(data: JsonObject, prompt: string) {
+    const resultsContainer = $("#results");
+    resultsContainer.replaceChildren();
+    resultsContainer.classList.add("ai-result-list");
+    resultsContainer.setAttribute("aria-label", "AI recommendation results");
+    const recommendations = Array.isArray(data.recommendations)
+      ? data.recommendations
+      : [];
+    if (!recommendations.length) {
+      $("#ai-message").textContent = "No MusicBrainz-verified music matched that request. Try widening the mood, era, or style.";
+      return;
+    }
+
+    const heading = document.createElement("div");
+    heading.className = "ai-response-heading";
+    const copy = document.createElement("div");
+    const title = document.createElement("h3");
+    title.textContent = "A grounded shortlist";
+    const summary = document.createElement("p");
+    summary.textContent = `Verified, new-to-library possibilities for “${prompt}”`;
+    copy.append(title, summary);
+
+    const grounding = document.createElement("div");
+    grounding.className = "ai-grounding";
+    const historyCount = Number(data.grounding?.historyItemCount || 0);
+    const playedArtistCount = Number(data.grounding?.playedArtistCount || 0);
+    const candidateCount = Number(data.grounding?.candidateCount || 0);
+    const queryTags = Array.isArray(data.grounding?.queryTags)
+      ? data.grounding.queryTags.map(String).filter(Boolean).slice(0, 3)
+      : [];
+    [
+      queryTags.length ? `Matched: ${queryTags.join(" · ")}` : "",
+      playedArtistCount
+        ? `${playedArtistCount.toLocaleString()} listening-history artists`
+        : "",
+      historyCount ? `${historyCount.toLocaleString()} prior requests considered` : "",
+      candidateCount ? `${candidateCount.toLocaleString()} query-matched candidates` : "",
+      [aiProviderName(data), data.model].filter(Boolean).join(" · "),
+    ].filter(Boolean).forEach((value) => {
+      const tag = document.createElement("span");
+      tag.textContent = value;
+      grounding.append(tag);
+    });
+    heading.append(copy, grounding);
+
+    const results = document.createElement("div");
+    results.className = "ai-results";
+    recommendations.forEach((item: JsonObject, index: number) => {
+      results.append(createAIRecommendationCard(item, index));
+    });
+    resultsContainer.append(heading, results);
+    $("#ai-message").textContent =
+      `${recommendations.length} ${recommendations.length === 1 ? "match" : "matches"} selected from query-matched MusicBrainz results.`;
+  }
+
+  async function askAI() {
+    const prompt = searchInput.value.trim();
+    if (!prompt) return;
+    if (aiAbort) {
+      setMessage($("#ai-message"), "Melodarr AI is already working on your recommendation.");
+      return;
+    }
+    if (!aiConfigured) {
+      setMessage($("#ai-message"), "An AI provider needs to be configured first.", true);
+      return;
+    }
+
+    const requestVersion = ++aiRequestVersion;
+    const controller = new AbortController();
+    aiAbort = controller;
+    searchSubmit.disabled = true;
+    $("#search-message").textContent = "";
+    const resultsContainer = $("#results");
+    resultsContainer.classList.add("ai-result-list");
+    resultsContainer.setAttribute("aria-label", "AI recommendation results");
+    resultsContainer.setAttribute("aria-busy", "true");
+    const loading = document.createElement("div");
+    loading.className = "ai-results";
+    loading.append(
+      skeletonBlock("skeleton-card", 1),
+      skeletonBlock("skeleton-card", 1),
+      skeletonBlock("skeleton-card", 1),
+      skeletonBlock("skeleton-card", 1),
+    );
+    resultsContainer.replaceChildren(loading);
+    setMessage($("#ai-message"), "Interpreting your request, searching music catalogs, and checking your listening history…");
+    try {
+      const data = await api("/api/ai/recommendations", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt, limit: 8 }),
+        signal: controller.signal,
+      });
+      if (requestVersion !== aiRequestVersion) return;
+      renderAIRecommendations(data, prompt);
+    } catch (error) {
+      if (requestVersion !== aiRequestVersion) return;
+      resultsContainer.replaceChildren();
+      setMessage(
+        $("#ai-message"),
+        error.name === "AbortError"
+          ? "That recommendation request was stopped."
+          : `We couldn’t finish that recommendation. ${error.message}`,
+        true,
+      );
+    } finally {
+      if (requestVersion === aiRequestVersion) {
+        aiAbort = undefined;
+        resultsContainer.removeAttribute("aria-busy");
+        updateSearchSubmitState();
+      }
+    }
+  }
+
+  document.querySelectorAll<HTMLButtonElement>("[data-ai-prompt]").forEach((button) => {
+    button.addEventListener("click", () => {
+      searchInput.value = button.dataset.aiPrompt || "";
+      updateSearchSubmitState();
+      searchInput.focus();
+    });
+  });
+  $("#ai-settings-link").addEventListener("click", () => {
+    const settings = document.querySelector<HTMLButtonElement>(".nav-link[data-view=settings]");
+    settings?.click();
+    window.requestAnimationFrame(() => {
+      document.querySelector("#ai-settings")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
   });
 
   async function loadRecommendations(button: HTMLButtonElement) {
@@ -1686,8 +2074,12 @@
   $("#load-recommendations").addEventListener("click", () => {
     loadRecommendations($("#load-recommendations"));
   });
-  window.addEventListener("melodarr-authenticated", () => loadRecommendations($("#load-recommendations")));
+  window.addEventListener("melodarr-authenticated", () => {
+    loadRecommendations($("#load-recommendations"));
+    refreshAIStatus();
+  });
   window.addEventListener("melodarr-recommendations-changed", () => loadRecommendations($("#load-recommendations")));
+  window.addEventListener("melodarr-ai-settings-changed", () => refreshAIStatus());
   window.addEventListener("melodarr-lidarr-settings-changed", () => {
     lidarrExternalUrlVersion += 1;
     lidarrExternalUrl = undefined;
@@ -1695,15 +2087,21 @@
   });
   window.addEventListener("melodarr-signed-out", () => {
     recommendationRequestVersion += 1;
+    aiRequestVersion += 1;
     searchRequestVersion += 1;
     recommendationAbort?.abort();
+    aiAbort?.abort();
     searchAbort?.abort();
     clearTimeout(recommendationPoll);
     clearTimeout(searchDebounce);
     stopDetailAvailability();
     currentDetailData = undefined;
     $("#recommendation-results").replaceChildren();
+    $("#ai-message").textContent = "";
     $("#results").replaceChildren();
+    $("#results").classList.remove("ai-result-list");
+    $("#results").removeAttribute("aria-busy");
+    $("#results").setAttribute("aria-label", "Search results");
   });
 
   $("#back-to-search").addEventListener("click", () => {
@@ -1744,9 +2142,14 @@
     requestedArtist = undefined;
     $("#search-form").classList.remove("searching");
     $("#search-form").reset();
-    $("#search-input").placeholder = "Search artists…";
+    activeSearchType = "artist";
+    applySearchMode(activeSearchType);
     $("#search-message").textContent = "";
+    $("#ai-message").textContent = "";
     $("#results").replaceChildren();
+    $("#results").classList.remove("ai-result-list");
+    $("#results").removeAttribute("aria-busy");
+    $("#results").setAttribute("aria-label", "Search results");
     // Recommendation cards remain current through their own refresh events.
     // Keeping them mounted avoids refetching every thumbnail on navigation.
   });

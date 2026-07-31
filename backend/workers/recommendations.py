@@ -1,5 +1,6 @@
 """Periodic recommendation-cache refresh worker."""
 
+import logging
 import time
 from threading import Event
 
@@ -11,6 +12,7 @@ else:  # Support the existing `python backend/app.py` entry point.
     from recommendations import refresh_recommendation_cache
 
 
+logger = logging.getLogger(__name__)
 refresh_requested = Event()
 running = Event()
 last_completed_at = None
@@ -45,6 +47,12 @@ def run(initial_delay=0):
                 RECOMMENDATION_RETRY_INTERVAL
                 if retry_required
                 else RECOMMENDATION_REFRESH_INTERVAL
+            )
+        except Exception:
+            # Database failures and unexpected provider shapes must not kill
+            # the application's only recommendation-refresh loop.
+            logger.exception(
+                "Recommendation refresh failed; retrying on the short interval"
             )
         finally:
             last_completed_at = time.time()

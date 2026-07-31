@@ -16,6 +16,7 @@ if __package__ == "backend.workers":
         prune_plex_listens,
     )
     from . import recommendations as recommendation_worker
+    from . import listening_profiles as listening_profile_worker
 else:  # Support the existing `python backend/worker.py` entry point.
     from services import plex_history
     from storage import (
@@ -26,6 +27,7 @@ else:  # Support the existing `python backend/worker.py` entry point.
         prune_plex_listens,
     )
     from workers import recommendations as recommendation_worker
+    from workers import listening_profiles as listening_profile_worker
 
 
 logger = logging.getLogger(__name__)
@@ -248,6 +250,7 @@ def _run_sync(*, full=False):
         succeeded = True
         if result["inserted"] or result["pruned"]:
             recommendation_worker.request_refresh()
+            listening_profile_worker.request_refresh()
     except (ValueError, requests.RequestException) as exc:
         job_state["lastError"] = str(exc)
         logger.warning("Plex listening-history synchronization failed: %s", exc)

@@ -15,7 +15,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 if __package__ == "backend.routes":
     from ..api_cache import clear_cache
     from ..detail_cache import invalidate_all as invalidate_detail_payloads
-    from ..responses import api_error
+    from ..responses import api_error, request_json_object
     from ..security import (
         current_user,
         login_required,
@@ -24,13 +24,14 @@ if __package__ == "backend.routes":
         user_payload,
     )
     from ..services import plex, plex_auth
-    from ..storage import db, get_service, save_service
+    from ..storage import clear_listening_profiles, db, get_service, save_service
     from ..workers import plex as plex_worker
     from ..workers import plex_history as plex_history_worker
+    from ..workers import listening_profiles as listening_profile_worker
 else:  # Support the existing `python backend/app.py` entry point.
     from api_cache import clear_cache
     from detail_cache import invalidate_all as invalidate_detail_payloads
-    from responses import api_error
+    from responses import api_error, request_json_object
     from security import (
         current_user,
         login_required,
@@ -39,9 +40,10 @@ else:  # Support the existing `python backend/app.py` entry point.
         user_payload,
     )
     from services import plex, plex_auth
-    from storage import db, get_service, save_service
+    from storage import clear_listening_profiles, db, get_service, save_service
     from workers import plex as plex_worker
     from workers import plex_history as plex_history_worker
+    from workers import listening_profiles as listening_profile_worker
 
 
 blueprint = Blueprint("auth", __name__)
@@ -241,6 +243,7 @@ def _finish_plex_login(account, resources):
         return api_error("That Plex account is already linked to another user.", 409)
     if created:
         plex_history_worker.request_full_sync()
+        listening_profile_worker.request_refresh()
     return start_session(user, remember=True)
 
 
@@ -312,6 +315,7 @@ def _finish_plex_link(flow, account, resources):
         "credentials or Plex."
     )
     plex_history_worker.request_full_sync()
+    listening_profile_worker.request_refresh()
     return jsonify(payload)
 
 
@@ -344,7 +348,9 @@ def auth_status():
 
 @blueprint.post("/api/auth/register")
 def register():
-    values = request.get_json(silent=True) or {}
+    values = request_json_object()
+    if values is None:
+        return api_error("Request body must be a JSON object.")
     username = str(values.get("username", "")).strip()
     password = str(values.get("password", ""))
     invitation_token = str(values.get("invitationToken", ""))[:512]
@@ -391,7 +397,9 @@ def register():
 
 @blueprint.post("/api/auth/login")
 def login():
-    values = request.get_json(silent=True) or {}
+    values = request_json_object()
+    if values is None:
+        return api_error("Request body must be a JSON object.")
     username = str(values.get("username", "")).strip()
     password = str(values.get("password", ""))
     with db() as connection:
@@ -409,7 +417,9 @@ def login():
 
 @blueprint.post("/api/auth/plex/start")
 def start_plex_auth():
-    values = request.get_json(silent=True) or {}
+    values = request_json_object()
+    if values is None:
+        return api_error("Request body must be a JSON object.")
     purpose = str(values.get("purpose", "login"))
     if purpose not in {"login", "server", "link"}:
         return api_error("Unknown Plex sign-in purpose.")
@@ -487,7 +497,9 @@ def start_plex_auth():
 
 @blueprint.post("/api/auth/plex/poll")
 def poll_plex_auth():
-    values = request.get_json(silent=True) or {}
+    values = request_json_object()
+    if values is None:
+        return api_error("Request body must be a JSON object.")
     flow_token = str(values.get("flowToken", ""))
     flow, error = _load_flow(flow_token)
     if error:
@@ -554,7 +566,9 @@ def poll_plex_auth():
 
 @blueprint.post("/api/auth/plex/inspect")
 def inspect_plex_server():
-    values = request.get_json(silent=True) or {}
+    values = request_json_object()
+    if values is None:
+        return api_error("Request body must be a JSON object.")
     flow_token = str(values.get("flowToken", ""))
     flow, error = _load_flow(flow_token, purpose="server")
     if error:
@@ -622,7 +636,9 @@ def inspect_plex_server():
 
 @blueprint.post("/api/auth/plex/complete")
 def complete_plex_server():
-    values = request.get_json(silent=True) or {}
+    values = request_json_object()
+    if values is None:
+        return api_error("Request body must be a JSON object.")
     flow_token = str(values.get("flowToken", ""))
     flow, error = _load_flow(flow_token, purpose="server")
     if error:
@@ -692,9 +708,11 @@ def complete_plex_server():
 
     clear_cache("plex-library")
     clear_cache("plex-guid")
+    clear_listening_profiles()
     invalidate_detail_payloads()
     plex_worker.request_full_scan()
     plex_history_worker.request_full_sync()
+    listening_profile_worker.request_refresh()
     return start_session(user, remember=True)
 
 

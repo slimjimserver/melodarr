@@ -26,6 +26,7 @@ LISTENBRAINZ_METADATA_CACHE_TTL = 6 * 60 * 60
 LASTFM_CACHE_TTL = 60 * 60
 RECOMMENDATION_REFRESH_INTERVAL = 12 * 60 * 60
 RECOMMENDATION_RETRY_INTERVAL = 5 * 60
+LISTENING_PROFILE_REFRESH_INTERVAL = 24 * 60 * 60
 PLEX_RECENT_SCAN_INTERVAL = 5 * 60
 PLEX_FULL_SCAN_INTERVAL = 12 * 60 * 60
 PLEX_LIBRARY_CACHE_TTL = 30 * 24 * 60 * 60
@@ -74,7 +75,9 @@ def load_session_secret():
         return configured_secret
     if os.path.exists(SECRET_KEY_FILE):
         with open(SECRET_KEY_FILE, encoding="utf-8") as file:
-            return file.read().strip()
+            stored_secret = file.read().strip()
+        if stored_secret:
+            return stored_secret
 
     secret = os.urandom(48).hex()
     directory = os.path.dirname(os.path.abspath(SECRET_KEY_FILE))

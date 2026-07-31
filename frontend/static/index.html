@@ -143,16 +143,39 @@
     <section id="discover" class="view active">
       <p class="eyebrow">FIND YOUR NEXT FAVORITE</p>
       <h1>What do you want<br>to hear <em>next?</em></h1>
-      <p class="intro">Search for an artist, album, or track and we’ll help add it to your collection.</p>
+      <p class="intro">Explore MusicBrainz directly or ask for recommendations shaped around your listening history.</p>
       <form id="search-form" class="search">
         <select id="search-type" aria-label="Search type">
           <option value="artist">Artists</option>
           <option value="album">Albums</option>
           <option value="track">Tracks</option>
+          <option value="ai">AI recommendations</option>
         </select>
-        <input id="search-input" autocomplete="off" placeholder="Search artists…" aria-label="Search">
-        <button type="submit">Search</button>
+        <input id="search-input" autocomplete="off" placeholder="Search artists…" aria-label="Search artists">
+        <button id="search-submit" type="submit">Search</button>
       </form>
+      <section id="ai-recommendations" class="ai-search-options" aria-labelledby="ai-recommendations-title" hidden>
+        <div class="ai-search-heading">
+          <div class="ai-title-line">
+            <span class="ai-mark" aria-hidden="true">✦</span>
+            <h2 id="ai-recommendations-title">Personalized AI search</h2>
+            <span id="ai-provider-badge" class="ai-provider-badge">Checking AI…</span>
+          </div>
+          <p>Describe a mood, moment, or musical thread. Melodarr searches for matching music, verifies it with MusicBrainz, then personalizes the shortlist.</p>
+        </div>
+        <div class="ai-suggestions" aria-label="Prompt ideas">
+          <button type="button" data-ai-prompt="Surprise me with a hidden gem that connects several of my favorite artists.">Hidden gem</button>
+          <button type="button" data-ai-prompt="Recommend an album for focused late-night listening, based on my taste.">Late-night focus</button>
+          <button type="button" data-ai-prompt="Show me a recent release that feels fresh but still fits my listening history.">Something recent</button>
+          <button type="button" data-ai-prompt="Take one part of my taste and lead me somewhere unexpected.">A little adventurous</button>
+        </div>
+        <div id="ai-readiness" class="ai-readiness">
+          <span class="ai-readiness-dot" aria-hidden="true"></span>
+          <p id="ai-readiness-copy">Checking your private recommendation setup…</p>
+          <button id="ai-settings-link" class="ai-inline-action" type="button" hidden>Configure AI</button>
+        </div>
+        <p id="ai-message" class="message" aria-live="polite" aria-atomic="true"></p>
+      </section>
       <p id="search-message" class="message" aria-live="polite" aria-atomic="true"></p>
       <div id="results" class="results" aria-label="Search results"></div>
       <section class="recommendations" aria-labelledby="recommendations-title">
@@ -289,6 +312,50 @@
               <div>
                 <button id="clear-lastfm-key" class="secondary-action" type="button" hidden>Clear saved key</button>
                 <button id="save-lastfm-key" type="submit">Save API key</button>
+              </div>
+            </div>
+          </form>
+        </section>
+
+        <section id="ai-settings" class="settings-section">
+          <div class="service-intro">
+            <div class="service-icon ai-service-icon" aria-hidden="true">✦</div>
+            <div><h2>AI recommendations</h2><p>Let an AI reason over each user’s private listening profile and choose verified MusicBrainz matches.</p></div>
+            <span id="ai-settings-state" class="service-state">Not configured</span>
+          </div>
+          <form id="ai-settings-form" class="service-card ai-settings-card">
+            <div class="ai-privacy-note">
+              <span aria-hidden="true">◇</span>
+              <p><strong>Grounded by design.</strong> A minimized taste profile and bounded candidate list are sent to the configured provider, which can only return candidates Melodarr supplied. API keys stay on the server and never reach the browser.</p>
+            </div>
+            <div class="settings-fields">
+              <label>Provider
+                <select name="provider" id="ai-provider" required>
+                  <option value="openai">OpenAI</option>
+                  <option value="anthropic">Claude</option>
+                  <option value="gemini">Gemini</option>
+                  <option value="lmstudio">LM Studio</option>
+                  <option value="ollama">Ollama</option>
+                </select>
+              </label>
+              <label>Model
+                <input name="model" id="ai-model" autocomplete="off" placeholder="Provider default" required>
+                <small id="ai-model-help">Choose the model used to rank and explain recommendations.</small>
+              </label>
+              <label id="ai-api-key-field">API key
+                <input name="apiKey" type="password" autocomplete="off" placeholder="API key">
+                <small id="ai-api-key-help">The saved key is never displayed.</small>
+              </label>
+              <label id="ai-base-url-field" hidden>Base URL
+                <input name="baseUrl" type="url" autocomplete="off" placeholder="http://host.docker.internal:11434">
+                <small id="ai-base-url-help">Required for local providers; leave blank to use the provider default.</small>
+              </label>
+            </div>
+            <div class="form-actions">
+              <p class="form-message" aria-live="polite"></p>
+              <div>
+                <button id="clear-ai-key" class="secondary-action" type="button" hidden>Clear saved key</button>
+                <button id="save-ai-settings" type="submit">Save AI settings</button>
               </div>
             </div>
           </form>
