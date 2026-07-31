@@ -28,6 +28,10 @@ def db():
     )
     connection.row_factory = sqlite3.Row
     connection.execute(f"PRAGMA busy_timeout = {DATABASE_BUSY_TIMEOUT_MS}")
+    connection.execute("PRAGMA foreign_keys = ON")
+    if not connection.execute("PRAGMA foreign_keys").fetchone()[0]:
+        connection.close()
+        raise RuntimeError("SQLite foreign-key enforcement could not be enabled.")
     connection.execute("PRAGMA synchronous = NORMAL")
     try:
         yield connection
@@ -143,6 +147,13 @@ def record_request(
                 time.time(),
             ),
         )
+        if kind == "release-group":
+            connection.execute(
+                "INSERT OR IGNORE INTO pending_lidarr_search_requesters "
+                "(job_id, user_id) "
+                "SELECT id, ? FROM pending_lidarr_searches WHERE mbid = ?",
+                (user_id, mbid),
+            )
 
 
 def enqueue_lidarr_search(
@@ -161,11 +172,20 @@ def enqueue_lidarr_search(
     with db() as connection:
         cursor = connection.execute(
             "INSERT OR IGNORE INTO pending_lidarr_searches "
-            "(user_id, mbid, album_id, artist_id, name, refresh_type, "
-            "next_attempt_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "(mbid, album_id, artist_id, name, refresh_type, "
+            "next_attempt_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
             # Briefly hold new jobs so the request transaction is committed
             # before the background worker begins processing them.
-            (user_id, mbid, album_id, artist_id, name, "album", now + 1, now),
+            (mbid, album_id, artist_id, name, "album", now + 1, now),
+        )
+        job_id = connection.execute(
+            "SELECT id FROM pending_lidarr_searches WHERE mbid = ?",
+            (mbid,),
+        ).fetchone()["id"]
+        connection.execute(
+            "INSERT OR IGNORE INTO pending_lidarr_search_requesters "
+            "(job_id, user_id) VALUES (?, ?)",
+            (job_id, user_id),
         )
         # The queue is shared across users by release-group MBID, while
         # request history is private per user. Even when another request
@@ -282,15 +302,19 @@ def get_recommendation_cache(user_id):
 def save_recommendation_cache(user_id, value):
     """Replace one user's assembled recommendation cache."""
     with db() as connection:
-        connection.execute(
-            "INSERT OR REPLACE INTO recommendation_cache (user_id, value, refreshed_at) "
-            "VALUES (?, ?, ?)",
+        cursor = connection.execute(
+            "INSERT OR REPLACE INTO recommendation_cache "
+            "(user_id, value, refreshed_at) "
+            "SELECT ?, ?, ? WHERE EXISTS "
+            "(SELECT 1 FROM users WHERE id = ?)",
             (
                 user_id,
                 json.dumps(value, ensure_ascii=False, separators=(",", ":")),
                 time.time(),
+                user_id,
             ),
         )
+        return bool(cursor.rowcount)
 
 
 def delete_recommendation_cache(user_id):
@@ -347,18 +371,21 @@ def save_listening_profile(
         refreshed_at if last_attempted_at is None else float(last_attempted_at)
     )
     with db() as connection:
-        connection.execute(
+        cursor = connection.execute(
             "INSERT OR REPLACE INTO listening_profiles "
             "(user_id, value, refreshed_at, last_attempted_at, last_error) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "SELECT ?, ?, ?, ?, ? WHERE EXISTS "
+            "(SELECT 1 FROM users WHERE id = ?)",
             (
                 user_id,
                 json.dumps(value, ensure_ascii=False, separators=(",", ":")),
                 refreshed_at,
                 last_attempted_at,
                 str(last_error)[:500] if last_error else None,
+                user_id,
             ),
         )
+        return bool(cursor.rowcount)
 
 
 def record_listening_profile_failure(user_id, error, *, attempted_at=None):
@@ -434,6 +461,7 @@ def insert_plex_listens(listens):
             listen["artist_rating_key"],
             listen.get("album_rating_key"),
             listen["played_at"],
+            listen["user_id"],
         )
         for listen in listens
     ]
@@ -443,7 +471,9 @@ def insert_plex_listens(listens):
         cursor = connection.executemany(
             "INSERT OR IGNORE INTO plex_listens "
             "(server_id, history_key, user_id, artist_rating_key, "
-            "album_rating_key, played_at) VALUES (?, ?, ?, ?, ?, ?)",
+            "album_rating_key, played_at) "
+            "SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS "
+            "(SELECT 1 FROM users WHERE id = ?)",
             values,
         )
         return cursor.rowcount
@@ -505,6 +535,137 @@ def delete_plex_listens(user_id):
             (user_id,),
         )
         return cursor.rowcount
+
+
+def _create_pending_lidarr_searches_table(connection):
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS pending_lidarr_searches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mbid TEXT NOT NULL UNIQUE,
+            album_id INTEGER NOT NULL,
+            artist_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            refresh_type TEXT NOT NULL DEFAULT 'album'
+                CHECK(refresh_type IN ('artist', 'album')),
+            refresh_command_id INTEGER,
+            search_command_id INTEGER,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at REAL NOT NULL,
+            last_error TEXT,
+            created_at REAL NOT NULL
+        )
+    """)
+
+
+def _migrate_pending_lidarr_searches(connection):
+    """Separate shared queue work from the users who requested it."""
+    exists = connection.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'pending_lidarr_searches'"
+    ).fetchone()
+    legacy_table = None
+    if exists:
+        columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(pending_lidarr_searches)"
+            )
+        }
+        if "refresh_type" not in columns:
+            connection.execute(
+                "ALTER TABLE pending_lidarr_searches ADD COLUMN "
+                "refresh_type TEXT NOT NULL DEFAULT 'album'"
+            )
+            columns.add("refresh_type")
+        if "user_id" in columns:
+            legacy_table = "pending_lidarr_searches_legacy"
+            connection.execute(
+                "ALTER TABLE pending_lidarr_searches "
+                f"RENAME TO {legacy_table}"
+            )
+            _create_pending_lidarr_searches_table(connection)
+            connection.execute(
+                "INSERT INTO pending_lidarr_searches "
+                "(id, mbid, album_id, artist_id, name, refresh_type, "
+                "refresh_command_id, search_command_id, attempts, "
+                "next_attempt_at, last_error, created_at) "
+                "SELECT id, mbid, album_id, artist_id, name, refresh_type, "
+                "refresh_command_id, search_command_id, attempts, "
+                f"next_attempt_at, last_error, created_at FROM {legacy_table}"
+            )
+    else:
+        _create_pending_lidarr_searches_table(connection)
+
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS pending_lidarr_search_requesters (
+            job_id INTEGER NOT NULL
+                REFERENCES pending_lidarr_searches(id) ON DELETE CASCADE,
+            user_id INTEGER NOT NULL
+                REFERENCES users(id) ON DELETE CASCADE,
+            PRIMARY KEY(job_id, user_id)
+        )
+    """)
+    if legacy_table:
+        connection.execute(
+            "INSERT OR IGNORE INTO pending_lidarr_search_requesters "
+            "(job_id, user_id) "
+            f"SELECT legacy.id, legacy.user_id FROM {legacy_table} AS legacy "
+            "JOIN users ON users.id = legacy.user_id"
+        )
+    # Older releases retained every requester's private history even though the
+    # queue row named only its first requester. Recover all of those associations.
+    connection.execute(
+        "INSERT OR IGNORE INTO pending_lidarr_search_requesters "
+        "(job_id, user_id) "
+        "SELECT jobs.id, history.user_id "
+        "FROM pending_lidarr_searches AS jobs "
+        "JOIN request_history AS history "
+        "ON history.kind = 'release-group' AND history.mbid = jobs.mbid "
+        "JOIN users ON users.id = history.user_id"
+    )
+    connection.execute(
+        "DELETE FROM pending_lidarr_searches "
+        "WHERE NOT EXISTS ("
+        "SELECT 1 FROM pending_lidarr_search_requesters AS requesters "
+        "WHERE requesters.job_id = pending_lidarr_searches.id)"
+    )
+    if legacy_table:
+        connection.execute(f"DROP TABLE {legacy_table}")
+
+
+def _delete_legacy_orphans(connection):
+    """Remove rows written before every connection enforced foreign keys."""
+    for table, column in (
+        ("plex_auth_flows", "user_id"),
+        ("request_history", "user_id"),
+        ("recommendation_cache", "user_id"),
+        ("listening_profiles", "user_id"),
+        ("plex_listens", "user_id"),
+        ("account_invitations", "created_by"),
+    ):
+        connection.execute(
+            f"DELETE FROM {table} WHERE {column} IS NOT NULL "
+            f"AND NOT EXISTS (SELECT 1 FROM users WHERE id = {table}.{column})"
+        )
+    connection.execute(
+        "DELETE FROM pending_lidarr_search_requesters "
+        "WHERE NOT EXISTS (SELECT 1 FROM users "
+        "WHERE users.id = pending_lidarr_search_requesters.user_id) "
+        "OR NOT EXISTS (SELECT 1 FROM pending_lidarr_searches "
+        "WHERE pending_lidarr_searches.id = "
+        "pending_lidarr_search_requesters.job_id)"
+    )
+    connection.execute(
+        "DELETE FROM pending_lidarr_searches "
+        "WHERE NOT EXISTS (SELECT 1 FROM pending_lidarr_search_requesters "
+        "WHERE pending_lidarr_search_requesters.job_id = "
+        "pending_lidarr_searches.id)"
+    )
+    violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+    if violations:
+        raise RuntimeError(
+            "The Melodarr database contains unresolved foreign-key violations."
+        )
 
 
 def init_db():
@@ -572,7 +733,7 @@ def init_db():
                 pin_id INTEGER NOT NULL,
                 client_identifier TEXT NOT NULL,
                 purpose TEXT NOT NULL CHECK(purpose IN ('login', 'server', 'link')),
-                user_id INTEGER REFERENCES users(id),
+                user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
                 created_at REAL NOT NULL,
                 expires_at REAL NOT NULL,
                 auth_token TEXT,
@@ -588,7 +749,7 @@ def init_db():
         connection.execute("""
             CREATE TABLE IF NOT EXISTS request_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL REFERENCES users(id),
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 kind TEXT NOT NULL CHECK(kind IN ('artist', 'release-group')),
                 mbid TEXT NOT NULL,
                 name TEXT NOT NULL,
@@ -609,14 +770,14 @@ def init_db():
                 )
         connection.execute("""
             CREATE TABLE IF NOT EXISTS recommendation_cache (
-                user_id INTEGER PRIMARY KEY REFERENCES users(id),
+                user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
                 value TEXT NOT NULL,
                 refreshed_at REAL NOT NULL
             )
         """)
         connection.execute("""
             CREATE TABLE IF NOT EXISTS listening_profiles (
-                user_id INTEGER PRIMARY KEY REFERENCES users(id),
+                user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
                 value TEXT NOT NULL,
                 refreshed_at REAL NOT NULL,
                 last_attempted_at REAL NOT NULL,
@@ -628,7 +789,7 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 server_id TEXT NOT NULL,
                 history_key TEXT NOT NULL,
-                user_id INTEGER NOT NULL REFERENCES users(id),
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 artist_rating_key TEXT NOT NULL,
                 album_rating_key TEXT,
                 played_at REAL NOT NULL,
@@ -647,47 +808,20 @@ def init_db():
             CREATE TABLE IF NOT EXISTS account_invitations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 token_hash TEXT NOT NULL UNIQUE,
-                created_by INTEGER NOT NULL REFERENCES users(id),
+                created_by INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 created_at REAL NOT NULL,
                 expires_at REAL NOT NULL,
                 used_at REAL
             )
         """)
-        connection.execute("""
-            CREATE TABLE IF NOT EXISTS pending_lidarr_searches (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL REFERENCES users(id),
-                mbid TEXT NOT NULL UNIQUE,
-                album_id INTEGER NOT NULL,
-                artist_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                refresh_type TEXT NOT NULL DEFAULT 'album'
-                    CHECK(refresh_type IN ('artist', 'album')),
-                refresh_command_id INTEGER,
-                search_command_id INTEGER,
-                attempts INTEGER NOT NULL DEFAULT 0,
-                next_attempt_at REAL NOT NULL,
-                last_error TEXT,
-                created_at REAL NOT NULL
-            )
-        """)
-        search_columns = {
-            row["name"]
-            for row in connection.execute(
-                "PRAGMA table_info(pending_lidarr_searches)"
-            )
-        }
-        if "refresh_type" not in search_columns:
-            connection.execute(
-                "ALTER TABLE pending_lidarr_searches ADD COLUMN "
-                "refresh_type TEXT NOT NULL DEFAULT 'album'"
-            )
+        _migrate_pending_lidarr_searches(connection)
         # Release-group requests always use RefreshAlbum. Convert work queued
         # by versions that conditionally selected RefreshArtist as well.
         connection.execute(
             "UPDATE pending_lidarr_searches SET refresh_type = 'album' "
             "WHERE refresh_type != 'album'"
         )
+        _delete_legacy_orphans(connection)
         has_legacy_settings = connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'settings'"
         ).fetchone()

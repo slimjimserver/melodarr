@@ -159,6 +159,7 @@
 
     try {
       const response = await fetch(url, { signal: controller.signal });
+      handleAuthenticationFailure(response);
       if (response.status === 204) {
         const error = new Error("Requested detail is not cached.");
         error.name = "CacheMissError";
@@ -2106,8 +2107,12 @@
     searchAbort?.abort();
     clearTimeout(recommendationPoll);
     clearTimeout(searchDebounce);
+    stopArtistRevalidation();
     stopDetailAvailability();
+    currentDetail = null;
     currentDetailData = undefined;
+    detailHistory.length = 0;
+    requestedArtist = undefined;
     $("#recommendation-results").replaceChildren();
     $("#ai-message").textContent = "";
     $("#results").replaceChildren();

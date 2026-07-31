@@ -177,6 +177,6 @@ Service credentials are normally configured after signing in. AI credentials can
 - **Last.fm listening history (optional, per user):** each user can add their own public Last.fm username to receive recommendations based on their listening history. Individual users do not need Last.fm API keys.
 - **AI recommendations (optional, administrator-managed):** choose OpenAI, Claude, Gemini, LM Studio, or Ollama, then save the provider's server details, credential, and model as applicable. Stored API keys and LM Studio tokens are never returned by the API or shown again after they are saved.
 
-Settings and service credentials are stored in `data/settings.json` when using Docker. Keep the data directory private. Back up `melodarr.db`, `settings.json`, and `session-secret.key`; the reproducible `cache/` directory can be excluded from backups.
+Settings and service credentials are stored in `data/settings.json` when using Docker. Keep the data directory private. For a consistent backup, stop Melodarr cleanly before copying `melodarr.db`, `settings.json`, and `session-secret.key`. If the service must remain online, back up `melodarr.db` with SQLite's online backup API or the SQLite shell's `.backup` command; do not make a raw copy of a live database because committed data may still be in its WAL file. The reproducible `cache/` directory can be excluded from backups.
 
 Melodarr is licensed under the [GNU General Public License v3.0](LICENSE).

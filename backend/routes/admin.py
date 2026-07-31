@@ -391,7 +391,14 @@ def delete_user(user_id):
             "DELETE FROM plex_auth_flows WHERE user_id = ?", (user_id,)
         )
         connection.execute(
-            "DELETE FROM pending_lidarr_searches WHERE user_id = ?", (user_id,)
+            "DELETE FROM pending_lidarr_search_requesters WHERE user_id = ?",
+            (user_id,),
+        )
+        connection.execute(
+            "DELETE FROM pending_lidarr_searches "
+            "WHERE NOT EXISTS ("
+            "SELECT 1 FROM pending_lidarr_search_requesters AS requesters "
+            "WHERE requesters.job_id = pending_lidarr_searches.id)"
         )
         connection.execute(
             "DELETE FROM recommendation_cache WHERE user_id = ?", (user_id,)

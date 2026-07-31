@@ -188,6 +188,9 @@ let adminRequestsPagination: AdminRequestPagination = {
   totalPages: 0,
 };
 let discoveryLoad: Promise<void> | undefined;
+let accountRenderGeneration = 0;
+let accountRenderAbort: AbortController | undefined;
+let sessionExpiryHandled = false;
 let aiProviderOptions: AIProviderOption[] = [
   { id: "openai", name: "OpenAI", defaultModel: "gpt-5.6-sol", requiresApiKey: true, supportsApiKey: true },
   { id: "anthropic", name: "Claude", defaultModel: "claude-sonnet-5", requiresApiKey: true, supportsApiKey: true },
@@ -369,6 +372,7 @@ async function api<T = JsonObject>(url: string, options: RequestInit = {}): Prom
   }
   requestOptions.headers = headers;
   const response = await fetch(url, requestOptions);
+  handleAuthenticationFailure(response);
   const responseText = await response.text();
   let body: T & { error?: string };
   try {
@@ -384,6 +388,15 @@ async function api<T = JsonObject>(url: string, options: RequestInit = {}): Prom
     throw new Error(body.error || "We couldn’t complete that request. Please try again.");
   }
   return body;
+}
+
+/** Return an expired authenticated session to the sign-in screen exactly once. */
+function handleAuthenticationFailure(response: Response) {
+  if (response.status !== 401 || !currentUser || sessionExpiryHandled) return false;
+  sessionExpiryHandled = true;
+  window.dispatchEvent(new Event("melodarr-signed-out"));
+  void showAuth({ resetPath: true });
+  return true;
 }
 
 function wait(milliseconds: number) {
@@ -787,6 +800,7 @@ function tableCell(row: HTMLTableRowElement, value: string) {
 }
 
 async function refreshMaintenance() {
+  if (currentUser?.role !== "admin") return;
   if (maintenanceRefreshInFlight) return;
   maintenanceRefreshInFlight = true;
   const jobsTable = $<HTMLTableSectionElement>("#jobs-table");
@@ -875,6 +889,11 @@ async function refreshMaintenance() {
 }
 
 function showSettingsPage(page: SettingsPage, updateHistory = true) {
+  if (currentUser?.role !== "admin") {
+    if (maintenanceRefreshTimer !== undefined) window.clearInterval(maintenanceRefreshTimer);
+    maintenanceRefreshTimer = undefined;
+    return;
+  }
   document.querySelectorAll<HTMLButtonElement>("[data-settings-page]").forEach((button) => {
     const isCurrent = button.dataset.settingsPage === page;
     button.classList.toggle("active", isCurrent);
@@ -924,6 +943,11 @@ function setupNavigation() {
 
   function showView(view: AppView, updateHistory = true) {
     if (!currentUser || (currentUser.role !== "admin" && !VIEWS_FOR_EVERY_USER.includes(view))) view = "discover";
+    if (view !== "account") {
+      accountRenderGeneration += 1;
+      accountRenderAbort?.abort();
+      accountRenderAbort = undefined;
+    }
     document.querySelectorAll(".nav-link, .view").forEach((element) => element.classList.remove("active"));
     // Account and detail are application views without a matching nav button,
     // and the header and bottom tab bar both carry a button per view.
@@ -1034,9 +1058,18 @@ function setupNavigation() {
     const user = currentUser;
     if (!user) return;
     const targetUsername = activeAccountUsername || user.username;
+    const targetRequestPage = activeAccountRequestPage;
     const isOwnAccount = isOwnAccountUsername(targetUsername);
-    const accountApiPath = (path: string) => (
-      `${path}?username=${encodeURIComponent(activeAccountUsername || targetUsername)}`
+    const accountApiPath = (path: string) => `${path}?username=${encodeURIComponent(targetUsername)}`;
+    const renderGeneration = ++accountRenderGeneration;
+    accountRenderAbort?.abort();
+    const controller = new AbortController();
+    accountRenderAbort = controller;
+    const isCurrentRender = () => (
+      renderGeneration === accountRenderGeneration
+      && accountRenderAbort === controller
+      && currentUser === user
+      && activeAccountUsername === targetUsername
     );
     const content = $("#account-content");
     $("#account-title").textContent = page === "profile" ? "Profile" : page.split("-").map((word) => word[0].toUpperCase() + word.slice(1)).join(" ");
@@ -1055,7 +1088,9 @@ function setupNavigation() {
       if (page === "profile") {
         const data = await api(
           `/api/account/profile?username=${encodeURIComponent(targetUsername)}&page=1`,
+          { signal: controller.signal },
         );
+        if (!isCurrentRender()) return;
         content.replaceChildren();
         const identity = data.user as AdminUserIdentity;
         const section = document.createElement("section");
@@ -1148,8 +1183,10 @@ function setupNavigation() {
         }
       } else if (page === "requests") {
         const data = await api(
-          `/api/account/profile?username=${encodeURIComponent(targetUsername)}&page=${encodeURIComponent(activeAccountRequestPage)}`,
+          `/api/account/profile?username=${encodeURIComponent(targetUsername)}&page=${encodeURIComponent(targetRequestPage)}`,
+          { signal: controller.signal },
         );
+        if (!isCurrentRender()) return;
         content.replaceChildren();
         const requestGroups: [string, JsonObject[], string][] = [
           ["Artists", data.requests?.artist || [], "artists"],
@@ -1196,7 +1233,10 @@ function setupNavigation() {
         paginationControls.append(previous, status, next);
         content.append(paginationControls);
       } else if (page === "general") {
-        const accountSettings = await api(accountApiPath("/api/account/settings"));
+        const accountSettings = await api(accountApiPath("/api/account/settings"), {
+          signal: controller.signal,
+        });
+        if (!isCurrentRender()) return;
         content.replaceChildren();
         const form = document.createElement("form") as AppForm; form.className = "service-card account-form";
         form.innerHTML = '<h2>General</h2><label>Username<input name="username" autocomplete="username" required></label><label>New password<small>Leave blank to keep your current password.</small><input name="password" type="password" autocomplete="new-password" minlength="12"></label><div class="form-actions"><p class="form-message"></p><button>Save general settings</button></div>';
@@ -1210,7 +1250,9 @@ function setupNavigation() {
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify(Object.fromEntries(new FormData(form))),
             });
-            activeAccountUsername = result.username;
+            const formStillActive = form.isConnected
+              && activeAccountUsername === targetUsername;
+            if (formStillActive) activeAccountUsername = result.username;
             if (isOwnAccount) {
               user.username = result.username;
               const accountMenu = $<HTMLAnchorElement>("#account-menu");
@@ -1218,18 +1260,23 @@ function setupNavigation() {
               accountMenu.href = accountPath("profile");
             }
             formMessage.textContent = result.message;
-            window.history.replaceState(
-              { account: "general" },
-              "",
-              accountPath("general"),
-            );
+            if (formStillActive) {
+              window.history.replaceState(
+                { account: "general" },
+                "",
+                accountPath("general"),
+              );
+            }
           } catch (error) {
             setMessage(formMessage, error.message, true);
           }
         });
         content.append(form);
       } else if (page === "linked-accounts") {
-        const accountSettings = await api(accountApiPath("/api/account/settings"));
+        const accountSettings = await api(accountApiPath("/api/account/settings"), {
+          signal: controller.signal,
+        });
+        if (!isCurrentRender()) return;
         content.replaceChildren();
         const form = document.createElement("form") as AppForm; form.className = "service-card account-form";
         form.innerHTML = `
@@ -1366,7 +1413,13 @@ function setupNavigation() {
         });
         content.append(form);
       }
-    } catch (error) { setMessage(message, error.message, true); }
+    } catch (error) {
+      if (error.name !== "AbortError" && isCurrentRender()) {
+        setMessage(message, error.message, true);
+      }
+    } finally {
+      if (accountRenderAbort === controller) accountRenderAbort = undefined;
+    }
   }
 
   showAccountPage = (
@@ -1422,6 +1475,12 @@ function setupNavigation() {
 
   window.addEventListener("popstate", () => {
     if (["/settings", "/settings/requests", "/settings/users", "/settings/jobs"].includes(window.location.pathname)) {
+      if (currentUser?.role !== "admin") {
+        showView("discover", false);
+        window.history.replaceState({ view: "discover" }, "", "/");
+        window.dispatchEvent(new Event("melodarr-home"));
+        return;
+      }
       showView("settings", false);
       const page: SettingsPage = window.location.pathname.endsWith("/requests")
         ? "requests"
@@ -1486,6 +1545,7 @@ function setupNavigation() {
 }
 
 async function applyCurrentUser(user: CurrentUser) {
+  sessionExpiryHandled = false;
   currentUser = user;
   document.body.classList.add("authenticated");
   updateSessionChrome();
@@ -1505,6 +1565,11 @@ function adminUserDisplayName(user: AdminUserIdentity) {
     return user.plexUsername || user.username || user.plexEmail || "Plex user";
   }
   return user.localUsername || user.username || "Local user";
+}
+
+/** Use the unique local identity for routes; Plex display names may collide. */
+function adminUserRouteUsername(user: AdminUserIdentity) {
+  return user.localUsername || user.username;
 }
 
 function createUserAvatar(user: AdminUserIdentity, large = false) {
@@ -1598,7 +1663,7 @@ function createAdminRequestItem(item: AdminRequest) {
   const requesterCopy = document.createElement("span");
   const requesterName = document.createElement("a");
   requesterName.className = "admin-request-requester-link";
-  requesterName.href = `/${encodeURIComponent(adminUserDisplayName(item.requester))}`;
+  requesterName.href = `/${encodeURIComponent(adminUserRouteUsername(item.requester))}`;
   requesterName.textContent = adminUserDisplayName(item.requester);
   const requesterMeta = document.createElement("small");
   const requestedAtDate = joinedDate(item.created_at);
@@ -1832,7 +1897,7 @@ function renderAdminUsers() {
     requests.dataset.label = "Requests";
     requests.className = "user-request-count";
     const requestLink = document.createElement("a");
-    requestLink.href = `/${encodeURIComponent(adminUserDisplayName(user))}/requests`;
+    requestLink.href = `/${encodeURIComponent(adminUserRouteUsername(user))}/requests`;
     requestLink.textContent = Number(user.requestCount || 0).toLocaleString();
     requestLink.setAttribute(
       "aria-label",
@@ -1876,7 +1941,7 @@ function renderAdminUsers() {
     actionButtons.className = "user-action-buttons";
     const edit = document.createElement("a");
     edit.className = "outline edit-user";
-    const routeUsername = adminUserDisplayName(user);
+    const routeUsername = adminUserRouteUsername(user);
     edit.href = `/${encodeURIComponent(routeUsername)}`;
     edit.textContent = "Edit";
     edit.setAttribute("aria-label", `Edit settings for ${routeUsername}`);
@@ -2013,6 +2078,13 @@ function showSetupPanel(
 }
 
 async function showAuth({ resetPath = false } = {}) {
+  accountRenderGeneration += 1;
+  accountRenderAbort?.abort();
+  accountRenderAbort = undefined;
+  adminUsersRequest += 1;
+  adminRequestsRequest += 1;
+  if (maintenanceRefreshTimer !== undefined) window.clearInterval(maintenanceRefreshTimer);
+  maintenanceRefreshTimer = undefined;
   currentUser = undefined;
   document.body.classList.remove("authenticated");
   const authCard = $("#auth-card");
@@ -2247,8 +2319,10 @@ async function signOut() {
   try {
     await api("/api/auth/logout", { method: "POST" });
   } finally {
-    window.dispatchEvent(new Event("melodarr-signed-out"));
-    showAuth({ resetPath: true });
+    if (!sessionExpiryHandled) {
+      window.dispatchEvent(new Event("melodarr-signed-out"));
+      void showAuth({ resetPath: true });
+    }
   }
 }
 

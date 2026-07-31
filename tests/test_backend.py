@@ -1251,8 +1251,176 @@ class LidarrSearchQueueTests(DatabaseTestCase):
             }
         self.assertEqual(command_ids, {55})
 
+    def test_main_database_connections_enforce_foreign_keys(self):
+        with db() as connection:
+            self.assertEqual(
+                connection.execute("PRAGMA foreign_keys").fetchone()[0],
+                1,
+            )
+
+    def test_stale_worker_writes_do_not_resurrect_deleted_user_data(self):
+        self.register()
+        with db() as connection:
+            user_id = connection.execute(
+                "SELECT id FROM users WHERE username = 'test-user'"
+            ).fetchone()["id"]
+            connection.execute("DELETE FROM users WHERE id = ?", (user_id,))
+
+        self.assertFalse(
+            storage_module.save_recommendation_cache(user_id, {"private": True})
+        )
+        self.assertFalse(
+            storage_module.save_listening_profile(
+                user_id,
+                {"private": True},
+            )
+        )
+        self.assertEqual(
+            insert_plex_listens([
+                {
+                    "server_id": "server-1",
+                    "history_key": "stale-history",
+                    "user_id": user_id,
+                    "artist_rating_key": "artist-1",
+                    "album_rating_key": None,
+                    "played_at": time.time(),
+                }
+            ]),
+            0,
+        )
+        with db() as connection:
+            for table in (
+                "recommendation_cache",
+                "listening_profiles",
+                "plex_listens",
+            ):
+                self.assertEqual(
+                    connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0],
+                    0,
+                )
+
+    def test_legacy_queue_migration_recovers_every_requester(self):
+        with tempfile.TemporaryDirectory(prefix="melodarr-queue-migration-") as directory:
+            database = os.path.join(directory, "melodarr.db")
+            settings = os.path.join(directory, "settings.json")
+            connection = sqlite3.connect(database)
+            connection.executescript("""
+                CREATE TABLE users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    password_hash TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                );
+                CREATE TABLE request_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL REFERENCES users(id),
+                    kind TEXT NOT NULL,
+                    mbid TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                );
+                CREATE TABLE pending_lidarr_searches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL REFERENCES users(id),
+                    mbid TEXT NOT NULL UNIQUE,
+                    album_id INTEGER NOT NULL,
+                    artist_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    refresh_command_id INTEGER,
+                    search_command_id INTEGER,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at REAL NOT NULL,
+                    last_error TEXT,
+                    created_at REAL NOT NULL
+                );
+                CREATE TABLE recommendation_cache (
+                    user_id INTEGER PRIMARY KEY REFERENCES users(id),
+                    value TEXT NOT NULL,
+                    refreshed_at REAL NOT NULL
+                );
+                INSERT INTO recommendation_cache
+                    (user_id, value, refreshed_at)
+                    VALUES (999, '{"orphaned":true}', 1);
+            """)
+            connection.executemany(
+                "INSERT INTO users "
+                "(id, username, password_hash, role, created_at) "
+                "VALUES (?, ?, 'hash', 'user', 1)",
+                ((1, "first-user"), (2, "second-user")),
+            )
+            connection.executemany(
+                "INSERT INTO request_history "
+                "(user_id, kind, mbid, name, created_at) "
+                "VALUES (?, 'release-group', 'shared-mbid', 'Shared Album', 1)",
+                ((1,), (2,)),
+            )
+            connection.execute(
+                "INSERT INTO pending_lidarr_searches "
+                "(user_id, mbid, album_id, artist_id, name, "
+                "next_attempt_at, created_at) "
+                "VALUES (1, 'shared-mbid', 10, 20, 'Shared Album', 1, 1)"
+            )
+            connection.commit()
+            connection.close()
+
+            with (
+                patch.object(storage_module, "DATABASE", database),
+                patch.object(storage_module, "SETTINGS_FILE", settings),
+            ):
+                storage_module.init_db()
+                with storage_module.db() as migrated:
+                    columns = {
+                        row["name"]
+                        for row in migrated.execute(
+                            "PRAGMA table_info(pending_lidarr_searches)"
+                        )
+                    }
+                    requester_ids = [
+                        row["user_id"]
+                        for row in migrated.execute(
+                            "SELECT user_id FROM pending_lidarr_search_requesters "
+                            "ORDER BY user_id"
+                        )
+                    ]
+                    violations = migrated.execute(
+                        "PRAGMA foreign_key_check"
+                    ).fetchall()
+                    orphaned_recommendations = migrated.execute(
+                        "SELECT COUNT(*) FROM recommendation_cache"
+                    ).fetchone()[0]
+
+            self.assertNotIn("user_id", columns)
+            self.assertEqual(requester_ids, [1, 2])
+            self.assertEqual(violations, [])
+            self.assertEqual(orphaned_recommendations, 0)
+
 
 class DeploymentConfigTests(unittest.TestCase):
+    def test_blank_path_environment_variables_fail_fast(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        config_path = os.path.join(project_root, "backend", "config.py")
+        for variable in (
+            "MELODARR_DATABASE",
+            "MELODARR_CACHE_DATABASE",
+            "MELODARR_SETTINGS",
+            "MELODARR_SECRET_KEY_FILE",
+            "MELODARR_ARTWORK_CACHE",
+        ):
+            with self.subTest(variable=variable):
+                with patch.dict(os.environ, {variable: " \t "}):
+                    with self.assertRaisesRegex(RuntimeError, variable):
+                        runpy.run_path(config_path)
+
+    def test_backup_guidance_requires_a_consistent_sqlite_snapshot(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(project_root, "README.md"), encoding="utf-8") as file:
+            readme = file.read()
+
+        self.assertIn("stop Melodarr cleanly", readme)
+        self.assertIn("SQLite's online backup API", readme)
+        self.assertIn("do not make a raw copy of a live database", readme)
+
     def test_production_frontend_is_minified_and_precompressed_without_maps(self):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with open(
@@ -1684,7 +1852,7 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn('className = "request-pagination"', typescript)
         self.assertIn(
             '/api/account/profile?username=${encodeURIComponent(targetUsername)}'
-            '&page=${encodeURIComponent(activeAccountRequestPage)}',
+            '&page=${encodeURIComponent(targetRequestPage)}',
             typescript,
         )
         # The header and the mobile tab bar both carry a button per view, and
@@ -1711,6 +1879,22 @@ class DeploymentConfigTests(unittest.TestCase):
         )
         self.assertIn(
             'showAccountPage?.("profile", true, routeUsername)',
+            typescript,
+        )
+        self.assertIn(
+            "const routeUsername = adminUserRouteUsername(user);",
+            typescript,
+        )
+        self.assertIn(
+            "requesterName.href = `/${encodeURIComponent(adminUserRouteUsername(item.requester))}`",
+            typescript,
+        )
+        self.assertIn(
+            "requestLink.href = `/${encodeURIComponent(adminUserRouteUsername(user))}/requests`",
+            typescript,
+        )
+        self.assertNotIn(
+            "const routeUsername = adminUserDisplayName(user);",
             typescript,
         )
         self.assertNotIn(
@@ -1743,6 +1927,50 @@ class DeploymentConfigTests(unittest.TestCase):
             typescript,
         )
         self.assertIn("}, targetUsername);", typescript)
+
+    def test_frontend_invalidates_stale_account_and_expired_session_requests(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(
+            os.path.join(project_root, "frontend", "src", "app.ts"),
+            encoding="utf-8",
+        ) as file:
+            app_typescript = file.read()
+        with open(
+            os.path.join(project_root, "frontend", "src", "discovery.ts"),
+            encoding="utf-8",
+        ) as file:
+            discovery_typescript = file.read()
+
+        self.assertIn("const renderGeneration = ++accountRenderGeneration", app_typescript)
+        self.assertIn("accountRenderAbort?.abort()", app_typescript)
+        self.assertIn("if (!isCurrentRender()) return", app_typescript)
+        self.assertIn(
+            "`${path}?username=${encodeURIComponent(targetUsername)}`",
+            app_typescript,
+        )
+        self.assertNotIn(
+            "encodeURIComponent(activeAccountUsername || targetUsername)",
+            app_typescript,
+        )
+        self.assertIn("handleAuthenticationFailure(response);", app_typescript)
+        self.assertIn("handleAuthenticationFailure(response);", discovery_typescript)
+        self.assertIn('response.status !== 401', app_typescript)
+        self.assertIn('new Event("melodarr-signed-out")', app_typescript)
+
+    def test_non_admin_settings_deep_links_are_normalized_without_polling(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(
+            os.path.join(project_root, "frontend", "src", "app.ts"),
+            encoding="utf-8",
+        ) as file:
+            typescript = file.read()
+
+        self.assertIn('if (currentUser?.role !== "admin") {', typescript)
+        self.assertIn(
+            'window.history.replaceState({ view: "discover" }, "", "/")',
+            typescript,
+        )
+        self.assertIn('if (currentUser?.role !== "admin") return;', typescript)
 
     def test_library_navigation_is_available_to_every_authenticated_user(self):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -2682,6 +2910,12 @@ class AuthenticationTests(DatabaseTestCase):
             headers={"X-CSRF-Token": token},
         )
         self.assertEqual(accepted.status_code, 200)
+        expired = self.client.post(
+            "/api/auth/logout",
+            headers={"X-CSRF-Token": token},
+        )
+        self.assertEqual(expired.status_code, 401)
+        self.assertEqual(expired.get_json()["error"], "Sign in is required.")
 
     def test_authenticated_route_loads_the_user_once(self):
         self.register()
@@ -2778,6 +3012,35 @@ class AdminUsersTests(DatabaseTestCase):
         self.assertNotIn("lastfmApiKey", plex_user)
         self.assertNotIn("passwordHash", plex_user)
         self.assertNotIn("plexId", plex_user)
+
+    def test_canonical_username_disambiguates_a_plex_display_name_collision(self):
+        self.register()
+        local_user_id = self.add_user("SharedName")
+        plex_user_id = self.add_user(
+            "shared-name-2",
+            plex_id="plex-shared-name",
+            plex_username="SharedName",
+        )
+
+        users = self.client.get("/api/admin/users").get_json()["users"]
+        plex_user = next(user for user in users if user["id"] == plex_user_id)
+        self.assertEqual(plex_user["username"], "SharedName")
+        self.assertEqual(plex_user["localUsername"], "shared-name-2")
+
+        canonical = self.client.get(
+            "/api/account/profile?username=shared-name-2"
+        )
+        ambiguous_display_name = self.client.get(
+            "/api/account/profile?username=SharedName"
+        )
+
+        self.assertEqual(canonical.status_code, 200)
+        self.assertEqual(canonical.get_json()["user"]["id"], plex_user_id)
+        self.assertEqual(ambiguous_display_name.status_code, 200)
+        self.assertEqual(
+            ambiguous_display_name.get_json()["user"]["id"],
+            local_user_id,
+        )
 
     @patch("backend.routes.admin._profile_plex_index")
     def test_admin_request_list_includes_metadata_availability_and_requesters(
@@ -3203,12 +3466,11 @@ class AdminUsersTests(DatabaseTestCase):
                 "VALUES (?, ?, ?, ?)",
                 ("departing-invite", user_id, now, now + 600),
             )
-            connection.execute(
+            job_id = connection.execute(
                 "INSERT INTO pending_lidarr_searches "
-                "(user_id, mbid, album_id, artist_id, name, "
-                "next_attempt_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "(mbid, album_id, artist_id, name, next_attempt_at, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
                 (
-                    user_id,
                     "departing-release",
                     41,
                     42,
@@ -3216,6 +3478,11 @@ class AdminUsersTests(DatabaseTestCase):
                     now,
                     now,
                 ),
+            ).lastrowid
+            connection.execute(
+                "INSERT INTO pending_lidarr_search_requesters "
+                "(job_id, user_id) VALUES (?, ?)",
+                (job_id, user_id),
             )
 
         response = self.client.delete(
@@ -3233,7 +3500,7 @@ class AdminUsersTests(DatabaseTestCase):
             )
             for table, column in (
                 ("plex_auth_flows", "user_id"),
-                ("pending_lidarr_searches", "user_id"),
+                ("pending_lidarr_search_requesters", "user_id"),
                 ("recommendation_cache", "user_id"),
                 ("plex_listens", "user_id"),
                 ("request_history", "user_id"),
@@ -3245,6 +3512,67 @@ class AdminUsersTests(DatabaseTestCase):
                         (user_id,),
                     ).fetchone()
                 )
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM pending_lidarr_searches WHERE id = ?",
+                    (job_id,),
+                ).fetchone()
+            )
+
+    def test_deleting_one_requester_preserves_shared_lidarr_work(self):
+        csrf_token = self.register()
+        first_user_id = self.add_user("first-requester")
+        second_user_id = self.add_user("second-requester")
+        mbid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        enqueue_lidarr_search(
+            first_user_id,
+            mbid,
+            41,
+            42,
+            "Shared Album",
+        )
+        storage_module.record_request(
+            second_user_id,
+            "release-group",
+            mbid,
+            "Shared Album",
+        )
+
+        first_delete = self.client.delete(
+            f"/api/admin/users/{first_user_id}",
+            headers={"X-CSRF-Token": csrf_token},
+        )
+
+        self.assertEqual(first_delete.status_code, 200)
+        with db() as connection:
+            job = connection.execute(
+                "SELECT id FROM pending_lidarr_searches WHERE mbid = ?",
+                (mbid,),
+            ).fetchone()
+            requester_ids = [
+                row["user_id"]
+                for row in connection.execute(
+                    "SELECT user_id FROM pending_lidarr_search_requesters "
+                    "WHERE job_id = ? ORDER BY user_id",
+                    (job["id"],),
+                )
+            ]
+        self.assertIsNotNone(job)
+        self.assertEqual(requester_ids, [second_user_id])
+
+        second_delete = self.client.delete(
+            f"/api/admin/users/{second_user_id}",
+            headers={"X-CSRF-Token": csrf_token},
+        )
+
+        self.assertEqual(second_delete.status_code, 200)
+        with db() as connection:
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM pending_lidarr_searches WHERE mbid = ?",
+                    (mbid,),
+                ).fetchone()
+            )
 
     def test_admin_cannot_delete_self_and_missing_user_returns_not_found(self):
         csrf_token = self.register()
@@ -7160,6 +7488,101 @@ class ArtworkCacheTests(DatabaseTestCase):
             ARTWORK_CACHE_DIRECTORY,
             f"release-group-{mbid}.miss",
         )))
+
+    def test_negative_cache_removes_expired_markers_and_caps_fresh_entries(self):
+        with tempfile.TemporaryDirectory(prefix="melodarr-artwork-misses-") as directory:
+            timestamps = {
+                "expired.miss": 899,
+                "oldest.miss": 920,
+                "middle.miss": 940,
+                "newest.miss": 960,
+            }
+            for name, modified_at in timestamps.items():
+                path = os.path.join(directory, name)
+                with open(path, "w", encoding="utf-8"):
+                    pass
+                os.utime(path, (modified_at, modified_at))
+            image_path = os.path.join(directory, "cover.jpg")
+            with open(image_path, "wb") as file:
+                file.write(b"image")
+
+            with (
+                patch.object(artwork_cache, "ARTWORK_CACHE_DIRECTORY", directory),
+                patch.object(artwork_cache, "ARTWORK_MISS_TTL", 100),
+                patch.object(artwork_cache, "ARTWORK_MISS_CACHE_MAX_ENTRIES", 2),
+            ):
+                removed = artwork_cache.trim_artwork_miss_cache(now=1000)
+
+            self.assertEqual(removed, 2)
+            self.assertEqual(
+                sorted(name for name in os.listdir(directory) if name.endswith(".miss")),
+                ["middle.miss", "newest.miss"],
+            )
+            self.assertTrue(os.path.isfile(image_path))
+
+    @patch("backend.artwork_cache.requests.get")
+    def test_expired_negative_cache_is_renewed_by_one_upstream_404(self, get):
+        get.return_value = Response(404)
+        cache_key = "release-group-renewed-miss"
+        with tempfile.TemporaryDirectory(prefix="melodarr-artwork-renew-") as directory:
+            miss_file = os.path.join(directory, f"{cache_key}.miss")
+            with open(miss_file, "w", encoding="utf-8"):
+                pass
+            os.utime(miss_file, (800, 800))
+
+            with (
+                patch.object(artwork_cache, "ARTWORK_CACHE_DIRECTORY", directory),
+                patch.object(artwork_cache, "ARTWORK_MISS_TTL", 100),
+                patch.object(artwork_cache.time, "time", return_value=1000),
+                self.app.test_request_context(),
+            ):
+                first = artwork_cache.cached_artwork(
+                    cache_key, "https://images.example/renewed.jpg"
+                )
+                second = artwork_cache.cached_artwork(
+                    cache_key, "https://images.example/renewed.jpg"
+                )
+
+            self.assertEqual(first, ("", 404))
+            self.assertEqual(second, ("", 404))
+            get.assert_called_once_with(
+                "https://images.example/renewed.jpg",
+                headers=None,
+                stream=True,
+                timeout=20,
+            )
+            self.assertEqual(os.path.getmtime(miss_file), 1000)
+
+    @patch("backend.artwork_cache.requests.get")
+    def test_successful_refresh_removes_expired_negative_cache_marker(self, get):
+        get.return_value = Response(
+            headers={"Content-Type": "image/jpeg"},
+            chunks=(b"new-artwork",),
+        )
+        cache_key = "release-group-recovered-artwork"
+        with tempfile.TemporaryDirectory(prefix="melodarr-artwork-success-") as directory:
+            miss_file = os.path.join(directory, f"{cache_key}.miss")
+            with open(miss_file, "w", encoding="utf-8"):
+                pass
+            os.utime(miss_file, (800, 800))
+
+            with (
+                patch.object(artwork_cache, "ARTWORK_CACHE_DIRECTORY", directory),
+                patch.object(artwork_cache, "ARTWORK_MISS_TTL", 100),
+                patch.object(artwork_cache.time, "time", return_value=1000),
+                self.app.test_request_context(),
+            ):
+                response = artwork_cache.cached_artwork(
+                    cache_key, "https://images.example/recovered.jpg"
+                )
+                response.direct_passthrough = False
+                self.assertEqual(response.get_data(), b"new-artwork")
+                response.close()
+
+            self.assertFalse(os.path.exists(miss_file))
+            self.assertTrue(
+                os.path.isfile(os.path.join(directory, f"{cache_key}.jpg"))
+            )
 
     @patch("backend.artwork_cache.ARTWORK_MAX_DOWNLOAD_BYTES", 5)
     @patch("backend.artwork_cache.requests.get")

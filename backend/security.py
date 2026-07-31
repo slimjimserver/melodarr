@@ -158,6 +158,8 @@ def verify_csrf_token():
         return None
     expected_token = session.get("csrf_token", "")
     received_token = request.headers.get("X-CSRF-Token", "")
-    if not expected_token or not compare_digest(expected_token, received_token):
+    if not expected_token:
+        return api_error("Sign in is required.", 401)
+    if not compare_digest(expected_token, received_token):
         return api_error("Invalid or missing CSRF token.", 403)
     return None

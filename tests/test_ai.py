@@ -2250,7 +2250,7 @@ class AIRouteTests(unittest.TestCase):
                 "/api/ai/recommendations",
                 json={"prompt": "new music"},
             ).status_code,
-            403,
+            401,
         )
         admin = self.register_admin()
         self.assertEqual(

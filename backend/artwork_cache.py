@@ -20,6 +20,7 @@ if __package__:
         ARTWORK_CACHE_LIMIT_BYTES,
         ARTWORK_CACHE_TRIM_INTERVAL,
         ARTWORK_MAX_DOWNLOAD_BYTES,
+        ARTWORK_MISS_CACHE_MAX_ENTRIES,
         ARTWORK_MISS_TTL,
         ARTWORK_SIZES,
         ARTWORK_WEBP_QUALITY,
@@ -32,6 +33,7 @@ else:
         ARTWORK_CACHE_LIMIT_BYTES,
         ARTWORK_CACHE_TRIM_INTERVAL,
         ARTWORK_MAX_DOWNLOAD_BYTES,
+        ARTWORK_MISS_CACHE_MAX_ENTRIES,
         ARTWORK_MISS_TTL,
         ARTWORK_SIZES,
         ARTWORK_WEBP_QUALITY,
@@ -40,6 +42,7 @@ else:
 
 _trim_lock = Lock()
 _size_lock = Lock()
+_miss_lock = Lock()
 _key_locks_lock = Lock()
 _key_locks = {}
 _last_trim_at = None
@@ -121,6 +124,91 @@ def _replace_cache_file(temporary_path, final_path):
             _cached_size_bytes = max(
                 0, _cached_size_bytes - previous_size + replacement_size
             )
+
+
+def _trim_artwork_misses_locked(now):
+    """Remove expired markers, then evict the oldest markers above the cap."""
+    entries = []
+    removed = 0
+    try:
+        with os.scandir(ARTWORK_CACHE_DIRECTORY) as directory:
+            for entry in directory:
+                if (
+                    not entry.name.endswith(".miss")
+                    or not entry.is_file(follow_symlinks=False)
+                ):
+                    continue
+                try:
+                    modified_at = entry.stat(follow_symlinks=False).st_mtime
+                except OSError:
+                    continue
+                if now - modified_at >= ARTWORK_MISS_TTL:
+                    try:
+                        os.unlink(entry.path)
+                        removed += 1
+                    except OSError:
+                        pass
+                    continue
+                entries.append((modified_at, entry.path))
+    except OSError:
+        return removed
+
+    excess = max(0, len(entries) - ARTWORK_MISS_CACHE_MAX_ENTRIES)
+    for _, path in sorted(entries)[:excess]:
+        try:
+            os.unlink(path)
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def trim_artwork_miss_cache(*, now=None):
+    """Bound negative-cache inode use and discard markers past their TTL."""
+    checked_at = time.time() if now is None else now
+    with _miss_lock:
+        return _trim_artwork_misses_locked(checked_at)
+
+
+def _fresh_artwork_miss(miss_file, *, now=None):
+    """Return whether a marker is live, deleting it once it expires."""
+    checked_at = time.time() if now is None else now
+    with _miss_lock:
+        try:
+            modified_at = os.path.getmtime(miss_file)
+        except OSError:
+            return False
+        if checked_at - modified_at < ARTWORK_MISS_TTL:
+            return True
+        try:
+            os.unlink(miss_file)
+        except OSError:
+            pass
+        return False
+
+
+def _record_artwork_miss(miss_file, *, now=None):
+    """Create or renew one marker and enforce the global marker count cap."""
+    recorded_at = time.time() if now is None else now
+    with _miss_lock:
+        os.makedirs(ARTWORK_CACHE_DIRECTORY, exist_ok=True)
+        with open(miss_file, "a", encoding="utf-8"):
+            pass
+        # Opening an existing file without writing does not refresh its mtime.
+        os.utime(miss_file, (recorded_at, recorded_at))
+        _trim_artwork_misses_locked(recorded_at)
+
+
+def _remove_artwork_miss(miss_file):
+    """Discard a negative record after the provider starts serving artwork."""
+    with _miss_lock:
+        try:
+            os.unlink(miss_file)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return False
+    return True
 
 
 def normalized_size(size):
@@ -350,14 +438,8 @@ def cached_artwork(cache_key, source_url, *, headers=None, size=None):
             return _serve_at_size(cached_file, cache_key, size)
 
         miss_file = os.path.join(ARTWORK_CACHE_DIRECTORY, f"{cache_key}.miss")
-        try:
-            if (
-                os.path.isfile(miss_file)
-                and time.time() - os.path.getmtime(miss_file) < ARTWORK_MISS_TTL
-            ):
-                return "", 404
-        except OSError:
-            pass
+        if _fresh_artwork_miss(miss_file):
+            return "", 404
 
         resolved_source_url = source_url() if callable(source_url) else source_url
         if not resolved_source_url:
@@ -370,9 +452,7 @@ def cached_artwork(cache_key, source_url, *, headers=None, size=None):
                 resolved_source_url, headers=headers, stream=True, timeout=20
             )
             if provider_response.status_code == 404:
-                os.makedirs(ARTWORK_CACHE_DIRECTORY, exist_ok=True)
-                with open(miss_file, "a", encoding="utf-8"):
-                    pass
+                _record_artwork_miss(miss_file)
                 return "", 404
             provider_response.raise_for_status()
             content_type = (
@@ -407,6 +487,7 @@ def cached_artwork(cache_key, source_url, *, headers=None, size=None):
                     file.write(chunk)
             _replace_cache_file(temporary_path, final_path)
             temporary_path = None
+            _remove_artwork_miss(miss_file)
             served_response = _serve_at_size(final_path, cache_key, size)
             maybe_trim_artwork_cache()
             return served_response
