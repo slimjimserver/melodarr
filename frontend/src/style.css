@@ -165,7 +165,7 @@ h1 em { font-style: normal; }
 .artist-detail-link { color: var(--foreground); font-weight: 650; text-decoration-color: var(--accent); text-underline-offset: 3px; }
 
 .search { display: flex; height: 60px; max-width: 740px; overflow: hidden; border: 1px solid var(--border-hover); border-radius: 16px; background: rgba(255, 252, 247, .93); box-shadow: 0 12px 30px rgba(68, 50, 38, .08); }
-.search:focus-within { border-color: rgba(168, 68, 45, .55); box-shadow: 0 0 0 3px rgba(168, 68, 45, .11), 0 12px 30px rgba(68, 50, 38, .08); }
+.search:has(input:focus) { border-color: rgba(168, 68, 45, .55); box-shadow: 0 0 0 3px rgba(168, 68, 45, .11), 0 12px 30px rgba(68, 50, 38, .08); }
 .search select { flex: 0 0 118px; height: 100%; border: 0; border-right: 1px solid var(--border); border-radius: 0; background: rgba(230, 217, 203, .28); box-shadow: none; color: var(--foreground-subtle); font-size: 13px; font-weight: 600; }
 .search select option { background: #fffaf3; color: var(--foreground); }
 .search select option:checked { background: var(--accent); color: #fffaf4; }
@@ -975,7 +975,7 @@ button,
   background: rgba(15, 15, 18, .88);
   box-shadow: 0 10px 32px rgba(0, 0, 0, .24), inset 0 1px rgba(255, 255, 255, .05);
 }
-:root[data-theme="midnight"] .search:focus-within {
+:root[data-theme="midnight"] .search:has(input:focus) {
   border-color: rgba(94, 106, 210, .65);
   box-shadow: 0 0 0 3px rgba(94, 106, 210, .14), 0 10px 32px rgba(0, 0, 0, .24);
 }

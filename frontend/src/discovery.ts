@@ -1544,6 +1544,7 @@
   const searchInput = $<HTMLInputElement>("#search-input");
   const searchSubmit = $<HTMLButtonElement>("#search-submit");
   let activeSearchType = searchType.value;
+  let searchTypePointerActive = false;
 
   function isAISearchMode() {
     return searchType.value === "ai";
@@ -1581,6 +1582,16 @@
     return type === "track" ? `${summary} for matching tracks` : summary;
   }
 
+  searchType.addEventListener("pointerdown", () => {
+    searchTypePointerActive = true;
+  });
+  searchType.addEventListener("keydown", () => {
+    searchTypePointerActive = false;
+  });
+  searchType.addEventListener("blur", () => {
+    searchTypePointerActive = false;
+  });
+
   searchType.addEventListener("change", (event) => {
     const type = (event.target as HTMLSelectElement).value;
     const crossedAIBoundary = type === "ai" || activeSearchType === "ai";
@@ -1608,6 +1619,7 @@
     } else if (searchInput.value.trim().length >= 2) {
       runSearch();
     }
+    if (searchTypePointerActive) searchType.blur();
   });
 
   async function runSearch() {
