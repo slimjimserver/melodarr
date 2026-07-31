@@ -125,60 +125,46 @@ MELODARR_COOKIE_SECURE: "true"
 
 ### AI recommendations
 
-An administrator can enable AI recommendations from **Settings → AI recommendations**:
+Administrators can enable AI recommendations from **Settings → AI recommendations**:
 
 | Provider | Default model | Credential |
 | --- | --- | --- |
 | OpenAI | `gpt-5.6-sol` | OpenAI API key |
 | Claude | `claude-sonnet-5` | Anthropic API key |
 | Gemini | `gemini-3.6-flash` | Google AI API key |
-| LM Studio | No universal default | Exact LM Studio model identifier, server URL, and optional API token |
-| Ollama | No universal default | Exact installed model name and an Ollama server URL |
+| LM Studio | None | Model identifier, server URL, and optional API token |
+| Ollama | None | Installed model name and server URL |
 
-Each user should link ListenBrainz or Last.fm, or have usable Plex listening history, then allow the personalized recommendation refresh to complete. On **Discover**, choose **AI recommendations** from the Search type menu and enter a natural-language request such as “intricate late-night electronic music, but no artists I already know.” The four prompt templates beneath the shared search bar provide quick starting points.
+Users open **Discover**, select **AI recommendations** from the Search type menu, and describe what they want. Linking ListenBrainz, Last.fm, or Plex provides better personalization; Melodarr also learns from its request history.
 
-Melodarr builds one private listening profile per user in the background every 24 hours and wakes that job after linked-account, shared Last.fm, Plex-history, and music-request changes. The durable profile combines Plex, Last.fm, ListenBrainz, and Melodarr requests into bounded short-, medium-, and long-term artist affinities; genre, style, and mood weights; recency, exploration, and diversity signals; familiar-artist/album exclusions; and per-source freshness and confidence. Familiar music is recorded only as a novelty exclusion, never inferred to be a dislike. If one provider is temporarily unavailable, Melodarr retains that provider's last good slice, marks it stale with reduced confidence, and retries after 15 minutes. An unexpected total build failure leaves the previously saved profile untouched.
+Melodarr refreshes a compact private listening profile for each user every 24 hours and after relevant account or history changes. It summarizes artist affinities, genres, moods, listening patterns, recent requests, and familiar music; familiar items are excluded from discovery, not treated as dislikes. Temporary source failures retain the last successful profile with reduced confidence.
 
-AI calls read a deterministic compact projection of that stored profile rather than fetching listening services during the request. The projection uses tuple arrays and abbreviated documented keys and is capped at 6,000 characters, while retaining the canonical structured profile locally for future rebuilds. It contains display names, bounded counts/weights, freshness ages, recent request titles, and familiar-item counts; it excludes usernames, email addresses, linked-account IDs, credentials, service URLs, raw listening events, and event timestamps. A new account whose first daily build has not completed uses a request-only, no-network fallback and reports its profile as pending.
-
-Melodarr uses the model as a creative discovery planner without treating it as a music database. The plan separates genres or styles literally present in the user's request (`mustMatchTags`) from adjacent genres, moods, and other model-proposed search directions (`discoveryTags`). Only the literal tags are hard filters, so “new drill rapper” must retain verified drill evidence while an open-ended prompt can explore several parts of the taste profile instead of collapsing to its first inferred genre. The model may also propose up to three bridge artists as discovery hypotheses. Those names are exact-match resolved to MusicBrainz before they can seed a Last.fm similarity lookup, and the seed itself is never a recommendation.
-
-Melodarr searches those hypotheses through MusicBrainz and, when a shared Last.fm key is configured, Last.fm tag and similarity indexes. Every eligible artist or release must end with a UUID-shaped MusicBrainz identity, and familiar results found in the user's stored listening profile, Lidarr, Plex, or request history are removed. For artist searches, at most two additional MusicBrainz queries look for dated release groups and use their MusicBrainz artist credits as recent-activity evidence; an artist's founding date is never treated as music recency. Missing release dates receive a neutral recency score. Candidate order is deterministic: `75% catalog relevance + 20% release recency + 5% evidence depth`. Evidence depth starts at 30, adds 15 per matched tag, 20 per verified similarity bridge, and 10 per additional independent source, capped at 100. Releases from the last year score 100 for recency, then 90 within two years, 80 within three, 65 within five, 40 within ten, and 15 when older; an unknown date scores 50. Relevance therefore remains dominant, but newer music wins when two candidates fit equally well.
-
-Only the highest-scoring 24 verified candidates can reach the optional second model pass. That pass remains a compact ordered-ID selection with at most 600 output tokens; it cannot introduce names, explanations, or IDs outside the server-created whitelist. Melodarr generates display reasons from trusted tag, similarity, and recent-release evidence. Targeted searches never fall back to unrelated Discover recommendations, and an empty verified result is shown instead of filler. The existing recommendation cache is used only for genuinely open-ended prompts that produce no search terms. Catalog searches and recent-release enrichment degrade independently when a source is unavailable. Recommendation quality still depends on the depth of the user's listening profile and external catalog tagging; no recommender can guarantee that every person will like every result.
-
-The complete request flow is:
+The model proposes search directions; Melodarr searches MusicBrainz and optional Last.fm indexes, verifies every result has a MusicBrainz ID, and removes music already heard, owned, or requested. Candidates are scored primarily for catalog relevance, with newer releases favored when fit is otherwise similar (`75% relevance + 20% recency + 5% evidence`). Only the top 24 verified candidates can reach the ranking pass, and the model can return only IDs from that whitelist. Targeted searches return no result rather than unrelated filler.
 
 ```mermaid
 sequenceDiagram
     participant U as User
     participant M as Melodarr
     participant AI as Configured AI model
-    participant C as MusicBrainz + Last.fm
+    participant C as Music catalogs
 
     U->>M: Natural-language request
-    M->>M: Load stored listening profile and novelty exclusions
-    M->>AI: Call 1 - propose a bounded discovery plan
-    AI-->>M: Entity types, literal tags, exploration tags, bridge seeds
-    M->>M: Re-derive hard constraints from the literal user query
-    M->>C: Verify seeds and retrieve tag/similarity candidates
-    C-->>M: MusicBrainz IDs and catalog evidence
-    M->>M: Remove heard, Plex, Lidarr, and requested music
-    M->>C: Run up to two recent-release enrichment searches
-    C-->>M: Dated release-group and artist-credit evidence
-    M->>M: Score 75% relevance + 20% recency + 5% evidence
-    M->>M: Keep the top 24 verified candidates
-    M->>AI: Call 2 - order only the permitted candidate IDs
+    M->>M: Load compact profile and exclusions
+    M->>AI: Create a bounded discovery plan
+    AI-->>M: Search tags, entity types, and bridge artists
+    M->>C: Retrieve and verify MusicBrainz candidates
+    M->>M: Exclude familiar music and score candidates
+    M->>AI: Order permitted candidate IDs
     AI-->>M: Ordered candidate IDs only
-    M->>M: Validate, de-duplicate, and generate grounded reasons
-    M-->>U: Single-digit verified recommendations
+    M->>M: Validate IDs and generate grounded reasons
+    M-->>U: Verified recommendations
 ```
 
-Every AI request sends the user's prompt as written, the automatically minimized compact daily taste projection, and limited metadata for verified candidates to the configured provider. Query interpretation and candidate ranking are separate bounded structured calls when a live catalog search is required. Melodarr automatically omits the Melodarr username, email address, Plex identity, raw listening events, timestamps, credentials, and internal service URLs from its generated profile, but it does not inspect or redact user-authored prompt text. Users should not put names, contact details, credentials, API keys, secrets, or other sensitive personal information in prompts. OpenAI, Claude, Gemini, LM Studio, Ollama, or the operator of the configured endpoint may retain or log request bodies according to their configuration and policies.
+Each request sends the prompt, minimized taste profile, and verified candidate metadata to the configured provider. Melodarr omits account identifiers, credentials, internal URLs, and raw listening events from the generated profile, but it does not redact prompt text. Providers or local model servers may retain request bodies; users should not enter personal information or secrets.
 
-LM Studio and Ollama are administrator-configured endpoints; choosing one does not by itself guarantee that processing stays on the user's device. A loopback URL such as `http://127.0.0.1` confines transport to the Melodarr host's network stack, but HTTP is still unencrypted. A Docker-host, container-network, or LAN URL such as `http://host.docker.internal:1234` or `http://192.168.1.20:11434` sends prompts and taste-profile data unencrypted across that route, where anyone able to observe the traffic could read it. Prefer HTTPS or a trusted isolated network, restrict the model server to intended clients, and review its request-logging settings. When Melodarr runs in Docker and the model server runs on the Docker host, the included Compose file maps `host.docker.internal` on Linux. If both services share a Compose network, the model-server service name can be used. Melodarr uses LM Studio's OpenAI-compatible `/v1/chat/completions` endpoint and Ollama's native `/api/chat` endpoint.
+LM Studio and Ollama use administrator-configured endpoints. HTTP is unencrypted, so prefer HTTPS or a trusted isolated network and review the model server's logging settings. From Docker, use `host.docker.internal` for a model server on the host, or its service name on a shared Compose network.
 
-Each local inference stage is allowed up to four minutes because prompt processing speed depends on the model and hardware. Query-aware requests can use one small planning stage followed by candidate ranking, so the production worker permits up to ten minutes for the complete request. The structured-output schema constrains the model to Melodarr's verified candidate IDs, and the server applies the same authoritative whitelist to the returned JSON. If Melodarr is behind a reverse proxy, configure its upstream response timeout for at least ten minutes so it does not disconnect first.
+Local inference allows up to four minutes per model stage and ten minutes for the complete request. Reverse proxies should use an upstream timeout of at least ten minutes.
 
 ### Service configuration
 
