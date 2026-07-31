@@ -504,6 +504,17 @@ button.ai-result-art { cursor: pointer; }
 .ai-privacy-note > span { color: var(--accent-bright); font-size: 17px; }
 .ai-privacy-note p { margin: 0; color: var(--foreground-muted); font-size: 11px; line-height: 1.55; }
 .ai-privacy-note strong { color: var(--foreground-subtle); }
+.service-card > .ai-transport-warning {
+  display: grid;
+  gap: 4px;
+  border: 1px solid rgba(168, 116, 45, .3);
+  border-radius: 11px;
+  background: rgba(190, 145, 73, .08);
+  padding: 12px 14px;
+}
+.service-card > .ai-transport-warning[hidden] { display: none; }
+.ai-transport-warning strong { color: var(--foreground-subtle); font-size: 11px; }
+.ai-transport-warning p { margin: 0; color: var(--foreground-muted); font-size: 11px; line-height: 1.55; }
 .wide-field { grid-column: 1 / -1; }
 label { display: grid; gap: 7px; color: var(--foreground-subtle); font-size: 12px; font-weight: 600; letter-spacing: .01em; }
 .service-card button { height: 44px; padding: 0 16px; }

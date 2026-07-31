@@ -171,7 +171,7 @@
         </div>
         <div id="ai-readiness" class="ai-readiness">
           <span class="ai-readiness-dot" aria-hidden="true"></span>
-          <p id="ai-readiness-copy">Checking your private recommendation setup…</p>
+          <p id="ai-readiness-copy">Checking your recommendation setup…</p>
           <button id="ai-settings-link" class="ai-inline-action" type="button" hidden>Configure AI</button>
         </div>
         <p id="ai-message" class="message" aria-live="polite" aria-atomic="true"></p>
@@ -326,7 +326,7 @@
           <form id="ai-settings-form" class="service-card ai-settings-card">
             <div class="ai-privacy-note">
               <span aria-hidden="true">◇</span>
-              <p><strong>Grounded by design.</strong> A minimized taste profile and bounded candidate list are sent to the configured provider, which can only return candidates Melodarr supplied. API keys stay on the server and never reach the browser.</p>
+              <p><strong>Know what is sent.</strong> Each request sends the user-authored prompt exactly as entered, an automatically minimized behavioral taste profile, and verified candidate metadata to the configured provider. With a cloud provider, this data leaves Melodarr and may be retained or logged under that provider’s policies; a local model server may also log request bodies. Melodarr omits usernames, email addresses, linked-account IDs, and raw listening events from the automatically generated profile, but it does not inspect or redact prompt text. Users should not enter names, contact details, credentials, API keys, secrets, or other sensitive personal information. Provider API keys stay on the Melodarr server and never reach the browser.</p>
             </div>
             <div class="settings-fields">
               <label>Provider
@@ -350,6 +350,10 @@
                 <input name="baseUrl" type="url" autocomplete="off" placeholder="http://host.docker.internal:11434">
                 <small id="ai-base-url-help">Required for local providers; leave blank to use the provider default.</small>
               </label>
+            </div>
+            <div id="ai-transport-warning" class="ai-transport-warning" role="note" hidden>
+              <strong id="ai-transport-warning-title">Local model transport</strong>
+              <p id="ai-transport-warning-copy"></p>
             </div>
             <div class="form-actions">
               <p class="form-message" aria-live="polite"></p>

@@ -555,6 +555,49 @@ function selectedAIProvider() {
     || aiProviderOptions[0];
 }
 
+function updateAILocalTransportWarning() {
+  const form = $<AISettingsForm>("#ai-settings-form");
+  const provider = selectedAIProvider();
+  const warning = $("#ai-transport-warning");
+  const title = $("#ai-transport-warning-title");
+  const copy = $("#ai-transport-warning-copy");
+  const isLocalProvider = ["lmstudio", "ollama"].includes(provider.id);
+  warning.hidden = !isLocalProvider;
+  if (!isLocalProvider) return;
+
+  const fallbackUrl = provider.id === "lmstudio"
+    ? "http://localhost:1234"
+    : "http://localhost:11434";
+  let parsed: URL;
+  try {
+    parsed = new URL(form.baseUrl.value.trim() || fallbackUrl);
+  } catch {
+    title.textContent = "Review local model transport";
+    copy.textContent = "Enter a valid server URL to see whether prompts and taste-profile data will use encrypted, loopback, or network transport. The model server may log request bodies.";
+    return;
+  }
+  const hostname = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  const loopback = hostname === "localhost"
+    || hostname === "::1"
+    || /^127(?:\.\d{1,3}){3}$/.test(hostname);
+  const encrypted = parsed.protocol === "https:";
+  if (encrypted) {
+    title.textContent = loopback
+      ? "Encrypted loopback model connection"
+      : "Encrypted network model connection";
+    copy.textContent = loopback
+      ? `Melodarr sends prompts and minimized taste-profile data to ${provider.name} over HTTPS on the Melodarr host. The model server may still retain or log request bodies.`
+      : `Melodarr sends prompts and minimized taste-profile data to ${provider.name} over HTTPS. The server may be another device and may retain or log request bodies; “local provider” does not guarantee on-device processing.`;
+  } else {
+    title.textContent = loopback
+      ? "Unencrypted loopback model connection"
+      : "Unencrypted network model connection";
+    copy.textContent = loopback
+      ? `HTTP does not encrypt prompts or taste-profile data. This loopback address confines transport to the Melodarr host, but ${provider.name} may still retain or log request bodies.`
+      : `HTTP sends prompts and taste-profile data unencrypted across the container, host, or LAN route to ${provider.name}. Anyone able to observe that route may read them. Use HTTPS or a trusted isolated network; the model server may retain or log request bodies.`;
+  }
+}
+
 function updateAIProviderFields(useDefaultModel = false) {
   const form = $<AISettingsForm>("#ai-settings-form");
   const provider = selectedAIProvider();
@@ -607,6 +650,7 @@ function updateAIProviderFields(useDefaultModel = false) {
     : provider.id === "lmstudio"
       ? "Optional unless authentication is enabled in LM Studio 0.4 or newer."
       : "Stored server-side and never returned to this browser.";
+  updateAILocalTransportWarning();
 }
 
 function populateAISettings(settings: JsonObject, status: JsonObject) {
@@ -2290,6 +2334,7 @@ function setupAISettings() {
   const message = requiredDescendant<HTMLElement>(form, ".form-message");
 
   form.provider.addEventListener("change", () => updateAIProviderFields(true));
+  form.baseUrl.addEventListener("input", updateAILocalTransportWarning);
 
   const save = async (clearApiKey = false) => {
     const provider = selectedAIProvider();

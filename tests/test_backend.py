@@ -1819,6 +1819,36 @@ class DeploymentConfigTests(unittest.TestCase):
         gunicorn_worker.log.info.assert_called_once_with("Background workers started")
 
 
+    def test_ai_ui_discloses_prompt_profile_and_local_transport_risks(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        paths = {
+            "html": os.path.join(
+                project_root, "frontend", "static", "index.html"
+            ),
+            "app": os.path.join(project_root, "frontend", "src", "app.ts"),
+            "discovery": os.path.join(
+                project_root, "frontend", "src", "discovery.ts"
+            ),
+        }
+        content = {}
+        for name, path in paths.items():
+            with open(path, encoding="utf-8") as file:
+                content[name] = file.read()
+
+        self.assertNotIn('id="ai-data-disclosure-copy"', content["html"])
+        self.assertIn('id="ai-transport-warning"', content["html"])
+        settings_copy = content["html"].split(
+            '<div class="ai-privacy-note">', 1
+        )[1].split("</div>", 1)[0]
+        self.assertIn("does not inspect or redact prompt text", settings_copy)
+        self.assertIn("credentials, API keys, secrets", settings_copy)
+        self.assertIn("may be retained or logged", settings_copy)
+        self.assertIn("Unencrypted loopback model connection", content["app"])
+        self.assertIn("Unencrypted network model connection", content["app"])
+        self.assertIn("does not guarantee on-device processing", content["app"])
+        self.assertNotIn("aiDataDisclosure", content["discovery"])
+
+
 class AuthenticationTests(DatabaseTestCase):
     def login_non_admin(self, username="local-listener"):
         admin_csrf = self.register()
@@ -3668,13 +3698,28 @@ class ListenBrainzLinkingTests(DatabaseTestCase):
 
     @patch("backend.routes.account.listenbrainz.user_listen_count")
     def test_transient_failure_defers_validation_and_saves(self, listen_count):
-        listen_count.side_effect = requests.Timeout("upstream timeout")
+        private_url = (
+            "https://api.listenbrainz.example/user/"
+            "bitemyear/listen-count?token=sentinel-secret"
+        )
+        error = requests.HTTPError(f"HTTP 503 for url: {private_url}")
+        error.response = Response(503)
+        listen_count.side_effect = error
         with self.assertLogs(level="WARNING") as logs:
             response = self.link(self.register())
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.get_json()["validationDeferred"])
         self.assertEqual(self.saved_username(), "bitemyear")
-        self.assertIn("validation deferred", logs.output[0])
+        rendered = "\n".join(logs.output)
+        self.assertIn("validation deferred", rendered)
+        self.assertIn("HTTPError HTTP 503", rendered)
+        for private_value in (
+            "bitemyear",
+            "sentinel-secret",
+            private_url,
+            "HTTP 503 for url",
+        ):
+            self.assertNotIn(private_value, rendered)
 
 
 class LastFmLinkingTests(DatabaseTestCase):
@@ -4016,6 +4061,50 @@ class ApiCacheTests(DatabaseTestCase):
         self.assertEqual(result, {"result": "recovered"})
         self.assertEqual(get.call_count, 2)
         sleep.assert_called_once_with(1.0)
+
+    @patch("backend.api_cache.time.sleep")
+    @patch("backend.api_cache.requests.get")
+    def test_retry_logs_never_include_prepared_urls_or_exception_text(
+        self, get, sleep
+    ):
+        api_key = "sentinel-lastfm-api-key"
+        username = "sentinel-linked-username"
+        private_scope = "lastfm:user:sentinel-pseudonymous-handle-hash"
+        secret_url = (
+            "https://example.test/private?"
+            f"api_key={api_key}&user={username}"
+        )
+        get.side_effect = [
+            requests.ConnectionError(f"failed request for {secret_url}"),
+            Response(503),
+            Response(200, {"result": "recovered"}),
+        ]
+
+        with self.assertLogs("backend.api_cache", level="WARNING") as logs:
+            result = cached_json_get(
+                secret_url,
+                namespace=private_scope,
+                ttl=60,
+                retry_statuses={503},
+                retry_exceptions=(requests.ConnectionError,),
+                max_attempts=3,
+            )
+
+        rendered = "\n".join(logs.output)
+        self.assertEqual(result, {"result": "recovered"})
+        self.assertIn("ConnectionError", rendered)
+        self.assertIn("HTTP 503", rendered)
+        for private_value in (
+            api_key,
+            username,
+            private_scope,
+            "sentinel-pseudonymous-handle-hash",
+            secret_url,
+            "failed request",
+        ):
+            self.assertNotIn(private_value, rendered)
+        self.assertEqual(get.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
 
     @patch("backend.api_cache.requests.get")
     def test_force_refresh_replaces_a_fresh_cached_response(self, get):
@@ -6738,7 +6827,12 @@ class RecommendationAssemblyTests(unittest.TestCase):
             "lastfm": "ok",
             "plexHistory": "disabled",
         })
-        self.assertIn("ListenBrainz recommendations unavailable", logs.output[0])
+        rendered = "\n".join(logs.output)
+        self.assertIn("ListenBrainz recommendations unavailable", rendered)
+        self.assertIn("user id unknown", rendered)
+        self.assertIn("Timeout", rendered)
+        self.assertNotIn("offline-listener", rendered)
+        self.assertNotIn("lastfm-user", rendered)
 
     @patch("backend.recommendations.save_recommendation_cache")
     @patch("backend.recommendations.build_recommendation_cache")
@@ -6746,16 +6840,39 @@ class RecommendationAssemblyTests(unittest.TestCase):
     def test_refresh_continues_when_one_user_fails(
         self, recommendation_users, build_cache, save_cache
     ):
+        api_key = "sentinel-lastfm-api-key"
+        linked_username = "sentinel-lastfm-username"
+        melodarr_username = "sentinel-melodarr-username"
+        private_url = (
+            "https://ws.audioscrobbler.example/2.0/?"
+            f"api_key={api_key}&user={linked_username}"
+        )
+        error = requests.HTTPError(f"HTTP 503 for url: {private_url}")
+        error.response = Response(503)
         recommendation_users.return_value = [
-            {"id": 1, "username": "offline"},
+            {
+                "id": 1,
+                "username": melodarr_username,
+                "lastfm_username": linked_username,
+            },
             {"id": 2, "username": "working"},
         ]
-        build_cache.side_effect = [requests.Timeout("timeout"), {"artists": []}]
+        build_cache.side_effect = [error, {"artists": []}]
         with self.assertLogs("backend.recommendations", level="WARNING") as logs:
             retry_required = recommendation_engine.refresh_recommendation_cache()
         save_cache.assert_called_once_with(2, {"artists": []})
         self.assertTrue(retry_required)
-        self.assertIn("offline", logs.output[0])
+        rendered = "\n".join(logs.output)
+        self.assertIn("user id 1", rendered)
+        self.assertIn("HTTPError HTTP 503", rendered)
+        for private_value in (
+            api_key,
+            linked_username,
+            melodarr_username,
+            private_url,
+            "HTTP 503 for url",
+        ):
+            self.assertNotIn(private_value, rendered)
 
     @patch("backend.recommendations.save_recommendation_cache")
     @patch("backend.recommendations.build_recommendation_cache")

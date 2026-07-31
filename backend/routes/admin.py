@@ -14,6 +14,7 @@ if __package__ == "backend.routes":
     )
     from ..responses import api_error
     from ..security import admin_required, current_user
+    from ..services import lastfm
     from ..storage import (
         db,
         delete_listening_profile,
@@ -30,6 +31,7 @@ else:  # Support the existing `python backend/app.py` entry point.
     )
     from responses import api_error
     from security import admin_required, current_user
+    from services import lastfm
     from storage import (
         db,
         delete_listening_profile,
@@ -319,6 +321,11 @@ def update_user(user_id):
                     str(values["lastfmUsername"] or "").strip() or None
                 )
                 if lastfm_username != existing["lastfm_username"]:
+                    # Clear the old private provider scope before committing
+                    # the identity change. If cache deletion fails, the main
+                    # transaction rolls back and a retry still knows which
+                    # Last.fm scope must be removed.
+                    lastfm.clear_user_cache(existing["lastfm_username"])
                     updates.extend([
                         "lastfm_username = ?",
                         "lastfm_api_key = NULL",
@@ -354,7 +361,8 @@ def delete_user(user_id):
     with db() as connection:
         connection.execute("BEGIN IMMEDIATE")
         existing = connection.execute(
-            "SELECT id, role FROM users WHERE id = ?", (user_id,)
+            "SELECT id, role, lastfm_username FROM users WHERE id = ?",
+            (user_id,),
         ).fetchone()
         if not existing:
             return api_error("User not found.", 404)
@@ -370,6 +378,11 @@ def delete_user(user_id):
                 return api_error(
                     "The final administrator cannot be deleted.", 409
                 )
+
+        # The external-response cache lives in a separate SQLite database and
+        # has no foreign key to users. Remove its private scope before deleting
+        # the durable account so failures cannot orphan listening-derived data.
+        lastfm.clear_user_cache(existing["lastfm_username"])
 
         # The schema predates SQLite foreign-key cascades. Delete every
         # user-owned row explicitly so removal cannot leave orphaned account

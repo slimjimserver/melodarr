@@ -58,6 +58,13 @@ REQUESTS_PAGE_SIZE = 100
 SQLITE_MAX_INTEGER = (2 ** 63) - 1
 
 
+def _safe_error_label(error):
+    """Describe an upstream failure without logging its prepared URL."""
+    status = getattr(getattr(error, "response", None), "status_code", None)
+    name = type(error).__name__
+    return f"{name} HTTP {status}" if isinstance(status, int) else name
+
+
 def _requested_page():
     raw_page = request.args.get("page", "1")
     try:
@@ -333,9 +340,9 @@ def configure_listenbrainz():
         # their next request and during the background refresh.
         validation_deferred = True
         current_app.logger.warning(
-            "ListenBrainz username validation deferred for %s: %s",
-            username,
-            exc,
+            "ListenBrainz username validation deferred for user id %s (%s)",
+            user_id,
+            _safe_error_label(exc),
         )
 
     with db() as connection:
@@ -368,7 +375,9 @@ def configure_lastfm():
     if values is None:
         return api_error("Request body must be a JSON object.")
     username = str(values.get("username", "")).strip()
+    previous_username = str(user["lastfm_username"] or "").strip()
     if not username:
+        lastfm.clear_user_cache(previous_username)
         with db() as connection:
             connection.execute(
                 "UPDATE users SET lastfm_username = NULL, lastfm_api_key = NULL WHERE id = ?",
@@ -384,6 +393,8 @@ def configure_lastfm():
         )
     try:
         lastfm.get("user.getinfo", username, api_key)
+        if username != previous_username:
+            lastfm.clear_user_cache(previous_username)
         with db() as connection:
             connection.execute(
                 "UPDATE users SET lastfm_username = ?, lastfm_api_key = NULL WHERE id = ?",

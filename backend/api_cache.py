@@ -25,6 +25,16 @@ _cleanup_lock = Lock()
 _last_cleanup_at = None
 
 
+def _safe_error_label(error):
+    """Describe a failure without serializing URLs, paths, or payload data."""
+    return type(error).__name__
+
+
+def _safe_namespace_label(namespace):
+    """Return only the non-identifying top-level cache namespace."""
+    return str(namespace or "unknown").partition(":")[0] or "unknown"
+
+
 def _serialize_json(value):
     """Encode cache values compactly without escaping non-ASCII metadata."""
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
@@ -85,7 +95,10 @@ def _cached_value(key, row):
     try:
         return json.loads(row["value"])
     except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        logger.warning("Discarding invalid metadata cache entry %s: %s", key, exc)
+        logger.warning(
+            "Discarding invalid metadata cache entry (%s)",
+            _safe_error_label(exc),
+        )
 
         def delete_invalid(connection):
             connection.execute(
@@ -101,9 +114,8 @@ def _cached_value(key, row):
             )
         except sqlite3.Error as delete_exc:
             logger.warning(
-                "Could not discard invalid metadata cache entry %s: %s",
-                key,
-                delete_exc,
+                "Could not discard invalid metadata cache entry (%s)",
+                _safe_error_label(delete_exc),
             )
         return None
 
@@ -160,7 +172,7 @@ def migrate_legacy_cache():
                 migrated += len(batch)
         source.execute("DROP TABLE api_cache")
         source.commit()
-        logger.info("Moved %s API cache entries to %s", migrated, CACHE_DATABASE)
+        logger.info("Moved %s API cache entries to the metadata database", migrated)
     finally:
         source.close()
 
@@ -367,9 +379,8 @@ def cleanup_expired_cache():
             )
         except sqlite3.OperationalError as exc:
             logger.warning(
-                "Could not clean expired metadata cache entries at %s: %s",
-                CACHE_DATABASE,
-                exc,
+                "Could not clean expired metadata cache entries (%s)",
+                _safe_error_label(exc),
             )
             return 0
         if removed < 0:
@@ -433,9 +444,10 @@ def cached_json_get(
                 raise
             delay = retry_backoff * (2 ** attempt)
             logger.warning(
-                "External API request failed for %s: %s; retrying in %.1f seconds",
-                url,
-                exc,
+                "External API request failed in the %s namespace (%s); "
+                "retrying in %.1f seconds",
+                _safe_namespace_label(namespace),
+                type(exc).__name__,
                 delay,
             )
             time.sleep(delay)
@@ -447,9 +459,10 @@ def cached_json_get(
             except (TypeError, ValueError):
                 delay = retry_backoff * (2 ** attempt)
             logger.warning(
-                "External API returned HTTP %s for %s; retrying in %.1f seconds",
+                "External API returned HTTP %s in the %s namespace; "
+                "retrying in %.1f seconds",
                 response.status_code,
-                url,
+                _safe_namespace_label(namespace),
                 delay,
             )
             time.sleep(delay)
@@ -479,30 +492,79 @@ def cached_json_get(
             # A non-locking filesystem error should remain visible, but caching
             # must never turn a successful upstream request into an API failure.
             logger.warning(
-                "Could not write metadata cache at %s: %s",
-                CACHE_DATABASE,
-                exc,
+                "Could not write metadata cache (%s)",
+                _safe_error_label(exc),
             )
     cleanup_expired_cache()
     return (value, False) if include_cache_status else value
 
 
-def clear_cache(namespace):
-    """Remove all cached responses belonging to one external API namespace."""
+def delete_cache_namespace(namespace):
+    """Strictly remove one namespace, including any nested private scopes.
+
+    Privacy-sensitive account workflows use this variant so a cache-database
+    failure aborts the identity change instead of silently retaining data that
+    the user asked Melodarr to unlink.  Maintenance endpoints use
+    :func:`clear_cache`, which preserves their historical best-effort behavior.
+    """
+    namespace = str(namespace or "").strip()
+    if not namespace:
+        raise ValueError("Cache namespace is required.")
 
     def clear(connection):
-        connection.execute(
+        cursor = connection.execute(
             "DELETE FROM api_cache WHERE cache_key LIKE ?", (f"{namespace}:%",)
         )
+        return cursor.rowcount
+
+    return _cache_operation(
+        clear,
+        description=f"delete the {_safe_namespace_label(namespace)} namespace",
+    )
+
+
+def delete_legacy_cache_namespace(namespace):
+    """Remove only pre-scoping keys from ``namespace``.
+
+    Historical HTTP cache keys have exactly one colon (``namespace:digest``).
+    New private Last.fm scopes add more colon-delimited components.  The old
+    digest includes the username and cannot be reversed or safely attributed,
+    so unlinking any legacy account must discard these unattributable rows once
+    while leaving all new scoped rows intact.
+    """
+    namespace = str(namespace or "").strip()
+    if not namespace:
+        raise ValueError("Cache namespace is required.")
+    prefix = f"{namespace}:"
+
+    def clear_legacy(connection):
+        cursor = connection.execute(
+            "DELETE FROM api_cache "
+            "WHERE substr(cache_key, 1, ?) = ? "
+            "AND instr(substr(cache_key, ?), ':') = 0",
+            (len(prefix), prefix, len(prefix) + 1),
+        )
+        return cursor.rowcount
+
+    return _cache_operation(
+        clear_legacy,
+        description=(
+            f"delete legacy {_safe_namespace_label(namespace)} responses"
+        ),
+    )
+
+
+def clear_cache(namespace):
+    """Best-effort removal of one external API cache namespace."""
 
     try:
-        _cache_operation(
-            clear,
-            locked_default=None,
-            description=f"clear the {namespace} namespace",
-        )
+        return delete_cache_namespace(namespace)
     except sqlite3.OperationalError as exc:
-        logger.warning("Could not clear metadata cache at %s: %s", CACHE_DATABASE, exc)
+        logger.warning(
+            "Could not clear metadata cache (%s)",
+            _safe_error_label(exc),
+        )
+        return 0
 
 
 def cache_stats():

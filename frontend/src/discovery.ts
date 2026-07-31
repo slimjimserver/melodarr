@@ -1716,7 +1716,7 @@
     const settingsLink = $("#ai-settings-link");
     settingsLink.hidden = true;
     readiness.className = "ai-readiness";
-    readinessCopy.textContent = "Checking your private recommendation setup…";
+    readinessCopy.textContent = "Checking your recommendation setup…";
     try {
       const status = await getJson("/api/ai/status", 15_000);
       aiConfigured = Boolean(status.configured);
@@ -1728,11 +1728,9 @@
       readiness.classList.toggle("ready", aiConfigured);
       readiness.classList.toggle("error", !aiConfigured);
       readinessCopy.textContent = aiConfigured
-        ? ["lmstudio", "ollama"].includes(String(status.provider))
-          ? `Your prompt, compact taste profile, and query-matched catalog candidates stay on your configured ${provider} server.`
-          : `Submitting sends your prompt, a compact taste profile, and query-matched catalog candidates to ${provider}. API keys stay on the server.`
+        ? `${provider} is configured. Melodarr will show only MusicBrainz-verified results.`
         : currentUser?.role === "admin"
-          ? "Choose an AI provider to start private, listening-history-grounded discovery."
+          ? "Choose an AI provider to start listening-history-grounded discovery."
           : "An administrator needs to configure an AI provider before you can ask for recommendations.";
       settingsLink.hidden = aiConfigured || currentUser?.role !== "admin";
       updateSearchSubmitState();

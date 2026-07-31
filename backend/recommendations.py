@@ -34,6 +34,19 @@ else:  # Support the existing `python backend/app.py` entry point.
 logger = logging.getLogger(__name__)
 
 
+def _safe_error_label(error):
+    """Describe an upstream failure without serializing its URL or payload."""
+    status = getattr(getattr(error, "response", None), "status_code", None)
+    name = type(error).__name__
+    return f"{name} HTTP {status}" if isinstance(status, int) else name
+
+
+def _safe_user_log_id(user):
+    """Return only SQLite's opaque numeric identity for operational logs."""
+    value = _user_value(user, "id", None)
+    return value if isinstance(value, int) and not isinstance(value, bool) else "unknown"
+
+
 def _musicbrainz_lookup(path, inc=""):
     """Make a cached lookup, treating a confirmed missing entity as empty."""
     try:
@@ -428,7 +441,8 @@ def seeded_lastfm_recommendations(
             ).get("topalbums", {}).get("album", [])
         except (ValueError, requests.RequestException) as exc:
             logger.warning(
-                "Skipping Last.fm albums for %s: %s", artist["name"], exc
+                "Skipping Last.fm album lookup after %s",
+                _safe_error_label(exc),
             )
             continue
         for album_rank, album in enumerate(top_albums):
@@ -452,10 +466,8 @@ def seeded_lastfm_recommendations(
                 metadata = _musicbrainz_lookup(f"/release-group/{mbid}") or {}
             except requests.RequestException as exc:
                 logger.warning(
-                    "Skipping Last.fm album %s by %s after MusicBrainz lookup failed: %s",
-                    name,
-                    artist_name or "Unknown artist",
-                    exc,
+                    "Skipping Last.fm album after MusicBrainz lookup failed (%s)",
+                    _safe_error_label(exc),
                 )
                 continue
             date = metadata.get("first-release-date", "")
@@ -782,7 +794,10 @@ def _service_recommendation_exclusions():
                 if mbid:
                     excluded["album_ids"].add(mbid)
         except (ValueError, requests.RequestException) as exc:
-            logger.warning("Could not load Lidarr exclusions: %s", exc)
+            logger.warning(
+                "Could not load Lidarr exclusions (%s)",
+                _safe_error_label(exc),
+            )
 
     plex_config = get_service("plex")
     if plex_config:
@@ -804,7 +819,10 @@ def _service_recommendation_exclusions():
                 if release_group.get("musicbrainzReleaseGroupId")
             )
         except (ValueError, requests.RequestException) as exc:
-            logger.warning("Could not load Plex exclusions: %s", exc)
+            logger.warning(
+                "Could not load Plex exclusions (%s)",
+                _safe_error_label(exc),
+            )
     return excluded
 
 
@@ -934,9 +952,9 @@ def build_recommendation_cache(user, *, shared_exclusions=None):
         except (ValueError, requests.RequestException) as exc:
             payload["providerStatus"]["listenbrainz"] = "unavailable"
             logger.warning(
-                "ListenBrainz recommendations unavailable for %s: %s",
-                user["listenbrainz_username"],
-                exc,
+                "ListenBrainz recommendations unavailable for user id %s (%s)",
+                _safe_user_log_id(user),
+                _safe_error_label(exc),
             )
     if has_plex_history:
         try:
@@ -966,9 +984,9 @@ def build_recommendation_cache(user, *, shared_exclusions=None):
         except (ValueError, requests.RequestException) as exc:
             payload["providerStatus"]["plexHistory"] = "unavailable"
             logger.warning(
-                "Plex-history recommendations unavailable for %s: %s",
-                user["username"],
-                exc,
+                "Plex-history recommendations unavailable for user id %s (%s)",
+                _safe_user_log_id(user),
+                _safe_error_label(exc),
             )
     if user["lastfm_username"] and lastfm_api_key:
         username, api_key = user["lastfm_username"], lastfm_api_key
@@ -996,9 +1014,9 @@ def build_recommendation_cache(user, *, shared_exclusions=None):
         except (ValueError, requests.RequestException) as exc:
             lastfm_failed = True
             logger.warning(
-                "Last.fm personalized recommendations unavailable for %s: %s",
-                username,
-                exc,
+                "Last.fm personalized recommendations unavailable for user id %s (%s)",
+                _safe_user_log_id(user),
+                _safe_error_label(exc),
             )
 
         try:
@@ -1016,14 +1034,22 @@ def build_recommendation_cache(user, *, shared_exclusions=None):
             ]
         except (ValueError, requests.RequestException) as exc:
             lastfm_failed = True
-            logger.warning("Last.fm charts unavailable for %s: %s", username, exc)
+            logger.warning(
+                "Last.fm charts unavailable for user id %s (%s)",
+                _safe_user_log_id(user),
+                _safe_error_label(exc),
+            )
 
         try:
             tags = lastfm_top_tags(username, api_key, limit=10)
         except (ValueError, requests.RequestException) as exc:
             tags = []
             lastfm_failed = True
-            logger.warning("Last.fm tags unavailable for %s: %s", username, exc)
+            logger.warning(
+                "Last.fm tags unavailable for user id %s (%s)",
+                _safe_user_log_id(user),
+                _safe_error_label(exc),
+            )
         main_album_ids = {
             album["id"]
             for album in personalized_albums[:LASTFM_PRIMARY_ALBUM_LIMIT]
@@ -1090,10 +1116,9 @@ def build_recommendation_cache(user, *, shared_exclusions=None):
                 except (ValueError, requests.RequestException) as exc:
                     lastfm_failed = True
                     logger.warning(
-                        "Last.fm taste-row backfill unavailable for %s (%s): %s",
-                        username,
-                        tag_name,
-                        exc,
+                        "Last.fm taste-row backfill unavailable for user id %s (%s)",
+                        _safe_user_log_id(user),
+                        _safe_error_label(exc),
                     )
             mapped = [
                 {
@@ -1148,5 +1173,9 @@ def refresh_recommendation_cache():
                 retry_required = True
         except (ValueError, requests.RequestException) as exc:
             retry_required = True
-            logger.warning("Could not refresh recommendations for %s: %s", user["username"], exc)
+            logger.warning(
+                "Could not refresh recommendations for user id %s (%s)",
+                _safe_user_log_id(user),
+                _safe_error_label(exc),
+            )
     return retry_required
