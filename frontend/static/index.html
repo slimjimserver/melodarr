@@ -8,71 +8,183 @@
   <link rel="icon" href="/icons/melodarr.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="/icons/melodarr-180.png">
   <link rel="manifest" href="/static/site.webmanifest">
+  <script src="/static/theme.js"></script>
   <link rel="stylesheet" href="/static/style.css">
 </head>
-<body>
+<body data-discovery-src="/static/discovery.js">
+  <a class="skip-link" href="#main-content">Skip to main content</a>
   <div id="pull-to-refresh" class="pull-to-refresh" aria-live="polite" aria-label="Pull down to refresh">↓</div>
   <header>
     <a class="brand" href="/" aria-label="Melodarr home">
-      <img src="/icons/melodarr.svg" alt="">
+      <img src="/icons/melodarr.svg" alt="" width="32" height="32">
       <span>melodarr</span>
     </a>
     <nav class="header-nav">
-      <button class="nav-link active" data-view="discover">Discover</button>
-      <button class="nav-link" data-view="library">Your library</button>
-      <button class="nav-link admin-only" data-view="settings">Settings</button>
+      <button class="nav-link active" type="button" data-view="discover" aria-current="page">Discover</button>
+      <button class="nav-link" type="button" data-view="library">Your library</button>
+      <button class="nav-link admin-only" type="button" data-view="settings">Settings</button>
     </nav>
-    <div id="status" class="status">Checking services…</div>
+    <div id="status" class="status" role="status" aria-live="polite">Checking services…</div>
+    <button id="theme-toggle" class="theme-toggle" type="button">
+      <span class="theme-icon" aria-hidden="true">☾</span>
+      <span class="theme-label">Midnight</span>
+    </button>
     <a id="account-menu" class="account-menu" href="/" aria-label="Open account settings" title="Account settings">●</a>
-    <button id="logout" class="logout" type="button">Sign out</button>
+    <button id="logout" class="logout" type="button" title="Sign out">
+      <svg class="logout-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/>
+      </svg>
+      <span class="logout-label">Sign out</span>
+    </button>
   </header>
 
   <section id="auth" class="auth-view">
-    <div class="auth-card">
+    <div id="auth-card" class="auth-card">
       <p class="eyebrow">MELODARR</p>
       <h1 id="auth-title">Music, for<br><em>your people.</em></h1>
-      <p id="auth-intro" class="intro">Checking account access…</p>
+      <p id="auth-intro" class="intro">Getting your music space ready…</p>
       <form id="login-form" class="auth-form" hidden>
         <h2>Sign in</h2>
         <label>Username<input name="username" autocomplete="username" required></label>
         <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
         <label class="checkbox auth-checkbox"><input name="remember" type="checkbox"> Remember me for 30 days</label>
         <button>Sign in</button>
-        <p class="form-message"></p>
+        <p class="form-message" aria-live="polite"></p>
       </form>
       <form id="register-form" class="auth-form" hidden>
         <h2 id="register-title">Create owner account</h2>
         <label>Username<input name="username" autocomplete="username" minlength="3" maxlength="32" required></label>
         <label>Password<input name="password" type="password" autocomplete="new-password" minlength="12" required></label>
         <button>Create account</button>
-        <p class="form-message"></p>
+        <p class="form-message" aria-live="polite"></p>
       </form>
+      <div id="plex-login-option" class="plex-login-option" hidden>
+        <span>or</span>
+        <button id="plex-login" class="plex-button" type="button">
+          Sign in with <img src="/icons/plex.svg" alt="Plex">
+        </button>
+        <p class="form-message" aria-live="polite"></p>
+      </div>
+    </div>
+
+    <div id="setup-wizard" class="setup-card" hidden>
+      <div class="setup-brand">
+        <img src="/icons/melodarr.svg" alt="" width="58" height="58">
+        <span>melodarr</span>
+      </div>
+      <ol class="setup-steps" aria-label="Setup progress">
+        <li class="active" data-setup-step="1"><span>1</span><strong>Media server</strong></li>
+        <li data-setup-step="2"><span>2</span><strong>Sign in</strong></li>
+        <li data-setup-step="3"><span>3</span><strong>Configure Plex</strong></li>
+      </ol>
+
+      <section id="setup-choice" class="setup-panel">
+        <p class="eyebrow">WELCOME TO MELODARR</p>
+        <h1>Choose your<br><em>media server.</em></h1>
+        <p class="intro">Connect your music library now, or create a local administrator and add Plex later.</p>
+        <div class="server-choice">
+          <img src="/icons/plex.svg" alt="Plex" width="112" height="40">
+          <p>Use your Plex account to securely discover a server you own.</p>
+          <button id="setup-choose-plex" class="plex-button" type="button">Configure Plex</button>
+        </div>
+        <button id="setup-skip-plex" class="outline setup-skip" type="button">Skip for now</button>
+      </section>
+
+      <section id="setup-plex-login" class="setup-panel" hidden>
+        <p class="eyebrow">PLEX ACCOUNT</p>
+        <h2>Sign in as the server owner</h2>
+        <p class="setup-copy">Plex will open in a secure window. Use the account that owns the server you want Melodarr to scan.</p>
+        <div class="plex-signin-box">
+          <button id="setup-plex-login-button" class="plex-button" type="button">
+            Sign in with <img src="/icons/plex.svg" alt="Plex">
+          </button>
+        </div>
+        <p class="form-message" aria-live="polite"></p>
+        <button class="outline setup-back" data-setup-back="choice" type="button">Go back</button>
+      </section>
+
+      <section id="setup-local-account" class="setup-panel" hidden>
+        <p class="eyebrow">LOCAL ADMINISTRATOR</p>
+        <h2>Create your owner account</h2>
+        <p class="setup-copy">You can connect Plex later from Settings. Plex integration will still require signing in with a server-owner account.</p>
+        <form id="setup-local-form" class="auth-form">
+          <label>Username<input name="username" autocomplete="username" minlength="3" maxlength="32" required></label>
+          <label>Password<input name="password" type="password" autocomplete="new-password" minlength="12" required></label>
+          <button>Create local administrator</button>
+          <p class="form-message" aria-live="polite"></p>
+        </form>
+        <button class="outline setup-back" data-setup-back="choice" type="button">Go back</button>
+      </section>
+
+      <section id="setup-plex-server" class="setup-panel" hidden>
+        <p class="eyebrow">PLEX SERVER</p>
+        <h2>Configure your music library</h2>
+        <p id="setup-plex-account" class="setup-copy"></p>
+        <div class="setup-server-fields">
+          <label>Server<select id="setup-plex-server-select"></select></label>
+          <label>Connection<select id="setup-plex-connection-select"></select></label>
+        </div>
+        <div class="setup-actions">
+          <p id="setup-plex-message" class="message form-message" aria-live="polite"></p>
+          <button id="setup-test-plex" class="secondary-action" type="button">Load music libraries</button>
+        </div>
+        <fieldset id="setup-plex-libraries" disabled>
+          <div id="setup-plex-library-sections" class="option-picker" role="group" aria-label="Plex music libraries"></div>
+        </fieldset>
+        <div class="setup-actions">
+          <button class="outline setup-back" data-setup-back="plex-login" type="button">Sign in again</button>
+          <button id="setup-finish-plex" type="button" disabled>Finish setup</button>
+        </div>
+      </section>
     </div>
   </section>
 
-  <main>
+  <main id="main-content" tabindex="-1">
     <section id="discover" class="view active">
-      <p class="eyebrow">YOUR MUSIC, ON REQUEST</p>
+      <p class="eyebrow">FIND YOUR NEXT FAVORITE</p>
       <h1>What do you want<br>to hear <em>next?</em></h1>
-      <p class="intro">Find an artist and send them straight to your music collection.</p>
+      <p class="intro">Explore MusicBrainz directly or ask for recommendations shaped around your listening history.</p>
       <form id="search-form" class="search">
         <select id="search-type" aria-label="Search type">
           <option value="artist">Artists</option>
           <option value="album">Albums</option>
           <option value="track">Tracks</option>
+          <option value="ai">Recommendations</option>
         </select>
-        <input id="search-input" autocomplete="off" placeholder="Search artists…" aria-label="Search">
-        <button>Search</button>
+        <input id="search-input" autocomplete="off" placeholder="Search artists…" aria-label="Search artists">
+        <button id="search-submit" type="submit">Search</button>
       </form>
-      <p id="search-message" class="message"></p>
-      <div id="results" class="results"></div>
+      <section id="ai-recommendations" class="ai-search-options" aria-labelledby="ai-recommendations-title" hidden>
+        <div class="ai-search-heading">
+          <div class="ai-title-line">
+            <span class="ai-mark" aria-hidden="true">✦</span>
+            <h2 id="ai-recommendations-title">Personalized AI search</h2>
+            <span id="ai-provider-badge" class="ai-provider-badge">Checking AI…</span>
+          </div>
+          <p>Describe a mood, moment, or musical thread. Melodarr searches for matching music, verifies it with MusicBrainz, then personalizes the shortlist.</p>
+        </div>
+        <div class="ai-suggestions" aria-label="Prompt ideas">
+          <button type="button" data-ai-prompt="Surprise me with a hidden gem that connects several of my favorite artists.">Hidden gem</button>
+          <button type="button" data-ai-prompt="Recommend an album for focused late-night listening, based on my taste.">Late-night focus</button>
+          <button type="button" data-ai-prompt="Show me a recent release that feels fresh but still fits my listening history.">Something recent</button>
+          <button type="button" data-ai-prompt="Take one part of my taste and lead me somewhere unexpected.">A little adventurous</button>
+        </div>
+        <div id="ai-readiness" class="ai-readiness">
+          <span class="ai-readiness-dot" aria-hidden="true"></span>
+          <p id="ai-readiness-copy">Checking your recommendation setup…</p>
+          <button id="ai-settings-link" class="ai-inline-action" type="button" hidden>Configure AI</button>
+        </div>
+        <p id="ai-message" class="message" aria-live="polite" aria-atomic="true"></p>
+      </section>
+      <p id="search-message" class="message" aria-live="polite" aria-atomic="true"></p>
+      <div id="results" class="results" aria-label="Search results"></div>
       <section class="recommendations" aria-labelledby="recommendations-title">
         <div class="recommendations-heading">
           <div><p class="eyebrow">LINKED ACCOUNTS</p><h2 id="recommendations-title">Recommended for you</h2></div>
           <button id="load-recommendations" class="outline" type="button">Get recommendations</button>
         </div>
-        <p id="recommendations-message" class="message">Add a ListenBrainz or Last.fm account in Linked accounts to discover recommendations based on your listening history.</p>
-        <div id="recommendation-results"></div>
+        <p id="recommendations-message" class="message" aria-live="polite">Connect ListenBrainz or Last.fm in Linked accounts and we’ll shape recommendations around what you love.</p>
+        <div id="recommendation-results" aria-label="Music recommendations"></div>
       </section>
     </section>
 
@@ -84,9 +196,9 @@
           <h1 id="detail-title"></h1>
           <p id="detail-subtitle" class="intro"></p>
         </div>
-        <div id="detail-cover" class="detail-cover" hidden><img id="detail-cover-image" alt=""></div>
+        <div id="detail-cover" class="detail-cover" hidden><img id="detail-cover-image" width="280" height="280" decoding="async" alt=""></div>
       </div>
-      <p id="detail-message" class="message"></p>
+      <p id="detail-message" class="message" aria-live="polite"></p>
       <div id="detail-results" class="results"></div>
     </section>
 
@@ -102,7 +214,7 @@
         <input id="library-search" type="search" placeholder="Search your Plex artists…" autocomplete="off">
         <span id="library-filter-count" aria-live="polite"></span>
       </div>
-      <p id="library-message" class="message"></p>
+      <p id="library-message" class="message" aria-live="polite"></p>
       <div id="library-results" class="library-results"></div>
     </section>
 
@@ -112,35 +224,52 @@
         <p>Connect the services Melodarr uses, then choose the defaults for new requests. Credentials are stored in this app’s local settings file.</p>
       </div>
 
-      <nav class="settings-tabs" aria-label="Settings sections">
-        <button class="active" type="button" data-settings-page="services">Services</button>
-        <button type="button" data-settings-page="jobs">Jobs &amp; Cache</button>
-      </nav>
+      <div class="settings-tabs" role="tablist" aria-label="Settings sections">
+        <button id="settings-tab-services" class="active" type="button" role="tab" aria-selected="true" aria-controls="settings-services" data-settings-page="services">Services</button>
+        <button id="settings-tab-requests" type="button" role="tab" aria-selected="false" aria-controls="settings-requests" tabindex="-1" data-settings-page="requests">Requests</button>
+        <button id="settings-tab-users" type="button" role="tab" aria-selected="false" aria-controls="settings-users" tabindex="-1" data-settings-page="users">Users</button>
+        <button id="settings-tab-jobs" type="button" role="tab" aria-selected="false" aria-controls="settings-jobs" tabindex="-1" data-settings-page="jobs">Jobs &amp; Cache</button>
+      </div>
 
-      <div id="settings-services" class="settings-stack settings-panel">
+      <div id="settings-services" class="settings-stack settings-panel" role="tabpanel" aria-labelledby="settings-tab-services" tabindex="0">
         <section class="settings-section">
-          <div class="service-intro"><img class="service-icon" src="/icons/plex.svg" alt="Plex"><div><h2>Plex library</h2><p>Detect artists you already own and open them directly in Plex.</p></div><span id="plex-state" class="service-state">Not connected</span></div>
-          <form id="plex-settings" class="service-card">
-            <div class="settings-fields">
-              <label>Plex address<input name="url" placeholder="http://plex:32400" required></label>
-              <label>Authentication token<input name="token" type="password" placeholder="Plex token (leave blank to keep saved token)"></label>
-            </div>
-            <div class="form-actions"><p class="form-message"></p><button type="button" id="test-plex" class="secondary-action">Test connection</button></div>
-            <fieldset id="plex-libraries" disabled>
-              <hr>
-              <div class="defaults-heading"><div><h3>Music libraries</h3><p class="field-help">Only selected Plex music libraries are scanned and used to filter recommendations.</p></div></div>
-              <div class="option-field">
-                <span class="option-field-label">Select music libraries</span>
-                <div id="plex-library-sections" class="option-picker" role="group" aria-label="Plex music libraries"></div>
-                <small>Select every library Melodarr should use.</small>
+          <div class="service-intro"><img class="service-icon" src="/icons/plex.svg" width="42" height="42" loading="lazy" decoding="async" alt="Plex"><div><h2>Plex library</h2><p>Detect artists you already own and open them directly in Plex.</p></div><span id="plex-state" class="service-state">Not connected</span></div>
+          <div id="plex-settings" class="service-card plex-connect-card">
+            <div class="plex-connect-intro">
+              <div>
+                <h3>Connect with Plex</h3>
+                <p>Sign in with the account that owns your Plex server. Melodarr will retrieve its available connections securely.</p>
               </div>
-              <div class="form-actions"><span></span><button>Save Plex connection</button></div>
-            </fieldset>
-          </form>
+              <button id="connect-plex" class="plex-button" type="button">Sign in with <img src="/icons/plex.svg" alt="Plex"></button>
+            </div>
+            <p class="form-message" aria-live="polite"></p>
+            <div id="plex-current-connection" class="plex-current-connection" hidden>
+              <div><span>Server</span><strong id="plex-current-server"></strong></div>
+              <div><span>Connection</span><strong id="plex-current-url"></strong></div>
+              <div><span>Music libraries</span><strong id="plex-current-libraries"></strong></div>
+            </div>
+            <div id="plex-settings-config" hidden>
+              <hr>
+              <div class="settings-fields">
+                <label>Server<select id="settings-plex-server-select"></select></label>
+                <label>Connection<select id="settings-plex-connection-select"></select></label>
+              </div>
+              <div class="form-actions"><span></span><button id="settings-test-plex" class="secondary-action" type="button">Load music libraries</button></div>
+              <fieldset id="plex-libraries" disabled>
+                <div class="defaults-heading"><div><h3>Music libraries</h3><p class="field-help">Only selected Plex music libraries are scanned and used to filter recommendations.</p></div></div>
+                <div class="option-field">
+                  <span class="option-field-label">Select music libraries</span>
+                  <div id="plex-library-sections" class="option-picker" role="group" aria-label="Plex music libraries"></div>
+                  <small>Select every library Melodarr should use.</small>
+                </div>
+                <div class="form-actions"><span></span><button id="settings-save-plex" type="button" disabled>Save Plex connection</button></div>
+              </fieldset>
+            </div>
+          </div>
         </section>
 
         <section class="settings-section">
-          <div class="service-intro"><img class="service-icon" src="/icons/lidarr.svg" alt="Lidarr"><div><h2>Lidarr</h2><p>Where approved artist requests are added and monitored.</p></div><span id="lidarr-state" class="service-state">Not connected</span></div>
+          <div class="service-intro"><img class="service-icon" src="/icons/lidarr.svg" width="42" height="42" loading="lazy" decoding="async" alt="Lidarr"><div><h2>Lidarr</h2><p>Where approved artist requests are added and monitored.</p></div><span id="lidarr-state" class="service-state">Not connected</span></div>
           <form id="lidarr-settings" class="service-card lidarr-card">
           <div class="settings-fields">
             <label>Hostname or IP Address<input name="hostname" placeholder="lidarr" required></label>
@@ -170,9 +299,156 @@
           </fieldset>
         </form>
         </section>
+
+        <section class="settings-section">
+          <div class="service-intro"><img class="service-icon" src="/icons/last-fm.svg" width="42" height="42" loading="lazy" decoding="async" alt="Last.fm"><div><h2>Last.fm</h2><p>Use one shared API key for personalized recommendations across Melodarr.</p></div><span id="lastfm-state" class="service-state">Not configured</span></div>
+          <form id="lastfm-settings" class="service-card">
+            <label>API key
+              <small>The saved key is never displayed. Enter a key to save it or replace the existing one.</small>
+              <input name="apiKey" type="password" autocomplete="off" placeholder="Last.fm API key">
+            </label>
+            <div class="form-actions">
+              <p class="form-message" aria-live="polite"></p>
+              <div>
+                <button id="clear-lastfm-key" class="secondary-action" type="button" hidden>Clear saved key</button>
+                <button id="save-lastfm-key" type="submit">Save API key</button>
+              </div>
+            </div>
+          </form>
+        </section>
+
+        <section id="ai-settings" class="settings-section">
+          <div class="service-intro">
+            <div class="service-icon ai-service-icon" aria-hidden="true">✦</div>
+            <div><h2>AI recommendations</h2><p>Let an AI reason over each user’s private listening profile and choose verified MusicBrainz matches.</p></div>
+            <span id="ai-settings-state" class="service-state">Not configured</span>
+          </div>
+          <form id="ai-settings-form" class="service-card ai-settings-card">
+            <div class="ai-privacy-note">
+              <span aria-hidden="true">◇</span>
+              <p><strong>Know what is sent.</strong> Each request sends the user-authored prompt exactly as entered, an automatically minimized behavioral taste profile, and verified candidate metadata to the configured provider. With a cloud provider, this data leaves Melodarr and may be retained or logged under that provider’s policies; a local model server may also log request bodies. Melodarr omits usernames, email addresses, linked-account IDs, and raw listening events from the automatically generated profile, but it does not inspect or redact prompt text. Users should not enter names, contact details, credentials, API keys, secrets, or other sensitive personal information. Provider API keys stay on the Melodarr server and never reach the browser.</p>
+            </div>
+            <div class="settings-fields">
+              <label>Provider
+                <select name="provider" id="ai-provider" required>
+                  <option value="openai">OpenAI</option>
+                  <option value="anthropic">Claude</option>
+                  <option value="gemini">Gemini</option>
+                  <option value="lmstudio">LM Studio</option>
+                  <option value="ollama">Ollama</option>
+                </select>
+              </label>
+              <label>Model
+                <input name="model" id="ai-model" autocomplete="off" placeholder="Provider default" required>
+                <small id="ai-model-help">Choose the model used to rank and explain recommendations.</small>
+              </label>
+              <label id="ai-api-key-field">API key
+                <input name="apiKey" type="password" autocomplete="off" placeholder="API key">
+                <small id="ai-api-key-help">The saved key is never displayed.</small>
+              </label>
+              <label id="ai-base-url-field" hidden>Base URL
+                <input name="baseUrl" type="url" autocomplete="off" placeholder="http://host.docker.internal:11434">
+                <small id="ai-base-url-help">Required for local providers; leave blank to use the provider default.</small>
+              </label>
+            </div>
+            <div id="ai-transport-warning" class="ai-transport-warning" role="note" hidden>
+              <strong id="ai-transport-warning-title">Local model transport</strong>
+              <p id="ai-transport-warning-copy"></p>
+            </div>
+            <div class="form-actions">
+              <p class="form-message" aria-live="polite"></p>
+              <div>
+                <button id="clear-ai-key" class="secondary-action" type="button" hidden>Clear saved key</button>
+                <button id="save-ai-settings" type="submit">Save AI settings</button>
+              </div>
+            </div>
+          </form>
+        </section>
       </div>
 
-      <div id="settings-jobs" class="settings-stack settings-panel" hidden>
+      <div id="settings-requests" class="settings-stack settings-panel" role="tabpanel" aria-labelledby="settings-tab-requests" tabindex="0" hidden>
+        <section class="settings-section admin-requests-section">
+          <div class="admin-requests-heading">
+            <div>
+              <p class="eyebrow">REQUEST ACTIVITY</p>
+              <h2>Requests</h2>
+              <p>Review every artist and release-group request across Melodarr, including who requested it and whether it is available in Plex.</p>
+            </div>
+            <button id="refresh-admin-requests" class="outline" type="button">Refresh</button>
+          </div>
+          <div class="user-stats" aria-label="Request summary">
+            <div><strong id="admin-requests-total">—</strong><span>Total requests</span></div>
+            <div><strong id="admin-requests-artists">—</strong><span>Artists on page</span></div>
+            <div><strong id="admin-requests-releases">—</strong><span>Releases on page</span></div>
+          </div>
+          <div class="admin-request-filters">
+            <label class="users-filter" for="admin-requests-search">
+              <span>Find a request</span>
+              <input id="admin-requests-search" type="search" placeholder="Search music or requester…" autocomplete="off">
+            </label>
+            <label class="users-filter" for="admin-requests-type">
+              <span>Request type</span>
+              <select id="admin-requests-type">
+                <option value="all">All requests</option>
+                <option value="artist">Artists</option>
+                <option value="release-group">Release groups</option>
+              </select>
+            </label>
+          </div>
+          <p id="admin-requests-message" class="form-message" aria-live="polite"></p>
+          <div id="admin-requests-list" class="admin-request-list" aria-label="Global request history">
+            <p class="message">Open Requests to load request history.</p>
+          </div>
+          <nav id="admin-requests-pagination" class="admin-request-pagination" aria-label="Request history pages" hidden>
+            <button id="admin-requests-previous" class="outline" type="button">Previous</button>
+            <span id="admin-requests-page" aria-live="polite">Page 1 of 1</span>
+            <button id="admin-requests-next" class="outline" type="button">Next</button>
+          </nav>
+        </section>
+      </div>
+
+      <div id="settings-users" class="settings-stack settings-panel" role="tabpanel" aria-labelledby="settings-tab-users" tabindex="0" hidden>
+        <section class="settings-section users-section">
+          <div class="users-heading">
+            <div>
+              <p class="eyebrow">ACCESS &amp; ACCOUNTS</p>
+              <h2>Users</h2>
+              <p>Manage who can use Melodarr, how they sign in, and the accounts that shape their recommendations.</p>
+            </div>
+            <button id="refresh-users" class="outline" type="button">Refresh</button>
+          </div>
+          <div class="user-stats" aria-label="User summary">
+            <div><strong id="users-total">—</strong><span>Total users</span></div>
+            <div><strong id="users-plex">—</strong><span>Plex users</span></div>
+            <div><strong id="users-local">—</strong><span>Local users</span></div>
+          </div>
+          <label class="users-filter" for="users-search">
+            <span>Find a user</span>
+            <input id="users-search" type="search" placeholder="Search by username or account type…" autocomplete="off">
+          </label>
+          <p id="users-message" class="form-message" aria-live="polite"></p>
+          <div class="users-table-wrap">
+            <table class="users-table">
+              <caption class="sr-only">Melodarr users</caption>
+              <thead>
+                <tr>
+                  <th scope="col">Username</th>
+                  <th scope="col">Requests</th>
+                  <th scope="col">User type</th>
+                  <th scope="col">Role</th>
+                  <th scope="col">Joined</th>
+                  <th scope="col"><span class="sr-only">Actions</span></th>
+                </tr>
+              </thead>
+              <tbody id="users-table">
+                <tr><td colspan="6" class="table-empty">Open Users to load accounts.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+
+      <div id="settings-jobs" class="settings-stack settings-panel" role="tabpanel" aria-labelledby="settings-tab-jobs" tabindex="0" hidden>
         <section class="settings-section maintenance-section">
           <div class="maintenance-heading">
             <div><h2>Jobs</h2><p>Background maintenance runs automatically, and can also be triggered here without changing its schedule.</p></div>
@@ -180,7 +456,8 @@
           </div>
           <div class="maintenance-table-wrap">
             <table class="maintenance-table">
-              <thead><tr><th>Job name</th><th>Type</th><th>Schedule</th><th>Status</th><th></th></tr></thead>
+              <caption class="sr-only">Background maintenance jobs</caption>
+              <thead><tr><th scope="col">Job name</th><th scope="col">Type</th><th scope="col">Schedule</th><th scope="col">Status</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
               <tbody id="jobs-table"><tr><td colspan="5" class="table-empty">Loading jobs…</td></tr></tbody>
             </table>
           </div>
@@ -193,7 +470,8 @@
           </div>
           <div class="maintenance-table-wrap">
             <table class="maintenance-table">
-              <thead><tr><th>Cache name</th><th>Entries</th><th>Expired / misses</th><th>Size</th><th>Latest expiry</th><th></th></tr></thead>
+              <caption class="sr-only">Application caches</caption>
+              <thead><tr><th scope="col">Cache name</th><th scope="col">Entries</th><th scope="col">Expired / misses</th><th scope="col">Size</th><th scope="col">Latest expiry</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
               <tbody id="cache-table"><tr><td colspan="6" class="table-empty">Loading caches…</td></tr></tbody>
             </table>
           </div>
@@ -207,10 +485,11 @@
       <div class="account-layout">
         <nav class="account-nav" aria-label="Account navigation">
           <a data-account-route="profile" href="#">Profile</a>
-          <p>Settings</p>
-          <a data-account-route="general" href="#">General</a>
-          <a data-account-route="linked-accounts" href="#">Linked accounts</a>
-          <a class="admin-only" data-account-route="invitations" href="#" hidden>Invitations</a>
+          <a data-account-route="requests" href="#">Requests</a>
+          <p data-account-owner-only>Settings</p>
+          <a data-account-owner-only data-account-route="general" href="#">General</a>
+          <a data-account-owner-only data-account-route="linked-accounts" href="#">Linked accounts</a>
+          <a class="admin-only" data-account-owner-only data-account-route="invitations" href="#" hidden>Invitations</a>
         </nav>
         <div id="account-content" class="account-content"></div>
       </div>
@@ -242,13 +521,12 @@
     </form>
   </dialog>
   <nav class="tab-bar" aria-label="Primary">
-    <button class="nav-link active" data-view="discover"><span class="tab-icon" aria-hidden="true">◎</span>Discover</button>
-    <button class="nav-link" data-view="library"><span class="tab-icon" aria-hidden="true">▤</span>Library</button>
-    <button class="nav-link admin-only" data-view="settings"><span class="tab-icon" aria-hidden="true">⚙</span>Settings</button>
+    <button class="nav-link active" type="button" data-view="discover" aria-current="page"><span class="tab-icon" aria-hidden="true">◎</span>Discover</button>
+    <button class="nav-link" type="button" data-view="library"><span class="tab-icon" aria-hidden="true">▤</span>Library</button>
+    <button class="nav-link admin-only" type="button" data-view="settings"><span class="tab-icon" aria-hidden="true">⚙</span>Settings</button>
   </nav>
   <div id="toasts" class="toasts" aria-live="polite" aria-atomic="false"></div>
   <button id="back-to-top" type="button" aria-label="Back to top">↑ <span>Top</span></button>
   <script src="/static/app.js"></script>
-  <script src="/static/discovery.js"></script>
 </body>
 </html>

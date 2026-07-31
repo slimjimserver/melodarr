@@ -9,10 +9,11 @@ import sqlite3
 import tempfile
 import time
 import unittest
-from threading import Event, Thread
+from threading import Barrier, BrokenBarrierError, Event, Thread
 from urllib.parse import parse_qs, urlparse
 from unittest.mock import Mock, patch
 
+from werkzeug.security import check_password_hash, generate_password_hash
 
 # Application paths are resolved when backend.config is first imported. Keep
 # every test artifact outside the repository and disable daemon workers before
@@ -32,9 +33,11 @@ from PIL import Image
 from backend import api_cache
 from backend import artwork_cache
 from backend import cache_memo
+from backend import config as backend_config
 from backend import detail_cache
 from backend import recommendations as recommendation_engine
 from backend import security
+from backend import storage as storage_module
 from backend.api_cache import (
     cache_db,
     cache_key,
@@ -47,13 +50,28 @@ from backend.api_cache import (
 )
 from backend.application import create_app
 from backend.config import ARTWORK_CACHE_DIRECTORY
-from backend.services import lidarr, musicbrainz, plex
-from backend.storage import db, enqueue_lidarr_search, get_service, set_lidarr_refresh_command
+from backend.services import lidarr, musicbrainz, plex, plex_auth, plex_history
+from backend.storage import (
+    db,
+    enqueue_lidarr_search,
+    get_lastfm_api_key,
+    get_plex_listens,
+    get_service,
+    init_db,
+    insert_plex_listens,
+    plex_listen_stats,
+    prune_plex_listens,
+    save_service,
+    set_lidarr_refresh_command,
+    write_settings_file,
+)
 from backend import worker
 from backend.workers import artist_metadata as artist_metadata_worker
 from backend.workers import lidarr_searches as lidarr_search_worker
 from backend.workers import lidarr_library as lidarr_library_worker
+from backend.workers import listening_profiles as listening_profile_worker
 from backend.workers import plex as plex_worker
+from backend.workers import plex_history as plex_history_worker
 from backend.workers import plex_metadata as plex_metadata_worker
 from backend.workers import recommendations as recommendation_worker
 
@@ -90,6 +108,10 @@ class Response:
         return iter(self._chunks)
 
 
+class _StopWorker(BaseException):
+    """Test-only signal that can escape worker Exception handlers."""
+
+
 class DatabaseTestCase(unittest.TestCase):
     """Create an isolated app and reset mutable database state per test."""
 
@@ -117,12 +139,43 @@ class DatabaseTestCase(unittest.TestCase):
                 lastCompletedAt=None,
             )
         artist_metadata_worker.wake_requested.clear()
+        with plex_history_worker.request_lock:
+            plex_history_worker.sync_requested = False
+            plex_history_worker.full_sync_requested = False
+        plex_history_worker.wake_requested.clear()
+        plex_history_worker.job_state.update(
+            running=False,
+            lastCompletedAt=None,
+            lastSuccessfulAt=None,
+            nextExecutionAt=None,
+            lastError=None,
+            pages=0,
+            scanned=0,
+            tracks=0,
+            normalized=0,
+            selected=0,
+            sections=0,
+            cachedArtists=0,
+            cachedAlbums=0,
+            fetched=0,
+            mapped=0,
+            inserted=0,
+            pruned=0,
+            stored=0,
+            users=0,
+            oldestPlayedAt=None,
+            newestPlayedAt=None,
+        )
         with db() as connection:
+            connection.execute("DELETE FROM plex_auth_flows")
             connection.execute("DELETE FROM pending_lidarr_searches")
             connection.execute("DELETE FROM recommendation_cache")
+            connection.execute("DELETE FROM listening_profiles")
+            connection.execute("DELETE FROM plex_listens")
             connection.execute("DELETE FROM request_history")
             connection.execute("DELETE FROM account_invitations")
             connection.execute("DELETE FROM users")
+        write_settings_file({})
         with cache_db() as connection:
             connection.execute("DELETE FROM api_cache")
 
@@ -144,12 +197,129 @@ class ApplicationFactoryTests(DatabaseTestCase):
             for method in rule.methods
             if method not in {"HEAD", "OPTIONS"}
         }
-        self.assertEqual(len(rules), 54)
-        self.assertEqual(len(route_methods), 54)
+        self.assertEqual(len(rules), 69)
+        self.assertEqual(len(route_methods), 69)
 
     def test_factory_applies_test_configuration(self):
         self.assertTrue(self.app.config["TESTING"])
         self.assertEqual(self.app.config["SECRET_KEY"], "test-secret")
+
+    def test_empty_session_secret_file_is_replaced(self):
+        with tempfile.TemporaryDirectory(prefix="melodarr-secret-") as directory:
+            secret_path = os.path.join(directory, "session-secret.key")
+            with open(secret_path, "w", encoding="utf-8") as file:
+                file.write(" \n")
+
+            with patch.object(
+                backend_config,
+                "SECRET_KEY_FILE",
+                secret_path,
+            ):
+                secret = backend_config.load_session_secret()
+
+            self.assertEqual(len(secret), 96)
+            self.assertTrue(secret)
+            with open(secret_path, encoding="utf-8") as file:
+                self.assertEqual(file.read(), secret)
+
+    def test_legacy_manifest_url_redirects_to_the_active_manifest(self):
+        response = self.client.get("/manifest.webmanifest")
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers["Location"], "/static/site.webmanifest")
+
+    def test_conventional_icon_urls_serve_canonical_brand_assets(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        cases = (
+            ("/favicon.ico", "melodarr.svg"),
+            ("/apple-touch-icon.png", "melodarr-180.png"),
+        )
+
+        for url, filename in cases:
+            with self.subTest(url=url):
+                with self.client.get(url) as response:
+                    with open(
+                        os.path.join(project_root, "frontend", "icons", filename),
+                        "rb",
+                    ) as file:
+                        expected = file.read()
+
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.data, expected)
+
+
+class PlexListenStorageTests(DatabaseTestCase):
+    def test_listens_are_deduplicated_scoped_and_pruned(self):
+        self.register()
+        with db() as connection:
+            user_id = connection.execute(
+                "SELECT id FROM users WHERE username = 'test-user'"
+            ).fetchone()["id"]
+        listens = [
+            {
+                "server_id": "server-1",
+                "history_key": "history-1",
+                "user_id": user_id,
+                "artist_rating_key": "artist-1",
+                "album_rating_key": "album-1",
+                "played_at": 1_000.0,
+            },
+            {
+                "server_id": "server-1",
+                "history_key": "history-2",
+                "user_id": user_id,
+                "artist_rating_key": "artist-2",
+                "album_rating_key": None,
+                "played_at": 2_000.0,
+            },
+        ]
+
+        self.assertEqual(insert_plex_listens(listens), 2)
+        self.assertEqual(insert_plex_listens(listens), 0)
+        rows = get_plex_listens(user_id, 1_500, server_id="server-1")
+        self.assertEqual([row["history_key"] for row in rows], ["history-2"])
+        self.assertEqual(plex_listen_stats(user_id=user_id)["count"], 2)
+        self.assertEqual(prune_plex_listens(1_500), 1)
+        self.assertEqual(plex_listen_stats(user_id=user_id)["count"], 1)
+
+
+class SettingsStorageTests(DatabaseTestCase):
+    def test_parallel_service_saves_preserve_unrelated_settings(self):
+        write_barrier = Barrier(2)
+        real_write = storage_module.write_settings_file
+        errors = []
+
+        def delayed_write(settings):
+            try:
+                write_barrier.wait(timeout=0.25)
+            except BrokenBarrierError:
+                pass
+            real_write(settings)
+
+        def save(name, values):
+            try:
+                save_service(name, values)
+            except Exception as exc:
+                errors.append(exc)
+
+        with patch.object(
+            storage_module,
+            "write_settings_file",
+            side_effect=delayed_write,
+        ):
+            threads = [
+                Thread(target=save, args=("lidarr", {"url": "http://lidarr"})),
+                Thread(target=save, args=("plex", {"url": "http://plex"})),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=2)
+
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(get_service("lidarr"), {"url": "http://lidarr"})
+        self.assertEqual(get_service("plex"), {"url": "http://plex"})
 
 
 class WorkerEntrypointTests(unittest.TestCase):
@@ -162,12 +332,16 @@ class WorkerEntrypointTests(unittest.TestCase):
     @patch("backend.worker.Thread")
     @patch("backend.worker.recommendation_worker.run")
     @patch("backend.worker.init_db")
-    def test_worker_initializes_storage_and_background_loops(self, init_db, run, thread_class):
+    def test_worker_initializes_storage_and_background_loops(
+        self, init_db, run, thread_class
+    ):
         calls = []
         artist_metadata_thread = Mock()
         lidarr_thread = Mock()
         plex_thread = Mock()
         plex_metadata_thread = Mock()
+        plex_history_thread = Mock()
+        listening_profile_thread = Mock()
         lidarr_library_thread = Mock()
         thread_class.side_effect = [
             artist_metadata_thread,
@@ -175,12 +349,14 @@ class WorkerEntrypointTests(unittest.TestCase):
             lidarr_library_thread,
             plex_thread,
             plex_metadata_thread,
+            plex_history_thread,
+            listening_profile_thread,
         ]
         init_db.side_effect = lambda: calls.append("database")
-        run.side_effect = lambda: calls.append("recommendations")
+        run.side_effect = lambda *_args: calls.append("recommendations")
         worker.main()
         self.assertEqual(calls, ["database", "recommendations"])
-        self.assertEqual(thread_class.call_count, 5)
+        self.assertEqual(thread_class.call_count, 7)
         thread_class.assert_any_call(
             target=artist_metadata_worker.run,
             name="musicbrainz-artist-revalidation",
@@ -190,21 +366,175 @@ class WorkerEntrypointTests(unittest.TestCase):
             target=lidarr_search_worker.run, name="lidarr-search-followups", daemon=True
         )
         thread_class.assert_any_call(
-            target=lidarr_library_worker.run, name="lidarr-library-scan", daemon=True
+            target=lidarr_library_worker.run,
+            args=(worker.LIDARR_LIBRARY_STARTUP_DELAY,),
+            name="lidarr-library-scan",
+            daemon=True,
         )
         thread_class.assert_any_call(
-            target=plex_worker.run, name="plex-library-scans", daemon=True
+            target=plex_worker.run,
+            args=(worker.PLEX_LIBRARY_STARTUP_DELAY,),
+            name="plex-library-scans",
+            daemon=True,
         )
         thread_class.assert_any_call(
             target=plex_metadata_worker.run,
             name="plex-musicbrainz-enrichment",
             daemon=True,
         )
+        thread_class.assert_any_call(
+            target=plex_history_worker.run,
+            args=(worker.PLEX_HISTORY_STARTUP_DELAY,),
+            name="plex-listening-history",
+            daemon=True,
+        )
+        thread_class.assert_any_call(
+            target=listening_profile_worker.run,
+            args=(worker.LISTENING_PROFILE_STARTUP_DELAY,),
+            name="listening-profile-refresh",
+            daemon=True,
+        )
         lidarr_thread.start.assert_called_once_with()
         lidarr_library_thread.start.assert_called_once_with()
         plex_thread.start.assert_called_once_with()
         plex_metadata_thread.start.assert_called_once_with()
+        plex_history_thread.start.assert_called_once_with()
+        listening_profile_thread.start.assert_called_once_with()
         artist_metadata_thread.start.assert_called_once_with()
+        run.assert_called_once_with(worker.RECOMMENDATION_STARTUP_DEADLINE)
+
+    @patch("backend.workers.lidarr_library.time.time", return_value=100)
+    @patch("backend.workers.lidarr_library._run_scan", side_effect=StopIteration)
+    def test_lidarr_startup_delay_preserves_an_early_manual_wake(
+        self, run_scan, current_time
+    ):
+        lidarr_library_worker.wake_requested.set()
+
+        with self.assertRaises(StopIteration):
+            lidarr_library_worker.run(initial_delay=10)
+
+        run_scan.assert_called_once_with()
+        lidarr_library_worker.wake_requested.clear()
+
+    @patch(
+        "backend.workers.recommendations.refresh_recommendation_cache",
+        side_effect=_StopWorker,
+    )
+    @patch("backend.workers.recommendations.time.time", return_value=100)
+    @patch("backend.workers.recommendations.refresh_requested.wait")
+    def test_recommendations_wait_for_startup_deadline(
+        self, wait, current_time, refresh
+    ):
+        recommendation_worker.refresh_requested.clear()
+
+        with self.assertRaises(_StopWorker):
+            recommendation_worker.run(initial_delay=120)
+
+        wait.assert_called_once_with(120)
+
+    def test_listening_profile_refresh_request_wakes_sleeping_worker(self):
+        listening_profile_worker.refresh_requested.clear()
+        listening_profile_worker.request_refresh()
+        self.assertTrue(listening_profile_worker.refresh_requested.is_set())
+        listening_profile_worker.refresh_requested.clear()
+
+    @patch(
+        "backend.workers.listening_profiles.refresh_all_profiles",
+        return_value=False,
+    )
+    @patch("backend.workers.listening_profiles.time.time", return_value=100)
+    def test_listening_profiles_run_daily_after_success(self, current_time, refresh):
+        waits = []
+
+        def wait(timeout):
+            waits.append(timeout)
+            if len(waits) == 2:
+                raise _StopWorker()
+            return False
+
+        listening_profile_worker.refresh_requested.clear()
+        with patch.object(
+            listening_profile_worker.refresh_requested,
+            "wait",
+            side_effect=wait,
+        ):
+            with self.assertRaises(_StopWorker):
+                listening_profile_worker.run(initial_delay=0)
+
+        refresh.assert_called_once_with()
+        self.assertEqual(waits, [0, 24 * 60 * 60])
+
+    @patch(
+        "backend.workers.listening_profiles.refresh_all_profiles",
+        return_value=True,
+    )
+    @patch("backend.workers.listening_profiles.time.time", return_value=100)
+    def test_listening_profiles_retry_soon_after_partial_outage(
+        self,
+        current_time,
+        refresh,
+    ):
+        waits = []
+
+        def wait(timeout):
+            waits.append(timeout)
+            if len(waits) == 2:
+                raise _StopWorker()
+            return False
+
+        listening_profile_worker.refresh_requested.clear()
+        with patch.object(
+            listening_profile_worker.refresh_requested,
+            "wait",
+            side_effect=wait,
+        ):
+            with self.assertRaises(_StopWorker):
+                listening_profile_worker.run(initial_delay=0)
+
+        refresh.assert_called_once_with()
+        self.assertEqual(
+            waits,
+            [0, listening_profile_worker.RETRY_INTERVAL],
+        )
+
+    @patch(
+        "backend.workers.recommendations.refresh_recommendation_cache",
+        side_effect=RuntimeError("unexpected refresh failure"),
+    )
+    @patch(
+        "backend.workers.recommendations.refresh_requested.wait",
+        side_effect=[False, _StopWorker],
+    )
+    def test_recommendation_worker_retries_after_unexpected_failure(
+        self, wait, refresh
+    ):
+        recommendation_worker.refresh_requested.clear()
+        recommendation_worker.running.clear()
+
+        with self.assertLogs(
+            "backend.workers.recommendations",
+            level="ERROR",
+        ):
+            with self.assertRaises(_StopWorker):
+                recommendation_worker.run()
+
+        refresh.assert_called_once_with()
+        self.assertEqual(wait.call_count, 2)
+        self.assertFalse(recommendation_worker.running.is_set())
+
+    @patch("backend.workers.plex_history.recommendation_worker.request_refresh")
+    @patch("backend.workers.plex_history._run_sync", side_effect=StopIteration)
+    def test_first_history_attempt_releases_recommendation_startup(
+        self, run_sync, request_refresh
+    ):
+        with plex_history_worker.request_lock:
+            plex_history_worker.sync_requested = True
+
+        with self.assertRaises(StopIteration):
+            plex_history_worker.run(initial_delay=60)
+
+        run_sync.assert_called_once_with(full=False)
+        request_refresh.assert_called_once_with()
 
     @patch("backend.worker.Thread")
     def test_background_worker_uses_one_daemon_thread(self, thread_class):
@@ -237,19 +567,21 @@ class PlexMetadataWorkerTests(unittest.TestCase):
     ):
         unresolved.return_value = [{"musicbrainzReleaseId": "release-1"}]
         musicbrainz_get.return_value = {
-            "release-group": {"id": "release-group-1"}
+            "release-group": {"id": "release-group-1"},
+            "artist-credit": [{"artist": {"id": "artist-1"}}],
         }
 
         plex_metadata_worker._resolve_release_groups({"url": "http://plex"})
 
         musicbrainz_get.assert_called_once_with(
             "/release/release-1",
-            "release-groups",
+            "release-groups+artist-credits",
             priority="background",
         )
         apply_mappings.assert_called_once_with(
             {"url": "http://plex"},
             {"release-1": "release-group-1"},
+            artist_mappings={"release-1": "artist-1"},
         )
 
     @patch("backend.workers.plex_metadata.plex.music_library")
@@ -304,7 +636,8 @@ class PlexMetadataWorkerTests(unittest.TestCase):
         self, musicbrainz_get, apply_mappings, unresolved
     ):
         musicbrainz_get.return_value = {
-            "release-group": {"id": "release-group-2"}
+            "release-group": {"id": "release-group-2"},
+            "artist-credit": [{"artist": {"id": "artist-2"}}],
         }
 
         plex_metadata_worker._resolve_release_groups(
@@ -313,7 +646,9 @@ class PlexMetadataWorkerTests(unittest.TestCase):
 
         unresolved.assert_not_called()
         apply_mappings.assert_called_once_with(
-            {"url": "http://plex"}, {"release-2": "release-group-2"}
+            {"url": "http://plex"},
+            {"release-2": "release-group-2"},
+            artist_mappings={"release-2": "artist-2"},
         )
 
     @patch("backend.workers.plex_metadata.wake_requested.set")
@@ -847,6 +1182,42 @@ class LidarrSearchQueueTests(DatabaseTestCase):
         self.assertEqual(history["release_type"], "Album")
         self.assertEqual(history["release_date"], "2026-07-23")
 
+        with db() as connection:
+            second_user_id = connection.execute(
+                "INSERT INTO users (username, password_hash, role, created_at) "
+                "VALUES (?, ?, 'user', ?)",
+                (
+                    "second-listener",
+                    generate_password_hash("listener-password"),
+                    time.time(),
+                ),
+            ).lastrowid
+
+        duplicate = enqueue_lidarr_search(
+            second_user_id,
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            33,
+            44,
+            "Queued Album",
+        )
+
+        self.assertFalse(duplicate)
+        with db() as connection:
+            history_user_ids = [
+                row["user_id"]
+                for row in connection.execute(
+                    "SELECT user_id FROM request_history WHERE mbid = ? "
+                    "ORDER BY id",
+                    ("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",),
+                )
+            ]
+            queued_jobs = connection.execute(
+                "SELECT COUNT(*) FROM pending_lidarr_searches WHERE mbid = ?",
+                ("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",),
+            ).fetchone()[0]
+        self.assertEqual(history_user_ids, [user_id, second_user_id])
+        self.assertEqual(queued_jobs, 1)
+
     def test_one_refresh_command_is_persisted_for_an_exact_job_batch(self):
         self.register()
         with db() as connection:
@@ -880,8 +1251,176 @@ class LidarrSearchQueueTests(DatabaseTestCase):
             }
         self.assertEqual(command_ids, {55})
 
+    def test_main_database_connections_enforce_foreign_keys(self):
+        with db() as connection:
+            self.assertEqual(
+                connection.execute("PRAGMA foreign_keys").fetchone()[0],
+                1,
+            )
+
+    def test_stale_worker_writes_do_not_resurrect_deleted_user_data(self):
+        self.register()
+        with db() as connection:
+            user_id = connection.execute(
+                "SELECT id FROM users WHERE username = 'test-user'"
+            ).fetchone()["id"]
+            connection.execute("DELETE FROM users WHERE id = ?", (user_id,))
+
+        self.assertFalse(
+            storage_module.save_recommendation_cache(user_id, {"private": True})
+        )
+        self.assertFalse(
+            storage_module.save_listening_profile(
+                user_id,
+                {"private": True},
+            )
+        )
+        self.assertEqual(
+            insert_plex_listens([
+                {
+                    "server_id": "server-1",
+                    "history_key": "stale-history",
+                    "user_id": user_id,
+                    "artist_rating_key": "artist-1",
+                    "album_rating_key": None,
+                    "played_at": time.time(),
+                }
+            ]),
+            0,
+        )
+        with db() as connection:
+            for table in (
+                "recommendation_cache",
+                "listening_profiles",
+                "plex_listens",
+            ):
+                self.assertEqual(
+                    connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0],
+                    0,
+                )
+
+    def test_legacy_queue_migration_recovers_every_requester(self):
+        with tempfile.TemporaryDirectory(prefix="melodarr-queue-migration-") as directory:
+            database = os.path.join(directory, "melodarr.db")
+            settings = os.path.join(directory, "settings.json")
+            connection = sqlite3.connect(database)
+            connection.executescript("""
+                CREATE TABLE users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    password_hash TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                );
+                CREATE TABLE request_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL REFERENCES users(id),
+                    kind TEXT NOT NULL,
+                    mbid TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    created_at REAL NOT NULL
+                );
+                CREATE TABLE pending_lidarr_searches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL REFERENCES users(id),
+                    mbid TEXT NOT NULL UNIQUE,
+                    album_id INTEGER NOT NULL,
+                    artist_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    refresh_command_id INTEGER,
+                    search_command_id INTEGER,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at REAL NOT NULL,
+                    last_error TEXT,
+                    created_at REAL NOT NULL
+                );
+                CREATE TABLE recommendation_cache (
+                    user_id INTEGER PRIMARY KEY REFERENCES users(id),
+                    value TEXT NOT NULL,
+                    refreshed_at REAL NOT NULL
+                );
+                INSERT INTO recommendation_cache
+                    (user_id, value, refreshed_at)
+                    VALUES (999, '{"orphaned":true}', 1);
+            """)
+            connection.executemany(
+                "INSERT INTO users "
+                "(id, username, password_hash, role, created_at) "
+                "VALUES (?, ?, 'hash', 'user', 1)",
+                ((1, "first-user"), (2, "second-user")),
+            )
+            connection.executemany(
+                "INSERT INTO request_history "
+                "(user_id, kind, mbid, name, created_at) "
+                "VALUES (?, 'release-group', 'shared-mbid', 'Shared Album', 1)",
+                ((1,), (2,)),
+            )
+            connection.execute(
+                "INSERT INTO pending_lidarr_searches "
+                "(user_id, mbid, album_id, artist_id, name, "
+                "next_attempt_at, created_at) "
+                "VALUES (1, 'shared-mbid', 10, 20, 'Shared Album', 1, 1)"
+            )
+            connection.commit()
+            connection.close()
+
+            with (
+                patch.object(storage_module, "DATABASE", database),
+                patch.object(storage_module, "SETTINGS_FILE", settings),
+            ):
+                storage_module.init_db()
+                with storage_module.db() as migrated:
+                    columns = {
+                        row["name"]
+                        for row in migrated.execute(
+                            "PRAGMA table_info(pending_lidarr_searches)"
+                        )
+                    }
+                    requester_ids = [
+                        row["user_id"]
+                        for row in migrated.execute(
+                            "SELECT user_id FROM pending_lidarr_search_requesters "
+                            "ORDER BY user_id"
+                        )
+                    ]
+                    violations = migrated.execute(
+                        "PRAGMA foreign_key_check"
+                    ).fetchall()
+                    orphaned_recommendations = migrated.execute(
+                        "SELECT COUNT(*) FROM recommendation_cache"
+                    ).fetchone()[0]
+
+            self.assertNotIn("user_id", columns)
+            self.assertEqual(requester_ids, [1, 2])
+            self.assertEqual(violations, [])
+            self.assertEqual(orphaned_recommendations, 0)
+
 
 class DeploymentConfigTests(unittest.TestCase):
+    def test_blank_path_environment_variables_fail_fast(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        config_path = os.path.join(project_root, "backend", "config.py")
+        for variable in (
+            "MELODARR_DATABASE",
+            "MELODARR_CACHE_DATABASE",
+            "MELODARR_SETTINGS",
+            "MELODARR_SECRET_KEY_FILE",
+            "MELODARR_ARTWORK_CACHE",
+        ):
+            with self.subTest(variable=variable):
+                with patch.dict(os.environ, {variable: " \t "}):
+                    with self.assertRaisesRegex(RuntimeError, variable):
+                        runpy.run_path(config_path)
+
+    def test_backup_guidance_requires_a_consistent_sqlite_snapshot(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(project_root, "README.md"), encoding="utf-8") as file:
+            readme = file.read()
+
+        self.assertIn("stop Melodarr cleanly", readme)
+        self.assertIn("SQLite's online backup API", readme)
+        self.assertIn("do not make a raw copy of a live database", readme)
+
     def test_production_frontend_is_minified_and_precompressed_without_maps(self):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with open(
@@ -914,11 +1453,146 @@ class DeploymentConfigTests(unittest.TestCase):
             encoding="utf-8",
         ) as file:
             typescript = file.read()
+        with open(
+            os.path.join(project_root, "frontend", "src", "style.css"),
+            encoding="utf-8",
+        ) as file:
+            stylesheet = file.read()
         self.assertNotIn("<summary>Create an account</summary>", frontend)
         self.assertIn('name="remember"', frontend)
         self.assertIn('data-account-route="invitations"', frontend)
+        self.assertIn('data-discovery-src="/static/discovery.js"', frontend)
+        self.assertNotIn('<script src="/static/discovery.js"', frontend)
+        self.assertIn("function loadDiscovery()", typescript)
         self.assertIn("status.firstAccount", typescript)
         self.assertIn("status.invitationValid", typescript)
+        self.assertIn('id="setup-wizard"', frontend)
+        self.assertIn('id="setup-choose-plex"', frontend)
+        self.assertIn('id="setup-skip-plex"', frontend)
+        self.assertIn('id="setup-plex-message"', frontend)
+        self.assertIn('id="plex-current-connection"', frontend)
+        self.assertIn('"#setup-plex-message"', typescript)
+        self.assertIn('"#plex-current-connection"', typescript)
+        self.assertIn("if (popup.closed)", typescript)
+        self.assertIn('"/api/auth/plex/start"', typescript)
+        self.assertIn('id="account-link-plex"', typescript)
+        self.assertIn('startPlexAuthentication("link"', typescript)
+        self.assertIn(".linked-account-summary", stylesheet)
+        self.assertIn(".service-card > .plex-current-connection", stylesheet)
+        self.assertNotIn("#plex-settings-config { display: grid !important", stylesheet)
+        self.assertNotIn('name="token"', frontend)
+
+    def test_color_theme_switcher_preserves_midnight_and_warm_palettes(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(
+            os.path.join(project_root, "frontend", "static", "index.html"),
+            encoding="utf-8",
+        ) as file:
+            frontend = file.read()
+        with open(
+            os.path.join(project_root, "frontend", "src", "theme.ts"),
+            encoding="utf-8",
+        ) as file:
+            theme_typescript = file.read()
+        with open(
+            os.path.join(project_root, "frontend", "src", "style.css"),
+            encoding="utf-8",
+        ) as file:
+            stylesheet = file.read()
+
+        self.assertIn('<script src="/static/theme.js"></script>', frontend)
+        self.assertIn('id="theme-toggle"', frontend)
+        self.assertIn('"melodarr-theme"', theme_typescript)
+        self.assertIn('theme = "midnight"', theme_typescript)
+        self.assertIn(':root[data-theme="midnight"]', stylesheet)
+        self.assertIn(':root[data-theme="warm"]', stylesheet)
+
+    def test_detail_navigation_and_mobile_back_to_top_preserve_context(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(
+            os.path.join(project_root, "frontend", "src", "discovery.ts"),
+            encoding="utf-8",
+        ) as file:
+            discovery_typescript = file.read()
+        with open(
+            os.path.join(project_root, "frontend", "src", "style.css"),
+            encoding="utf-8",
+        ) as file:
+            stylesheet = file.read()
+
+        self.assertIn(
+            'const currentNavigationView = id === "detail" ? detailOrigin.view : id;',
+            discovery_typescript,
+        )
+        self.assertIn(
+            "const isCurrent = button.dataset.view === currentNavigationView;",
+            discovery_typescript,
+        )
+        self.assertIn(
+            "#back-to-top { right: 16px; width: 44px; height: 44px; padding: 0; }",
+            stylesheet,
+        )
+
+    def test_recommendation_source_badges_stay_inside_mobile_cards(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(
+            os.path.join(project_root, "frontend", "src", "style.css"),
+            encoding="utf-8",
+        ) as file:
+            stylesheet = file.read()
+
+        self.assertIn(
+            "max-width: calc(100% - 16px)",
+            stylesheet,
+        )
+        self.assertNotIn(
+            ".recommendation-source { display: flex; position: absolute; "
+            "top: 8px; left: 8px; align-items: center; max-width: 136px;",
+            stylesheet,
+        )
+
+    def test_mobile_logout_remains_visible_and_accessible(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(
+            os.path.join(project_root, "frontend", "static", "index.html"),
+            encoding="utf-8",
+        ) as file:
+            frontend = file.read()
+        with open(
+            os.path.join(project_root, "frontend", "src", "style.css"),
+            encoding="utf-8",
+        ) as file:
+            stylesheet = file.read()
+
+        self.assertIn('class="logout-icon"', frontend)
+        self.assertIn('<span class="logout-label">Sign out</span>', frontend)
+        self.assertIn(
+            ".logout { display: grid; flex: 0 0 44px; width: 44px; "
+            "height: 44px; place-items: center; padding: 0; }",
+            stylesheet,
+        )
+        self.assertNotIn(".logout { display: none; }", stylesheet)
+
+    def test_logout_resets_stale_authentication_messages(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(
+            os.path.join(project_root, "frontend", "src", "app.ts"),
+            encoding="utf-8",
+        ) as file:
+            typescript = file.read()
+
+        self.assertIn(
+            'setMessage(requiredDescendant(loginForm, ".form-message"), "");',
+            typescript,
+        )
+        self.assertIn(
+            'setMessage(requiredDescendant(plexLoginOption, ".form-message"), "");',
+            typescript,
+        )
+        self.assertIn('$<HTMLButtonElement>("#plex-login").disabled = false;', typescript)
+        self.assertIn('element.classList.add("message");', typescript)
+        self.assertIn('element.classList.toggle("error", isError);', typescript)
+        self.assertNotIn("element.className = `message", typescript)
 
     def test_invitation_copy_supports_http_lan_hosts(self):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -932,7 +1606,7 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn('document.execCommand("copy")', typescript)
         self.assertIn("copied ? \"Invitation link copied.\"", typescript)
 
-    def test_settings_clear_submitted_secrets_and_invalidate_lidarr_links(self):
+    def test_settings_use_plex_login_and_invalidate_lidarr_links(self):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with open(
             os.path.join(project_root, "frontend", "src", "app.ts"),
@@ -945,7 +1619,8 @@ class DeploymentConfigTests(unittest.TestCase):
         ) as file:
             discovery_typescript = file.read()
 
-        self.assertIn('plexForm.token.value = "";', app_typescript)
+        self.assertIn('startPlexAuthentication("server"', app_typescript)
+        self.assertNotIn('"/api/settings/plex/test"', app_typescript)
         self.assertIn('form.apiKey.value = "";', app_typescript)
         self.assertIn(
             'new Event("melodarr-lidarr-settings-changed")',
@@ -955,6 +1630,32 @@ class DeploymentConfigTests(unittest.TestCase):
             'window.addEventListener("melodarr-lidarr-settings-changed"',
             discovery_typescript,
         )
+
+    def test_lastfm_key_is_admin_managed_and_user_forms_only_collect_usernames(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(
+            os.path.join(project_root, "frontend", "static", "index.html"),
+            encoding="utf-8",
+        ) as file:
+            frontend = file.read()
+        with open(
+            os.path.join(project_root, "frontend", "src", "app.ts"),
+            encoding="utf-8",
+        ) as file:
+            app_typescript = file.read()
+
+        self.assertIn('id="lastfm-settings"', frontend)
+        self.assertIn('id="lastfm-state"', frontend)
+        self.assertIn('id="save-lastfm-key"', frontend)
+        self.assertIn('id="clear-lastfm-key"', frontend)
+        self.assertIn('name="apiKey"', frontend)
+        self.assertIn('name="listenbrainzUsername"', app_typescript)
+        self.assertIn('name="lastfmUsername"', app_typescript)
+        self.assertIn('"/api/settings/lastfm"', app_typescript)
+        self.assertIn('"/api/account/lastfm"', app_typescript)
+        self.assertNotIn('name="lastfmApiKey"', frontend)
+        self.assertNotIn('name="lastfmApiKey"', app_typescript)
+        self.assertNotIn("lastfmApiKey", app_typescript)
 
     def test_discovery_search_offers_track_to_release_group_results(self):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -978,6 +1679,8 @@ class DeploymentConfigTests(unittest.TestCase):
             'showDetail("release-group", result.id)',
             discovery_typescript,
         )
+        self.assertIn("const batchSize =", discovery_typescript)
+        self.assertIn("deferredTasteRows", discovery_typescript)
 
     def test_brand_navigation_stays_inside_the_loaded_application(self):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1001,7 +1704,10 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn('<link rel="apple-touch-icon" href="/icons/melodarr-180.png">', frontend)
         self.assertIn('<link rel="manifest" href="/static/site.webmanifest">', frontend)
         self.assertIn('<a class="brand" href="/" aria-label="Melodarr home">', frontend)
-        self.assertIn('<img src="/icons/melodarr.svg" alt="">', frontend)
+        self.assertIn(
+            '<img src="/icons/melodarr.svg" alt="" width="32" height="32">',
+            frontend,
+        )
         self.assertIn('$(".brand").addEventListener("click"', app_typescript)
         self.assertIn('showView("discover")', app_typescript)
         self.assertIn('new Event("melodarr-home")', app_typescript)
@@ -1134,15 +1840,137 @@ class DeploymentConfigTests(unittest.TestCase):
 
         self.assertIn('<a id="account-menu"', frontend)
         self.assertIn("accountMenu.href = `/${encodeURIComponent(user.username)}`", typescript)
-        self.assertIn('showAccountPage?.("profile")', typescript)
+        self.assertIn(
+            'showAccountPage?.("profile", true, currentUser.username)',
+            typescript,
+        )
+        self.assertIn(
+            '<a data-account-route="requests" href="#">Requests</a>',
+            frontend,
+        )
+        self.assertIn('return `/${encodedUsername}/requests${query}`', typescript)
+        self.assertIn('className = "request-pagination"', typescript)
+        self.assertIn(
+            '/api/account/profile?username=${encodeURIComponent(targetUsername)}'
+            '&page=${encodeURIComponent(targetRequestPage)}',
+            typescript,
+        )
         # The header and the mobile tab bar both carry a button per view, and
         # detail/account views have none, so this must not use the strict
         # single-element helper that throws when a selector matches nothing.
         self.assertIn(
-            'document.querySelectorAll<HTMLElement>(`[data-view="${view}"]`)',
+            'document.querySelectorAll<HTMLElement>("[data-view]")',
             typescript,
         )
         self.assertNotIn('$(`[data-view=${view}]`)', typescript)
+
+    def test_admin_user_edit_link_navigates_to_the_profile(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(
+            os.path.join(project_root, "frontend", "src", "app.ts"),
+            encoding="utf-8",
+        ) as file:
+            typescript = file.read()
+
+        self.assertIn('const edit = document.createElement("a")', typescript)
+        self.assertIn(
+            "edit.href = `/${encodeURIComponent(routeUsername)}`",
+            typescript,
+        )
+        self.assertIn(
+            'showAccountPage?.("profile", true, routeUsername)',
+            typescript,
+        )
+        self.assertIn(
+            "const routeUsername = adminUserRouteUsername(user);",
+            typescript,
+        )
+        self.assertIn(
+            "requesterName.href = `/${encodeURIComponent(adminUserRouteUsername(item.requester))}`",
+            typescript,
+        )
+        self.assertIn(
+            "requestLink.href = `/${encodeURIComponent(adminUserRouteUsername(user))}/requests`",
+            typescript,
+        )
+        self.assertNotIn(
+            "const routeUsername = adminUserDisplayName(user);",
+            typescript,
+        )
+        self.assertNotIn(
+            'edit.addEventListener("click", () => openAdminUserDialog(user))',
+            typescript,
+        )
+
+    def test_admin_account_navigation_targets_other_users_settings(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(
+            os.path.join(project_root, "frontend", "src", "app.ts"),
+            encoding="utf-8",
+        ) as file:
+            typescript = file.read()
+
+        self.assertIn(
+            'if (isOwnAccount || currentUser.role === "admin")',
+            typescript,
+        )
+        self.assertIn(
+            'if (currentUser.role === "admin") allowedPages.push("invitations")',
+            typescript,
+        )
+        self.assertIn(
+            'api(accountApiPath("/api/account/general")',
+            typescript,
+        )
+        self.assertIn(
+            'api(accountApiPath("/api/account/settings")',
+            typescript,
+        )
+        self.assertIn("}, targetUsername);", typescript)
+
+    def test_frontend_invalidates_stale_account_and_expired_session_requests(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(
+            os.path.join(project_root, "frontend", "src", "app.ts"),
+            encoding="utf-8",
+        ) as file:
+            app_typescript = file.read()
+        with open(
+            os.path.join(project_root, "frontend", "src", "discovery.ts"),
+            encoding="utf-8",
+        ) as file:
+            discovery_typescript = file.read()
+
+        self.assertIn("const renderGeneration = ++accountRenderGeneration", app_typescript)
+        self.assertIn("accountRenderAbort?.abort()", app_typescript)
+        self.assertIn("if (!isCurrentRender()) return", app_typescript)
+        self.assertIn(
+            "`${path}?username=${encodeURIComponent(targetUsername)}`",
+            app_typescript,
+        )
+        self.assertNotIn(
+            "encodeURIComponent(activeAccountUsername || targetUsername)",
+            app_typescript,
+        )
+        self.assertIn("handleAuthenticationFailure(response);", app_typescript)
+        self.assertIn("handleAuthenticationFailure(response);", discovery_typescript)
+        self.assertIn('response.status !== 401', app_typescript)
+        self.assertIn('new Event("melodarr-signed-out")', app_typescript)
+
+    def test_non_admin_settings_deep_links_are_normalized_without_polling(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(
+            os.path.join(project_root, "frontend", "src", "app.ts"),
+            encoding="utf-8",
+        ) as file:
+            typescript = file.read()
+
+        self.assertIn('if (currentUser?.role !== "admin") {', typescript)
+        self.assertIn(
+            'window.history.replaceState({ view: "discover" }, "", "/")',
+            typescript,
+        )
+        self.assertIn('if (currentUser?.role !== "admin") return;', typescript)
 
     def test_library_navigation_is_available_to_every_authenticated_user(self):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1153,16 +1981,17 @@ class DeploymentConfigTests(unittest.TestCase):
             frontend = file.read()
 
         self.assertIn(
-            '<button class="nav-link" data-view="library">Your library</button>',
+            '<button class="nav-link" type="button" '
+            'data-view="library">Your library</button>',
             frontend,
         )
         self.assertIn(
-            '<button class="nav-link" data-view="library">'
+            '<button class="nav-link" type="button" data-view="library">'
             '<span class="tab-icon" aria-hidden="true">▤</span>Library</button>',
             frontend,
         )
         self.assertNotIn(
-            'class="nav-link admin-only" data-view="library"',
+            'class="nav-link admin-only" type="button" data-view="library"',
             frontend,
         )
 
@@ -1173,6 +2002,7 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertEqual(config["workers"], 1)
         self.assertEqual(config["worker_class"], "gthread")
         self.assertEqual(config["threads"], 16)
+        self.assertEqual(config["timeout"], 600)
         self.assertFalse(config["preload_app"])
         self.assertTrue(config["control_socket_disable"])
 
@@ -1217,7 +2047,59 @@ class DeploymentConfigTests(unittest.TestCase):
         gunicorn_worker.log.info.assert_called_once_with("Background workers started")
 
 
+    def test_ai_ui_discloses_prompt_profile_and_local_transport_risks(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        paths = {
+            "html": os.path.join(
+                project_root, "frontend", "static", "index.html"
+            ),
+            "app": os.path.join(project_root, "frontend", "src", "app.ts"),
+            "discovery": os.path.join(
+                project_root, "frontend", "src", "discovery.ts"
+            ),
+        }
+        content = {}
+        for name, path in paths.items():
+            with open(path, encoding="utf-8") as file:
+                content[name] = file.read()
+
+        self.assertNotIn('id="ai-data-disclosure-copy"', content["html"])
+        self.assertIn('id="ai-transport-warning"', content["html"])
+        settings_copy = content["html"].split(
+            '<div class="ai-privacy-note">', 1
+        )[1].split("</div>", 1)[0]
+        self.assertIn("does not inspect or redact prompt text", settings_copy)
+        self.assertIn("credentials, API keys, secrets", settings_copy)
+        self.assertIn("may be retained or logged", settings_copy)
+        self.assertIn("Unencrypted loopback model connection", content["app"])
+        self.assertIn("Unencrypted network model connection", content["app"])
+        self.assertIn("does not guarantee on-device processing", content["app"])
+        self.assertNotIn("aiDataDisclosure", content["discovery"])
+
+
 class AuthenticationTests(DatabaseTestCase):
+    def login_non_admin(self, username="local-listener"):
+        admin_csrf = self.register()
+        with db() as connection:
+            connection.execute(
+                "INSERT INTO users (username, password_hash, role, created_at) "
+                "VALUES (?, ?, 'user', ?)",
+                (
+                    username,
+                    generate_password_hash("listener-password"),
+                    time.time(),
+                ),
+            )
+        self.client.post(
+            "/api/auth/logout", headers={"X-CSRF-Token": admin_csrf}
+        )
+        response = self.client.post(
+            "/api/auth/login",
+            json={"username": username, "password": "listener-password"},
+        )
+        self.assertEqual(response.status_code, 200)
+        return response.get_json()["csrfToken"]
+
     def test_empty_install_redirects_to_owner_setup(self):
         response = self.client.get("/", follow_redirects=False)
         self.assertEqual(response.status_code, 302)
@@ -1234,6 +2116,702 @@ class AuthenticationTests(DatabaseTestCase):
         self.assertEqual(response.status_code, 201)
         self.assertEqual(payload["role"], "admin")
         self.assertTrue(payload["csrfToken"])
+
+    def test_json_endpoints_reject_non_object_bodies(self):
+        invalid_body = ["not", "a", "JSON object"]
+        for path in ("/api/auth/register", "/api/auth/login"):
+            with self.subTest(path=path):
+                response = self.client.post(path, json=invalid_body)
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(
+                    response.get_json(),
+                    {"error": "Request body must be a JSON object."},
+                )
+
+        csrf = self.register()
+        paths = (
+            "/api/account/general",
+            "/api/account/settings",
+            "/api/account/lastfm",
+            "/api/request",
+            "/api/request/release-group",
+            "/api/settings/lidarr",
+            "/api/settings/lidarr/test",
+            "/api/auth/plex/start",
+            "/api/auth/plex/poll",
+            "/api/auth/plex/inspect",
+            "/api/auth/plex/complete",
+        )
+        for path in paths:
+            with self.subTest(path=path):
+                response = self.client.post(
+                    path,
+                    json=invalid_body,
+                    headers={"X-CSRF-Token": csrf},
+                )
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(
+                    response.get_json(),
+                    {"error": "Request body must be a JSON object."},
+                )
+
+    def test_plex_poll_stays_pending_until_the_pin_is_authorized(self):
+        with (
+            patch("backend.routes.auth.plex_auth.create_pin") as create_pin,
+            patch("backend.routes.auth.plex_auth.poll_pin", return_value=""),
+        ):
+            create_pin.return_value = {
+                "id": 42,
+                "authorizationUrl": "https://app.plex.tv/auth/#!?code=ABCD",
+                "expiresAt": time.time() + 600,
+            }
+            flow_token = self.client.post(
+                "/api/auth/plex/start", json={"purpose": "server"}
+            ).get_json()["flowToken"]
+
+            response = self.client.post(
+                "/api/auth/plex/poll", json={"flowToken": flow_token}
+            )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertTrue(response.get_json()["pending"])
+
+    def test_non_admin_can_link_plex_and_use_both_login_methods(self):
+        csrf_token = self.login_non_admin()
+        original_settings = {
+            "url": "http://plex:32400",
+            "token": "server-owner-token",
+            "machineIdentifier": "server-1",
+            "libraries": [{"id": "1", "title": "Music"}],
+            "librarySectionIds": ["1"],
+        }
+        save_service("plex", original_settings)
+        account = {
+            "id": "linked-101",
+            "username": "plex-listener",
+            "title": "Plex Listener",
+            "email": "listener@example.com",
+            "thumb": "https://plex.tv/listener.png",
+        }
+        resources = [{"clientIdentifier": "server-1", "owned": False}]
+        with db() as connection:
+            before = connection.execute(
+                "SELECT id, password_hash FROM users WHERE username = 'local-listener'"
+            ).fetchone()
+
+        with (
+            patch("backend.routes.auth.plex_auth.create_pin") as create_pin,
+            patch(
+                "backend.routes.auth.plex_auth.poll_pin",
+                return_value="listener-token",
+            ),
+            patch(
+                "backend.routes.auth.plex_auth.get_account", return_value=account
+            ),
+            patch(
+                "backend.routes.auth.plex_auth.get_resources",
+                return_value=resources,
+            ),
+        ):
+            create_pin.return_value = {
+                "id": 501,
+                "authorizationUrl": "https://app.plex.tv/auth/#!?code=LINK",
+                "expiresAt": time.time() + 600,
+            }
+            started = self.client.post(
+                "/api/auth/plex/start",
+                json={"purpose": "link"},
+                headers={"X-CSRF-Token": csrf_token},
+            )
+            self.assertEqual(started.status_code, 201)
+            linked = self.client.post(
+                "/api/auth/plex/poll",
+                json={"flowToken": started.get_json()["flowToken"]},
+                headers={"X-CSRF-Token": csrf_token},
+            )
+
+        self.assertEqual(linked.status_code, 200)
+        self.assertTrue(linked.get_json()["plexLinked"])
+        self.assertEqual(linked.get_json()["plexUsername"], "plex-listener")
+        with db() as connection:
+            after = connection.execute(
+                "SELECT id, username, password_hash, plex_id FROM users "
+                "WHERE username = 'local-listener'"
+            ).fetchone()
+        self.assertEqual(after["id"], before["id"])
+        self.assertEqual(after["password_hash"], before["password_hash"])
+        self.assertEqual(after["plex_id"], "linked-101")
+        self.assertEqual(get_service("plex"), original_settings)
+
+        self.client.post(
+            "/api/auth/logout", headers={"X-CSRF-Token": csrf_token}
+        )
+        local_login = self.client.post(
+            "/api/auth/login",
+            json={
+                "username": "local-listener",
+                "password": "listener-password",
+            },
+        )
+        self.assertEqual(local_login.status_code, 200)
+        self.assertEqual(local_login.get_json()["username"], "local-listener")
+        self.client.post(
+            "/api/auth/logout",
+            headers={"X-CSRF-Token": local_login.get_json()["csrfToken"]},
+        )
+
+        with (
+            patch("backend.routes.auth.plex_auth.create_pin") as create_pin,
+            patch(
+                "backend.routes.auth.plex_auth.poll_pin",
+                return_value="listener-token",
+            ),
+            patch(
+                "backend.routes.auth.plex_auth.get_account", return_value=account
+            ),
+            patch(
+                "backend.routes.auth.plex_auth.get_resources",
+                return_value=resources,
+            ),
+        ):
+            create_pin.return_value = {
+                "id": 502,
+                "authorizationUrl": "https://app.plex.tv/auth/#!?code=LOGIN",
+                "expiresAt": time.time() + 600,
+            }
+            login_flow = self.client.post(
+                "/api/auth/plex/start", json={"purpose": "login"}
+            ).get_json()["flowToken"]
+            plex_login = self.client.post(
+                "/api/auth/plex/poll", json={"flowToken": login_flow}
+            )
+
+        self.assertEqual(plex_login.status_code, 200)
+        self.assertEqual(plex_login.get_json()["username"], "local-listener")
+
+    def test_linking_plex_requires_access_to_the_configured_server(self):
+        csrf_token = self.login_non_admin()
+        original_settings = {
+            "url": "http://plex:32400",
+            "token": "server-owner-token",
+            "machineIdentifier": "server-1",
+            "libraries": [{"id": "1", "title": "Music"}],
+            "librarySectionIds": ["1"],
+        }
+        save_service("plex", original_settings)
+        with (
+            patch("backend.routes.auth.plex_auth.create_pin") as create_pin,
+            patch(
+                "backend.routes.auth.plex_auth.poll_pin",
+                return_value="other-token",
+            ),
+            patch(
+                "backend.routes.auth.plex_auth.get_account",
+                return_value={
+                    "id": "no-access",
+                    "username": "outside-user",
+                    "email": "",
+                    "thumb": "",
+                },
+            ),
+            patch(
+                "backend.routes.auth.plex_auth.get_resources",
+                return_value=[{"clientIdentifier": "another-server"}],
+            ),
+        ):
+            create_pin.return_value = {
+                "id": 503,
+                "authorizationUrl": "https://app.plex.tv/auth/#!?code=DENY",
+                "expiresAt": time.time() + 600,
+            }
+            started = self.client.post(
+                "/api/auth/plex/start",
+                json={"purpose": "link"},
+                headers={"X-CSRF-Token": csrf_token},
+            )
+            response = self.client.post(
+                "/api/auth/plex/poll",
+                json={"flowToken": started.get_json()["flowToken"]},
+                headers={"X-CSRF-Token": csrf_token},
+            )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("does not have access", response.get_json()["error"])
+        with db() as connection:
+            saved = connection.execute(
+                "SELECT plex_id FROM users WHERE username = 'local-listener'"
+            ).fetchone()
+        self.assertIsNone(saved["plex_id"])
+        self.assertEqual(get_service("plex"), original_settings)
+
+    def test_linking_rejects_a_plex_identity_owned_by_another_user(self):
+        csrf_token = self.login_non_admin()
+        save_service("plex", {
+            "url": "http://plex:32400",
+            "token": "server-owner-token",
+            "machineIdentifier": "server-1",
+        })
+        with db() as connection:
+            connection.execute(
+                "INSERT INTO users "
+                "(username, password_hash, role, plex_id, created_at) "
+                "VALUES (?, ?, 'user', ?, ?)",
+                (
+                    "already-linked",
+                    generate_password_hash("another-password"),
+                    "duplicate-plex-id",
+                    time.time(),
+                ),
+            )
+        with (
+            patch("backend.routes.auth.plex_auth.create_pin") as create_pin,
+            patch(
+                "backend.routes.auth.plex_auth.poll_pin",
+                return_value="duplicate-token",
+            ),
+            patch(
+                "backend.routes.auth.plex_auth.get_account",
+                return_value={
+                    "id": "duplicate-plex-id",
+                    "username": "duplicate-plex",
+                    "email": "",
+                    "thumb": "",
+                },
+            ),
+            patch(
+                "backend.routes.auth.plex_auth.get_resources",
+                return_value=[{"clientIdentifier": "server-1"}],
+            ),
+        ):
+            create_pin.return_value = {
+                "id": 504,
+                "authorizationUrl": "https://app.plex.tv/auth/#!?code=DUPL",
+                "expiresAt": time.time() + 600,
+            }
+            started = self.client.post(
+                "/api/auth/plex/start",
+                json={"purpose": "link"},
+                headers={"X-CSRF-Token": csrf_token},
+            )
+            response = self.client.post(
+                "/api/auth/plex/poll",
+                json={"flowToken": started.get_json()["flowToken"]},
+                headers={"X-CSRF-Token": csrf_token},
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("another Melodarr user", response.get_json()["error"])
+        with db() as connection:
+            saved = connection.execute(
+                "SELECT plex_id FROM users WHERE username = 'local-listener'"
+            ).fetchone()
+        self.assertIsNone(saved["plex_id"])
+
+    def test_plex_link_flow_requires_csrf_and_stays_bound_to_its_user(self):
+        self.assertEqual(
+            self.client.post(
+                "/api/auth/plex/start", json={"purpose": "link"}
+            ).status_code,
+            401,
+        )
+        owner_csrf = self.register()
+        save_service("plex", {
+            "url": "http://plex:32400",
+            "token": "server-owner-token",
+            "machineIdentifier": "server-1",
+        })
+        self.assertEqual(
+            self.client.post(
+                "/api/auth/plex/start", json={"purpose": "link"}
+            ).status_code,
+            403,
+        )
+        with patch("backend.routes.auth.plex_auth.create_pin") as create_pin:
+            create_pin.return_value = {
+                "id": 505,
+                "authorizationUrl": "https://app.plex.tv/auth/#!?code=BOUND",
+                "expiresAt": time.time() + 600,
+            }
+            started = self.client.post(
+                "/api/auth/plex/start",
+                json={"purpose": "link"},
+                headers={"X-CSRF-Token": owner_csrf},
+            )
+        flow_token = started.get_json()["flowToken"]
+
+        with db() as connection:
+            connection.execute(
+                "INSERT INTO users (username, password_hash, role, created_at) "
+                "VALUES (?, ?, 'user', ?)",
+                (
+                    "other-local-user",
+                    generate_password_hash("other-local-password"),
+                    time.time(),
+                ),
+            )
+        other_client = self.app.test_client()
+        other_login = other_client.post(
+            "/api/auth/login",
+            json={
+                "username": "other-local-user",
+                "password": "other-local-password",
+            },
+        )
+        other_csrf = other_login.get_json()["csrfToken"]
+        wrong_user = other_client.post(
+            "/api/auth/plex/poll",
+            json={"flowToken": flow_token},
+            headers={"X-CSRF-Token": other_csrf},
+        )
+        self.assertEqual(wrong_user.status_code, 403)
+        self.assertIn("another Melodarr user", wrong_user.get_json()["error"])
+
+        with patch("backend.routes.auth.plex_auth.poll_pin", return_value=""):
+            owner_poll = self.client.post(
+                "/api/auth/plex/poll",
+                json={"flowToken": flow_token},
+                headers={"X-CSRF-Token": owner_csrf},
+            )
+        self.assertEqual(owner_poll.status_code, 202)
+
+    def test_plex_link_flow_cannot_change_server_configuration(self):
+        csrf_token = self.login_non_admin()
+        settings = {
+            "url": "http://plex:32400",
+            "token": "server-owner-token",
+            "machineIdentifier": "server-1",
+            "libraries": [{"id": "1", "title": "Music"}],
+            "librarySectionIds": ["1"],
+        }
+        save_service("plex", settings)
+        with patch("backend.routes.auth.plex_auth.create_pin") as create_pin:
+            create_pin.return_value = {
+                "id": 506,
+                "authorizationUrl": "https://app.plex.tv/auth/#!?code=LIMIT",
+                "expiresAt": time.time() + 600,
+            }
+            started = self.client.post(
+                "/api/auth/plex/start",
+                json={"purpose": "link"},
+                headers={"X-CSRF-Token": csrf_token},
+            )
+        flow_token = started.get_json()["flowToken"]
+
+        inspected = self.client.post(
+            "/api/auth/plex/inspect",
+            json={
+                "flowToken": flow_token,
+                "serverId": "other",
+                "connectionUri": "http://other:32400",
+            },
+            headers={"X-CSRF-Token": csrf_token},
+        )
+        completed = self.client.post(
+            "/api/auth/plex/complete",
+            json={"flowToken": flow_token, "librarySectionIds": ["999"]},
+            headers={"X-CSRF-Token": csrf_token},
+        )
+
+        self.assertEqual(inspected.status_code, 400)
+        self.assertEqual(completed.status_code, 400)
+        self.assertEqual(get_service("plex"), settings)
+
+    def test_starting_plex_auth_purges_expired_flows(self):
+        with db() as connection:
+            connection.execute(
+                "INSERT INTO plex_auth_flows "
+                "(flow_hash, pin_id, client_identifier, purpose, created_at, "
+                "expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+                ("expired-flow", 1, "old-client", "server", time.time() - 60, time.time() - 1),
+            )
+
+        with patch("backend.routes.auth.plex_auth.create_pin") as create_pin:
+            create_pin.return_value = {
+                "id": 42,
+                "authorizationUrl": "https://app.plex.tv/auth/#!?code=ABCD",
+                "expiresAt": time.time() + 600,
+            }
+            response = self.client.post(
+                "/api/auth/plex/start", json={"purpose": "server"}
+            )
+
+        self.assertEqual(response.status_code, 201)
+        with db() as connection:
+            rows = connection.execute(
+                "SELECT flow_hash FROM plex_auth_flows"
+            ).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertNotEqual(rows[0]["flow_hash"], "expired-flow")
+
+    def test_plex_owner_setup_discovers_server_and_creates_admin(self):
+        owned_server = {
+            "name": "Music Plex",
+            "product": "Plex Media Server",
+            "clientIdentifier": "server-1",
+            "provides": ["server"],
+            "owned": True,
+            "accessToken": "server-token",
+            "connections": [{
+                "uri": "https://server-1.plex.direct:32400",
+                "protocol": "https",
+                "address": "server-1.plex.direct",
+                "port": 32400,
+                "local": True,
+                "secure": True,
+            }],
+        }
+        libraries = [
+            {"id": "1", "title": "Main Music"},
+            {"id": "2", "title": "Concerts"},
+        ]
+        with (
+            patch("backend.routes.auth.plex_auth.create_pin") as create_pin,
+            patch("backend.routes.auth.plex_auth.poll_pin", return_value="account-token"),
+            patch("backend.routes.auth.plex_auth.get_account") as get_account,
+            patch(
+                "backend.routes.auth.plex_auth.get_resources",
+                return_value=[owned_server],
+            ),
+            patch(
+                "backend.routes.auth.plex.machine_identifier",
+                return_value="server-1",
+            ),
+            patch("backend.routes.auth.plex.music_sections", return_value=libraries),
+            patch("backend.routes.auth.plex_worker.request_full_scan") as request_scan,
+        ):
+            create_pin.return_value = {
+                "id": 42,
+                "authorizationUrl": "https://app.plex.tv/auth/#!?code=ABCD",
+                "expiresAt": time.time() + 600,
+            }
+            get_account.return_value = {
+                "id": "99",
+                "username": "plex-owner",
+                "title": "Plex Owner",
+                "email": "owner@example.com",
+                "thumb": "https://plex.tv/avatar.png",
+            }
+
+            started = self.client.post(
+                "/api/auth/plex/start", json={"purpose": "server"}
+            )
+            self.assertEqual(started.status_code, 201)
+            flow_token = started.get_json()["flowToken"]
+
+            signed_in = self.client.post(
+                "/api/auth/plex/poll", json={"flowToken": flow_token}
+            )
+            self.assertEqual(signed_in.status_code, 200)
+            self.assertEqual(signed_in.get_json()["servers"][0]["id"], "server-1")
+            self.assertNotIn("accessToken", signed_in.get_json()["servers"][0])
+
+            inspected = self.client.post(
+                "/api/auth/plex/inspect",
+                json={
+                    "flowToken": flow_token,
+                    "serverId": "server-1",
+                    "connectionUri": "https://server-1.plex.direct:32400",
+                },
+            )
+            self.assertEqual(inspected.status_code, 200)
+            self.assertEqual(inspected.get_json()["libraries"], libraries)
+
+            completed = self.client.post(
+                "/api/auth/plex/complete",
+                json={"flowToken": flow_token, "librarySectionIds": ["1"]},
+            )
+
+        self.assertEqual(completed.status_code, 200)
+        self.assertEqual(completed.get_json()["role"], "admin")
+        self.assertEqual(completed.get_json()["authProvider"], "plex")
+        plex_settings = get_service("plex")
+        self.assertEqual(plex_settings["token"], "server-token")
+        self.assertEqual(plex_settings["machineIdentifier"], "server-1")
+        self.assertEqual(plex_settings["librarySectionIds"], ["1"])
+        request_scan.assert_called_once_with()
+
+    def test_server_setup_requires_an_owned_plex_server(self):
+        shared_server = {
+            "name": "Shared Plex",
+            "product": "Plex Media Server",
+            "clientIdentifier": "shared-1",
+            "provides": ["server"],
+            "owned": False,
+            "accessToken": "shared-token",
+            "connections": [{
+                "uri": "https://shared.plex.direct:32400",
+                "protocol": "https",
+                "address": "shared.plex.direct",
+                "port": 32400,
+                "local": False,
+                "secure": True,
+            }],
+        }
+        with (
+            patch("backend.routes.auth.plex_auth.create_pin") as create_pin,
+            patch("backend.routes.auth.plex_auth.poll_pin", return_value="account-token"),
+            patch("backend.routes.auth.plex_auth.get_account") as get_account,
+            patch(
+                "backend.routes.auth.plex_auth.get_resources",
+                return_value=[shared_server],
+            ),
+        ):
+            create_pin.return_value = {
+                "id": 43,
+                "authorizationUrl": "https://app.plex.tv/auth/#!?code=EFGH",
+                "expiresAt": time.time() + 600,
+            }
+            get_account.return_value = {
+                "id": "100",
+                "username": "shared-user",
+                "title": "Shared User",
+                "email": "shared@example.com",
+                "thumb": "",
+            }
+            flow_token = self.client.post(
+                "/api/auth/plex/start", json={"purpose": "server"}
+            ).get_json()["flowToken"]
+            response = self.client.post(
+                "/api/auth/plex/poll", json={"flowToken": flow_token}
+            )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("owns the server", response.get_json()["error"])
+
+    def test_plex_sso_creates_a_user_with_access_to_the_configured_server(self):
+        csrf_token = self.register()
+        save_service("plex", {
+            "url": "http://plex:32400",
+            "token": "owner-token",
+            "machineIdentifier": "server-1",
+            "libraries": [{"id": "1", "title": "Music"}],
+            "librarySectionIds": ["1"],
+        })
+        self.client.post(
+            "/api/auth/logout", headers={"X-CSRF-Token": csrf_token}
+        )
+        shared_server = {
+            "name": "Music Plex",
+            "product": "Plex Media Server",
+            "clientIdentifier": "server-1",
+            "provides": ["server"],
+            "owned": False,
+            "accessToken": "user-token",
+            "connections": [{
+                "uri": "https://server-1.plex.direct:32400",
+                "protocol": "https",
+                "address": "server-1.plex.direct",
+                "port": 32400,
+                "local": False,
+                "secure": True,
+            }],
+        }
+        with (
+            patch("backend.routes.auth.plex_auth.create_pin") as create_pin,
+            patch("backend.routes.auth.plex_auth.poll_pin", return_value="user-token"),
+            patch("backend.routes.auth.plex_auth.get_account") as get_account,
+            patch(
+                "backend.routes.auth.plex_auth.get_resources",
+                return_value=[shared_server],
+            ),
+        ):
+            create_pin.return_value = {
+                "id": 44,
+                "authorizationUrl": "https://app.plex.tv/auth/#!?code=IJKL",
+                "expiresAt": time.time() + 600,
+            }
+            get_account.return_value = {
+                "id": "101",
+                "username": "plex-friend",
+                "title": "Plex Friend",
+                "email": "friend@example.com",
+                "thumb": "",
+            }
+            flow_token = self.client.post(
+                "/api/auth/plex/start", json={"purpose": "login"}
+            ).get_json()["flowToken"]
+            response = self.client.post(
+                "/api/auth/plex/poll", json={"flowToken": flow_token}
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["role"], "user")
+        self.assertEqual(response.get_json()["authProvider"], "plex")
+        with db() as connection:
+            saved = connection.execute(
+                "SELECT plex_id FROM users WHERE username = 'plex-friend'"
+            ).fetchone()
+        self.assertEqual(saved["plex_id"], "101")
+
+    def test_legacy_plex_owner_must_link_the_local_admin_before_sso(self):
+        csrf_token = self.register()
+        save_service("plex", {
+            "url": "http://plex:32400",
+            "token": "owner-token",
+            "machineIdentifier": "server-1",
+            "libraries": [{"id": "1", "title": "Music"}],
+            "librarySectionIds": ["1"],
+        })
+        self.client.post(
+            "/api/auth/logout", headers={"X-CSRF-Token": csrf_token}
+        )
+        owned_server = {
+            "name": "Music Plex",
+            "product": "Plex Media Server",
+            "clientIdentifier": "server-1",
+            "provides": ["server"],
+            "owned": True,
+            "accessToken": "owner-token",
+            "connections": [{
+                "uri": "http://plex:32400",
+                "protocol": "http",
+                "address": "plex",
+                "port": 32400,
+                "local": True,
+                "secure": False,
+            }],
+        }
+        with (
+            patch("backend.routes.auth.plex_auth.create_pin") as create_pin,
+            patch("backend.routes.auth.plex_auth.poll_pin", return_value="owner-token"),
+            patch("backend.routes.auth.plex_auth.get_account") as get_account,
+            patch(
+                "backend.routes.auth.plex_auth.get_resources",
+                return_value=[owned_server],
+            ),
+        ):
+            create_pin.return_value = {
+                "id": 45,
+                "authorizationUrl": "https://app.plex.tv/auth/#!?code=MNOP",
+                "expiresAt": time.time() + 600,
+            }
+            get_account.return_value = {
+                "id": "102",
+                "username": "plex-owner",
+                "title": "Plex Owner",
+                "email": "owner@example.com",
+                "thumb": "",
+            }
+            flow_token = self.client.post(
+                "/api/auth/plex/start", json={"purpose": "login"}
+            ).get_json()["flowToken"]
+            response = self.client.post(
+                "/api/auth/plex/poll", json={"flowToken": flow_token}
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("local administrator", response.get_json()["error"])
+        with db() as connection:
+            users = connection.execute(
+                "SELECT username, plex_id FROM users"
+            ).fetchall()
+            remaining_flows = connection.execute(
+                "SELECT COUNT(*) FROM plex_auth_flows"
+            ).fetchone()[0]
+        self.assertEqual([(row["username"], row["plex_id"]) for row in users], [
+            ("test-user", None),
+        ])
+        self.assertEqual(remaining_flows, 0)
 
     def test_registration_requires_one_time_admin_invitation_after_setup(self):
         csrf_token = self.register()
@@ -1332,6 +2910,12 @@ class AuthenticationTests(DatabaseTestCase):
             headers={"X-CSRF-Token": token},
         )
         self.assertEqual(accepted.status_code, 200)
+        expired = self.client.post(
+            "/api/auth/logout",
+            headers={"X-CSRF-Token": token},
+        )
+        self.assertEqual(expired.status_code, 401)
+        self.assertEqual(expired.get_json()["error"], "Sign in is required.")
 
     def test_authenticated_route_loads_the_user_once(self):
         self.register()
@@ -1343,16 +2927,851 @@ class AuthenticationTests(DatabaseTestCase):
         get_user.assert_called_once()
 
 
+class AdminUsersTests(DatabaseTestCase):
+    def add_user(
+        self,
+        username,
+        *,
+        role="user",
+        created_at=1_700_000_000,
+        plex_id=None,
+        plex_username=None,
+        plex_email=None,
+        plex_avatar=None,
+        listenbrainz_username=None,
+        lastfm_username=None,
+        lastfm_api_key=None,
+        password="listener-password",
+    ):
+        with db() as connection:
+            cursor = connection.execute(
+                "INSERT INTO users "
+                "(username, password_hash, role, plex_id, plex_username, "
+                "plex_email, plex_avatar, listenbrainz_username, "
+                "lastfm_username, lastfm_api_key, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    username,
+                    generate_password_hash(password),
+                    role,
+                    plex_id,
+                    plex_username,
+                    plex_email,
+                    plex_avatar,
+                    listenbrainz_username,
+                    lastfm_username,
+                    lastfm_api_key,
+                    created_at,
+                ),
+            )
+            return cursor.lastrowid
+
+    def test_admin_list_uses_plex_display_name_and_counts_requests(self):
+        self.register()
+        save_service("lastfm", {"apiKey": "admin-shared-key"})
+        user_id = self.add_user(
+            "generated-plex-name",
+            plex_id="plex-42",
+            plex_username="Plex Listener",
+            plex_email="plex@example.com",
+            plex_avatar="https://plex.example/avatar.jpg",
+            listenbrainz_username="listener",
+            lastfm_username="last-listener",
+            lastfm_api_key="never-return-this",
+        )
+        with db() as connection:
+            connection.executemany(
+                "INSERT INTO request_history "
+                "(user_id, kind, mbid, name, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [
+                    (user_id, "artist", "artist-1", "Artist One", 10),
+                    (
+                        user_id,
+                        "release-group",
+                        "release-1",
+                        "Album One",
+                        20,
+                    ),
+                ],
+            )
+
+        response = self.client.get("/api/admin/users")
+
+        self.assertEqual(response.status_code, 200)
+        users = response.get_json()["users"]
+        plex_user = next(user for user in users if user["id"] == user_id)
+        self.assertEqual(plex_user["username"], "Plex Listener")
+        self.assertEqual(plex_user["localUsername"], "generated-plex-name")
+        self.assertEqual(plex_user["requestCount"], 2)
+        self.assertEqual(plex_user["userType"], "plex")
+        self.assertEqual(plex_user["role"], "user")
+        self.assertEqual(plex_user["joinedAt"], 1_700_000_000)
+        self.assertEqual(plex_user["plexEmail"], "plex@example.com")
+        self.assertTrue(plex_user["lastfmConfigured"])
+        self.assertNotIn("lastfmApiKey", plex_user)
+        self.assertNotIn("passwordHash", plex_user)
+        self.assertNotIn("plexId", plex_user)
+
+    def test_canonical_username_disambiguates_a_plex_display_name_collision(self):
+        self.register()
+        local_user_id = self.add_user("SharedName")
+        plex_user_id = self.add_user(
+            "shared-name-2",
+            plex_id="plex-shared-name",
+            plex_username="SharedName",
+        )
+
+        users = self.client.get("/api/admin/users").get_json()["users"]
+        plex_user = next(user for user in users if user["id"] == plex_user_id)
+        self.assertEqual(plex_user["username"], "SharedName")
+        self.assertEqual(plex_user["localUsername"], "shared-name-2")
+
+        canonical = self.client.get(
+            "/api/account/profile?username=shared-name-2"
+        )
+        ambiguous_display_name = self.client.get(
+            "/api/account/profile?username=SharedName"
+        )
+
+        self.assertEqual(canonical.status_code, 200)
+        self.assertEqual(canonical.get_json()["user"]["id"], plex_user_id)
+        self.assertEqual(ambiguous_display_name.status_code, 200)
+        self.assertEqual(
+            ambiguous_display_name.get_json()["user"]["id"],
+            local_user_id,
+        )
+
+    @patch("backend.routes.admin._profile_plex_index")
+    def test_admin_request_list_includes_metadata_availability_and_requesters(
+        self, profile_plex_index
+    ):
+        self.register()
+        local_user_id = self.add_user(
+            "local-listener",
+            lastfm_api_key="never-return-this-local-key",
+        )
+        plex_user_id = self.add_user(
+            "generated-plex-name",
+            plex_id="never-return-this-plex-id",
+            plex_username="Plex Listener",
+            plex_email="plex@example.com",
+            plex_avatar="https://plex.example/avatar.jpg",
+            lastfm_api_key="never-return-this-plex-key",
+        )
+        with db() as connection:
+            connection.executemany(
+                "INSERT INTO request_history "
+                "(user_id, kind, mbid, name, artist_name, release_type, "
+                "release_date, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        local_user_id,
+                        "artist",
+                        "artist-1",
+                        "Artist One",
+                        None,
+                        None,
+                        None,
+                        100,
+                    ),
+                    (
+                        plex_user_id,
+                        "release-group",
+                        "release-1",
+                        "Album One",
+                        "Artist Two",
+                        "Album",
+                        "2024-02-03",
+                        300,
+                    ),
+                    (
+                        local_user_id,
+                        "release-group",
+                        "release-2",
+                        "Newest at Same Time",
+                        "Artist Three",
+                        "EP",
+                        "2025",
+                        300,
+                    ),
+                ],
+            )
+        profile_plex_index.return_value = {
+            "artistsByMbid": {
+                "artist-1": {
+                    "url": "https://app.plex.tv/artist",
+                    "plexampUrl": "https://listen.plex.tv/artist/example",
+                },
+            },
+            "releaseGroupsByMbid": {
+                "release-1": [{
+                    "artistName": "Artist Two",
+                    "releaseType": "Album",
+                    "year": 2024,
+                    "url": "https://app.plex.tv/album",
+                    "plexampUrl": "https://listen.plex.tv/album/example",
+                }],
+            },
+        }
+
+        response = self.client.get("/api/admin/requests")
+
+        self.assertEqual(response.status_code, 200)
+        requests_payload = response.get_json()["requests"]
+        self.assertEqual(response.get_json()["pagination"], {
+            "page": 1,
+            "pageSize": 100,
+            "total": 3,
+            "totalPages": 1,
+        })
+        self.assertEqual(
+            [item["name"] for item in requests_payload],
+            ["Newest at Same Time", "Album One", "Artist One"],
+        )
+        self.assertTrue(all(isinstance(item["id"], int) for item in requests_payload))
+        self.assertGreater(requests_payload[0]["id"], requests_payload[1]["id"])
+
+        release = requests_payload[1]
+        self.assertEqual(release["kind"], "release-group")
+        self.assertEqual(release["mbid"], "release-1")
+        self.assertEqual(release["artist_name"], "Artist Two")
+        self.assertEqual(release["release_type"], "Album")
+        self.assertEqual(release["release_date"], "2024-02-03")
+        self.assertEqual(release["created_at"], 300)
+        self.assertTrue(release["availableInPlex"])
+        self.assertEqual(release["plexUrl"], "https://app.plex.tv/album")
+        self.assertEqual(
+            release["plexampUrl"],
+            "https://listen.plex.tv/album/example",
+        )
+        self.assertEqual(release["requester"], {
+            "id": plex_user_id,
+            "username": "Plex Listener",
+            "localUsername": "generated-plex-name",
+            "userType": "plex",
+            "role": "user",
+            "plexUsername": "Plex Listener",
+            "plexEmail": "plex@example.com",
+            "plexAvatar": "https://plex.example/avatar.jpg",
+        })
+
+        artist = requests_payload[2]
+        self.assertTrue(artist["availableInPlex"])
+        self.assertEqual(artist["plexUrl"], "https://app.plex.tv/artist")
+        self.assertEqual(
+            artist["plexampUrl"],
+            "https://listen.plex.tv/artist/example",
+        )
+        self.assertEqual(artist["requester"], {
+            "id": local_user_id,
+            "username": "local-listener",
+            "localUsername": "local-listener",
+            "userType": "local",
+            "role": "user",
+            "plexUsername": "",
+            "plexEmail": "",
+            "plexAvatar": "",
+        })
+
+        serialized = response.get_data(as_text=True)
+        self.assertNotIn("never-return-this-local-key", serialized)
+        self.assertNotIn("never-return-this-plex-key", serialized)
+        self.assertNotIn("never-return-this-plex-id", serialized)
+        self.assertNotIn("password_hash", serialized)
+
+    @patch(
+        "backend.routes.admin._profile_plex_index",
+        return_value={"artistsByMbid": {}, "releaseGroupsByMbid": {}},
+    )
+    def test_admin_request_list_paginates_at_100_items(
+        self, profile_plex_index
+    ):
+        self.register()
+        user_id = self.add_user("prolific-listener")
+        with db() as connection:
+            connection.executemany(
+                "INSERT INTO request_history "
+                "(user_id, kind, mbid, name, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [
+                    (
+                        user_id,
+                        "artist",
+                        f"artist-{index}",
+                        f"Request {index}",
+                        index,
+                    )
+                    for index in range(205)
+                ],
+            )
+
+        first = self.client.get("/api/admin/requests").get_json()
+        second = self.client.get("/api/admin/requests?page=2").get_json()
+        third = self.client.get("/api/admin/requests?page=3").get_json()
+
+        self.assertEqual(len(first["requests"]), 100)
+        self.assertEqual(first["requests"][0]["name"], "Request 204")
+        self.assertEqual(first["requests"][-1]["name"], "Request 105")
+        self.assertEqual(len(second["requests"]), 100)
+        self.assertEqual(second["requests"][0]["name"], "Request 104")
+        self.assertEqual(second["requests"][-1]["name"], "Request 5")
+        self.assertEqual(
+            [item["name"] for item in third["requests"]],
+            [
+                "Request 4",
+                "Request 3",
+                "Request 2",
+                "Request 1",
+                "Request 0",
+            ],
+        )
+        self.assertEqual(first["pagination"], {
+            "page": 1,
+            "pageSize": 100,
+            "total": 205,
+            "totalPages": 3,
+        })
+        self.assertEqual(second["pagination"]["page"], 2)
+        self.assertEqual(third["pagination"]["page"], 3)
+        profile_plex_index.assert_called()
+
+    def test_admin_request_list_rejects_invalid_pages(self):
+        self.register()
+
+        for page in ("0", "-1", "nope", "1.5", str(2 ** 100)):
+            with self.subTest(page=page):
+                response = self.client.get(
+                    f"/api/admin/requests?page={page}"
+                )
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("positive integer", response.get_json()["error"])
+
+    def test_admin_request_list_requires_an_administrator(self):
+        self.assertEqual(
+            self.client.get("/api/admin/requests").status_code,
+            401,
+        )
+        admin_csrf = self.register()
+        self.add_user("ordinary-user")
+        self.client.post(
+            "/api/auth/logout",
+            headers={"X-CSRF-Token": admin_csrf},
+        )
+        login = self.client.post(
+            "/api/auth/login",
+            json={
+                "username": "ordinary-user",
+                "password": "listener-password",
+            },
+        )
+        self.assertEqual(login.status_code, 200)
+
+        response = self.client.get("/api/admin/requests")
+
+        self.assertEqual(response.status_code, 403)
+        self.assertIn("Administrator", response.get_json()["error"])
+
+    def test_user_list_edits_and_deletion_require_an_admin(self):
+        self.assertEqual(self.client.get("/api/admin/users").status_code, 401)
+        admin_csrf = self.register()
+        user_id = self.add_user("ordinary-user")
+        self.assertEqual(
+            self.client.delete(f"/api/admin/users/{user_id}").status_code,
+            403,
+        )
+        self.client.post(
+            "/api/auth/logout", headers={"X-CSRF-Token": admin_csrf}
+        )
+        login = self.client.post(
+            "/api/auth/login",
+            json={
+                "username": "ordinary-user",
+                "password": "listener-password",
+            },
+        )
+        csrf_token = login.get_json()["csrfToken"]
+
+        self.assertEqual(self.client.get("/api/admin/users").status_code, 403)
+        self.assertEqual(
+            self.client.patch(
+                f"/api/admin/users/{user_id}",
+                json={"role": "admin"},
+                headers={"X-CSRF-Token": csrf_token},
+            ).status_code,
+            403,
+        )
+        self.assertEqual(
+            self.client.delete(
+                f"/api/admin/users/{user_id}",
+                headers={"X-CSRF-Token": csrf_token},
+            ).status_code,
+            403,
+        )
+
+    @patch("backend.routes.admin.recommendation_worker.request_refresh")
+    def test_admin_can_edit_account_and_recommendation_settings(
+        self, request_refresh
+    ):
+        csrf_token = self.register()
+        save_service("lastfm", {"apiKey": "admin-shared-key"})
+        original_hash = generate_password_hash("original-password")
+        user_id = self.add_user(
+            "old-name",
+            lastfm_username="old-lastfm",
+        )
+        with db() as connection:
+            connection.execute(
+                "UPDATE users SET password_hash = ? WHERE id = ?",
+                (original_hash, user_id),
+            )
+            connection.execute(
+                "INSERT INTO recommendation_cache "
+                "(user_id, value, refreshed_at) VALUES (?, '{}', ?)",
+                (user_id, time.time()),
+            )
+
+        response = self.client.patch(
+            f"/api/admin/users/{user_id}",
+            json={
+                "role": "admin",
+                "localUsername": "new-name",
+                "password": "",
+                "listenbrainzUsername": "new-listens",
+                "lastfmUsername": "new-lastfm",
+            },
+            headers={"X-CSRF-Token": csrf_token},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        user = response.get_json()["user"]
+        self.assertEqual(user["localUsername"], "new-name")
+        self.assertEqual(user["role"], "admin")
+        self.assertEqual(user["listenbrainzUsername"], "new-listens")
+        self.assertEqual(user["lastfmUsername"], "new-lastfm")
+        self.assertTrue(user["lastfmConfigured"])
+        self.assertNotIn("lastfmApiKey", user)
+        with db() as connection:
+            saved = connection.execute(
+                "SELECT password_hash, lastfm_username FROM users WHERE id = ?",
+                (user_id,),
+            ).fetchone()
+            cached = connection.execute(
+                "SELECT 1 FROM recommendation_cache WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+        self.assertEqual(saved["password_hash"], original_hash)
+        self.assertEqual(saved["lastfm_username"], "new-lastfm")
+        self.assertIsNone(cached)
+        request_refresh.assert_called_once_with()
+
+    def test_admin_edit_validation_protects_roles_and_plex_identity(self):
+        csrf_token = self.register()
+        with db() as connection:
+            admin_id = connection.execute(
+                "SELECT id FROM users WHERE username = 'test-user'"
+            ).fetchone()["id"]
+        self.assertEqual(
+            self.client.patch(
+                f"/api/admin/users/{admin_id}",
+                json={"role": "user"},
+                headers={"X-CSRF-Token": csrf_token},
+            ).status_code,
+            409,
+        )
+
+        second_admin_id = self.add_user("second-admin", role="admin")
+        self.assertEqual(
+            self.client.patch(
+                f"/api/admin/users/{admin_id}",
+                json={"role": "user"},
+                headers={"X-CSRF-Token": csrf_token},
+            ).status_code,
+            409,
+        )
+        readonly = self.client.patch(
+            f"/api/admin/users/{second_admin_id}",
+            json={"plexUsername": "impersonated"},
+            headers={"X-CSRF-Token": csrf_token},
+        )
+        self.assertEqual(readonly.status_code, 400)
+        self.assertIn("managed by Plex", readonly.get_json()["error"])
+
+    def test_admin_edit_validates_local_credentials_and_duplicates(self):
+        csrf_token = self.register()
+        user_id = self.add_user("ordinary-user")
+        duplicate = self.client.patch(
+            f"/api/admin/users/{user_id}",
+            json={"localUsername": "test-user"},
+            headers={"X-CSRF-Token": csrf_token},
+        )
+        short_password = self.client.patch(
+            f"/api/admin/users/{user_id}",
+            json={"password": "too-short"},
+            headers={"X-CSRF-Token": csrf_token},
+        )
+        missing = self.client.patch(
+            "/api/admin/users/999999",
+            json={"role": "user"},
+            headers={"X-CSRF-Token": csrf_token},
+        )
+
+        self.assertEqual(duplicate.status_code, 409)
+        self.assertEqual(short_password.status_code, 400)
+        self.assertEqual(missing.status_code, 404)
+
+    def test_admin_can_delete_a_user_and_all_owned_data(self):
+        csrf_token = self.register()
+        user_id = self.add_user(
+            "departing-user",
+            plex_id="deleted-plex-id",
+            plex_username="Departing Plex User",
+        )
+        now = time.time()
+        with db() as connection:
+            connection.execute(
+                "INSERT INTO plex_auth_flows "
+                "(flow_hash, pin_id, client_identifier, purpose, user_id, "
+                "created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "departing-flow",
+                    123,
+                    "client-id",
+                    "link",
+                    user_id,
+                    now,
+                    now + 600,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO request_history "
+                "(user_id, kind, mbid, name, created_at) "
+                "VALUES (?, 'artist', ?, ?, ?)",
+                (user_id, "departing-artist", "Departing Artist", now),
+            )
+            connection.execute(
+                "INSERT INTO recommendation_cache "
+                "(user_id, value, refreshed_at) VALUES (?, '{}', ?)",
+                (user_id, now),
+            )
+            connection.execute(
+                "INSERT INTO plex_listens "
+                "(server_id, history_key, user_id, artist_rating_key, played_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("server-1", "departing-history", user_id, "artist-1", now),
+            )
+            connection.execute(
+                "INSERT INTO account_invitations "
+                "(token_hash, created_by, created_at, expires_at) "
+                "VALUES (?, ?, ?, ?)",
+                ("departing-invite", user_id, now, now + 600),
+            )
+            job_id = connection.execute(
+                "INSERT INTO pending_lidarr_searches "
+                "(mbid, album_id, artist_id, name, next_attempt_at, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    "departing-release",
+                    41,
+                    42,
+                    "Departing Album",
+                    now,
+                    now,
+                ),
+            ).lastrowid
+            connection.execute(
+                "INSERT INTO pending_lidarr_search_requesters "
+                "(job_id, user_id) VALUES (?, ?)",
+                (job_id, user_id),
+            )
+
+        response = self.client.delete(
+            f"/api/admin/users/{user_id}",
+            headers={"X-CSRF-Token": csrf_token},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["message"], "User deleted.")
+        with db() as connection:
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM users WHERE id = ?", (user_id,)
+                ).fetchone()
+            )
+            for table, column in (
+                ("plex_auth_flows", "user_id"),
+                ("pending_lidarr_search_requesters", "user_id"),
+                ("recommendation_cache", "user_id"),
+                ("plex_listens", "user_id"),
+                ("request_history", "user_id"),
+                ("account_invitations", "created_by"),
+            ):
+                self.assertIsNone(
+                    connection.execute(
+                        f"SELECT 1 FROM {table} WHERE {column} = ?",
+                        (user_id,),
+                    ).fetchone()
+                )
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM pending_lidarr_searches WHERE id = ?",
+                    (job_id,),
+                ).fetchone()
+            )
+
+    def test_deleting_one_requester_preserves_shared_lidarr_work(self):
+        csrf_token = self.register()
+        first_user_id = self.add_user("first-requester")
+        second_user_id = self.add_user("second-requester")
+        mbid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        enqueue_lidarr_search(
+            first_user_id,
+            mbid,
+            41,
+            42,
+            "Shared Album",
+        )
+        storage_module.record_request(
+            second_user_id,
+            "release-group",
+            mbid,
+            "Shared Album",
+        )
+
+        first_delete = self.client.delete(
+            f"/api/admin/users/{first_user_id}",
+            headers={"X-CSRF-Token": csrf_token},
+        )
+
+        self.assertEqual(first_delete.status_code, 200)
+        with db() as connection:
+            job = connection.execute(
+                "SELECT id FROM pending_lidarr_searches WHERE mbid = ?",
+                (mbid,),
+            ).fetchone()
+            requester_ids = [
+                row["user_id"]
+                for row in connection.execute(
+                    "SELECT user_id FROM pending_lidarr_search_requesters "
+                    "WHERE job_id = ? ORDER BY user_id",
+                    (job["id"],),
+                )
+            ]
+        self.assertIsNotNone(job)
+        self.assertEqual(requester_ids, [second_user_id])
+
+        second_delete = self.client.delete(
+            f"/api/admin/users/{second_user_id}",
+            headers={"X-CSRF-Token": csrf_token},
+        )
+
+        self.assertEqual(second_delete.status_code, 200)
+        with db() as connection:
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM pending_lidarr_searches WHERE mbid = ?",
+                    (mbid,),
+                ).fetchone()
+            )
+
+    def test_admin_cannot_delete_self_and_missing_user_returns_not_found(self):
+        csrf_token = self.register()
+        with db() as connection:
+            admin_id = connection.execute(
+                "SELECT id FROM users WHERE username = 'test-user'"
+            ).fetchone()["id"]
+
+        self_delete = self.client.delete(
+            f"/api/admin/users/{admin_id}",
+            headers={"X-CSRF-Token": csrf_token},
+        )
+        missing = self.client.delete(
+            "/api/admin/users/999999",
+            headers={"X-CSRF-Token": csrf_token},
+        )
+
+        self.assertEqual(self_delete.status_code, 409)
+        self.assertIn("own account", self_delete.get_json()["error"])
+        self.assertEqual(missing.status_code, 404)
+
+
 class SettingsMaintenanceTests(DatabaseTestCase):
+    def test_legacy_user_key_is_promoted_and_per_user_copies_are_scrubbed(self):
+        self.register()
+        with db() as connection:
+            connection.execute(
+                "UPDATE users SET lastfm_api_key = ? WHERE username = ?",
+                ("legacy-admin-key", "test-user"),
+            )
+            connection.execute(
+                "INSERT INTO users "
+                "(username, password_hash, role, lastfm_api_key, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    "legacy-listener",
+                    generate_password_hash("listener-password"),
+                    "user",
+                    "legacy-user-key",
+                    time.time(),
+                ),
+            )
+        write_settings_file({})
+
+        init_db()
+
+        self.assertEqual(get_lastfm_api_key(), "legacy-admin-key")
+        with db() as connection:
+            remaining = connection.execute(
+                "SELECT COUNT(*) AS total FROM users "
+                "WHERE lastfm_api_key IS NOT NULL"
+            ).fetchone()["total"]
+        self.assertEqual(remaining, 0)
+
+    @patch("backend.routes.settings.recommendation_worker.request_refresh")
+    @patch("backend.routes.settings.lastfm.get")
+    def test_admin_can_save_replace_and_clear_the_shared_lastfm_key(
+        self, lastfm_get, request_refresh
+    ):
+        token = self.register()
+        initial = self.client.get("/api/settings")
+        self.assertEqual(initial.status_code, 200)
+        self.assertEqual(initial.get_json()["lastfm"], {"configured": False})
+
+        saved = self.client.post(
+            "/api/settings/lastfm",
+            json={"apiKey": "first-shared-key"},
+            headers={"X-CSRF-Token": token},
+        )
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(
+            saved.get_json()["message"],
+            "Last.fm API key saved.",
+        )
+        self.assertEqual(get_service("lastfm"), {"apiKey": "first-shared-key"})
+        lastfm_get.assert_called_once_with(
+            "chart.gettopartists",
+            "melodarr",
+            "first-shared-key",
+            limit=1,
+        )
+
+        configured = self.client.get("/api/settings")
+        self.assertEqual(
+            configured.get_json()["lastfm"],
+            {"configured": True},
+        )
+        self.assertNotIn("first-shared-key", configured.get_data(as_text=True))
+        self.assertNotIn("first-shared-key", saved.get_data(as_text=True))
+
+        replaced = self.client.post(
+            "/api/settings/lastfm",
+            json={"apiKey": "replacement-shared-key"},
+            headers={"X-CSRF-Token": token},
+        )
+        self.assertEqual(replaced.status_code, 200)
+        self.assertEqual(
+            get_service("lastfm"),
+            {"apiKey": "replacement-shared-key"},
+        )
+        self.assertNotIn(
+            "replacement-shared-key",
+            replaced.get_data(as_text=True),
+        )
+
+        cleared = self.client.post(
+            "/api/settings/lastfm",
+            json={"apiKey": "   "},
+            headers={"X-CSRF-Token": token},
+        )
+        self.assertEqual(cleared.status_code, 200)
+        self.assertEqual(
+            cleared.get_json()["message"],
+            "Last.fm API key removed.",
+        )
+        self.assertFalse(get_service("lastfm"))
+        self.assertEqual(
+            self.client.get("/api/settings").get_json()["lastfm"],
+            {"configured": False},
+        )
+        self.assertEqual(lastfm_get.call_count, 2)
+        self.assertEqual(request_refresh.call_count, 3)
+
+    @patch("backend.routes.settings.lastfm.get")
+    def test_shared_lastfm_key_is_validated_and_never_returned(
+        self, lastfm_get
+    ):
+        token = self.register()
+        lastfm_get.side_effect = ValueError("Invalid Last.fm API key.")
+
+        invalid = self.client.post(
+            "/api/settings/lastfm",
+            json={"apiKey": "invalid-shared-key"},
+            headers={"X-CSRF-Token": token},
+        )
+        missing = self.client.post(
+            "/api/settings/lastfm",
+            json={},
+            headers={"X-CSRF-Token": token},
+        )
+        wrong_type = self.client.post(
+            "/api/settings/lastfm",
+            json={"apiKey": ["not", "a", "string"]},
+            headers={"X-CSRF-Token": token},
+        )
+
+        self.assertEqual(invalid.status_code, 400)
+        self.assertEqual(missing.status_code, 400)
+        self.assertEqual(wrong_type.status_code, 400)
+        self.assertFalse(get_service("lastfm"))
+        self.assertNotIn(
+            "invalid-shared-key",
+            invalid.get_data(as_text=True),
+        )
+
+    def test_only_administrators_can_manage_the_shared_lastfm_key(self):
+        admin_token = self.register()
+        with db() as connection:
+            connection.execute(
+                "INSERT INTO users "
+                "(username, password_hash, role, created_at) VALUES (?, ?, ?, ?)",
+                (
+                    "ordinary-user",
+                    generate_password_hash("listener-password"),
+                    "user",
+                    time.time(),
+                ),
+            )
+        self.client.post(
+            "/api/auth/logout",
+            headers={"X-CSRF-Token": admin_token},
+        )
+        login = self.client.post(
+            "/api/auth/login",
+            json={
+                "username": "ordinary-user",
+                "password": "listener-password",
+            },
+        )
+        response = self.client.post(
+            "/api/settings/lastfm",
+            json={"apiKey": "user-supplied-key"},
+            headers={"X-CSRF-Token": login.get_json()["csrfToken"]},
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(get_service("lastfm"))
+
+    @patch("backend.routes.settings.plex_history_worker.request_full_sync")
     @patch("backend.routes.settings.lidarr_library_worker.request_scan")
     @patch("backend.routes.settings.plex_metadata_worker.request_enrichment")
     @patch("backend.routes.settings.plex_worker.request_full_scan")
     @patch("backend.routes.settings.plex_worker.request_recent_scan")
     @patch("backend.routes.settings.lidarr_search_worker.request_work")
     @patch("backend.routes.settings.recommendation_worker.request_refresh")
+    @patch("backend.routes.settings.listening_profile_worker.request_refresh")
     def test_jobs_are_listed_and_can_be_manually_queued(
-        self, request_refresh, request_work, request_recent, request_full,
-        request_enrichment, request_lidarr_scan,
+        self, request_profiles, request_refresh, request_work, request_recent, request_full,
+        request_enrichment, request_lidarr_scan, request_history,
     ):
         token = self.register()
         response = self.client.get("/api/settings/maintenance")
@@ -1361,11 +3780,13 @@ class SettingsMaintenanceTests(DatabaseTestCase):
             [job["id"] for job in response.get_json()["jobs"]],
             [
                 "recommendations",
+                "listening-profiles",
                 "lidarr-followups",
                 "lidarr-library",
                 "plex-recent",
                 "plex-full",
                 "plex-metadata",
+                "plex-history",
             ],
         )
         job_rows = response.get_json()["jobs"]
@@ -1373,15 +3794,22 @@ class SettingsMaintenanceTests(DatabaseTestCase):
             [job["name"] for job in job_rows],
             [
                 "Recommendation Refresh",
+                "AI Listening Profiles",
                 "Lidarr Search Follow-Ups",
                 "Lidarr Library Scan",
                 "Plex Recently Added Scan",
                 "Plex Full Library Scan",
                 "Plex MusicBrainz Enrichment",
+                "Plex Listening History",
             ],
         )
         jobs = {job["id"]: job for job in job_rows}
         self.assertEqual(jobs["lidarr-library"]["schedule"], "Every 4 minutes")
+        self.assertEqual(jobs["plex-history"]["schedule"], "Every 24 hours")
+        self.assertEqual(
+            jobs["listening-profiles"]["schedule"],
+            "Every 24 hours and after account changes",
+        )
 
         recommendation = self.client.post(
             "/api/settings/jobs/recommendations/run",
@@ -1407,43 +3835,38 @@ class SettingsMaintenanceTests(DatabaseTestCase):
             "/api/settings/jobs/plex-metadata/run",
             headers={"X-CSRF-Token": token},
         )
+        profiles = self.client.post(
+            "/api/settings/jobs/listening-profiles/run",
+            headers={"X-CSRF-Token": token},
+        )
+        history = self.client.post(
+            "/api/settings/jobs/plex-history/run",
+            headers={"X-CSRF-Token": token},
+        )
         self.assertEqual(recommendation.status_code, 200)
+        self.assertEqual(profiles.status_code, 200)
         self.assertEqual(lidarr.status_code, 200)
         self.assertEqual(lidarr_library.status_code, 200)
         self.assertEqual(recent.status_code, 200)
         self.assertEqual(full.status_code, 200)
         self.assertEqual(enrichment.status_code, 200)
+        self.assertEqual(history.status_code, 200)
         request_refresh.assert_called_once_with()
         request_work.assert_called_once_with()
         request_lidarr_scan.assert_called_once_with()
         request_recent.assert_called_once_with()
         request_full.assert_called_once_with()
         request_enrichment.assert_called_once_with()
+        request_history.assert_called_once_with()
 
-    @patch("backend.routes.settings.plex_worker.request_full_scan")
-    @patch("backend.routes.settings.plex.music_sections")
-    @patch("backend.routes.settings.plex.machine_identifier")
-    def test_plex_settings_save_only_selected_music_libraries(
-        self, machine_identifier, music_sections, request_full_scan
-    ):
-        machine_identifier.return_value = "server-1"
-        music_sections.return_value = [
-            {"id": "1", "title": "Main Music"},
-            {"id": "2", "title": "Audiobooks"},
-        ]
+    def test_raw_plex_tokens_are_not_accepted_by_settings(self):
         token = self.register()
         response = self.client.post(
             "/api/settings/plex",
-            json={
-                "url": "http://plex:32400",
-                "token": "plex-token",
-                "librarySectionIds": ["1"],
-            },
+            json={"url": "http://plex:32400", "token": "manually-copied-token"},
             headers={"X-CSRF-Token": token},
         )
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(get_service("plex")["librarySectionIds"], ["1"])
-        request_full_scan.assert_called_once_with()
+        self.assertEqual(response.status_code, 405)
 
     @patch("backend.routes.settings.plex_worker.request_full_scan")
     def test_flushing_plex_library_cache_queues_a_full_scan(self, request_full_scan):
@@ -1603,13 +4026,120 @@ class ListenBrainzLinkingTests(DatabaseTestCase):
 
     @patch("backend.routes.account.listenbrainz.user_listen_count")
     def test_transient_failure_defers_validation_and_saves(self, listen_count):
-        listen_count.side_effect = requests.Timeout("upstream timeout")
+        private_url = (
+            "https://api.listenbrainz.example/user/"
+            "bitemyear/listen-count?token=sentinel-secret"
+        )
+        error = requests.HTTPError(f"HTTP 503 for url: {private_url}")
+        error.response = Response(503)
+        listen_count.side_effect = error
         with self.assertLogs(level="WARNING") as logs:
             response = self.link(self.register())
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.get_json()["validationDeferred"])
         self.assertEqual(self.saved_username(), "bitemyear")
-        self.assertIn("validation deferred", logs.output[0])
+        rendered = "\n".join(logs.output)
+        self.assertIn("validation deferred", rendered)
+        self.assertIn("HTTPError HTTP 503", rendered)
+        for private_value in (
+            "bitemyear",
+            "sentinel-secret",
+            private_url,
+            "HTTP 503 for url",
+        ):
+            self.assertNotIn(private_value, rendered)
+
+
+class LastFmLinkingTests(DatabaseTestCase):
+    def saved_lastfm_fields(self):
+        with db() as connection:
+            return connection.execute(
+                "SELECT lastfm_username, lastfm_api_key "
+                "FROM users WHERE username = ?",
+                ("test-user",),
+            ).fetchone()
+
+    @patch("backend.routes.account.listening_profile_worker.request_refresh")
+    @patch("backend.routes.account.recommendation_worker.request_refresh")
+    @patch("backend.routes.account.lastfm.get")
+    def test_user_saves_only_a_username_with_the_shared_key(
+        self, lastfm_get, request_refresh, request_profiles
+    ):
+        save_service("lastfm", {"apiKey": "admin-shared-key"})
+        token = self.register()
+
+        response = self.client.post(
+            "/api/account/lastfm",
+            json={"username": "personal-listener"},
+            headers={"X-CSRF-Token": token},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json()["message"],
+            "Last.fm account saved.",
+        )
+        lastfm_get.assert_called_once_with(
+            "user.getinfo",
+            "personal-listener",
+            "admin-shared-key",
+        )
+        saved = self.saved_lastfm_fields()
+        self.assertEqual(saved["lastfm_username"], "personal-listener")
+        self.assertIsNone(saved["lastfm_api_key"])
+        account = self.client.get("/api/account/settings")
+        self.assertEqual(account.get_json()["lastfmUsername"], "personal-listener")
+        self.assertTrue(account.get_json()["lastfmConfigured"])
+        self.assertNotIn("admin-shared-key", account.get_data(as_text=True))
+        self.assertNotIn("apiKey", account.get_data(as_text=True))
+        request_refresh.assert_called_once_with()
+        request_profiles.assert_called_once_with()
+
+    @patch("backend.routes.account.lastfm.get")
+    def test_username_requires_an_admin_configured_shared_key(self, lastfm_get):
+        response = self.client.post(
+            "/api/account/lastfm",
+            json={"username": "personal-listener"},
+            headers={"X-CSRF-Token": self.register()},
+        )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("administrator", response.get_json()["error"].lower())
+        self.assertIsNone(self.saved_lastfm_fields()["lastfm_username"])
+        lastfm_get.assert_not_called()
+
+    @patch("backend.routes.account.listening_profile_worker.request_refresh")
+    @patch("backend.routes.account.recommendation_worker.request_refresh")
+    @patch("backend.routes.account.lastfm.get")
+    def test_user_can_clear_their_username_without_supplying_a_key(
+        self, lastfm_get, request_refresh, request_profiles
+    ):
+        save_service("lastfm", {"apiKey": "admin-shared-key"})
+        token = self.register()
+        with db() as connection:
+            connection.execute(
+                "UPDATE users SET lastfm_username = ?, lastfm_api_key = ? "
+                "WHERE username = ?",
+                ("old-listener", "legacy-user-key", "test-user"),
+            )
+
+        response = self.client.post(
+            "/api/account/lastfm",
+            json={"username": " "},
+            headers={"X-CSRF-Token": token},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json()["message"],
+            "Last.fm account removed.",
+        )
+        saved = self.saved_lastfm_fields()
+        self.assertIsNone(saved["lastfm_username"])
+        self.assertIsNone(saved["lastfm_api_key"])
+        lastfm_get.assert_not_called()
+        request_refresh.assert_called_once_with()
+        request_profiles.assert_called_once_with()
 
 
 class ApiCacheTests(DatabaseTestCase):
@@ -1860,6 +4390,50 @@ class ApiCacheTests(DatabaseTestCase):
         self.assertEqual(get.call_count, 2)
         sleep.assert_called_once_with(1.0)
 
+    @patch("backend.api_cache.time.sleep")
+    @patch("backend.api_cache.requests.get")
+    def test_retry_logs_never_include_prepared_urls_or_exception_text(
+        self, get, sleep
+    ):
+        api_key = "sentinel-lastfm-api-key"
+        username = "sentinel-linked-username"
+        private_scope = "lastfm:user:sentinel-pseudonymous-handle-hash"
+        secret_url = (
+            "https://example.test/private?"
+            f"api_key={api_key}&user={username}"
+        )
+        get.side_effect = [
+            requests.ConnectionError(f"failed request for {secret_url}"),
+            Response(503),
+            Response(200, {"result": "recovered"}),
+        ]
+
+        with self.assertLogs("backend.api_cache", level="WARNING") as logs:
+            result = cached_json_get(
+                secret_url,
+                namespace=private_scope,
+                ttl=60,
+                retry_statuses={503},
+                retry_exceptions=(requests.ConnectionError,),
+                max_attempts=3,
+            )
+
+        rendered = "\n".join(logs.output)
+        self.assertEqual(result, {"result": "recovered"})
+        self.assertIn("ConnectionError", rendered)
+        self.assertIn("HTTP 503", rendered)
+        for private_value in (
+            api_key,
+            username,
+            private_scope,
+            "sentinel-pseudonymous-handle-hash",
+            secret_url,
+            "failed request",
+        ):
+            self.assertNotIn(private_value, rendered)
+        self.assertEqual(get.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
     @patch("backend.api_cache.requests.get")
     def test_force_refresh_replaces_a_fresh_cached_response(self, get):
         get.side_effect = [
@@ -1962,6 +4536,58 @@ class LidarrRequestTests(DatabaseTestCase):
             return connection.execute(
                 "SELECT kind, mbid, name FROM request_history ORDER BY id"
             ).fetchall()
+
+    def test_already_queued_release_group_is_recorded_for_the_current_user(self):
+        admin_csrf = self.register()
+        with db() as connection:
+            admin_id = connection.execute(
+                "SELECT id FROM users WHERE username = 'test-user'"
+            ).fetchone()["id"]
+            listener_id = connection.execute(
+                "INSERT INTO users (username, password_hash, role, created_at) "
+                "VALUES (?, ?, 'user', ?)",
+                (
+                    "queue-listener",
+                    generate_password_hash("listener-password"),
+                    time.time(),
+                ),
+            ).lastrowid
+        enqueue_lidarr_search(
+            admin_id,
+            self.album_mbid,
+            33,
+            44,
+            "Already Queued Album",
+        )
+        self.client.post(
+            "/api/auth/logout",
+            headers={"X-CSRF-Token": admin_csrf},
+        )
+        login = self.client.post(
+            "/api/auth/login",
+            json={
+                "username": "queue-listener",
+                "password": "listener-password",
+            },
+        )
+
+        response = self.client.post(
+            "/api/request/release-group",
+            json={"mbid": self.album_mbid},
+            headers={"X-CSRF-Token": login.get_json()["csrfToken"]},
+        )
+
+        self.assertEqual(response.status_code, 202)
+        with db() as connection:
+            listener_history = connection.execute(
+                "SELECT name FROM request_history "
+                "WHERE user_id = ? AND mbid = ?",
+                (listener_id, self.album_mbid),
+            ).fetchall()
+        self.assertEqual(
+            [row["name"] for row in listener_history],
+            ["Already Queued Album"],
+        )
 
     @patch("backend.routes.requests.lidarr.lookup_album")
     @patch("backend.routes.requests.get_service", return_value=None)
@@ -2148,6 +4774,238 @@ class LidarrRequestTests(DatabaseTestCase):
         request_work.assert_called_once_with()
 
 
+class AccountSettingsAccessTests(DatabaseTestCase):
+    def add_target_user(self):
+        with db() as connection:
+            cursor = connection.execute(
+                "INSERT INTO users "
+                "(username, password_hash, role, listenbrainz_username, "
+                "lastfm_username, plex_id, plex_username, plex_email, "
+                "plex_avatar, created_at) "
+                "VALUES (?, ?, 'user', ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "target-user",
+                    generate_password_hash("target-old-password"),
+                    "old-listenbrainz",
+                    "old-lastfm",
+                    None,
+                    "Plex Listener",
+                    "listener@example.com",
+                    "https://plex.example/listener.jpg",
+                    100,
+                ),
+            )
+        return cursor.lastrowid
+
+    @patch("backend.routes.account.recommendation_worker.request_refresh")
+    @patch("backend.routes.account.lastfm.get")
+    @patch("backend.routes.account.listenbrainz.user_listen_count")
+    def test_admin_settings_requests_read_and_update_the_target_account(
+        self,
+        listen_count,
+        lastfm_get,
+        request_refresh,
+    ):
+        csrf = self.register()
+        target_id = self.add_target_user()
+        save_service("lastfm", {"apiKey": "shared-lastfm-key"})
+        listen_count.return_value = Response(200, {"payload": {"count": 10}})
+
+        settings = self.client.get(
+            "/api/account/settings?username=Plex%20Listener"
+        )
+        general = self.client.post(
+            "/api/account/general?username=Plex%20Listener",
+            json={
+                "username": "renamed-target",
+                "password": "target-new-password",
+            },
+            headers={"X-CSRF-Token": csrf},
+        )
+        listenbrainz = self.client.post(
+            "/api/account/settings?username=renamed-target",
+            json={"username": "new-listenbrainz"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        lastfm = self.client.post(
+            "/api/account/lastfm?username=renamed-target",
+            json={"username": "new-lastfm"},
+            headers={"X-CSRF-Token": csrf},
+        )
+
+        self.assertEqual(settings.status_code, 200)
+        self.assertEqual(settings.get_json()["username"], "target-user")
+        self.assertEqual(
+            settings.get_json()["listenbrainzUsername"],
+            "old-listenbrainz",
+        )
+        self.assertEqual(settings.get_json()["lastfmUsername"], "old-lastfm")
+        self.assertEqual(settings.get_json()["plexUsername"], "Plex Listener")
+        self.assertNotIn("password_hash", settings.get_data(as_text=True))
+        self.assertEqual(general.status_code, 200)
+        self.assertEqual(general.get_json()["username"], "renamed-target")
+        self.assertEqual(listenbrainz.status_code, 200)
+        self.assertEqual(lastfm.status_code, 200)
+        listen_count.assert_called_once_with("new-listenbrainz")
+        lastfm_get.assert_called_once_with(
+            "user.getinfo",
+            "new-lastfm",
+            "shared-lastfm-key",
+        )
+        self.assertEqual(request_refresh.call_count, 2)
+
+        with db() as connection:
+            admin = connection.execute(
+                "SELECT username, listenbrainz_username, lastfm_username "
+                "FROM users WHERE username = 'test-user'"
+            ).fetchone()
+            target = connection.execute(
+                "SELECT username, password_hash, listenbrainz_username, "
+                "lastfm_username FROM users WHERE id = ?",
+                (target_id,),
+            ).fetchone()
+        self.assertEqual(admin["username"], "test-user")
+        self.assertIsNone(admin["listenbrainz_username"])
+        self.assertIsNone(admin["lastfm_username"])
+        self.assertEqual(target["username"], "renamed-target")
+        self.assertTrue(
+            check_password_hash(
+                target["password_hash"],
+                "target-new-password",
+            )
+        )
+        self.assertEqual(
+            target["listenbrainz_username"],
+            "new-listenbrainz",
+        )
+        self.assertEqual(target["lastfm_username"], "new-lastfm")
+
+    def test_non_admin_cannot_read_or_update_another_users_settings(self):
+        admin_csrf = self.register()
+        target_id = self.add_target_user()
+        with db() as connection:
+            connection.execute(
+                "INSERT INTO users "
+                "(username, password_hash, role, created_at) "
+                "VALUES (?, ?, 'user', ?)",
+                (
+                    "ordinary-user",
+                    generate_password_hash("ordinary-password"),
+                    200,
+                ),
+            )
+        self.client.post(
+            "/api/auth/logout",
+            headers={"X-CSRF-Token": admin_csrf},
+        )
+        login = self.client.post(
+            "/api/auth/login",
+            json={
+                "username": "ordinary-user",
+                "password": "ordinary-password",
+            },
+        )
+        csrf = login.get_json()["csrfToken"]
+
+        settings = self.client.get(
+            "/api/account/settings?username=target-user"
+        )
+        general = self.client.post(
+            "/api/account/general?username=target-user",
+            json={"username": "stolen-name", "password": ""},
+            headers={"X-CSRF-Token": csrf},
+        )
+        linked = self.client.post(
+            "/api/account/settings?username=target-user",
+            json={"username": ""},
+            headers={"X-CSRF-Token": csrf},
+        )
+
+        self.assertEqual(settings.status_code, 403)
+        self.assertEqual(general.status_code, 403)
+        self.assertEqual(linked.status_code, 403)
+        with db() as connection:
+            target = connection.execute(
+                "SELECT username, listenbrainz_username FROM users WHERE id = ?",
+                (target_id,),
+            ).fetchone()
+        self.assertEqual(target["username"], "target-user")
+        self.assertEqual(
+            target["listenbrainz_username"],
+            "old-listenbrainz",
+        )
+
+    @patch("backend.routes.auth.plex_auth.get_resources")
+    @patch("backend.routes.auth.plex_auth.get_account")
+    @patch("backend.routes.auth.plex_auth.poll_pin")
+    @patch("backend.routes.auth.plex_auth.create_pin")
+    def test_admin_can_link_plex_to_the_target_account(
+        self,
+        create_pin,
+        poll_pin,
+        get_account,
+        get_resources,
+    ):
+        csrf = self.register()
+        target_id = self.add_target_user()
+        save_service("plex", {
+            "url": "http://plex:32400",
+            "token": "server-owner-token",
+            "machineIdentifier": "server-1",
+        })
+        create_pin.return_value = {
+            "id": 987,
+            "authorizationUrl": "https://app.plex.tv/auth/#!?code=TARGET",
+            "expiresAt": time.time() + 600,
+        }
+        poll_pin.return_value = "target-token"
+        get_account.return_value = {
+            "id": "target-plex-id",
+            "username": "target-plex-user",
+            "email": "target-plex@example.com",
+            "thumb": "https://plex.example/target.jpg",
+        }
+        get_resources.return_value = [{
+            "clientIdentifier": "server-1",
+        }]
+
+        started = self.client.post(
+            "/api/auth/plex/start",
+            json={"purpose": "link", "username": "target-user"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(started.status_code, 201)
+        flow_token = started.get_json()["flowToken"]
+        with db() as connection:
+            flow = connection.execute(
+                "SELECT user_id FROM plex_auth_flows"
+            ).fetchone()
+        self.assertEqual(flow["user_id"], target_id)
+
+        linked = self.client.post(
+            "/api/auth/plex/poll",
+            json={"flowToken": flow_token},
+            headers={"X-CSRF-Token": csrf},
+        )
+
+        self.assertEqual(linked.status_code, 200)
+        self.assertEqual(
+            linked.get_json()["plexUsername"],
+            "target-plex-user",
+        )
+        with db() as connection:
+            admin = connection.execute(
+                "SELECT plex_id FROM users WHERE username = 'test-user'"
+            ).fetchone()
+            target = connection.execute(
+                "SELECT plex_id, plex_username FROM users WHERE id = ?",
+                (target_id,),
+            ).fetchone()
+        self.assertIsNone(admin["plex_id"])
+        self.assertEqual(target["plex_id"], "target-plex-id")
+        self.assertEqual(target["plex_username"], "target-plex-user")
+
+
 class AccountProfileTests(DatabaseTestCase):
     release_group_mbid = "33333333-3333-3333-3333-333333333333"
 
@@ -2191,7 +5049,18 @@ class AccountProfileTests(DatabaseTestCase):
         response = self.client.get("/api/account/profile")
 
         self.assertEqual(response.status_code, 200)
-        item = response.get_json()["requests"]["release-group"][0]
+        payload = response.get_json()
+        self.assertEqual(payload["user"], {
+            "id": user_id,
+            "username": "test-user",
+            "localUsername": "test-user",
+            "userType": "local",
+            "role": "admin",
+            "plexUsername": "",
+            "plexEmail": "",
+            "plexAvatar": "",
+        })
+        item = payload["requests"]["release-group"][0]
         self.assertEqual(item["artist_name"], "Stray Kids")
         self.assertEqual(item["release_type"], "Album")
         self.assertEqual(item["release_date"], "2020-03-18")
@@ -2239,6 +5108,206 @@ class AccountProfileTests(DatabaseTestCase):
         self.assertEqual(item["release_date"], "2019-04-05")
         self.assertFalse(item["availableInPlex"])
         self.assertTrue(musicbrainz_get.call_args.kwargs["cache_only"])
+
+    @patch("backend.routes.account.get_service", return_value=None)
+    def test_profile_request_history_paginates_at_100_items(
+        self, get_service
+    ):
+        self.register()
+        with db() as connection:
+            user_id = connection.execute(
+                "SELECT id FROM users WHERE username = 'test-user'"
+            ).fetchone()["id"]
+            connection.executemany(
+                "INSERT INTO request_history "
+                "(user_id, kind, mbid, name, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [
+                    (
+                        user_id,
+                        "artist" if index % 2 else "release-group",
+                        f"request-{index}",
+                        f"Request {index}",
+                        index,
+                    )
+                    for index in range(205)
+                ],
+            )
+
+        first = self.client.get("/api/account/profile").get_json()
+        second = self.client.get("/api/account/profile?page=2").get_json()
+        third = self.client.get("/api/account/profile?page=3").get_json()
+
+        self.assertEqual(
+            sum(len(items) for items in first["requests"].values()),
+            100,
+        )
+        self.assertEqual(
+            sum(len(items) for items in second["requests"].values()),
+            100,
+        )
+        self.assertEqual(
+            sum(len(items) for items in third["requests"].values()),
+            5,
+        )
+        self.assertEqual(first["pagination"], {
+            "page": 1,
+            "pageSize": 100,
+            "total": 205,
+            "totalPages": 3,
+        })
+        self.assertEqual(second["pagination"]["page"], 2)
+        self.assertEqual(third["pagination"]["page"], 3)
+        first_names = {
+            item["name"]
+            for items in first["requests"].values()
+            for item in items
+        }
+        third_names = {
+            item["name"]
+            for items in third["requests"].values()
+            for item in items
+        }
+        self.assertIn("Request 204", first_names)
+        self.assertNotIn("Request 104", first_names)
+        self.assertEqual(
+            third_names,
+            {f"Request {index}" for index in range(5)},
+        )
+
+    def test_profile_request_history_rejects_invalid_pages(self):
+        self.register()
+
+        for page in ("0", "-1", "nope", "1.5", str(2 ** 100)):
+            with self.subTest(page=page):
+                response = self.client.get(
+                    f"/api/account/profile?page={page}"
+                )
+                self.assertEqual(response.status_code, 400)
+                self.assertIn("positive integer", response.get_json()["error"])
+
+    @patch("backend.routes.account.get_service", return_value=None)
+    def test_admin_can_view_another_profile_by_local_or_plex_username(
+        self, get_service
+    ):
+        self.register()
+        with db() as connection:
+            cursor = connection.execute(
+                "INSERT INTO users "
+                "(username, password_hash, role, plex_id, plex_username, "
+                "plex_email, plex_avatar, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "generated-plex-name",
+                    generate_password_hash("listener-password"),
+                    "user",
+                    "private-plex-id",
+                    "Plex Listener",
+                    "plex@example.com",
+                    "https://plex.example/avatar.jpg",
+                    100,
+                ),
+            )
+            user_id = cursor.lastrowid
+            connection.execute(
+                "INSERT INTO request_history "
+                "(user_id, kind, mbid, name, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (user_id, "artist", "artist-1", "Requested Artist", 200),
+            )
+
+        by_local = self.client.get(
+            "/api/account/profile?username=GENERATED-PLEX-NAME"
+        )
+        by_plex = self.client.get(
+            "/api/account/profile?username=Plex%20Listener"
+        )
+
+        self.assertEqual(by_local.status_code, 200)
+        self.assertEqual(by_plex.status_code, 200)
+        payload = by_plex.get_json()
+        self.assertEqual(payload["username"], "generated-plex-name")
+        self.assertEqual(payload["user"], {
+            "id": user_id,
+            "username": "Plex Listener",
+            "localUsername": "generated-plex-name",
+            "userType": "plex",
+            "role": "user",
+            "plexUsername": "Plex Listener",
+            "plexEmail": "plex@example.com",
+            "plexAvatar": "https://plex.example/avatar.jpg",
+        })
+        self.assertEqual(
+            payload["requests"]["artist"][0]["name"],
+            "Requested Artist",
+        )
+        self.assertEqual(by_local.get_json()["user"], payload["user"])
+        serialized = by_plex.get_data(as_text=True)
+        self.assertNotIn("private-plex-id", serialized)
+        self.assertNotIn("password_hash", serialized)
+
+    def test_non_admin_cannot_view_another_users_profile(self):
+        admin_csrf = self.register()
+        with db() as connection:
+            connection.executemany(
+                "INSERT INTO users "
+                "(username, password_hash, role, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                [
+                    (
+                        "ordinary-user",
+                        generate_password_hash("listener-password"),
+                        "user",
+                        100,
+                    ),
+                    (
+                        "another-user",
+                        generate_password_hash("listener-password"),
+                        "user",
+                        200,
+                    ),
+                ],
+            )
+        self.client.post(
+            "/api/auth/logout",
+            headers={"X-CSRF-Token": admin_csrf},
+        )
+        login = self.client.post(
+            "/api/auth/login",
+            json={
+                "username": "ordinary-user",
+                "password": "listener-password",
+            },
+        )
+        self.assertEqual(login.status_code, 200)
+
+        own_profile = self.client.get(
+            "/api/account/profile?username=ORDINARY-USER"
+        )
+        other_profile = self.client.get(
+            "/api/account/profile?username=another-user"
+        )
+        missing_profile = self.client.get(
+            "/api/account/profile?username=missing-user"
+        )
+
+        self.assertEqual(own_profile.status_code, 200)
+        self.assertEqual(
+            own_profile.get_json()["user"]["localUsername"],
+            "ordinary-user",
+        )
+        self.assertEqual(other_profile.status_code, 403)
+        self.assertEqual(missing_profile.status_code, 403)
+
+    def test_admin_profile_lookup_returns_not_found(self):
+        self.register()
+
+        response = self.client.get(
+            "/api/account/profile?username=missing-user"
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.get_json()["error"], "User not found.")
 
 
 class LidarrClientTests(unittest.TestCase):
@@ -2613,6 +5682,66 @@ class MusicBrainzClientTests(unittest.TestCase):
         )
 
 
+class LastFmDiscoveryTests(DatabaseTestCase):
+    @patch("backend.routes.discovery.recommendation_engine.lastfm_recommendations")
+    def test_personal_recommendations_use_the_shared_key(
+        self, lastfm_recommendations
+    ):
+        token = self.register()
+        save_service("lastfm", {"apiKey": "admin-shared-key"})
+        with db() as connection:
+            connection.execute(
+                "UPDATE users SET lastfm_username = ?, lastfm_api_key = ? "
+                "WHERE username = ?",
+                (
+                    "personal-listener",
+                    "legacy-key-that-must-not-be-used",
+                    "test-user",
+                ),
+            )
+        lastfm_recommendations.return_value = (
+            [{"id": "artist-id", "name": "Artist"}],
+            [{"id": "album-id", "name": "Album"}],
+        )
+
+        response = self.client.get(
+            "/api/recommendations/lastfm",
+            headers={"X-CSRF-Token": token},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        lastfm_recommendations.assert_called_once_with(
+            "personal-listener",
+            "admin-shared-key",
+        )
+        self.assertEqual(response.get_json()["username"], "personal-listener")
+        serialized = response.get_data(as_text=True)
+        self.assertNotIn("admin-shared-key", serialized)
+        self.assertNotIn("legacy-key-that-must-not-be-used", serialized)
+
+    @patch("backend.routes.discovery.lastfm.get")
+    def test_global_chart_uses_the_shared_key_without_a_personal_username(
+        self, lastfm_get
+    ):
+        token = self.register()
+        save_service("lastfm", {"apiKey": "admin-shared-key"})
+        lastfm_get.return_value = {"artists": {"artist": []}}
+
+        response = self.client.get(
+            "/api/charts/lastfm",
+            headers={"X-CSRF-Token": token},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        lastfm_get.assert_called_once_with(
+            "chart.gettopartists",
+            "melodarr",
+            "admin-shared-key",
+            limit=20,
+        )
+        self.assertNotIn("admin-shared-key", response.get_data(as_text=True))
+
+
 class DiscoveryRoutesTests(DatabaseTestCase):
     @patch("backend.routes.discovery.plex.cached_library_index")
     @patch("backend.routes.discovery.get_service")
@@ -2858,6 +5987,116 @@ class DiscoveryRoutesTests(DatabaseTestCase):
 
 
 class MusicRoutesTests(DatabaseTestCase):
+    @patch("backend.routes.music.get_service")
+    @patch("backend.routes.music.lidarr.cached_artist_availability")
+    @patch("backend.routes.music._plex_artist")
+    def test_artist_availability_returns_live_cached_service_links(
+        self, plex_artist, artist_availability, get_service
+    ):
+        get_service.side_effect = lambda name: {"configured": name}
+        plex_artist.return_value = {
+            "url": "https://app.plex.tv/artist",
+            "plexampUrl": "https://listen.plex.tv/artist/example",
+        }
+        artist_availability.return_value = {
+            "artist-id": {"id": 42, "name": "Tracked Artist"},
+        }
+        self.register()
+
+        response = self.client.get(
+            "/api/music/artist/artist-id/availability"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        self.assertEqual(response.get_json(), {
+            "id": "artist-id",
+            "availableInPlex": True,
+            "availableInLidarr": True,
+            "plexUrl": "https://app.plex.tv/artist",
+            "plexampUrl": "https://listen.plex.tv/artist/example",
+            "releaseGroups": {},
+            "settled": True,
+        })
+
+    @patch("backend.routes.music.get_service")
+    @patch("backend.routes.music.lidarr.cached_library_availability")
+    @patch("backend.routes.music.lidarr.cached_artist_availability")
+    @patch("backend.routes.music._plex_release_group_inventory")
+    @patch("backend.routes.music._plex_artist")
+    def test_artist_availability_includes_incomplete_discography_groups(
+        self,
+        plex_artist,
+        plex_inventory,
+        artist_availability,
+        album_availability,
+        get_service,
+    ):
+        get_service.side_effect = lambda name: {"configured": name}
+        plex_artist.return_value = {"url": "https://app.plex.tv/artist"}
+        plex_inventory.return_value = {"group-id": [{"name": "Owned Album"}]}
+        artist_availability.return_value = {"artist-id": {"id": 42}}
+        album_availability.return_value = {
+            "group-id": {"fullyAvailable": True},
+        }
+        self.register()
+
+        response = self.client.get(
+            "/api/music/artist/artist-id/availability"
+            "?releaseGroup=group-id"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["releaseGroups"], {
+            "group-id": {
+                "availableInPlex": True,
+                "availableInLidarr": True,
+                "fullyAvailableInLidarr": True,
+            },
+        })
+
+    @patch("backend.routes.music.get_service")
+    @patch("backend.routes.music.lidarr.cached_library_availability")
+    @patch("backend.routes.music._plex_release_group_inventory")
+    def test_release_group_availability_waits_for_lidarr_download_completion(
+        self, plex_inventory, lidarr_availability, get_service
+    ):
+        get_service.side_effect = lambda name: {"configured": name}
+        plex_inventory.return_value = {
+            "group-id": [{
+                "name": "Owned Album",
+                "releaseType": "album",
+                "musicbrainzReleaseId": "release-id",
+                "url": "https://app.plex.tv/album",
+                "plexampUrl": "https://listen.plex.tv/album/example",
+            }],
+        }
+        lidarr_availability.return_value = {
+            "group-id": {
+                "fullyAvailable": False,
+                "trackFileCount": 3,
+                "totalTrackCount": 10,
+            },
+        }
+        self.register()
+
+        response = self.client.get(
+            "/api/music/release-group/group-id/availability"
+        )
+        payload = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        self.assertTrue(payload["availableInPlex"])
+        self.assertTrue(payload["availableInLidarr"])
+        self.assertFalse(payload["fullyAvailableInLidarr"])
+        self.assertFalse(payload["settled"])
+        self.assertEqual(payload["ownedReleaseIds"], ["release-id"])
+        self.assertEqual(
+            payload["plexReleases"][0]["url"],
+            "https://app.plex.tv/album",
+        )
+
     @patch("backend.routes.music.musicbrainz.get")
     def test_completed_artist_payload_uses_shared_cache_and_etag(self, get):
         get.side_effect = [
@@ -3336,6 +6575,179 @@ class MusicRoutesTests(DatabaseTestCase):
 
 
 class RecommendationAssemblyTests(unittest.TestCase):
+    @patch("backend.recommendations.plex.cached_library_index")
+    @patch("backend.recommendations.get_plex_listens")
+    def test_plex_profile_applies_recency_play_counts_and_snapshot_tags(
+        self, get_listens, cached_index
+    ):
+        now = 400 * 24 * 60 * 60
+        get_listens.return_value = [
+            {
+                "artist_rating_key": "artist-1",
+                "album_rating_key": "album-1",
+                "played_at": now - 10 * 24 * 60 * 60,
+            },
+            {
+                "artist_rating_key": "artist-1",
+                "album_rating_key": "album-1",
+                "played_at": now - 200 * 24 * 60 * 60,
+            },
+            {
+                "artist_rating_key": "missing",
+                "album_rating_key": None,
+                "played_at": now,
+            },
+        ]
+        cached_index.return_value = {
+            "artistsByRatingKey": {
+                "artist-1": {
+                    "musicbrainzId": "artist-mbid",
+                    "name": "Known Artist",
+                    "genres": ["Alternative"],
+                    "styles": ["Indie Rock"],
+                    "moods": ["Energetic"],
+                },
+            },
+            "releaseGroupsByRatingKey": {
+                "album-1": {
+                    "genres": ["Alternative"],
+                    "styles": ["Garage Rock"],
+                    "moods": ["Reflective"],
+                },
+            },
+        }
+
+        seeds, tags = recommendation_engine.plex_taste_profile(
+            7,
+            {
+                "url": "http://plex:32400",
+                "machineIdentifier": "server-1",
+            },
+            now=now,
+        )
+
+        self.assertEqual(len(seeds), 1)
+        self.assertEqual(seeds[0]["id"], "artist-mbid")
+        self.assertEqual(seeds[0]["playCount"], 2)
+        self.assertAlmostEqual(seeds[0]["score"], 1.35)
+        self.assertEqual(tags["alternative"], 1.0)
+        self.assertGreater(tags["indie rock"], tags["energetic"])
+        get_listens.assert_called_once_with(
+            7,
+            now - 365 * 24 * 60 * 60,
+            server_id="server-1",
+        )
+
+    @patch("backend.recommendations._musicbrainz_lookup")
+    @patch("backend.recommendations.resolve_lastfm_album_mbid")
+    @patch("backend.recommendations.lastfm.get_public")
+    @patch("backend.recommendations.plex_taste_profile")
+    def test_plex_recommendations_use_similar_tags_and_existing_album_path(
+        self, taste_profile, get_public, resolve_album, musicbrainz_lookup
+    ):
+        taste_profile.return_value = (
+            [{"id": "seed-mbid", "name": "Seed", "score": 3.0}],
+            {"alternative": 1.0},
+        )
+
+        def public(method, _api_key, **_kwargs):
+            if method == "tag.getsimilar":
+                return {"similartags": {"tag": [{"name": "indie"}]}}
+            if method == "artist.getsimilar":
+                return {"similarartists": {"artist": [{
+                    "mbid": "candidate-mbid",
+                    "name": "Candidate",
+                    "match": "0.8",
+                }]}}
+            if method == "artist.gettoptags":
+                return {"toptags": {"tag": [{"name": "indie"}]}}
+            if method == "artist.gettopalbums":
+                return {"topalbums": {"album": [{
+                    "mbid": "album-mbid",
+                    "name": "Candidate Album",
+                    "artist": {"name": "Candidate"},
+                }]}}
+            self.fail(f"Unexpected Last.fm method {method}")
+
+        get_public.side_effect = public
+        resolve_album.return_value = "release-group-mbid"
+        musicbrainz_lookup.return_value = {
+            "title": "Candidate Album",
+            "first-release-date": "2025",
+            "primary-type": "Album",
+        }
+
+        artists, albums = recommendation_engine.plex_history_recommendations(
+            7,
+            {"url": "http://plex"},
+            "shared-key",
+        )
+
+        self.assertEqual([artist["id"] for artist in artists], ["candidate-mbid"])
+        self.assertEqual([album["id"] for album in albums], ["release-group-mbid"])
+        methods = [call.args[0] for call in get_public.call_args_list]
+        self.assertIn("tag.getsimilar", methods)
+        self.assertIn("artist.getsimilar", methods)
+        self.assertIn("artist.gettopalbums", methods)
+        self.assertNotIn("tag.gettopartists", methods)
+        self.assertNotIn("tag.gettopalbums", methods)
+
+    @patch("backend.recommendations._recommendation_exclusions")
+    @patch("backend.recommendations.lastfm_top_tags")
+    @patch("backend.recommendations.lastfm.get")
+    @patch("backend.recommendations.lastfm_recommendations")
+    @patch("backend.recommendations.plex_history_recommendations")
+    @patch("backend.recommendations.get_lastfm_api_key")
+    @patch("backend.recommendations.get_service")
+    def test_linked_lastfm_and_plex_results_are_blended_then_deduplicated(
+        self,
+        get_service,
+        get_api_key,
+        plex_recommendations,
+        lastfm_recommendations,
+        lastfm_get,
+        lastfm_top_tags,
+        exclusions,
+    ):
+        get_service.side_effect = lambda name: (
+            {"url": "http://plex", "machineIdentifier": "server-1"}
+            if name == "plex"
+            else None
+        )
+        get_api_key.return_value = "shared-key"
+        exclusions.return_value = recommendation_engine._empty_exclusions()
+        plex_recommendations.return_value = (
+            [{"id": "same-artist", "name": "Shared Artist", "score": 0.8}],
+            [{"id": "same-album", "name": "Shared Album", "score": 0.7}],
+        )
+        lastfm_recommendations.return_value = (
+            [{"id": "same-artist", "name": "Shared Artist", "score": 0.9}],
+            [{"id": "same-album", "name": "Shared Album", "score": 0.6}],
+        )
+        lastfm_get.return_value = {"artists": {"artist": []}}
+        lastfm_top_tags.return_value = []
+
+        payload = recommendation_engine.build_recommendation_cache({
+            "id": 7,
+            "username": "listener",
+            "plex_id": "global-plex-id",
+            "listenbrainz_username": None,
+            "lastfm_username": "lastfm-listener",
+        })
+
+        self.assertEqual(len(payload["artists"]), 1)
+        self.assertEqual(len(payload["albums"]), 1)
+        self.assertEqual(payload["artists"][0]["score"], 0.9)
+        self.assertEqual(
+            payload["artists"][0]["recommendationSource"],
+            "Plex history · Last.fm + Last.fm",
+        )
+        self.assertEqual(payload["providerStatus"], {
+            "listenbrainz": "disabled",
+            "lastfm": "ok",
+            "plexHistory": "ok",
+        })
+
     @patch("backend.recommendations.listenbrainz.recording_metadata")
     @patch("backend.recommendations.listenbrainz.recording_recommendations")
     def test_listenbrainz_deduplicates_using_highest_recording_score(
@@ -3643,6 +7055,7 @@ class RecommendationAssemblyTests(unittest.TestCase):
         lastfm_get,
         lastfm_top_tags,
     ):
+        save_service("lastfm", {"apiKey": "admin-shared-key"})
         listenbrainz_recommendations.return_value = (
             [{"id": "lb-artist", "name": "LB Artist"}],
             [{"id": "lb-album", "name": "LB Album"}],
@@ -3705,6 +7118,7 @@ class RecommendationAssemblyTests(unittest.TestCase):
         self.assertEqual(payload["providerStatus"], {
             "listenbrainz": "ok",
             "lastfm": "ok",
+            "plexHistory": "disabled",
         })
 
     @patch("backend.recommendations.lastfm_top_tags")
@@ -3718,6 +7132,7 @@ class RecommendationAssemblyTests(unittest.TestCase):
         lastfm_get,
         lastfm_top_tags,
     ):
+        save_service("lastfm", {"apiKey": "admin-shared-key"})
         listenbrainz_recommendations.side_effect = requests.Timeout("timed out")
         lastfm_recommendations.return_value = (
             [{"id": "lf-artist", "name": "LF Artist"}],
@@ -3738,8 +7153,14 @@ class RecommendationAssemblyTests(unittest.TestCase):
         self.assertEqual(payload["providerStatus"], {
             "listenbrainz": "unavailable",
             "lastfm": "ok",
+            "plexHistory": "disabled",
         })
-        self.assertIn("ListenBrainz recommendations unavailable", logs.output[0])
+        rendered = "\n".join(logs.output)
+        self.assertIn("ListenBrainz recommendations unavailable", rendered)
+        self.assertIn("user id unknown", rendered)
+        self.assertIn("Timeout", rendered)
+        self.assertNotIn("offline-listener", rendered)
+        self.assertNotIn("lastfm-user", rendered)
 
     @patch("backend.recommendations.save_recommendation_cache")
     @patch("backend.recommendations.build_recommendation_cache")
@@ -3747,16 +7168,39 @@ class RecommendationAssemblyTests(unittest.TestCase):
     def test_refresh_continues_when_one_user_fails(
         self, recommendation_users, build_cache, save_cache
     ):
+        api_key = "sentinel-lastfm-api-key"
+        linked_username = "sentinel-lastfm-username"
+        melodarr_username = "sentinel-melodarr-username"
+        private_url = (
+            "https://ws.audioscrobbler.example/2.0/?"
+            f"api_key={api_key}&user={linked_username}"
+        )
+        error = requests.HTTPError(f"HTTP 503 for url: {private_url}")
+        error.response = Response(503)
         recommendation_users.return_value = [
-            {"id": 1, "username": "offline"},
+            {
+                "id": 1,
+                "username": melodarr_username,
+                "lastfm_username": linked_username,
+            },
             {"id": 2, "username": "working"},
         ]
-        build_cache.side_effect = [requests.Timeout("timeout"), {"artists": []}]
+        build_cache.side_effect = [error, {"artists": []}]
         with self.assertLogs("backend.recommendations", level="WARNING") as logs:
             retry_required = recommendation_engine.refresh_recommendation_cache()
         save_cache.assert_called_once_with(2, {"artists": []})
         self.assertTrue(retry_required)
-        self.assertIn("offline", logs.output[0])
+        rendered = "\n".join(logs.output)
+        self.assertIn("user id 1", rendered)
+        self.assertIn("HTTPError HTTP 503", rendered)
+        for private_value in (
+            api_key,
+            linked_username,
+            melodarr_username,
+            private_url,
+            "HTTP 503 for url",
+        ):
+            self.assertNotIn(private_value, rendered)
 
     @patch("backend.recommendations.save_recommendation_cache")
     @patch("backend.recommendations.build_recommendation_cache")
@@ -4044,6 +7488,101 @@ class ArtworkCacheTests(DatabaseTestCase):
             ARTWORK_CACHE_DIRECTORY,
             f"release-group-{mbid}.miss",
         )))
+
+    def test_negative_cache_removes_expired_markers_and_caps_fresh_entries(self):
+        with tempfile.TemporaryDirectory(prefix="melodarr-artwork-misses-") as directory:
+            timestamps = {
+                "expired.miss": 899,
+                "oldest.miss": 920,
+                "middle.miss": 940,
+                "newest.miss": 960,
+            }
+            for name, modified_at in timestamps.items():
+                path = os.path.join(directory, name)
+                with open(path, "w", encoding="utf-8"):
+                    pass
+                os.utime(path, (modified_at, modified_at))
+            image_path = os.path.join(directory, "cover.jpg")
+            with open(image_path, "wb") as file:
+                file.write(b"image")
+
+            with (
+                patch.object(artwork_cache, "ARTWORK_CACHE_DIRECTORY", directory),
+                patch.object(artwork_cache, "ARTWORK_MISS_TTL", 100),
+                patch.object(artwork_cache, "ARTWORK_MISS_CACHE_MAX_ENTRIES", 2),
+            ):
+                removed = artwork_cache.trim_artwork_miss_cache(now=1000)
+
+            self.assertEqual(removed, 2)
+            self.assertEqual(
+                sorted(name for name in os.listdir(directory) if name.endswith(".miss")),
+                ["middle.miss", "newest.miss"],
+            )
+            self.assertTrue(os.path.isfile(image_path))
+
+    @patch("backend.artwork_cache.requests.get")
+    def test_expired_negative_cache_is_renewed_by_one_upstream_404(self, get):
+        get.return_value = Response(404)
+        cache_key = "release-group-renewed-miss"
+        with tempfile.TemporaryDirectory(prefix="melodarr-artwork-renew-") as directory:
+            miss_file = os.path.join(directory, f"{cache_key}.miss")
+            with open(miss_file, "w", encoding="utf-8"):
+                pass
+            os.utime(miss_file, (800, 800))
+
+            with (
+                patch.object(artwork_cache, "ARTWORK_CACHE_DIRECTORY", directory),
+                patch.object(artwork_cache, "ARTWORK_MISS_TTL", 100),
+                patch.object(artwork_cache.time, "time", return_value=1000),
+                self.app.test_request_context(),
+            ):
+                first = artwork_cache.cached_artwork(
+                    cache_key, "https://images.example/renewed.jpg"
+                )
+                second = artwork_cache.cached_artwork(
+                    cache_key, "https://images.example/renewed.jpg"
+                )
+
+            self.assertEqual(first, ("", 404))
+            self.assertEqual(second, ("", 404))
+            get.assert_called_once_with(
+                "https://images.example/renewed.jpg",
+                headers=None,
+                stream=True,
+                timeout=20,
+            )
+            self.assertEqual(os.path.getmtime(miss_file), 1000)
+
+    @patch("backend.artwork_cache.requests.get")
+    def test_successful_refresh_removes_expired_negative_cache_marker(self, get):
+        get.return_value = Response(
+            headers={"Content-Type": "image/jpeg"},
+            chunks=(b"new-artwork",),
+        )
+        cache_key = "release-group-recovered-artwork"
+        with tempfile.TemporaryDirectory(prefix="melodarr-artwork-success-") as directory:
+            miss_file = os.path.join(directory, f"{cache_key}.miss")
+            with open(miss_file, "w", encoding="utf-8"):
+                pass
+            os.utime(miss_file, (800, 800))
+
+            with (
+                patch.object(artwork_cache, "ARTWORK_CACHE_DIRECTORY", directory),
+                patch.object(artwork_cache, "ARTWORK_MISS_TTL", 100),
+                patch.object(artwork_cache.time, "time", return_value=1000),
+                self.app.test_request_context(),
+            ):
+                response = artwork_cache.cached_artwork(
+                    cache_key, "https://images.example/recovered.jpg"
+                )
+                response.direct_passthrough = False
+                self.assertEqual(response.get_data(), b"new-artwork")
+                response.close()
+
+            self.assertFalse(os.path.exists(miss_file))
+            self.assertTrue(
+                os.path.isfile(os.path.join(directory, f"{cache_key}.jpg"))
+            )
 
     @patch("backend.artwork_cache.ARTWORK_MAX_DOWNLOAD_BYTES", 5)
     @patch("backend.artwork_cache.requests.get")
@@ -4415,6 +7954,7 @@ class LibraryIndexMemoizationTests(DatabaseTestCase):
             }],
             "releaseGroups": [{
                 "name": "An album",
+                "ratingKey": "20",
                 "musicbrainzReleaseGroupId": "22222222-2222-2222-2222-222222222222",
             }],
         }
@@ -4435,6 +7975,545 @@ class LibraryIndexMemoizationTests(DatabaseTestCase):
             {"22222222-2222-2222-2222-222222222222"},
         )
         self.assertEqual(set(first["artistsByRatingKey"]), {"10"})
+        self.assertEqual(set(first["releaseGroupsByRatingKey"]), {"20"})
+
+
+class PlexHistoryClientTests(unittest.TestCase):
+    @patch("backend.services.plex_history.requests.get")
+    def test_accounts_normalize_server_local_ids_and_aliases(self, get):
+        get.return_value = Response(payload={"MediaContainer": {
+            "Account": [
+                {"id": 1, "name": "JRamperSaud123", "title": "Jeremy"},
+                {"id": 2, "name": "Managed Listener"},
+            ],
+        }})
+
+        result = plex_history.accounts({
+            "url": "http://plex:32400",
+            "token": "server-token",
+        })
+
+        self.assertEqual(result, [
+            {
+                "account_id": "1",
+                "aliases": ("JRamperSaud123", "Jeremy"),
+            },
+            {
+                "account_id": "2",
+                "aliases": ("Managed Listener",),
+            },
+        ])
+        self.assertEqual(
+            get.call_args.kwargs["headers"]["X-Plex-Token"],
+            "server-token",
+        )
+
+    @patch(
+        "backend.services.plex_history.plex.cached_library_index",
+        return_value={},
+    )
+    @patch("backend.services.plex_history.requests.get")
+    def test_history_is_paginated_and_normalized_without_track_metadata(
+        self, get, _cached_library_index
+    ):
+        get.side_effect = [
+            Response(payload={"MediaContainer": {
+                "totalSize": 2,
+                "offset": 0,
+                "size": 1,
+                "Metadata": [{
+                    "type": "track",
+                    "historyKey": "/status/sessions/history/100",
+                    "grandparentRatingKey": "artist-10",
+                    "parentRatingKey": "album-20",
+                    "librarySectionID": "music",
+                    "viewedAt": 1_000,
+                    "User": {"id": 1, "title": "Listener"},
+                    "title": "Intentionally not persisted",
+                }],
+            }}),
+            Response(payload={"MediaContainer": {
+                "totalSize": 2,
+                "offset": 1,
+                "size": 1,
+                "Metadata": [{
+                    "type": "track",
+                    "historyKey": "/status/sessions/history/101",
+                    "grandparentRatingKey": "artist-11",
+                    "librarySectionID": "music",
+                    "viewedAt": 2_000,
+                    "accountID": 2,
+                }],
+            }}),
+        ]
+
+        events = list(plex_history.iter_history(
+            {"url": "http://plex:32400", "token": "token"},
+            since=500,
+            until=2_500,
+            section_ids=["music"],
+            page_size=1,
+        ))
+
+        self.assertEqual(events, [
+            {
+                "history_key": "/status/sessions/history/100",
+                "account_id": "1",
+                "artist_rating_key": "artist-10",
+                "album_rating_key": "album-20",
+                "played_at": 1_000.0,
+            },
+            {
+                "history_key": "/status/sessions/history/101",
+                "account_id": "2",
+                "artist_rating_key": "artist-11",
+                "album_rating_key": None,
+                "played_at": 2_000.0,
+            },
+        ])
+        self.assertEqual(
+            get.call_args_list[1].kwargs["params"]["X-Plex-Container-Start"],
+            1,
+        )
+        history_params = get.call_args_list[0].kwargs["params"]
+        self.assertEqual(history_params["sort"], "viewedAt:desc")
+        self.assertNotIn("librarySectionID", history_params)
+        self.assertNotIn("viewedAt>", history_params)
+        self.assertNotIn("type", history_params)
+        self.assertNotIn("viewedAt>=", history_params)
+        self.assertNotIn("viewedAt<=", history_params)
+
+    @patch(
+        "backend.services.plex_history.plex.cached_library_index",
+        return_value={},
+    )
+    @patch("backend.services.plex_history.requests.get")
+    def test_history_enforces_exact_window_and_track_type_client_side(
+        self, get, _cached_library_index
+    ):
+        get.return_value = Response(payload={"MediaContainer": {
+            "totalSize": 4,
+            "offset": 0,
+            "size": 4,
+            "Metadata": [
+                {
+                    "type": "track",
+                    "historyKey": "too-old",
+                    "grandparentRatingKey": "artist-1",
+                    "librarySectionID": "music",
+                    "viewedAt": 499,
+                    "accountID": 1,
+                },
+                {
+                    "type": "movie",
+                    "historyKey": "movie",
+                    "grandparentRatingKey": "artist-1",
+                    "librarySectionID": "music",
+                    "viewedAt": 1_000,
+                    "accountID": 1,
+                },
+                {
+                    "type": "track",
+                    "historyKey": "in-window",
+                    "grandparentRatingKey": "artist-1",
+                    "librarySectionID": "music",
+                    "viewedAt": 1_500,
+                    "accountID": 1,
+                },
+                {
+                    "type": "track",
+                    "historyKey": "other-section",
+                    "grandparentRatingKey": "artist-1",
+                    "librarySectionID": "other-music",
+                    "viewedAt": 1_600,
+                    "accountID": 1,
+                },
+            ],
+        }})
+
+        events = list(plex_history.iter_history(
+            {"url": "http://plex:32400", "token": "token"},
+            since=500,
+            until=2_000,
+            section_ids=["music"],
+        ))
+
+        self.assertEqual([event["history_key"] for event in events], [
+            "in-window",
+        ])
+
+    @patch(
+        "backend.services.plex_history.plex.cached_library_index",
+        return_value={},
+    )
+    @patch("backend.services.plex_history.requests.get")
+    def test_mixed_age_page_does_not_end_global_pagination_early(
+        self, get, _cached_library_index
+    ):
+        get.side_effect = [
+            Response(payload={"MediaContainer": {
+                "totalSize": 3,
+                "offset": 0,
+                "size": 2,
+                "Metadata": [
+                    {
+                        "type": "track",
+                        "historyKey": "current-1",
+                        "grandparentRatingKey": "artist-1",
+                        "librarySectionID": "music",
+                        "viewedAt": 1_500,
+                        "accountID": 1,
+                    },
+                    {
+                        "type": "track",
+                        "historyKey": "old-outlier",
+                        "grandparentRatingKey": "artist-1",
+                        "librarySectionID": "music",
+                        "viewedAt": 400,
+                        "accountID": 1,
+                    },
+                ],
+            }}),
+            Response(payload={"MediaContainer": {
+                "totalSize": 3,
+                "offset": 2,
+                "size": 1,
+                "Metadata": [{
+                    "type": "track",
+                    "historyKey": "current-2",
+                    "grandparentRatingKey": "artist-1",
+                    "librarySectionID": "music",
+                    "viewedAt": 1_000,
+                    "accountID": 1,
+                }],
+            }}),
+        ]
+
+        events = list(plex_history.iter_history(
+            {"url": "http://plex:32400", "token": "token"},
+            since=500,
+            until=2_000,
+            section_ids=["music"],
+            page_size=2,
+        ))
+
+        self.assertEqual(
+            [event["history_key"] for event in events],
+            ["current-1", "current-2"],
+        )
+        self.assertEqual(get.call_count, 2)
+
+    def test_history_event_ignores_untyped_generic_children_as_accounts(self):
+        event = plex_history._history_event({
+            "type": "track",
+            "historyKey": "history-1",
+            "grandparentRatingKey": "artist-1",
+            "viewedAt": 1_000,
+            "_children": [{"id": 99, "title": "A media child"}],
+        })
+
+        self.assertIsNone(event)
+
+    @patch("backend.services.plex_history.plex.cached_library_index")
+    @patch("backend.services.plex_history.requests.get")
+    def test_history_accepts_key_paths_legacy_children_and_missing_section(
+        self, get, cached_library_index
+    ):
+        cached_library_index.return_value = {
+            "artistsByRatingKey": {"artist-42": {"ratingKey": "artist-42"}},
+            "releaseGroupsByRatingKey": {
+                "album-84": {"ratingKey": "album-84"},
+            },
+        }
+        get.return_value = Response(payload={
+            "size": 1,
+            "_children": [{
+                "type": "track",
+                "historyKey": "/status/sessions/history/200",
+                "grandparentKey": "/library/metadata/artist-42",
+                "parentKey": "/library/metadata/album-84",
+                "viewedAt": 1_500,
+                "_children": [{
+                    "_elementType": "User",
+                    "id": 7,
+                    "title": "Listener",
+                }],
+            }],
+        })
+        diagnostics = {}
+
+        events = list(plex_history.iter_history(
+            {"url": "http://plex:32400", "token": "token"},
+            since=500,
+            until=2_000,
+            section_ids=["music"],
+            diagnostics=diagnostics,
+        ))
+
+        self.assertEqual(events, [{
+            "history_key": "/status/sessions/history/200",
+            "account_id": "7",
+            "artist_rating_key": "artist-42",
+            "album_rating_key": "album-84",
+            "played_at": 1_500.0,
+        }])
+        self.assertEqual(diagnostics, {
+            "pages": 1,
+            "scanned": 1,
+            "tracks": 1,
+            "normalized": 1,
+            "selected": 1,
+            "sections": 1,
+            "cachedArtists": 1,
+            "cachedAlbums": 1,
+        })
+
+
+class PlexHistoryWorkerTests(DatabaseTestCase):
+    @patch("backend.workers.plex_history.plex_history.iter_history")
+    @patch("backend.workers.plex_history.plex_history.accounts")
+    def test_sync_maps_exact_plex_id_when_server_alias_differs(
+        self, accounts, iter_history
+    ):
+        self.register()
+        with db() as connection:
+            connection.execute(
+                "UPDATE users SET plex_username = ?, plex_id = ? "
+                "WHERE username = 'test-user'",
+                ("bitemyear", "50651486"),
+            )
+            user_id = connection.execute(
+                "SELECT id FROM users WHERE username = 'test-user'"
+            ).fetchone()["id"]
+        accounts.return_value = [{
+            "account_id": "50651486",
+            "aliases": ("Family Account",),
+        }]
+        iter_history.return_value = iter([{
+            "history_key": "family-history-1",
+            "account_id": "50651486",
+            "artist_rating_key": "artist-1",
+            "album_rating_key": "album-1",
+            "played_at": 2_000.0,
+        }])
+
+        result = plex_history_worker.synchronize(
+            {
+                "url": "http://plex:32400",
+                "token": "token",
+                "machineIdentifier": "server-1",
+                "librarySectionIds": ["music"],
+            },
+            full=True,
+            now=3_000.0,
+        )
+
+        self.assertEqual(result["fetched"], 1)
+        self.assertEqual(result["mapped"], 1)
+        self.assertEqual(result["inserted"], 1)
+        rows = get_plex_listens(user_id, 0, server_id="server-1")
+        self.assertEqual(
+            [row["history_key"] for row in rows],
+            ["family-history-1"],
+        )
+
+    @patch("backend.workers.plex_history.plex_history.iter_history")
+    @patch("backend.workers.plex_history.plex_history.accounts")
+    def test_sync_maps_accounts_case_insensitively_and_stores_only_play_keys(
+        self, accounts, iter_history
+    ):
+        self.register()
+        with db() as connection:
+            connection.execute(
+                "UPDATE users SET plex_username = ?, plex_id = ? "
+                "WHERE username = 'test-user'",
+                ("JRamperSaud123", "global-plex-id"),
+            )
+            user_id = connection.execute(
+                "SELECT id FROM users WHERE username = 'test-user'"
+            ).fetchone()["id"]
+        accounts.return_value = [{
+            "account_id": "7",
+            "aliases": ("jrampersaud123",),
+        }]
+        iter_history.return_value = iter([
+            {
+                "history_key": "history-1",
+                "account_id": "7",
+                "artist_rating_key": "artist-1",
+                "album_rating_key": "album-1",
+                "played_at": 2_000.0,
+            },
+            {
+                "history_key": "history-unmapped",
+                "account_id": "8",
+                "artist_rating_key": "artist-2",
+                "album_rating_key": "album-2",
+                "played_at": 2_100.0,
+            },
+        ])
+
+        result = plex_history_worker.synchronize(
+            {
+                "url": "http://plex:32400",
+                "token": "token",
+                "machineIdentifier": "server-1",
+                "librarySectionIds": ["music"],
+            },
+            full=True,
+            now=3_000.0,
+        )
+
+        self.assertEqual(result["fetched"], 2)
+        self.assertEqual(result["mapped"], 1)
+        self.assertEqual(result["inserted"], 1)
+        rows = get_plex_listens(user_id, 0, server_id="server-1")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(set(rows[0].keys()), {
+            "server_id",
+            "history_key",
+            "user_id",
+            "artist_rating_key",
+            "album_rating_key",
+            "played_at",
+        })
+
+    @patch("backend.workers.plex_history.plex_history.iter_history")
+    @patch("backend.workers.plex_history.plex_history.accounts")
+    def test_failed_pagination_does_not_advance_durable_history_cursor(
+        self, accounts, iter_history
+    ):
+        self.register()
+        with db() as connection:
+            connection.execute(
+                "UPDATE users SET plex_username = ?, plex_id = ? "
+                "WHERE username = 'test-user'",
+                ("listener", "7"),
+            )
+        accounts.return_value = [{
+            "account_id": "7",
+            "aliases": ("listener",),
+        }]
+
+        def failing_history():
+            for history_id in range(500):
+                yield {
+                    "history_key": f"history-{history_id}",
+                    "account_id": "7",
+                    "artist_rating_key": "artist-1",
+                    "album_rating_key": "album-1",
+                    "played_at": 2_000.0 + history_id,
+                }
+            raise requests.ConnectionError("later page failed")
+
+        iter_history.return_value = failing_history()
+
+        with self.assertRaises(requests.ConnectionError):
+            plex_history_worker.synchronize(
+                {
+                    "url": "http://plex:32400",
+                    "token": "token",
+                    "machineIdentifier": "server-1",
+                    "librarySectionIds": ["music"],
+                },
+                full=True,
+                now=3_000.0,
+            )
+
+        self.assertEqual(
+            plex_listen_stats(server_id="server-1")["count"],
+            0,
+        )
+
+    @patch("backend.workers.plex_history._linked_user_indexes")
+    @patch("backend.workers.plex_history.plex_history.accounts")
+    def test_account_map_rejects_conflicting_id_and_alias_matches(
+        self, accounts, linked_user_indexes
+    ):
+        accounts.return_value = [{
+            "account_id": "50651486",
+            "aliases": ("Family Account",),
+        }]
+        linked_user_indexes.return_value = (
+            {"50651486": {8}},
+            {"family account": {9}},
+        )
+
+        with self.assertLogs(
+            "backend.workers.plex_history", level="WARNING"
+        ) as logs:
+            result = plex_history_worker._account_user_map({
+                "url": "http://plex:32400",
+                "token": "token",
+            })
+
+        self.assertEqual(result, {})
+        self.assertIn(
+            "account ID and aliases match different linked users",
+            "\n".join(logs.output),
+        )
+
+
+class PlexAuthenticationClientTests(unittest.TestCase):
+    @patch("backend.services.plex_auth.requests.post")
+    def test_pin_creation_builds_the_plex_authorization_url(self, post):
+        post.return_value = Response(payload={
+            "id": 42,
+            "code": "ABCD",
+            "expiresAt": "2026-07-28T18:00:00Z",
+        })
+
+        result = plex_auth.create_pin("client-id")
+
+        self.assertEqual(result["id"], 42)
+        self.assertIn("https://app.plex.tv/auth/#!?", result["authorizationUrl"])
+        self.assertIn("clientID=client-id", result["authorizationUrl"])
+        self.assertIn("code=ABCD", result["authorizationUrl"])
+        post.assert_called_once()
+
+    @patch("backend.services.plex_auth.requests.get")
+    def test_poll_pin_treats_a_null_token_as_pending(self, get):
+        get.return_value = Response(payload={"id": 42, "authToken": None})
+
+        token = plex_auth.poll_pin(42, "client-id")
+
+        self.assertEqual(token, "")
+
+    @patch("backend.services.plex_auth.requests.get")
+    def test_resource_discovery_normalizes_owned_server_connections(self, get):
+        get.return_value = Response(
+            content=(
+                b'<MediaContainer>'
+                b'<Device name="Music Plex" product="Plex Media Server" '
+                b'clientIdentifier="server-1" provides="server" owned="1" '
+                b'accessToken="server-token">'
+                b'<Connection uri="https://server-1.plex.direct:32400" '
+                b'protocol="https" address="server-1.plex.direct" port="32400" '
+                b'local="1"/>'
+                b'<Connection uri="http://192.168.1.10:32400" protocol="http" '
+                b'address="192.168.1.10" port="32400" local="1"/>'
+                b'</Device>'
+                b'</MediaContainer>'
+            ),
+            headers={"Content-Type": "application/xml"},
+        )
+
+        servers = plex_auth.get_resources("account-token", "client-id")
+
+        self.assertEqual(servers[0]["clientIdentifier"], "server-1")
+        self.assertTrue(servers[0]["owned"])
+        self.assertTrue(servers[0]["connections"][0]["secure"])
+        self.assertFalse(servers[0]["connections"][1]["secure"])
+        self.assertEqual(
+            servers[0]["connections"][1]["uri"],
+            "http://192.168.1.10:32400",
+        )
+        self.assertEqual(servers[0]["accessToken"], "server-token")
+        self.assertEqual(
+            get.call_args.args[0],
+            "https://plex.tv/api/resources",
+        )
+        self.assertEqual(get.call_args.kwargs["params"], {"includeHttps": "1"})
 
 
 class PlexClientTests(unittest.TestCase):
@@ -4469,6 +8548,12 @@ class PlexClientTests(unittest.TestCase):
                             "key": "/library/metadata/1/children",
                             "thumb": "/a",
                             "guid": "plex://artist/artist-1",
+                            "Genre": [
+                                {"tag": "Alternative"},
+                                {"tag": " alternative "},
+                            ],
+                            "Style": {"tag": "Indie Rock"},
+                            "Mood": [{"tag": "Energetic"}],
                         },
                     ]
                 }
@@ -4484,6 +8569,9 @@ class PlexClientTests(unittest.TestCase):
                         "Guid": [{
                             "id": "mbid://11111111-1111-1111-1111-111111111111"
                         }],
+                        "Genre": [{"tag": "Rock"}],
+                        "Style": [{"tag": "Garage Rock"}],
+                        "Mood": [{"tag": "Rowdy"}],
                     }]
                 }
             }),
@@ -4497,6 +8585,9 @@ class PlexClientTests(unittest.TestCase):
         releases = plex.library_release_groups(config)
         self.assertEqual([artist["name"] for artist in artists], ["alpha", "Zulu"])
         self.assertEqual(artists[0]["sortName"], "The Alpha")
+        self.assertEqual(artists[0]["genres"], ["Alternative"])
+        self.assertEqual(artists[0]["styles"], ["Indie Rock"])
+        self.assertEqual(artists[0]["moods"], ["Energetic"])
         self.assertIn("key=%2Flibrary%2Fmetadata%2F1", artists[0]["url"])
         self.assertNotIn("%2Fchildren", artists[0]["url"])
         self.assertEqual(
@@ -4506,6 +8597,9 @@ class PlexClientTests(unittest.TestCase):
         )
         self.assertEqual([release["name"] for release in releases], ["An EP"])
         self.assertEqual(releases[0]["releaseType"], "ep")
+        self.assertEqual(releases[0]["genres"], ["Rock"])
+        self.assertEqual(releases[0]["styles"], ["Garage Rock"])
+        self.assertEqual(releases[0]["moods"], ["Rowdy"])
         self.assertEqual(
             releases[0]["plexampUrl"],
             "https://listen.plex.tv/album/album-3?"
@@ -4536,6 +8630,94 @@ class PlexClientTests(unittest.TestCase):
                 "WHERE cache_key LIKE 'plex-guid:%'"
             ).fetchone()["count"]
         self.assertEqual(guid_rows, 2)
+
+    @patch("backend.services.plex.requests.get")
+    def test_recent_album_hydrates_parent_artist_missing_from_recent_feed(self, get):
+        get.side_effect = [
+            Response(payload={"MediaContainer": {"Metadata": []}}),
+            Response(payload={"MediaContainer": {"Metadata": [{
+                "title": "A New Album",
+                "parentTitle": "A New Artist",
+                "parentRatingKey": "10",
+                "parentKey": "/library/metadata/10/children",
+                "parentGuid": "plex://artist/new-artist",
+                "ratingKey": "20",
+                "guid": "plex://album/new-album",
+                "Guid": [{
+                    "id": "mbid://11111111-1111-1111-1111-111111111111",
+                }],
+            }]}}),
+            Response(payload={"MediaContainer": {"Metadata": [{
+                "title": "A New Artist",
+                "ratingKey": "10",
+                "key": "/library/metadata/10/children",
+                "guid": "plex://artist/new-artist",
+            }]}}),
+        ]
+
+        result = plex._scan_sections(
+            {
+                "url": "http://plex:32400",
+                "token": "token",
+                "machineIdentifier": "server-1",
+            },
+            [{"id": "music", "title": "Music"}],
+            recently_added=True,
+        )
+
+        self.assertEqual([artist["name"] for artist in result["artists"]], [
+            "A New Artist",
+        ])
+        self.assertEqual(result["artists"][0]["ratingKey"], "10")
+        self.assertEqual(
+            result["releaseGroups"][0]["artistRatingKey"],
+            "10",
+        )
+        self.assertIn("/library/metadata/10", get.call_args_list[2].args[0])
+        self.assertNotIn("/children", get.call_args_list[2].args[0])
+
+    @patch("backend.services.plex.set_cache_document")
+    @patch("backend.services.plex.upsert_cache_documents")
+    @patch("backend.services.plex.get_cache_document")
+    def test_release_mapping_also_matches_its_unmatched_parent_artist(
+        self, get_document, upsert_documents, set_document
+    ):
+        payload = {
+            "artists": [{
+                "name": "A New Artist",
+                "ratingKey": "10",
+                "plexGuid": "plex://artist/new-artist",
+                "guids": ["plex://artist/new-artist"],
+                "musicbrainzId": "",
+            }],
+            "releaseGroups": [{
+                "name": "A New Album",
+                "artistName": "A New Artist",
+                "artistRatingKey": "10",
+                "ratingKey": "20",
+                "musicbrainzReleaseId": "release-1",
+            }],
+        }
+        get_document.return_value = payload
+
+        changed = plex.apply_release_group_mappings(
+            {"url": "http://plex", "machineIdentifier": "server-1"},
+            {"release-1": "release-group-1"},
+            artist_mappings={"release-1": "artist-1"},
+        )
+
+        self.assertEqual(changed, 1)
+        self.assertEqual(payload["artists"][0]["musicbrainzId"], "artist-1")
+        self.assertEqual(
+            payload["releaseGroups"][0]["musicbrainzReleaseGroupId"],
+            "release-group-1",
+        )
+        saved_guid_inventory = upsert_documents.call_args.args[1]
+        self.assertEqual(
+            saved_guid_inventory["server-1:artist:10"]["musicbrainzId"],
+            "artist-1",
+        )
+        set_document.assert_called_once()
 
     def test_cached_plex_urls_are_repaired_without_rescanning(self):
         payload = plex._normalize_snapshot_urls(

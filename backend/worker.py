@@ -1,5 +1,4 @@
-"""Dedicated recommendation-worker process entry point."""
-
+"""Dedicated background-worker process entry point."""
 from threading import Thread
 
 if __package__:
@@ -7,7 +6,9 @@ if __package__:
     from .workers import artist_metadata as artist_metadata_worker
     from .workers import lidarr_searches as lidarr_search_worker
     from .workers import lidarr_library as lidarr_library_worker
+    from .workers import listening_profiles as listening_profile_worker
     from .workers import plex as plex_worker
+    from .workers import plex_history as plex_history_worker
     from .workers import plex_metadata as plex_metadata_worker
     from .workers import recommendations as recommendation_worker
 else:  # Support `python backend/worker.py` for local development.
@@ -15,13 +16,22 @@ else:  # Support `python backend/worker.py` for local development.
     from workers import artist_metadata as artist_metadata_worker
     from workers import lidarr_searches as lidarr_search_worker
     from workers import lidarr_library as lidarr_library_worker
+    from workers import listening_profiles as listening_profile_worker
     from workers import plex as plex_worker
+    from workers import plex_history as plex_history_worker
     from workers import plex_metadata as plex_metadata_worker
     from workers import recommendations as recommendation_worker
 
 
+LIDARR_LIBRARY_STARTUP_DELAY = 10
+PLEX_LIBRARY_STARTUP_DELAY = 30
+PLEX_HISTORY_STARTUP_DELAY = 60
+RECOMMENDATION_STARTUP_DEADLINE = 120
+LISTENING_PROFILE_STARTUP_DELAY = 90
+
+
 def main():
-    """Initialize storage and run the background job loops."""
+    """Initialize storage and start background jobs in a controlled sequence."""
     init_db()
     artist_metadata_thread = Thread(
         target=artist_metadata_worker.run,
@@ -37,12 +47,14 @@ def main():
     lidarr_thread.start()
     lidarr_library_thread = Thread(
         target=lidarr_library_worker.run,
+        args=(LIDARR_LIBRARY_STARTUP_DELAY,),
         name="lidarr-library-scan",
         daemon=True,
     )
     lidarr_library_thread.start()
     plex_thread = Thread(
         target=plex_worker.run,
+        args=(PLEX_LIBRARY_STARTUP_DELAY,),
         name="plex-library-scans",
         daemon=True,
     )
@@ -53,7 +65,21 @@ def main():
         daemon=True,
     )
     plex_metadata_thread.start()
-    recommendation_worker.run()
+    plex_history_thread = Thread(
+        target=plex_history_worker.run,
+        args=(PLEX_HISTORY_STARTUP_DELAY,),
+        name="plex-listening-history",
+        daemon=True,
+    )
+    plex_history_thread.start()
+    listening_profile_thread = Thread(
+        target=listening_profile_worker.run,
+        args=(LISTENING_PROFILE_STARTUP_DELAY,),
+        name="listening-profile-refresh",
+        daemon=True,
+    )
+    listening_profile_thread.start()
+    recommendation_worker.run(RECOMMENDATION_STARTUP_DEADLINE)
 
 
 def start_background_thread():

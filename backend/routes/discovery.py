@@ -12,14 +12,18 @@ if __package__ == "backend.routes":
     from ..responses import api_error
     from ..security import current_user, login_required
     from ..services import lastfm, musicbrainz, plex
-    from ..storage import get_recommendation_cache, get_service
+    from ..storage import (
+        get_lastfm_api_key,
+        get_recommendation_cache,
+        get_service,
+    )
 else:  # Support the existing `python backend/app.py` entry point.
     import recommendations as recommendation_engine
     from media_urls import artist_cover_art, release_group_cover_art
     from responses import api_error
     from security import current_user, login_required
     from services import lastfm, musicbrainz, plex
-    from storage import get_recommendation_cache, get_service
+    from storage import get_lastfm_api_key, get_recommendation_cache, get_service
 
 
 blueprint = Blueprint("discovery", __name__)
@@ -233,14 +237,20 @@ def recommendations():
 @login_required
 def lastfm_recommendations():
     user = current_user()
-    if not user["lastfm_username"] or not user["lastfm_api_key"]:
+    api_key = get_lastfm_api_key()
+    if not api_key:
         return api_error(
-            "Add your Last.fm username and API key in Linked accounts to get recommendations.",
+            "Last.fm is not configured. Ask an administrator to add the API key.",
+            503,
+        )
+    if not user["lastfm_username"]:
+        return api_error(
+            "Add your Last.fm username in Linked accounts to get recommendations.",
             503,
         )
     try:
         artists, albums = recommendation_engine.lastfm_recommendations(
-            user["lastfm_username"], user["lastfm_api_key"]
+            user["lastfm_username"], api_key
         )
         return jsonify({
             "username": user["lastfm_username"],
@@ -259,16 +269,17 @@ def lastfm_recommendations():
 @blueprint.get("/api/charts/lastfm")
 @login_required
 def lastfm_charts():
-    user = current_user()
-    if not user["lastfm_api_key"]:
+    api_key = get_lastfm_api_key()
+    if not api_key:
         return api_error(
-            "Add a Last.fm API key in Linked accounts to load Last.fm charts.", 503
+            "Last.fm is not configured. Ask an administrator to add the API key.",
+            503,
         )
     try:
         artists_data = lastfm.get(
             "chart.gettopartists",
-            user["lastfm_username"] or "melodarr",
-            user["lastfm_api_key"],
+            "melodarr",
+            api_key,
             limit=20,
         )
         artists = [
@@ -291,14 +302,20 @@ def lastfm_charts():
 @login_required
 def lastfm_tags():
     user = current_user()
-    if not user["lastfm_username"] or not user["lastfm_api_key"]:
+    api_key = get_lastfm_api_key()
+    if not api_key:
         return api_error(
-            "Add a Last.fm username and API key in Linked accounts to load tag charts.",
+            "Last.fm is not configured. Ask an administrator to add the API key.",
+            503,
+        )
+    if not user["lastfm_username"]:
+        return api_error(
+            "Add your Last.fm username in Linked accounts to load tag charts.",
             503,
         )
     try:
         tags = recommendation_engine.lastfm_top_tags(
-            user["lastfm_username"], user["lastfm_api_key"], limit=10
+            user["lastfm_username"], api_key, limit=10
         )
         return jsonify({"tags": [tag["name"] for tag in tags[:10] if tag.get("name")]})
     except (ValueError, requests.RequestException):
@@ -310,9 +327,15 @@ def lastfm_tags():
 def lastfm_tag_albums():
     user = current_user()
     tag_name = request.args.get("tag", "").strip()
-    if not user["lastfm_username"] or not user["lastfm_api_key"]:
+    api_key = get_lastfm_api_key()
+    if not api_key:
         return api_error(
-            "Add a Last.fm username and API key in Linked accounts to load tag charts.",
+            "Last.fm is not configured. Ask an administrator to add the API key.",
+            503,
+        )
+    if not user["lastfm_username"]:
+        return api_error(
+            "Add your Last.fm username in Linked accounts to load tag charts.",
             503,
         )
     if not tag_name or len(tag_name) > 100:
@@ -321,14 +344,14 @@ def lastfm_tag_albums():
         albums = lastfm.get(
             "tag.gettopalbums",
             user["lastfm_username"],
-            user["lastfm_api_key"],
+            api_key,
             tag=tag_name,
             limit=10,
         ).get("albums", {}).get("album", [])
         mapped = []
         for album in albums:
             mbid = recommendation_engine.lastfm_album_mbid(
-                album, user["lastfm_username"], user["lastfm_api_key"]
+                album, user["lastfm_username"], api_key
             )
             if mbid and album.get("name"):
                 mapped.append({

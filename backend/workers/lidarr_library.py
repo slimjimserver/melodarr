@@ -49,11 +49,13 @@ def _run_scan():
         })
 
 
-def run():
-    job_state["nextExecutionAt"] = time.time()
+def run(initial_delay=0):
+    job_state["nextExecutionAt"] = time.time() + initial_delay
     while True:
         if time.time() >= (job_state["nextExecutionAt"] or 0):
             _run_scan()
         timeout = max(0.1, (job_state["nextExecutionAt"] or time.time() + 60) - time.time())
-        wake_requested.wait(timeout)
+        woken = wake_requested.wait(timeout)
         wake_requested.clear()
+        if woken:
+            job_state["nextExecutionAt"] = time.time()

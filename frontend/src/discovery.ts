@@ -17,6 +17,12 @@
     expiresAt: number;
     timer?: ReturnType<typeof setTimeout>;
   };
+  type DetailAvailabilityWatcher = {
+    kind: "artist" | "release-group";
+    id: string;
+    data: JsonObject;
+    timer?: ReturnType<typeof setTimeout>;
+  };
 
   const $ = <T extends Element = AppElement>(selector: string): T => {
     const element = document.querySelector<T>(selector);
@@ -24,6 +30,7 @@
     return element;
   };
   let currentDetail: DetailReference | null = null;
+  let currentDetailData: JsonObject | undefined;
   const detailHistory: DetailReference[] = [];
   let detailOrigin: DetailOrigin = { view: "discover", scrollY: 0 };
   let requestedArtist: JsonObject | undefined;
@@ -33,12 +40,17 @@
   let recommendationPoll: ReturnType<typeof setTimeout> | undefined;
   let recommendationRequestVersion = 0;
   let recommendationAbort: AbortController | undefined;
+  let aiRequestVersion = 0;
+  let aiAbort: AbortController | undefined;
+  let aiConfigured = false;
+  let aiProviderLabel = "AI";
   let searchRequestVersion = 0;
   let searchDebounce: ReturnType<typeof setTimeout>;
   let searchAbort: AbortController | undefined;
   const detailRequests = new Map<string, DetailRequest>();
   const detailUpgrades = new Map<string, Promise<JsonObject>>();
   let artistRevalidation: ArtistRevalidation | undefined;
+  let detailAvailabilityWatcher: DetailAvailabilityWatcher | undefined;
   const detailCacheMaxEntries = 32;
   const detailPrefetchTtl = 2 * 60 * 1000;
   const detailOpenedTtl = 15 * 60 * 1000;
@@ -147,13 +159,14 @@
 
     try {
       const response = await fetch(url, { signal: controller.signal });
+      handleAuthenticationFailure(response);
       if (response.status === 204) {
         const error = new Error("Requested detail is not cached.");
         error.name = "CacheMissError";
         throw error;
       }
       const body = await response.json() as JsonObject;
-      if (!response.ok) throw new Error(body.error || "MusicBrainz request failed.");
+      if (!response.ok) throw new Error(body.error || "MusicBrainz couldn’t complete that request just now.");
       return body;
     } finally {
       clearTimeout(timeout);
@@ -193,13 +206,20 @@
   }
 
   function showView(id: AppView) {
-    if (id !== "detail") stopArtistRevalidation();
+    if (id !== "detail") {
+      stopArtistRevalidation();
+      stopDetailAvailability();
+      currentDetailData = undefined;
+    }
     document.querySelectorAll(".view, .nav-link").forEach((element) => element.classList.remove("active"));
     $(`#${id}`).classList.add("active");
-    if (id !== "detail") {
-      document.querySelectorAll<HTMLElement>(`[data-view="${id}"]`)
-        .forEach((button) => button.classList.add("active"));
-    }
+    const currentNavigationView = id === "detail" ? detailOrigin.view : id;
+    document.querySelectorAll<HTMLElement>("[data-view]").forEach((button) => {
+      const isCurrent = button.dataset.view === currentNavigationView;
+      button.classList.toggle("active", isCurrent);
+      if (isCurrent) button.setAttribute("aria-current", "page");
+      else button.removeAttribute("aria-current");
+    });
     resetPageScroll();
   }
 
@@ -228,9 +248,18 @@
     const text = document.createElement("p");
     text.textContent = description;
     info.append(heading, text);
-    card.append(artwork, info);
-    if (onClick) card.addEventListener("click", onClick);
-    if (detailKind && detailId) addDetailPrefetch(card, detailKind, detailId);
+    if (onClick) {
+      const openButton = document.createElement("button");
+      openButton.className = "card-open";
+      openButton.type = "button";
+      openButton.setAttribute("aria-label", `Open details for ${title}`);
+      openButton.append(artwork, info);
+      openButton.addEventListener("click", onClick);
+      if (detailKind && detailId) addDetailPrefetch(openButton, detailKind, detailId);
+      card.append(openButton);
+    } else {
+      card.append(artwork, info);
+    }
     return card;
   }
 
@@ -247,6 +276,7 @@
   }
 
   function addPlexAvailability(element: HTMLElement, label = "Available in Plex") {
+    if (element.querySelector(".plex-availability")) return;
     const badge = document.createElement("span");
     badge.className = "plex-availability";
     badge.textContent = label;
@@ -497,6 +527,8 @@
 
   function showDetail(kind: DetailKind, id: string, addToHistory = true, updateHistory = true) {
     stopArtistRevalidation();
+    stopDetailAvailability();
+    currentDetailData = undefined;
     const activeView = document.querySelector<HTMLElement>(".view.active")?.id;
     if (addToHistory && currentDetail && activeView === "detail") {
       detailHistory.push(currentDetail);
@@ -520,7 +552,9 @@
       ? `← Back to ${previous.kind === "artist" ? "artist" : previous.kind === "release-group" ? "album" : "release"}`
       : detailOrigin.view === "library" ? "← Back to library" : "← Back to search";
     showView("detail");
-    $("#detail-results").replaceChildren(skeletonBlock("skeleton-card", kind === "release" ? 6 : 4));
+    const detailResults = $("#detail-results");
+    detailResults.setAttribute("aria-busy", "true");
+    detailResults.replaceChildren(skeletonBlock("skeleton-card", kind === "release" ? 6 : 4));
     $("#detail-title").textContent = "";
     $("#detail-eyebrow").textContent = "";
     $("#detail-subtitle").textContent = "";
@@ -543,14 +577,19 @@
       .catch((error) => {
         if (currentDetail?.kind !== kind || currentDetail?.id !== id) return;
         $("#detail-message").textContent = error.name === "AbortError"
-          ? "MusicBrainz took too long to respond."
-          : `Could not load this page: ${error.message}`;
+          ? "MusicBrainz is taking a little longer than usual. Please try again in a moment."
+          : `We couldn’t load this page just now. ${error.message}`;
         const retry = document.createElement("button");
         retry.className = "outline";
         retry.type = "button";
         retry.textContent = kind === "artist" ? "Retry discography" : "Retry";
         retry.addEventListener("click", () => showDetail(kind, id, false, false));
-        $("#detail-results").replaceChildren(retry);
+        detailResults.replaceChildren(retry);
+      })
+      .finally(() => {
+        if (currentDetail?.kind === kind && currentDetail?.id === id) {
+          detailResults.removeAttribute("aria-busy");
+        }
       });
   }
 
@@ -568,6 +607,9 @@
     const image = document.createElement("img");
     image.src = icon;
     image.alt = "";
+    image.width = 24;
+    image.height = 24;
+    image.decoding = "async";
     link.append(image);
     return link;
   }
@@ -595,7 +637,7 @@
     ];
 
     destinations.forEach(([icon, url, label]) => links.append(
-      createServiceIconLink(url, icon, label),
+      createServiceIconLink(url, icon, label, "external-link-musicbrainz"),
     ));
     if (spotify) {
       const mobile = isMobileDevice();
@@ -603,7 +645,7 @@
         spotify,
         "/icons/spotify.svg",
         mobile ? "Open in Spotify" : "Open on Spotify",
-        "",
+        "external-link-spotify",
         !mobile,
       ));
     }
@@ -613,7 +655,7 @@
         destination.url,
         "/icons/plex.svg",
         destination.label,
-        "",
+        "external-link-plex",
         destination.openInNewTab,
       ));
     }
@@ -625,8 +667,55 @@
         `${externalUrl}/${resource}/${encodeURIComponent(id)}`,
         "/icons/lidarr.svg",
         "Open in Lidarr",
+        "external-link-lidarr",
       ));
     });
+  }
+
+  function detailPlexLinks(kind: "artist" | "release-group", data: JsonObject) {
+    const plexRelease = kind === "release-group"
+      ? (data.plexReleases || []).find((release: JsonObject) => release.url)
+      : undefined;
+    return {
+      url: data.availableInPlex
+        ? String(kind === "artist" ? data.plexUrl || "" : plexRelease?.url || "")
+        : "",
+      plexampUrl: data.availableInPlex
+        ? String(
+          kind === "artist"
+            ? data.plexampUrl || ""
+            : plexRelease?.plexampUrl || "",
+        )
+        : "",
+    };
+  }
+
+  function updateDetailPlexLink(kind: "artist" | "release-group", data: JsonObject) {
+    const links = $("#detail-results").querySelector(".artist-meta .external-icons");
+    if (!links) return;
+    const existing = links.querySelector(".external-link-plex");
+    const destinationUrls = detailPlexLinks(kind, data);
+    if (!destinationUrls.url) {
+      existing?.remove();
+      return;
+    }
+    const destination = mobilePlexDestination(
+      destinationUrls.url,
+      destinationUrls.plexampUrl,
+    );
+    const updated = createServiceIconLink(
+      destination.url,
+      "/icons/plex.svg",
+      destination.label,
+      "external-link-plex",
+      destination.openInNewTab,
+    );
+    if (existing) {
+      existing.replaceWith(updated);
+      return;
+    }
+    const lidarrLink = links.querySelector(".external-link-lidarr");
+    links.insertBefore(updated, lidarrLink);
   }
 
   function createMeta(kind: DetailKind, data: JsonObject) {
@@ -635,18 +724,214 @@
     const id = document.createElement("strong");
     id.textContent = `MusicBrainz ID: ${data.id}`;
     meta.append(id);
-    const plexRelease = kind === "release-group"
-      ? (data.plexReleases || []).find((release: JsonObject) => release.url)
-      : undefined;
-    const plexUrl = data.availableInPlex
-      ? (kind === "artist" ? data.plexUrl : plexRelease?.url || "")
-      : "";
-    const plexampUrl = data.availableInPlex
-      ? (kind === "artist" ? data.plexampUrl : plexRelease?.plexampUrl || "")
-      : "";
-    addExternalLinks(meta, kind, data.id, data.spotify, plexUrl, plexampUrl);
+    const plexLinks = kind === "artist" || kind === "release-group"
+      ? detailPlexLinks(kind, data)
+      : { url: "", plexampUrl: "" };
+    addExternalLinks(
+      meta,
+      kind,
+      data.id,
+      data.spotify,
+      plexLinks.url,
+      plexLinks.plexampUrl,
+    );
     return meta;
   }
+
+  function stopDetailAvailability() {
+    if (detailAvailabilityWatcher?.timer) {
+      clearTimeout(detailAvailabilityWatcher.timer);
+    }
+    detailAvailabilityWatcher = undefined;
+  }
+
+  function artistReleaseGroups(data: JsonObject) {
+    return (Object.values(data.sections || {}) as JsonObject[][]).flat();
+  }
+
+  function incompleteArtistReleaseGroups(data: JsonObject) {
+    return artistReleaseGroups(data).filter(
+      (group) => group.availableInLidarr && !group.fullyAvailableInLidarr,
+    );
+  }
+
+  function applyArtistReleaseGroupAvailability(
+    data: JsonObject,
+    updates: JsonObject,
+  ) {
+    const groups = new Map(
+      artistReleaseGroups(data).map((group) => [String(group.id), group]),
+    );
+    Object.entries(updates || {}).forEach(([id, status]: [string, JsonObject]) => {
+      const group = groups.get(id);
+      if (!group) return;
+      group.availableInPlex = Boolean(
+        group.availableInPlex || status.availableInPlex,
+      );
+      group.availableInLidarr = Boolean(
+        group.availableInLidarr || status.availableInLidarr,
+      );
+      group.fullyAvailableInLidarr = Boolean(
+        group.fullyAvailableInLidarr || status.fullyAvailableInLidarr,
+      );
+      if (status.availableInLidarr) group.availabilityPending = false;
+    });
+
+    $("#detail-results").querySelectorAll<HTMLElement>("[data-release-group-id]")
+      .forEach((card) => {
+        const group = groups.get(String(card.dataset.releaseGroupId));
+        const button = card.querySelector<HTMLButtonElement>(
+          ".release-group-request",
+        );
+        if (!group || !button) return;
+        if (group.fullyAvailableInLidarr) {
+          button.textContent = "Available";
+          button.disabled = true;
+          button.title = "This release group is fully available in Lidarr";
+        } else if (group.availableInLidarr && !group.availabilityPending) {
+          button.textContent = "Search missing";
+          button.disabled = false;
+          button.title = "";
+        }
+      });
+  }
+
+  function applyDetailAvailability(
+    watcher: DetailAvailabilityWatcher,
+    availability: JsonObject,
+  ) {
+    Object.assign(watcher.data, availability);
+    updateDetailPlexLink(watcher.kind, watcher.data);
+    const action = $("#detail-results")
+      .querySelector<HTMLButtonElement>(".detail-availability-action");
+
+    if (watcher.kind === "artist") {
+      if (action && watcher.data.availableInLidarr) {
+        action.textContent = "In Lidarr";
+        action.disabled = true;
+        action.title = "This artist is already in Lidarr";
+      }
+      applyArtistReleaseGroupAvailability(
+        watcher.data,
+        availability.releaseGroups || {},
+      );
+      return;
+    }
+
+    if (action) {
+      if (watcher.data.fullyAvailableInLidarr) {
+        action.textContent = "Available";
+        action.disabled = true;
+        action.title = "This release group is fully available in Lidarr";
+      } else if (watcher.data.availableInLidarr) {
+        action.textContent = "Search missing";
+      }
+    }
+
+    const ownedReleaseIds = new Set(
+      (watcher.data.ownedReleaseIds || []).map(String),
+    );
+    (watcher.data.releases || []).forEach((release: JsonObject) => {
+      release.availableInPlex = ownedReleaseIds.has(String(release.id));
+    });
+    $("#detail-results").querySelectorAll<HTMLElement>("[data-release-id]")
+      .forEach((card) => {
+        const available = ownedReleaseIds.has(String(card.dataset.releaseId));
+        const badge = card.querySelector(".plex-availability");
+        if (available) addPlexAvailability(card, "This edition is in Plex");
+        else badge?.remove();
+      });
+  }
+
+  function scheduleDetailAvailability(
+    watcher: DetailAvailabilityWatcher,
+    delay = 15_000,
+  ) {
+    if (
+      detailAvailabilityWatcher !== watcher
+      || document.visibilityState === "hidden"
+    ) return;
+    watcher.timer = setTimeout(() => pollDetailAvailability(watcher), delay);
+  }
+
+  async function pollDetailAvailability(watcher: DetailAvailabilityWatcher) {
+    watcher.timer = undefined;
+    if (
+      detailAvailabilityWatcher !== watcher
+      || currentDetail?.kind !== watcher.kind
+      || currentDetail.id !== watcher.id
+      || !$("#detail").classList.contains("active")
+    ) return;
+    if (document.visibilityState === "hidden") return;
+
+    try {
+      const availabilityUrl = new URL(
+        `/api/music/${watcher.kind}/${encodeURIComponent(watcher.id)}/availability`,
+        window.location.origin,
+      );
+      if (watcher.kind === "artist") {
+        incompleteArtistReleaseGroups(watcher.data)
+          .slice(0, 50)
+          .forEach((group) => {
+            availabilityUrl.searchParams.append(
+              "releaseGroup",
+              String(group.id),
+            );
+          });
+      }
+      const availability = await getJson(
+        `${availabilityUrl.pathname}${availabilityUrl.search}`,
+      );
+      if (
+        detailAvailabilityWatcher !== watcher
+        || currentDetail?.kind !== watcher.kind
+        || currentDetail.id !== watcher.id
+      ) return;
+      applyDetailAvailability(watcher, availability);
+      if (
+        availability.settled
+        && (
+          watcher.kind !== "artist"
+          || !incompleteArtistReleaseGroups(watcher.data).length
+        )
+      ) {
+        stopDetailAvailability();
+      } else {
+        scheduleDetailAvailability(watcher);
+      }
+    } catch {
+      if (detailAvailabilityWatcher === watcher) {
+        scheduleDetailAvailability(watcher, 30_000);
+      }
+    }
+  }
+
+  function startDetailAvailability(
+    kind: DetailKind,
+    data: JsonObject,
+    delay = 5_000,
+  ) {
+    stopDetailAvailability();
+    if (kind !== "artist" && kind !== "release-group") return;
+    const watcher: DetailAvailabilityWatcher = {
+      kind,
+      id: String(data.id),
+      data,
+    };
+    detailAvailabilityWatcher = watcher;
+    scheduleDetailAvailability(watcher, delay);
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    const watcher = detailAvailabilityWatcher;
+    if (
+      document.visibilityState === "visible"
+      && watcher
+      && !watcher.timer
+    ) {
+      scheduleDetailAvailability(watcher, 0);
+    }
+  });
 
   function fillRequestSelect(select: HTMLSelectElement, options: JsonObject[], labelKey: string, valueKey: string) {
     select.replaceChildren();
@@ -678,6 +963,26 @@
       button.textContent = result.alreadyExists
         ? "Available"
         : (result.pending ? "Queued" : "Requested");
+      if (
+        currentDetail?.kind === "release-group"
+        && currentDetail.id === releaseGroup.id
+        && currentDetailData
+      ) {
+        startDetailAvailability("release-group", currentDetailData, 0);
+      } else if (
+        currentDetail?.kind === "artist"
+        && currentDetailData
+      ) {
+        const group = artistReleaseGroups(currentDetailData)
+          .find((item) => String(item.id) === releaseGroup.id);
+        if (group) {
+          // Keep the just-requested state stable until the Lidarr library
+          // snapshot observes it, then transition to Search missing/Available.
+          group.availableInLidarr = true;
+          group.availabilityPending = true;
+          startDetailAvailability("artist", currentDetailData, 0);
+        }
+      }
     } catch (error) {
       showToast(error.message, true);
       button.textContent = "Request release group";
@@ -727,8 +1032,6 @@
   function createRecommendationCarouselCard(item: JsonObject, kind: "artist" | "release-group") {
     const card = document.createElement("article");
     card.className = "recommendation-card";
-    card.tabIndex = 0;
-    card.setAttribute("role", "link");
     const fallback = document.createElement("div");
     fallback.className = "recommendation-art recommendation-fallback";
     let artwork: HTMLElement = fallback;
@@ -756,10 +1059,15 @@
     if (/last\.fm/i.test(sourceName)) {
       sourceIcons.push(["/icons/last-fm.svg", ""]);
     }
+    if (/plex/i.test(sourceName)) {
+      sourceIcons.unshift(["/icons/plex.svg", ""]);
+    }
     sourceIcons.forEach(([iconPath, alt]) => {
       const icon = document.createElement("img");
       icon.src = iconPath;
       icon.alt = alt;
+      icon.width = 13;
+      icon.height = 13;
       source.append(icon);
     });
     const sourceLabel = document.createElement("span");
@@ -774,10 +1082,14 @@
     subtitle.textContent = kind === "artist" ? (item.type || "Artist") : [item.artist, item.type].filter(Boolean).join(" · ");
     info.append(title, subtitle);
     const open = () => showDetail(kind === "artist" ? "artist" : "release-group", item.id);
-    addDetailPrefetch(card, kind === "artist" ? "artist" : "release-group", item.id);
-    card.addEventListener("click", open);
-    card.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); open(); } });
-    card.append(artwork, source, info);
+    const openButton = document.createElement("button");
+    openButton.className = "recommendation-open";
+    openButton.type = "button";
+    openButton.setAttribute("aria-label", `Open details for ${item.name}`);
+    openButton.append(artwork, source, info);
+    openButton.addEventListener("click", open);
+    addDetailPrefetch(openButton, kind === "artist" ? "artist" : "release-group", item.id);
+    card.append(openButton);
     const requestButton = document.createElement("button");
     requestButton.className = "recommendation-request";
     requestButton.type = "button";
@@ -796,8 +1108,58 @@
     group.className = "recommendation-row";
     const heading = document.createElement("h3"); heading.textContent = title;
     const carousel = document.createElement("div"); carousel.className = "recommendation-carousel";
-    items.forEach((item) => carousel.append(createRecommendationCarouselCard(item, kind)));
     group.append(heading, carousel);
+    const batchSize = window.matchMedia("(max-width: 700px)").matches ? 6 : 8;
+    let rendered = 0;
+    const more = document.createElement("button");
+    more.className = "outline recommendation-more";
+    more.type = "button";
+
+    const renderMore = () => {
+      const end = Math.min(rendered + batchSize, items.length);
+      const fragment = document.createDocumentFragment();
+      for (let index = rendered; index < end; index += 1) {
+        fragment.append(createRecommendationCarouselCard(items[index], kind));
+      }
+      carousel.append(fragment);
+      rendered = end;
+      if (rendered >= items.length) {
+        more.remove();
+      } else {
+        more.textContent = `Show ${Math.min(batchSize, items.length - rendered)} more`;
+        more.setAttribute("aria-label", `Show more from ${title}`);
+      }
+    };
+
+    more.addEventListener("click", renderMore);
+    renderMore();
+    if (rendered < items.length) group.append(more);
+    return group;
+  }
+
+  function deferredTasteRows(rows: JsonObject[]) {
+    const group = document.createElement("section");
+    group.className = "recommendation-later";
+    const copy = document.createElement("p");
+    copy.textContent = `${rows.length} more ${rows.length === 1 ? "shelf is" : "shelves are"} ready from your listening tastes.`;
+    const reveal = document.createElement("button");
+    reveal.className = "outline";
+    reveal.type = "button";
+    reveal.textContent = "Show more recommendations";
+    reveal.addEventListener("click", () => {
+      const fragment = document.createDocumentFragment();
+      rows.forEach((row) => fragment.append(
+        recommendationRow(`More for your ${row.tag} taste`, row.albums, "release-group"),
+      ));
+      group.className = "recommendation-expanded";
+      group.replaceChildren(fragment);
+      const firstHeading = group.querySelector<HTMLElement>("h3");
+      if (firstHeading) {
+        firstHeading.tabIndex = -1;
+        firstHeading.focus();
+      }
+    }, { once: true });
+    group.append(copy, reveal);
     return group;
   }
 
@@ -827,6 +1189,7 @@
       });
     }
     card.append(groupRequest);
+    card.dataset.releaseGroupId = String(group.id);
     return card;
   }
 
@@ -1044,6 +1407,7 @@
 
   function renderDetail(kind: DetailKind, data: JsonObject) {
     const results = $("#detail-results");
+    currentDetailData = data;
     results.replaceChildren();
     $("#detail-message").textContent = "";
 
@@ -1061,7 +1425,7 @@
       if (facts) meta.append(document.createElement("br"), `Artist information: ${facts}`);
       results.append(meta);
       const requestButton = document.createElement("button");
-      requestButton.className = "request-artist";
+      requestButton.className = "request-artist detail-availability-action";
       if (data.availableInLidarr) {
         requestButton.textContent = "In Lidarr";
         requestButton.disabled = true;
@@ -1101,6 +1465,7 @@
 
       results.append(renderDiscography(data));
       startArtistRevalidation(data);
+      startDetailAvailability("artist", data);
       return;
     }
 
@@ -1130,7 +1495,7 @@
       [data.type, data.date].filter(Boolean).forEach((value) => subtitle.append(` · ${value}`));
       results.append(createMeta("release-group", data));
       const requestButton = document.createElement("button");
-      requestButton.className = "request-artist";
+      requestButton.className = "request-artist detail-availability-action";
       if (data.fullyAvailableInLidarr) {
         requestButton.textContent = "Available";
         requestButton.disabled = true;
@@ -1148,9 +1513,11 @@
           [release.date, release.country, release.format, release.trackCount ? `${release.trackCount} tracks` : "", release.status, release.disambiguation].filter(Boolean).join(" · "),
           () => showDetail("release", release.id),
         );
+        card.dataset.releaseId = String(release.id);
         if (release.availableInPlex) addPlexAvailability(card, "This edition is in Plex");
         results.append(card);
       });
+      startDetailAvailability("release-group", data);
       return;
     }
 
@@ -1164,11 +1531,51 @@
     artist: { placeholder: "Search artists…", noun: "artist" },
     album: { placeholder: "Search albums…", noun: "album" },
     track: { placeholder: "Search tracks…", noun: "release group" },
+    ai: {
+      placeholder: "Ask for music based on your listening history…",
+      noun: "recommendation",
+    },
   } as const;
 
   function copyForSearchType(type: string) {
     return searchTypeCopy[type as keyof typeof searchTypeCopy] || searchTypeCopy.artist;
   }
+
+  const searchType = $<HTMLSelectElement>("#search-type");
+  const searchInput = $<HTMLInputElement>("#search-input");
+  const searchSubmit = $<HTMLButtonElement>("#search-submit");
+  let activeSearchType = searchType.value;
+  let searchTypePointerActive = false;
+
+  function isAISearchMode() {
+    return searchType.value === "ai";
+  }
+
+  function updateSearchSubmitState() {
+    searchSubmit.disabled = isAISearchMode()
+      ? !aiConfigured || !searchInput.value.trim() || Boolean(aiAbort)
+      : searchInput.value.trim().length < 2;
+  }
+
+  function applySearchMode(type: string) {
+    const aiMode = type === "ai";
+    $("#ai-recommendations").hidden = !aiMode;
+    searchInput.placeholder = copyForSearchType(type).placeholder;
+    searchInput.setAttribute(
+      "aria-label",
+      aiMode ? "Ask for personalized music recommendations" : `Search ${type}s`,
+    );
+    if (aiMode) {
+      searchInput.maxLength = 500;
+      searchSubmit.textContent = "Ask AI";
+    } else {
+      searchInput.removeAttribute("maxlength");
+      searchSubmit.textContent = "Search";
+    }
+    updateSearchSubmitState();
+  }
+
+  applySearchMode(activeSearchType);
 
   function searchResultMessage(type: string, count: number) {
     const noun = copyForSearchType(type).noun;
@@ -1176,31 +1583,72 @@
     return type === "track" ? `${summary} for matching tracks` : summary;
   }
 
-  $("#search-type").addEventListener("change", (event) => {
+  searchType.addEventListener("pointerdown", () => {
+    searchTypePointerActive = true;
+  });
+  searchType.addEventListener("keydown", () => {
+    searchTypePointerActive = false;
+  });
+  searchType.addEventListener("blur", () => {
+    searchTypePointerActive = false;
+  });
+
+  searchType.addEventListener("change", (event) => {
     const type = (event.target as HTMLSelectElement).value;
-    $("#search-input").placeholder = copyForSearchType(type).placeholder;
-    if ($("#search-input").value.trim().length >= 2) runSearch();
+    const crossedAIBoundary = type === "ai" || activeSearchType === "ai";
+    activeSearchType = type;
+    searchRequestVersion += 1;
+    searchAbort?.abort();
+    searchAbort = undefined;
+    clearTimeout(searchDebounce);
+    if (crossedAIBoundary) {
+      aiRequestVersion += 1;
+      aiAbort?.abort();
+      aiAbort = undefined;
+      searchInput.value = "";
+      const results = $("#results");
+      results.replaceChildren();
+      results.classList.remove("ai-result-list");
+      results.removeAttribute("aria-busy");
+      results.setAttribute("aria-label", "Search results");
+      $("#search-message").textContent = "";
+      $("#ai-message").textContent = "";
+    }
+    applySearchMode(type);
+    if (type === "ai") {
+      refreshAIStatus();
+    } else if (searchInput.value.trim().length >= 2) {
+      runSearch();
+    }
+    if (searchTypePointerActive) searchType.blur();
   });
 
   async function runSearch() {
+    if (isAISearchMode()) {
+      await askAI();
+      return;
+    }
     const requestVersion = ++searchRequestVersion;
     searchAbort?.abort();
-    const query = $("#search-input").value.trim();
-    const type = $("#search-type").value;
+    const query = searchInput.value.trim();
+    const type = searchType.value;
     const results = $("#results");
+    results.classList.remove("ai-result-list");
+    results.setAttribute("aria-label", "Search results");
 
     if (query.length < 2) {
       searchAbort = undefined;
       $("#search-form").classList.remove("searching");
       results.replaceChildren();
-      $("#search-message").textContent = query ? "Enter at least two characters." : "";
+      $("#search-message").textContent = "";
       return;
     }
 
     const controller = new AbortController();
     searchAbort = controller;
-    $("#search-message").textContent = "Searching MusicBrainz…";
+    $("#search-message").textContent = "Looking through MusicBrainz…";
     $("#search-form").classList.add("searching");
+    results.setAttribute("aria-busy", "true");
     results.replaceChildren(skeletonBlock("skeleton-card", 5));
     try {
       const data = await getJson(
@@ -1212,7 +1660,7 @@
       results.replaceChildren();
       $("#search-message").textContent = data.results.length
         ? searchResultMessage(type, data.results.length)
-        : "No results found.";
+        : "We couldn’t find a match. Try a different spelling or search type.";
       data.results.forEach((result: JsonObject) => {
         const description = type === "artist"
           ? [result.type, result.country, result.disambiguation].filter(Boolean).join(" · ")
@@ -1234,12 +1682,13 @@
       if (requestVersion !== searchRequestVersion) return;
       results.replaceChildren();
       $("#search-message").textContent = error.name === "AbortError"
-        ? "MusicBrainz took too long to respond."
-        : error.message;
+        ? "MusicBrainz is taking a little longer than usual. Please try again in a moment."
+        : `We couldn’t finish that search. ${error.message}`;
     } finally {
       if (requestVersion === searchRequestVersion) {
         searchAbort = undefined;
         $("#search-form").classList.remove("searching");
+        results.removeAttribute("aria-busy");
       }
     }
   }
@@ -1247,15 +1696,331 @@
   // MusicBrainz requests are serialized at roughly one per second upstream, so
   // this waits for a genuine pause in typing rather than firing per keystroke.
   const searchDebounceMilliseconds = 450;
-  $("#search-input").addEventListener("input", () => {
+  searchInput.addEventListener("input", () => {
     clearTimeout(searchDebounce);
+    updateSearchSubmitState();
+    if (isAISearchMode()) {
+      return;
+    }
     searchDebounce = setTimeout(runSearch, searchDebounceMilliseconds);
   });
 
   $("#search-form").addEventListener("submit", (event) => {
     event.preventDefault();
     clearTimeout(searchDebounce);
-    runSearch();
+    if (isAISearchMode()) askAI();
+    else runSearch();
+  });
+
+  function aiProviderName(status: JsonObject) {
+    const provider = (status.providers || [])
+      .find((option: JsonObject) => String(option.id) === String(status.provider));
+    const names: Record<string, string> = {
+      openai: "OpenAI",
+      anthropic: "Claude",
+      gemini: "Gemini",
+      lmstudio: "LM Studio",
+      ollama: "Ollama",
+    };
+    return String(provider?.name || names[String(status.provider)] || aiProviderLabel);
+  }
+
+  async function refreshAIStatus() {
+    const readiness = $("#ai-readiness");
+    const readinessCopy = $("#ai-readiness-copy");
+    const settingsLink = $("#ai-settings-link");
+    settingsLink.hidden = true;
+    readiness.className = "ai-readiness";
+    readinessCopy.textContent = "Checking your recommendation setup…";
+    try {
+      const status = await getJson("/api/ai/status", 15_000);
+      aiConfigured = Boolean(status.configured);
+      const provider = aiProviderName(status);
+      aiProviderLabel = provider;
+      $("#ai-provider-badge").textContent = aiConfigured
+        ? `${provider} · ${status.model || "configured"}`
+        : "Setup needed";
+      readiness.classList.toggle("ready", aiConfigured);
+      readiness.classList.toggle("error", !aiConfigured);
+      readinessCopy.textContent = aiConfigured
+        ? `${provider} is configured. Melodarr will show only MusicBrainz-verified results.`
+        : currentUser?.role === "admin"
+          ? "Choose an AI provider to start listening-history-grounded discovery."
+          : "An administrator needs to configure an AI provider before you can ask for recommendations.";
+      settingsLink.hidden = aiConfigured || currentUser?.role !== "admin";
+      updateSearchSubmitState();
+    } catch {
+      aiConfigured = false;
+      $("#ai-provider-badge").textContent = "Unavailable";
+      readiness.classList.add("error");
+      readinessCopy.textContent = "We couldn’t check the AI provider just now. Try again in a moment.";
+      updateSearchSubmitState();
+    }
+  }
+
+  function aiRecommendationKind(item: JsonObject): "artist" | "release-group" {
+    return item.kind === "artist" ? "artist" : "release-group";
+  }
+
+  function aiRecommendationId(item: JsonObject) {
+    return String(item.id || item.mbid || "");
+  }
+
+  function aiEvidence(item: JsonObject) {
+    const evidence: string[] = [];
+    if (item.unheard === true) evidence.push("Not in listen history");
+    if (item.availableInPlex === false) evidence.push("New to your library");
+    if (item.recommendationSource) evidence.push(String(item.recommendationSource));
+    const supplied = Array.isArray(item.evidence)
+      ? item.evidence
+      : Array.isArray(item.basedOn) ? item.basedOn : [];
+    supplied.forEach((entry: unknown) => {
+      const value = typeof entry === "string"
+        ? entry
+        : typeof entry === "object" && entry
+          ? String((entry as JsonObject).label || (entry as JsonObject).name || "")
+          : "";
+      if (value && !evidence.includes(value)) evidence.push(value);
+    });
+    return evidence.slice(0, 3);
+  }
+
+  function createAIRecommendationCard(item: JsonObject, index: number) {
+    const kind = aiRecommendationKind(item);
+    const id = aiRecommendationId(item);
+    const titleText = String(item.name || item.title || "Untitled recommendation");
+    const card = document.createElement("article");
+    card.className = "ai-recommendation-card";
+
+    const fallback = document.createElement("div");
+    fallback.className = "ai-result-art";
+    const art = id ? document.createElement("button") : fallback;
+    if (id) {
+      art.className = "ai-result-art";
+      (art as HTMLButtonElement).type = "button";
+      art.setAttribute("aria-label", `Open details for ${titleText}`);
+      if (item.coverArt) {
+        const image = document.createElement("img");
+        image.alt = "";
+        image.loading = "lazy";
+        image.decoding = "async";
+        loadArtworkWhenNear(image, String(item.coverArt), fallback);
+        art.append(image);
+      }
+      art.addEventListener("click", () => showDetail(kind, id));
+      addDetailPrefetch(art, kind, id);
+    }
+
+    const body = document.createElement("div");
+    body.className = "ai-result-body";
+    const top = document.createElement("div");
+    top.className = "ai-result-topline";
+    const title = document.createElement("h4");
+    title.textContent = titleText;
+    top.append(title);
+
+    const meta = document.createElement("p");
+    meta.className = "ai-result-meta";
+    meta.textContent = [
+      item.artist,
+      kind === "artist" ? item.type || "Artist" : item.type || "Album",
+      item.date,
+    ].filter(Boolean).join(" · ");
+    const reason = document.createElement("p");
+    reason.className = "ai-reason";
+    reason.textContent = String(item.reason || "Selected as a grounded match for this request.");
+    body.append(top, meta, reason);
+
+    const evidence = aiEvidence(item);
+    if (evidence.length) {
+      const evidenceRow = document.createElement("div");
+      evidenceRow.className = "ai-evidence";
+      evidence.forEach((value) => {
+        const tag = document.createElement("span");
+        tag.textContent = value;
+        evidenceRow.append(tag);
+      });
+      body.append(evidenceRow);
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "ai-result-actions";
+    if (id) {
+      const details = document.createElement("button");
+      details.type = "button";
+      details.textContent = "View details";
+      details.addEventListener("click", () => showDetail(kind, id));
+      actions.append(details);
+    }
+
+    const plexUrl = String(item.plexUrl || item.plex?.url || "");
+    if (item.availableInPlex && plexUrl) {
+      const destination = mobilePlexDestination(
+        plexUrl,
+        String(item.plexampUrl || item.plex?.plexampUrl || ""),
+      );
+      const plex = document.createElement("a");
+      plex.href = destination.url;
+      plex.textContent = destination.label;
+      if (destination.openInNewTab) {
+        plex.target = "_blank";
+        plex.rel = "noopener noreferrer";
+      }
+      actions.append(plex);
+    } else if (id) {
+      const request = document.createElement("button");
+      request.type = "button";
+      request.className = "ai-request-action";
+      if (item.availableInLidarr) {
+        request.textContent = "In Lidarr";
+        request.disabled = true;
+      } else if (item.requested) {
+        request.textContent = "Requested";
+        request.disabled = true;
+      } else {
+        request.textContent = "Add to Lidarr";
+        request.addEventListener("click", () => {
+          if (kind === "artist") {
+            openRequestDialog({ ...item, id, name: titleText }, $("#ai-message"));
+          } else {
+            requestReleaseGroup({ id, button: request });
+          }
+        });
+      }
+      actions.append(request);
+    }
+    card.style.setProperty("--ai-result-index", String(index));
+    card.append(art, body, actions);
+    return card;
+  }
+
+  function renderAIRecommendations(data: JsonObject, prompt: string) {
+    const resultsContainer = $("#results");
+    resultsContainer.replaceChildren();
+    resultsContainer.classList.add("ai-result-list");
+    resultsContainer.setAttribute("aria-label", "AI recommendation results");
+    const recommendations = Array.isArray(data.recommendations)
+      ? data.recommendations
+      : [];
+    if (!recommendations.length) {
+      $("#ai-message").textContent = "No MusicBrainz-verified music matched that request. Try widening the mood, era, or style.";
+      return;
+    }
+
+    const heading = document.createElement("div");
+    heading.className = "ai-response-heading";
+    const copy = document.createElement("div");
+    const title = document.createElement("h3");
+    title.textContent = "A grounded shortlist";
+    const summary = document.createElement("p");
+    summary.textContent = `Verified, new-to-library possibilities for “${prompt}”`;
+    copy.append(title, summary);
+
+    const grounding = document.createElement("div");
+    grounding.className = "ai-grounding";
+    const historyCount = Number(data.grounding?.historyItemCount || 0);
+    const playedArtistCount = Number(data.grounding?.playedArtistCount || 0);
+    const candidateCount = Number(data.grounding?.candidateCount || 0);
+    const queryTags = Array.isArray(data.grounding?.queryTags)
+      ? data.grounding.queryTags.map(String).filter(Boolean).slice(0, 3)
+      : [];
+    [
+      queryTags.length ? `Matched: ${queryTags.join(" · ")}` : "",
+      playedArtistCount
+        ? `${playedArtistCount.toLocaleString()} listening-history artists`
+        : "",
+      historyCount ? `${historyCount.toLocaleString()} prior requests considered` : "",
+      candidateCount ? `${candidateCount.toLocaleString()} query-matched candidates` : "",
+      [aiProviderName(data), data.model].filter(Boolean).join(" · "),
+    ].filter(Boolean).forEach((value) => {
+      const tag = document.createElement("span");
+      tag.textContent = value;
+      grounding.append(tag);
+    });
+    heading.append(copy, grounding);
+
+    const results = document.createElement("div");
+    results.className = "ai-results";
+    recommendations.forEach((item: JsonObject, index: number) => {
+      results.append(createAIRecommendationCard(item, index));
+    });
+    resultsContainer.append(heading, results);
+    $("#ai-message").textContent =
+      `${recommendations.length} ${recommendations.length === 1 ? "match" : "matches"} selected from query-matched MusicBrainz results.`;
+  }
+
+  async function askAI() {
+    const prompt = searchInput.value.trim();
+    if (!prompt) return;
+    if (aiAbort) {
+      setMessage($("#ai-message"), "Melodarr AI is already working on your recommendation.");
+      return;
+    }
+    if (!aiConfigured) {
+      setMessage($("#ai-message"), "An AI provider needs to be configured first.", true);
+      return;
+    }
+
+    const requestVersion = ++aiRequestVersion;
+    const controller = new AbortController();
+    aiAbort = controller;
+    searchSubmit.disabled = true;
+    $("#search-message").textContent = "";
+    const resultsContainer = $("#results");
+    resultsContainer.classList.add("ai-result-list");
+    resultsContainer.setAttribute("aria-label", "AI recommendation results");
+    resultsContainer.setAttribute("aria-busy", "true");
+    const loading = document.createElement("div");
+    loading.className = "ai-results";
+    loading.append(
+      skeletonBlock("skeleton-card", 1),
+      skeletonBlock("skeleton-card", 1),
+      skeletonBlock("skeleton-card", 1),
+      skeletonBlock("skeleton-card", 1),
+    );
+    resultsContainer.replaceChildren(loading);
+    setMessage($("#ai-message"), "Interpreting your request, searching music catalogs, and checking your listening history…");
+    try {
+      const data = await api("/api/ai/recommendations", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt, limit: 8 }),
+        signal: controller.signal,
+      });
+      if (requestVersion !== aiRequestVersion) return;
+      renderAIRecommendations(data, prompt);
+    } catch (error) {
+      if (requestVersion !== aiRequestVersion) return;
+      resultsContainer.replaceChildren();
+      setMessage(
+        $("#ai-message"),
+        error.name === "AbortError"
+          ? "That recommendation request was stopped."
+          : `We couldn’t finish that recommendation. ${error.message}`,
+        true,
+      );
+    } finally {
+      if (requestVersion === aiRequestVersion) {
+        aiAbort = undefined;
+        resultsContainer.removeAttribute("aria-busy");
+        updateSearchSubmitState();
+      }
+    }
+  }
+
+  document.querySelectorAll<HTMLButtonElement>("[data-ai-prompt]").forEach((button) => {
+    button.addEventListener("click", () => {
+      searchInput.value = button.dataset.aiPrompt || "";
+      updateSearchSubmitState();
+      searchInput.focus();
+    });
+  });
+  $("#ai-settings-link").addEventListener("click", () => {
+    const settings = document.querySelector<HTMLButtonElement>(".nav-link[data-view=settings]");
+    settings?.click();
+    window.requestAnimationFrame(() => {
+      document.querySelector("#ai-settings")?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
   });
 
   async function loadRecommendations(button: HTMLButtonElement) {
@@ -1267,11 +2032,12 @@
     const message = $("#recommendations-message");
     const results = $("#recommendation-results");
     button.disabled = true;
+    results.setAttribute("aria-busy", "true");
     const placeholder = document.createElement("div");
     placeholder.className = "recommendation-carousel";
     placeholder.append(skeletonBlock("skeleton-art", 8));
     results.replaceChildren(placeholder);
-    message.textContent = "Loading cached recommendations…";
+    message.textContent = "Gathering a few recommendations for you…";
     try {
       const data = await getJson("/api/discover", 30_000, controller.signal);
       if (requestVersion !== recommendationRequestVersion) return;
@@ -1289,6 +2055,7 @@
       const unavailableProviders = [];
       if (["partial", "unavailable"].includes(providerStatus.listenbrainz)) unavailableProviders.push("ListenBrainz");
       if (["partial", "unavailable"].includes(providerStatus.lastfm)) unavailableProviders.push("Last.fm");
+      if (["partial", "unavailable"].includes(providerStatus.plexHistory)) unavailableProviders.push("Plex history");
       const retryNotice = unavailableProviders.length
         ? ` ${unavailableProviders.join(" and ")} was temporarily unavailable; available results are shown and a retry is scheduled.`
         : "";
@@ -1297,18 +2064,22 @@
       if (otherReleases.length) results.append(recommendationRow("Albums", otherReleases, "release-group"));
       if (singles.length) results.append(recommendationRow("Singles", singles, "release-group"));
       if (data.chartArtists?.length) results.append(recommendationRow("Popular on Last.fm", data.chartArtists, "artist"));
-      (data.tagRows || []).forEach((row: JsonObject) => results.append(recommendationRow(`More for your ${row.tag} taste`, row.albums, "release-group")));
-      if (!artists.length && !albums.length && !data.chartArtists?.length && !(data.tagRows || []).length && !unavailableProviders.length) message.textContent = "No MusicBrainz-linked recommendations were found in the latest scan.";
+      const tagRows = (data.tagRows || []).filter((row: JsonObject) => row.albums?.length);
+      if (tagRows.length) results.append(deferredTasteRows(tagRows));
+      if (!artists.length && !albums.length && !data.chartArtists?.length && !tagRows.length && !unavailableProviders.length) {
+        message.textContent = "We don’t have a recommendation match yet. A little more listening history will help.";
+      }
     } catch (error) {
       if (requestVersion !== recommendationRequestVersion) return;
       results.replaceChildren();
       message.textContent = error.name === "AbortError"
-        ? "Recommendations took too long to load."
-        : error.message;
+        ? "Recommendations are taking a little longer than usual. Please try again in a moment."
+        : `We couldn’t load recommendations just now. ${error.message}`;
     } finally {
       if (requestVersion === recommendationRequestVersion) {
         recommendationAbort = undefined;
         button.disabled = false;
+        results.removeAttribute("aria-busy");
       }
     }
   }
@@ -1316,12 +2087,38 @@
   $("#load-recommendations").addEventListener("click", () => {
     loadRecommendations($("#load-recommendations"));
   });
-  window.addEventListener("melodarr-authenticated", () => loadRecommendations($("#load-recommendations")));
+  window.addEventListener("melodarr-authenticated", () => {
+    loadRecommendations($("#load-recommendations"));
+    refreshAIStatus();
+  });
   window.addEventListener("melodarr-recommendations-changed", () => loadRecommendations($("#load-recommendations")));
+  window.addEventListener("melodarr-ai-settings-changed", () => refreshAIStatus());
   window.addEventListener("melodarr-lidarr-settings-changed", () => {
     lidarrExternalUrlVersion += 1;
     lidarrExternalUrl = undefined;
     lidarrExternalUrlRequest = undefined;
+  });
+  window.addEventListener("melodarr-signed-out", () => {
+    recommendationRequestVersion += 1;
+    aiRequestVersion += 1;
+    searchRequestVersion += 1;
+    recommendationAbort?.abort();
+    aiAbort?.abort();
+    searchAbort?.abort();
+    clearTimeout(recommendationPoll);
+    clearTimeout(searchDebounce);
+    stopArtistRevalidation();
+    stopDetailAvailability();
+    currentDetail = null;
+    currentDetailData = undefined;
+    detailHistory.length = 0;
+    requestedArtist = undefined;
+    $("#recommendation-results").replaceChildren();
+    $("#ai-message").textContent = "";
+    $("#results").replaceChildren();
+    $("#results").classList.remove("ai-result-list");
+    $("#results").removeAttribute("aria-busy");
+    $("#results").setAttribute("aria-label", "Search results");
   });
 
   $("#back-to-search").addEventListener("click", () => {
@@ -1353,6 +2150,8 @@
 
   window.addEventListener("melodarr-home", () => {
     currentDetail = null;
+    currentDetailData = undefined;
+    stopDetailAvailability();
     detailHistory.length = 0;
     searchRequestVersion += 1;
     clearTimeout(searchDebounce);
@@ -1360,9 +2159,14 @@
     requestedArtist = undefined;
     $("#search-form").classList.remove("searching");
     $("#search-form").reset();
-    $("#search-input").placeholder = "Search artists…";
+    activeSearchType = "artist";
+    applySearchMode(activeSearchType);
     $("#search-message").textContent = "";
+    $("#ai-message").textContent = "";
     $("#results").replaceChildren();
+    $("#results").classList.remove("ai-result-list");
+    $("#results").removeAttribute("aria-busy");
+    $("#results").setAttribute("aria-label", "Search results");
     // Recommendation cards remain current through their own refresh events.
     // Keeping them mounted avoids refetching every thumbnail on navigation.
   });
@@ -1395,6 +2199,8 @@
   window.addEventListener("popstate", () => {
     if (showDetailFromLocation()) return;
     currentDetail = null;
+    currentDetailData = undefined;
+    stopDetailAvailability();
     detailHistory.length = 0;
   });
   window.addEventListener("melodarr-open-detail", (event) => {
@@ -1428,6 +2234,13 @@
       const result = await postJson("/api/request", body);
       $("#request-dialog").close();
       showToast(result.message);
+      if (
+        currentDetail?.kind === "artist"
+        && currentDetail.id === requestedArtist.id
+        && currentDetailData
+      ) {
+        startDetailAvailability("artist", currentDetailData, 0);
+      }
     } catch (error) {
       $("#request-message").textContent = error.message;
     }

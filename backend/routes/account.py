@@ -12,35 +12,80 @@ from flask import Blueprint, current_app, jsonify, request
 from werkzeug.security import generate_password_hash
 
 if __package__ == "backend.routes":
-    from ..responses import api_error
-    from ..security import admin_required, current_user, login_required
+    from ..responses import api_error, request_json_object
+    from ..security import (
+        admin_required,
+        current_user,
+        login_required,
+        resolve_account_user,
+    )
     from ..services import lastfm, listenbrainz, musicbrainz, plex
     from ..storage import (
         db,
+        count_request_history,
+        delete_listening_profile,
         delete_recommendation_cache,
+        get_lastfm_api_key,
         get_request_history,
         get_service,
     )
     from ..workers import recommendations as recommendation_worker
+    from ..workers import listening_profiles as listening_profile_worker
 else:  # Support the existing `python backend/app.py` entry point.
-    from responses import api_error
-    from security import admin_required, current_user, login_required
+    from responses import api_error, request_json_object
+    from security import (
+        admin_required,
+        current_user,
+        login_required,
+        resolve_account_user,
+    )
     from services import lastfm, listenbrainz, musicbrainz, plex
     from storage import (
         db,
+        count_request_history,
+        delete_listening_profile,
         delete_recommendation_cache,
+        get_lastfm_api_key,
         get_request_history,
         get_service,
     )
     from workers import recommendations as recommendation_worker
+    from workers import listening_profiles as listening_profile_worker
 
 
 blueprint = Blueprint("account", __name__)
+REQUESTS_PAGE_SIZE = 100
+SQLITE_MAX_INTEGER = (2 ** 63) - 1
+
+
+def _safe_error_label(error):
+    """Describe an upstream failure without logging its prepared URL."""
+    status = getattr(getattr(error, "response", None), "status_code", None)
+    name = type(error).__name__
+    return f"{name} HTTP {status}" if isinstance(status, int) else name
+
+
+def _requested_page():
+    raw_page = request.args.get("page", "1")
+    try:
+        page = int(raw_page)
+    except (TypeError, ValueError):
+        return None
+    if (
+        page < 1
+        or page - 1 > SQLITE_MAX_INTEGER // REQUESTS_PAGE_SIZE
+    ):
+        return None
+    return page
 
 
 def _recommendation_inputs_changed(user_id):
     delete_recommendation_cache(user_id)
+    # A deliberate unlink must stop the old provider slice from reaching AI
+    # immediately; stale preservation is reserved for transient outages.
+    delete_listening_profile(user_id)
     recommendation_worker.request_refresh()
+    listening_profile_worker.request_refresh()
 
 
 def _profile_plex_index():
@@ -122,6 +167,25 @@ def _profile_history_item(row, plex_index):
     return item
 
 
+def _profile_user_payload(user):
+    """Return profile identity without authentication or integration secrets."""
+    is_plex_user = bool(user["plex_id"])
+    return {
+        "id": user["id"],
+        "username": (
+            user["plex_username"] or user["username"]
+            if is_plex_user
+            else user["username"]
+        ),
+        "localUsername": user["username"],
+        "userType": "plex" if is_plex_user else "local",
+        "role": user["role"],
+        "plexUsername": user["plex_username"] or "",
+        "plexEmail": user["plex_email"] or "",
+        "plexAvatar": user["plex_avatar"] or "",
+    }
+
+
 @blueprint.post("/api/account/invitations")
 @admin_required
 def create_invitation():
@@ -149,29 +213,75 @@ def create_invitation():
 @blueprint.get("/api/account/settings")
 @login_required
 def account_settings():
-    user = current_user()
+    user, error = resolve_account_user(
+        current_user(),
+        request.args.get("username"),
+    )
+    if error:
+        return error
     return jsonify({
+        "username": user["username"],
+        "plexConfigured": bool(get_service("plex")),
+        "plexLinked": bool(user["plex_id"]),
+        "plexUsername": user["plex_username"] or "",
+        "plexEmail": user["plex_email"] or "",
         "listenbrainzUsername": user["listenbrainz_username"] or "",
         "lastfmUsername": user["lastfm_username"] or "",
-        "lastfmConfigured": bool(user["lastfm_username"] and user["lastfm_api_key"]),
+        "lastfmConfigured": bool(
+            user["lastfm_username"] and get_lastfm_api_key()
+        ),
     })
 
 
 @blueprint.get("/api/account/profile")
 @login_required
 def account_profile():
-    user = current_user()
+    signed_in_user = current_user()
+    user, error = resolve_account_user(
+        signed_in_user,
+        request.args.get("username"),
+    )
+    if error:
+        return error
+    page = _requested_page()
+    if page is None:
+        return api_error("Page must be a positive integer.")
+    total = count_request_history(user["id"])
     history = {"artist": [], "release-group": []}
     plex_index = _profile_plex_index()
-    for row in get_request_history(user["id"]):
+    for row in get_request_history(
+        user["id"],
+        limit=REQUESTS_PAGE_SIZE,
+        offset=(page - 1) * REQUESTS_PAGE_SIZE,
+    ):
         history[row["kind"]].append(_profile_history_item(row, plex_index))
-    return jsonify({"username": user["username"], "requests": history})
+    return jsonify({
+        "username": user["username"],
+        "user": _profile_user_payload(user),
+        "requests": history,
+        "pagination": {
+            "page": page,
+            "pageSize": REQUESTS_PAGE_SIZE,
+            "total": total,
+            "totalPages": (
+                (total + REQUESTS_PAGE_SIZE - 1) // REQUESTS_PAGE_SIZE
+            ),
+        },
+    })
 
 
 @blueprint.post("/api/account/general")
 @login_required
 def account_general():
-    values = request.get_json(silent=True) or {}
+    user, error = resolve_account_user(
+        current_user(),
+        request.args.get("username"),
+    )
+    if error:
+        return error
+    values = request_json_object()
+    if values is None:
+        return api_error("Request body must be a JSON object.")
     username = str(values.get("username", "")).strip()
     password = str(values.get("password", ""))
     if not re.fullmatch(r"[A-Za-z0-9_.-]{3,32}", username):
@@ -183,12 +293,12 @@ def account_general():
             if password:
                 connection.execute(
                     "UPDATE users SET username = ?, password_hash = ? WHERE id = ?",
-                    (username, generate_password_hash(password), current_user()["id"]),
+                    (username, generate_password_hash(password), user["id"]),
                 )
             else:
                 connection.execute(
                     "UPDATE users SET username = ? WHERE id = ?",
-                    (username, current_user()["id"]),
+                    (username, user["id"]),
                 )
         return jsonify({"message": "General settings saved.", "username": username})
     except sqlite3.IntegrityError:
@@ -198,10 +308,18 @@ def account_general():
 @blueprint.post("/api/account/settings")
 @login_required
 def configure_listenbrainz():
-    values = request.get_json(silent=True) or {}
+    user, error = resolve_account_user(
+        current_user(),
+        request.args.get("username"),
+    )
+    if error:
+        return error
+    user_id = user["id"]
+    values = request_json_object()
+    if values is None:
+        return api_error("Request body must be a JSON object.")
     username = str(values.get("username", "")).strip()
     if not username:
-        user_id = current_user()["id"]
         with db() as connection:
             connection.execute(
                 "UPDATE users SET listenbrainz_username = NULL WHERE id = ?",
@@ -222,12 +340,11 @@ def configure_listenbrainz():
         # their next request and during the background refresh.
         validation_deferred = True
         current_app.logger.warning(
-            "ListenBrainz username validation deferred for %s: %s",
-            username,
-            exc,
+            "ListenBrainz username validation deferred for user id %s (%s)",
+            user_id,
+            _safe_error_label(exc),
         )
 
-    user_id = current_user()["id"]
     with db() as connection:
         connection.execute(
             "UPDATE users SET listenbrainz_username = ? WHERE id = ?",
@@ -248,11 +365,19 @@ def configure_listenbrainz():
 @blueprint.post("/api/account/lastfm")
 @login_required
 def configure_lastfm():
-    values = request.get_json(silent=True) or {}
+    user, error = resolve_account_user(
+        current_user(),
+        request.args.get("username"),
+    )
+    if error:
+        return error
+    values = request_json_object()
+    if values is None:
+        return api_error("Request body must be a JSON object.")
     username = str(values.get("username", "")).strip()
-    supplied_api_key = str(values.get("apiKey", "")).strip()
-    user = current_user()
-    if not username and not supplied_api_key:
+    previous_username = str(user["lastfm_username"] or "").strip()
+    if not username:
+        lastfm.clear_user_cache(previous_username)
         with db() as connection:
             connection.execute(
                 "UPDATE users SET lastfm_username = NULL, lastfm_api_key = NULL WHERE id = ?",
@@ -260,15 +385,20 @@ def configure_lastfm():
             )
         _recommendation_inputs_changed(user["id"])
         return jsonify({"message": "Last.fm account removed."})
-    api_key = supplied_api_key or user["lastfm_api_key"] or ""
-    if not username or not api_key:
-        return api_error("Enter both a Last.fm username and API key.")
+    api_key = get_lastfm_api_key()
+    if not api_key:
+        return api_error(
+            "Last.fm is not configured. Ask an administrator to add the API key.",
+            503,
+        )
     try:
         lastfm.get("user.getinfo", username, api_key)
+        if username != previous_username:
+            lastfm.clear_user_cache(previous_username)
         with db() as connection:
             connection.execute(
-                "UPDATE users SET lastfm_username = ?, lastfm_api_key = ? WHERE id = ?",
-                (username, api_key, user["id"]),
+                "UPDATE users SET lastfm_username = ?, lastfm_api_key = NULL WHERE id = ?",
+                (username, user["id"]),
             )
         _recommendation_inputs_changed(user["id"])
         return jsonify({"message": "Last.fm account saved."})

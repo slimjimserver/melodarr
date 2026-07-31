@@ -7,40 +7,50 @@ if __package__ == "backend.routes":
     from ..api_cache import cache_stats, clear_cache
     from ..artwork_cache import artwork_cache_stats, clear_artwork_cache
     from ..detail_cache import invalidate_all as invalidate_detail_payloads
-    from ..responses import api_error
+    from ..responses import api_error, request_json_object
     from ..security import admin_required, login_required
-    from ..services import lidarr, plex
+    from ..services import ai_providers, lastfm, lidarr
     from ..storage import (
         clear_recommendation_cache,
+        clear_listening_profiles,
         get_service,
+        listening_profile_stats,
         pending_lidarr_search_stats,
+        plex_listen_stats,
         recommendation_cache_stats,
         save_service,
     )
     from ..workers import lidarr_searches as lidarr_search_worker
     from ..workers import lidarr_library as lidarr_library_worker
     from ..workers import plex as plex_worker
+    from ..workers import plex_history as plex_history_worker
     from ..workers import plex_metadata as plex_metadata_worker
     from ..workers import recommendations as recommendation_worker
+    from ..workers import listening_profiles as listening_profile_worker
 else:  # Support the existing `python backend/app.py` entry point.
     from api_cache import cache_stats, clear_cache
     from artwork_cache import artwork_cache_stats, clear_artwork_cache
     from detail_cache import invalidate_all as invalidate_detail_payloads
-    from responses import api_error
+    from responses import api_error, request_json_object
     from security import admin_required, login_required
-    from services import lidarr, plex
+    from services import ai_providers, lastfm, lidarr
     from storage import (
         clear_recommendation_cache,
+        clear_listening_profiles,
         get_service,
+        listening_profile_stats,
         pending_lidarr_search_stats,
+        plex_listen_stats,
         recommendation_cache_stats,
         save_service,
     )
     from workers import lidarr_searches as lidarr_search_worker
     from workers import lidarr_library as lidarr_library_worker
     from workers import plex as plex_worker
+    from workers import plex_history as plex_history_worker
     from workers import plex_metadata as plex_metadata_worker
     from workers import recommendations as recommendation_worker
+    from workers import listening_profiles as listening_profile_worker
 
 
 blueprint = Blueprint("settings", __name__)
@@ -68,8 +78,12 @@ def health():
 @blueprint.get("/api/settings")
 @admin_required
 def settings():
-    lidarr_config, plex_config = get_service("lidarr"), get_service("plex")
+    ai_config = get_service("ai")
+    lidarr_config = get_service("lidarr")
+    plex_config = get_service("plex")
+    lastfm_config = get_service("lastfm") or {}
     return jsonify({
+        "ai": ai_providers.administrative_status(ai_config),
         "lidarr": {
             "configured": bool(lidarr_config),
             "url": lidarr_config.get("url", "") if lidarr_config else "",
@@ -79,8 +93,14 @@ def settings():
         "plex": {
             "configured": bool(plex_config),
             "url": plex_config.get("url", "") if plex_config else "",
+            "serverName": plex_config.get("serverName", "") if plex_config else "",
             "libraries": plex_config.get("libraries", []) if plex_config else [],
             "librarySectionIds": plex_config.get("librarySectionIds", []) if plex_config else [],
+        },
+        "lastfm": {
+            "configured": bool(
+                str(lastfm_config.get("apiKey") or "").strip()
+            ),
         },
     })
 
@@ -117,13 +137,16 @@ def maintenance():
         })
 
     recommendation_status = recommendation_worker.status()
+    listening_profile_status = listening_profile_worker.status()
     lidarr_status = lidarr_search_worker.status()
     lidarr_library_status = lidarr_library_worker.status()
     plex_recent_status = plex_worker.status("recent")
     plex_full_status = plex_worker.status("full")
+    plex_history_status = plex_history_worker.status()
     plex_metadata_status = plex_metadata_worker.status()
     lidarr_queue = pending_lidarr_search_stats()
     recommendations = recommendation_cache_stats()
+    listening_profiles = listening_profile_stats()
     artwork = artwork_cache_stats()
     return jsonify({
         "jobs": [
@@ -133,6 +156,14 @@ def maintenance():
                 "type": "process",
                 "schedule": "Every 12 hours",
                 **recommendation_status,
+            },
+            {
+                "id": "listening-profiles",
+                "name": "AI Listening Profiles",
+                "type": "process",
+                "schedule": "Every 24 hours and after account changes",
+                **listening_profiles,
+                **listening_profile_status,
             },
             {
                 "id": "lidarr-followups",
@@ -171,6 +202,14 @@ def maintenance():
                 "schedule": "After Plex library changes",
                 **plex_metadata_status,
             },
+            {
+                "id": "plex-history",
+                "name": "Plex Listening History",
+                "type": "process",
+                "schedule": "Every 24 hours",
+                **plex_listen_stats(),
+                **plex_history_status,
+            },
         ],
         "caches": [
             *api_caches,
@@ -201,6 +240,9 @@ def run_job(job_id):
     if job_id == "recommendations":
         recommendation_worker.request_refresh()
         return jsonify({"message": "Recommendation refresh queued."})
+    if job_id == "listening-profiles":
+        listening_profile_worker.request_refresh()
+        return jsonify({"message": "AI listening-profile refresh queued."})
     if job_id == "lidarr-followups":
         lidarr_search_worker.request_work()
         return jsonify({"message": "Lidarr follow-up check queued."})
@@ -216,6 +258,9 @@ def run_job(job_id):
     if job_id == "plex-metadata":
         plex_metadata_worker.request_enrichment()
         return jsonify({"message": "Plex MusicBrainz enrichment queued."})
+    if job_id == "plex-history":
+        plex_history_worker.request_full_sync()
+        return jsonify({"message": "Plex listening-history backfill queued."})
     return api_error("Unknown maintenance job.", 404)
 
 
@@ -254,7 +299,9 @@ def flush_cache(cache_id):
 @blueprint.post("/api/settings/lidarr")
 @admin_required
 def configure_lidarr():
-    values = request.get_json(silent=True) or {}
+    values = request_json_object()
+    if values is None:
+        return api_error("Request body must be a JSON object.")
     old = get_service("lidarr") or {}
     config = {
         **lidarr.connection(values, old),
@@ -290,10 +337,55 @@ def configure_lidarr():
         return api_error("Could not connect to Lidarr. Check the URL, port, and API key.", 502)
 
 
+@blueprint.post("/api/settings/lastfm")
+@admin_required
+def configure_lastfm():
+    """Validate and save the application-wide Last.fm API key."""
+    values = request.get_json(silent=True)
+    if not isinstance(values, dict) or "apiKey" not in values:
+        return api_error("Enter a Last.fm API key.")
+    if not isinstance(values["apiKey"], str):
+        return api_error("Last.fm API key must be text.")
+
+    api_key = values["apiKey"].strip()
+    if api_key:
+        try:
+            # chart.gettopartists does not depend on an end-user account; the
+            # client signature still accepts a username for all API methods.
+            lastfm.get(
+                "chart.gettopartists",
+                "melodarr",
+                api_key,
+                limit=1,
+            )
+        except ValueError as exc:
+            return api_error(str(exc))
+        except requests.RequestException:
+            return api_error(
+                "Could not connect to Last.fm. Try again shortly.",
+                502,
+            )
+        save_service("lastfm", {"apiKey": api_key})
+        message = "Last.fm API key saved."
+    else:
+        save_service("lastfm", {})
+        message = "Last.fm API key removed."
+
+    clear_cache("lastfm")
+    clear_recommendation_cache()
+    clear_listening_profiles()
+    invalidate_detail_payloads()
+    recommendation_worker.request_refresh()
+    listening_profile_worker.request_refresh()
+    return jsonify({"message": message})
+
+
 @blueprint.post("/api/settings/lidarr/test")
 @admin_required
 def test_lidarr():
-    values = request.get_json(silent=True) or {}
+    values = request_json_object()
+    if values is None:
+        return api_error("Request body must be a JSON object.")
     config = lidarr.connection(values)
     if not config["url"] or not config["apiKey"]:
         return api_error("Enter a hostname, port, and API key before testing.")
@@ -315,67 +407,3 @@ def get_lidarr_options():
         return jsonify(lidarr.options())
     except (ValueError, requests.RequestException):
         return api_error("Lidarr could not be reached. Recheck its connection in Settings.", 502)
-
-
-@blueprint.post("/api/settings/plex")
-@admin_required
-def configure_plex():
-    values = request.get_json(silent=True) or {}
-    old = get_service("plex") or {}
-    config = {
-        "url": str(values.get("url", "")).strip().rstrip("/"),
-        "token": str(values.get("token", "")).strip() or old.get("token", ""),
-    }
-    if not config["url"] or not config["token"]:
-        return api_error("Enter both a Plex URL and token.")
-    try:
-        config["machineIdentifier"] = plex.machine_identifier(config)
-        libraries = plex.music_sections(config)
-        requested_ids = values.get("librarySectionIds")
-        if requested_ids is None:
-            requested_ids = old.get("librarySectionIds", [item["id"] for item in libraries])
-        if not isinstance(requested_ids, list):
-            requested_ids = [requested_ids]
-        available_ids = {item["id"] for item in libraries}
-        selected_ids = [str(value) for value in requested_ids if str(value) in available_ids]
-        if not selected_ids:
-            return api_error("Select at least one Plex music library.")
-        config["libraries"] = libraries
-        config["librarySectionIds"] = selected_ids
-        save_service("plex", config)
-        clear_cache("plex-library")
-        clear_cache("plex-guid")
-        invalidate_detail_payloads()
-        plex_worker.request_full_scan()
-        return jsonify({
-            "message": "Connected to Plex; full music-library scan queued.",
-            "libraries": libraries,
-            "librarySectionIds": selected_ids,
-        })
-    except (ValueError, requests.RequestException):
-        return api_error("Could not connect to Plex. Check the URL and token.", 502)
-
-
-@blueprint.post("/api/settings/plex/test")
-@admin_required
-def test_plex():
-    values = request.get_json(silent=True) or {}
-    old = get_service("plex") or {}
-    config = {
-        "url": str(values.get("url", "")).strip().rstrip("/"),
-        "token": str(values.get("token", "")).strip() or old.get("token", ""),
-    }
-    if not config["url"] or not config["token"]:
-        return api_error("Enter a Plex address and token before testing.")
-    try:
-        machine_identifier = plex.machine_identifier(config)
-        libraries = plex.music_sections(config)
-        if not libraries:
-            return api_error("Plex has no music libraries available for Melodarr.")
-        return jsonify({
-            "message": "Connected to Plex. Select the music libraries Melodarr should scan.",
-            "machineIdentifier": machine_identifier,
-            "libraries": libraries,
-        })
-    except (ValueError, requests.RequestException):
-        return api_error("Could not connect to Plex. Check the URL and token.", 502)

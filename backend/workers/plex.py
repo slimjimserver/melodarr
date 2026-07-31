@@ -90,10 +90,11 @@ def _run_scan(kind):
         )
 
 
-def run():
+def run(initial_delay=0):
     """Run an initial full scan, then service both fixed schedules and requests."""
-    job_state["recent"]["nextExecutionAt"] = time.time()
-    job_state["full"]["nextExecutionAt"] = time.time()
+    first_execution_at = time.time() + initial_delay
+    job_state["recent"]["nextExecutionAt"] = first_execution_at
+    job_state["full"]["nextExecutionAt"] = first_execution_at
     while True:
         now = time.time()
         with request_lock:

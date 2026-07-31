@@ -7,6 +7,16 @@ from tempfile import NamedTemporaryFile
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FRONTEND_ROOT = os.path.join(PROJECT_ROOT, "frontend")
 
+
+def _path_from_environment(name, default):
+    """Return a configured filesystem path, rejecting explicit blank values."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    if not value.strip():
+        raise RuntimeError(f"{name} must not be blank.")
+    return value
+
 MUSICBRAINZ_URL = "https://musicbrainz.org/ws/2"
 COVER_ART_ARCHIVE_URL = "https://coverartarchive.org"
 LIDARR_METADATA_URL = "https://api.lidarr.audio/api/v0.4"
@@ -26,6 +36,7 @@ LISTENBRAINZ_METADATA_CACHE_TTL = 6 * 60 * 60
 LASTFM_CACHE_TTL = 60 * 60
 RECOMMENDATION_REFRESH_INTERVAL = 12 * 60 * 60
 RECOMMENDATION_RETRY_INTERVAL = 5 * 60
+LISTENING_PROFILE_REFRESH_INTERVAL = 24 * 60 * 60
 PLEX_RECENT_SCAN_INTERVAL = 5 * 60
 PLEX_FULL_SCAN_INTERVAL = 12 * 60 * 60
 PLEX_LIBRARY_CACHE_TTL = 30 * 24 * 60 * 60
@@ -34,7 +45,7 @@ DETAIL_PAYLOAD_CACHE_TTL = 5 * 60
 DETAIL_PAYLOAD_BROWSER_TTL = 60
 DETAIL_PAYLOAD_CACHE_MAX_ENTRIES = 128
 
-ARTWORK_CACHE_DIRECTORY = os.getenv(
+ARTWORK_CACHE_DIRECTORY = _path_from_environment(
     "MELODARR_ARTWORK_CACHE",
     os.path.join(PROJECT_ROOT, "data", "cache", "artwork"),
 )
@@ -44,6 +55,7 @@ ARTWORK_CACHE_LIMIT_BYTES = 500 * 1024 * 1024
 ARTWORK_CACHE_HIGH_WATER_BYTES = int(ARTWORK_CACHE_LIMIT_BYTES * 1.05)
 ARTWORK_CACHE_TRIM_INTERVAL = 5 * 60
 ARTWORK_MISS_TTL = 24 * 60 * 60
+ARTWORK_MISS_CACHE_MAX_ENTRIES = 4096
 ARTWORK_BROWSER_CACHE_TTL = 7 * 24 * 60 * 60
 ARTWORK_MAX_DOWNLOAD_BYTES = 5 * 1024 * 1024
 # Longest-edge pixel budgets for the resized variants Melodarr serves. Providers
@@ -52,16 +64,19 @@ ARTWORK_MAX_DOWNLOAD_BYTES = 5 * 1024 * 1024
 ARTWORK_SIZES = {"thumb": 128, "card": 384, "large": 640}
 ARTWORK_WEBP_QUALITY = 80
 
-DATABASE = os.getenv("MELODARR_DATABASE", os.path.join(PROJECT_ROOT, "melodarr.db"))
-CACHE_DATABASE = os.getenv(
+DATABASE = _path_from_environment(
+    "MELODARR_DATABASE",
+    os.path.join(PROJECT_ROOT, "melodarr.db"),
+)
+CACHE_DATABASE = _path_from_environment(
     "MELODARR_CACHE_DATABASE",
     os.path.join(os.path.dirname(os.path.abspath(DATABASE)), "cache", "metadata.db"),
 )
-SETTINGS_FILE = os.getenv(
+SETTINGS_FILE = _path_from_environment(
     "MELODARR_SETTINGS",
     os.path.join(os.path.dirname(os.path.abspath(DATABASE)), "settings.json"),
 )
-SECRET_KEY_FILE = os.getenv(
+SECRET_KEY_FILE = _path_from_environment(
     "MELODARR_SECRET_KEY_FILE",
     os.path.join(os.path.dirname(os.path.abspath(DATABASE)), "session-secret.key"),
 )
@@ -74,7 +89,9 @@ def load_session_secret():
         return configured_secret
     if os.path.exists(SECRET_KEY_FILE):
         with open(SECRET_KEY_FILE, encoding="utf-8") as file:
-            return file.read().strip()
+            stored_secret = file.read().strip()
+        if stored_secret:
+            return stored_secret
 
     secret = os.urandom(48).hex()
     directory = os.path.dirname(os.path.abspath(SECRET_KEY_FILE))

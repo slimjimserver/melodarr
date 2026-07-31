@@ -5,7 +5,6 @@ type AppForm = HTMLFormElement & {
   remember: HTMLInputElement;
   listenbrainzUsername: HTMLInputElement;
   lastfmUsername: HTMLInputElement;
-  lastfmApiKey: HTMLInputElement;
   invitationLink: HTMLInputElement;
 };
 interface AppElement extends HTMLElement {
@@ -30,17 +29,95 @@ interface AppElement extends HTMLElement {
   alt: string;
   fetchPriority: string;
 }
-type AccountPage = "profile" | "general" | "linked-accounts" | "invitations";
+type AccountPage = "profile" | "requests" | "general" | "linked-accounts" | "invitations";
 type AppView = "discover" | "detail" | "library" | "settings" | "account";
-type SettingsPage = "services" | "jobs";
+type SettingsPage = "services" | "requests" | "users" | "jobs";
+type ThemeName = "midnight" | "warm";
 
 interface CurrentUser {
+  id?: number;
   username: string;
   role: "admin" | "user";
   csrfToken?: string;
+  authProvider?: "local" | "plex";
+  plexLinked?: boolean;
+  plexUsername?: string;
+  plexEmail?: string;
   listenbrainzUsername?: string;
   lastfmUsername?: string;
   lastfmConfigured?: boolean;
+}
+
+interface AdminUserIdentity {
+  id: number;
+  username: string;
+  localUsername?: string;
+  userType: "plex" | "local";
+  role: "admin" | "user";
+  plexUsername?: string;
+  plexEmail?: string;
+  plexAvatar?: string;
+}
+
+interface AdminUser extends AdminUserIdentity {
+  requestCount: number;
+  joinedAt: number | string;
+  listenbrainzUsername?: string;
+  lastfmUsername?: string;
+  lastfmConfigured?: boolean;
+}
+
+interface AdminRequest {
+  id: number;
+  kind: "artist" | "release-group";
+  mbid: string;
+  name: string;
+  artist_name?: string;
+  release_type?: string;
+  release_date?: string;
+  created_at: number | string;
+  availableInPlex: boolean;
+  plexUrl?: string;
+  plexampUrl?: string;
+  requester: AdminUserIdentity;
+}
+
+interface AdminRequestPagination {
+  page: number;
+  pageSize: number;
+  total: number;
+  totalPages: number;
+}
+
+type LastfmSettingsForm = HTMLFormElement & {
+  apiKey: HTMLInputElement;
+};
+
+type AISettingsForm = HTMLFormElement & {
+  provider: HTMLSelectElement;
+  model: HTMLInputElement;
+  apiKey: HTMLInputElement;
+  baseUrl: HTMLInputElement;
+};
+
+interface AIProviderOption {
+  id: string;
+  name: string;
+  defaultModel: string;
+  requiresApiKey: boolean;
+  supportsApiKey: boolean;
+}
+
+interface PlexConnection extends JsonObject {
+  uri: string;
+  local: boolean;
+  secure: boolean;
+}
+
+interface PlexServer extends JsonObject {
+  id: string;
+  name: string;
+  connections: PlexConnection[];
 }
 
 interface LidarrDefaults extends JsonObject {
@@ -87,10 +164,40 @@ function mobilePlexDestination(plexUrl: string, plexampUrl: string) {
 let lidarrOptions: JsonObject | undefined;
 let lidarrDefaults: LidarrDefaults = {};
 let currentUser: CurrentUser | undefined;
-let showAccountPage: ((page?: AccountPage, updateHistory?: boolean) => void) | undefined;
+let showAccountPage: ((
+  page?: AccountPage,
+  updateHistory?: boolean,
+  username?: string,
+  requestPage?: number,
+) => void) | undefined;
 let invitationToken = "";
+let setupPlexFlowToken = "";
+let setupPlexServers: PlexServer[] = [];
+let settingsPlexFlowToken = "";
+let settingsPlexServers: PlexServer[] = [];
 let maintenanceRefreshTimer: number | undefined;
 let maintenanceRefreshInFlight = false;
+let adminUsers: AdminUser[] = [];
+let adminUsersRequest = 0;
+let adminRequests: AdminRequest[] = [];
+let adminRequestsRequest = 0;
+let adminRequestsPagination: AdminRequestPagination = {
+  page: 1,
+  pageSize: 100,
+  total: 0,
+  totalPages: 0,
+};
+let discoveryLoad: Promise<void> | undefined;
+let accountRenderGeneration = 0;
+let accountRenderAbort: AbortController | undefined;
+let sessionExpiryHandled = false;
+let aiProviderOptions: AIProviderOption[] = [
+  { id: "openai", name: "OpenAI", defaultModel: "gpt-5.6-sol", requiresApiKey: true, supportsApiKey: true },
+  { id: "anthropic", name: "Claude", defaultModel: "claude-sonnet-5", requiresApiKey: true, supportsApiKey: true },
+  { id: "gemini", name: "Gemini", defaultModel: "gemini-3.6-flash", requiresApiKey: true, supportsApiKey: true },
+  { id: "lmstudio", name: "LM Studio", defaultModel: "", requiresApiKey: false, supportsApiKey: true },
+  { id: "ollama", name: "Ollama", defaultModel: "", requiresApiKey: false, supportsApiKey: false },
+];
 // Plex holdings tell a requester what is already available, so the library is
 // readable by every account. Settings remains administrator-only.
 const VIEWS_FOR_EVERY_USER = ["discover", "detail", "library", "account"];
@@ -150,7 +257,60 @@ function setupStandalonePullToRefresh() {
 
 function setMessage(element: Element, message: string, isError = false) {
   element.textContent = message;
-  element.className = `message${isError ? " error" : ""}`;
+  element.classList.add("message");
+  element.classList.toggle("error", isError);
+}
+
+function setupTheme() {
+  const button = $<HTMLButtonElement>("#theme-toggle");
+  const icon = requiredDescendant<HTMLElement>(button, ".theme-icon");
+  const label = requiredDescendant<HTMLElement>(button, ".theme-label");
+  const storageKey = "melodarr-theme";
+
+  const applyTheme = (theme: ThemeName, persist = false) => {
+    const nextTheme: ThemeName = theme === "midnight" ? "warm" : "midnight";
+    document.documentElement.dataset.theme = theme;
+    icon.textContent = theme === "midnight" ? "☾" : "☀";
+    label.textContent = theme === "midnight" ? "Midnight" : "Warm";
+    button.setAttribute("aria-label", `Switch to ${nextTheme === "midnight" ? "Midnight" : "Warm"} theme`);
+    button.title = `Switch to ${nextTheme === "midnight" ? "Midnight" : "Warm"} theme`;
+    document.querySelector('meta[name="theme-color"]')?.setAttribute(
+      "content",
+      theme === "midnight" ? "#050506" : "#f6f0e7",
+    );
+    if (persist) {
+      try {
+        window.localStorage.setItem(storageKey, theme);
+      } catch {
+        // The selected theme still applies for this page when storage is
+        // unavailable in a strict privacy mode.
+      }
+    }
+  };
+
+  applyTheme(document.documentElement.dataset.theme === "warm" ? "warm" : "midnight");
+  button.addEventListener("click", () => {
+    applyTheme(
+      document.documentElement.dataset.theme === "midnight" ? "warm" : "midnight",
+      true,
+    );
+  });
+}
+
+function loadDiscovery() {
+  if (discoveryLoad) return discoveryLoad;
+  discoveryLoad = new Promise<void>((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = document.body.dataset.discoverySrc || "/static/discovery.js";
+    script.async = true;
+    script.addEventListener("load", () => resolve(), { once: true });
+    script.addEventListener("error", () => {
+      discoveryLoad = undefined;
+      reject(new Error("We couldn’t finish loading the music browser. Please refresh and try again."));
+    }, { once: true });
+    document.body.append(script);
+  });
+  return discoveryLoad;
 }
 
 async function copyInputValue(input: HTMLInputElement) {
@@ -212,21 +372,129 @@ async function api<T = JsonObject>(url: string, options: RequestInit = {}): Prom
   }
   requestOptions.headers = headers;
   const response = await fetch(url, requestOptions);
+  handleAuthenticationFailure(response);
   const responseText = await response.text();
   let body: T & { error?: string };
   try {
     body = (responseText ? JSON.parse(responseText) : {}) as T & { error?: string };
   } catch {
     const message = response.ok
-      ? "The server returned an invalid response."
-      : `Request failed with status ${response.status}.`;
+      ? "We received an unexpected response. Please try again."
+      : "We couldn’t complete that request. Please try again.";
     throw new Error(message);
   }
 
   if (!response.ok) {
-    throw new Error(body.error || "Request failed.");
+    throw new Error(body.error || "We couldn’t complete that request. Please try again.");
   }
   return body;
+}
+
+/** Return an expired authenticated session to the sign-in screen exactly once. */
+function handleAuthenticationFailure(response: Response) {
+  if (response.status !== 401 || !currentUser || sessionExpiryHandled) return false;
+  sessionExpiryHandled = true;
+  window.dispatchEvent(new Event("melodarr-signed-out"));
+  void showAuth({ resetPath: true });
+  return true;
+}
+
+function wait(milliseconds: number) {
+  return new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
+async function startPlexAuthentication(
+  purpose: "login" | "server" | "link",
+  message: Element,
+  onComplete: (result: JsonObject) => Promise<void> | void,
+  accountUsername?: string,
+) {
+  const popup = window.open(
+    "",
+    "Melodarr Plex Sign In",
+    "popup=yes,scrollbars=yes,width=600,height=700",
+  );
+  if (!popup) {
+    setMessage(message, "Allow popups for Melodarr, then try again.", true);
+    return;
+  }
+  popup.document.title = "Opening Plex…";
+  popup.document.body.textContent = "Opening secure Plex sign-in…";
+  setMessage(message, "Opening secure Plex sign-in…");
+
+  try {
+    const started = await api("/api/auth/plex/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        purpose,
+        ...(accountUsername ? { username: accountUsername } : {}),
+      }),
+    });
+    popup.location.href = started.authorizationUrl;
+    const deadline = Math.min(
+      Number(started.expiresAt || (Date.now() / 1000) + 900) * 1000,
+      Date.now() + 15 * 60 * 1000,
+    );
+
+    while (Date.now() < deadline) {
+      if (popup.closed) {
+        throw new Error("Plex sign-in was closed. Try again.");
+      }
+      const result = await api("/api/auth/plex/poll", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ flowToken: started.flowToken }),
+      });
+      if (!result.pending) {
+        popup.close();
+        await onComplete({ ...result, flowToken: started.flowToken });
+        return;
+      }
+      await wait(1_000);
+    }
+    throw new Error("Plex sign-in expired before it was completed.");
+  } catch (error) {
+    popup.close();
+    setMessage(message, error.message, true);
+  }
+}
+
+function plexControlElements(scope: "setup" | "settings") {
+  return {
+    server: $<HTMLSelectElement>(`#${scope}-plex-server-select`),
+    connection: $<HTMLSelectElement>(`#${scope}-plex-connection-select`),
+  };
+}
+
+function populatePlexConnections(scope: "setup" | "settings", servers: PlexServer[]) {
+  const controls = plexControlElements(scope);
+  const server = servers.find((item) => item.id === controls.server.value) || servers[0];
+  controls.connection.replaceChildren();
+  (server?.connections || []).forEach((connection) => {
+    const location = connection.local ? "local" : "remote";
+    const security = connection.secure ? " · secure" : "";
+    controls.connection.add(
+      new Option(`${connection.uri} · ${location}${security}`, connection.uri),
+    );
+  });
+  controls.connection.disabled = !server?.connections.length;
+}
+
+function populatePlexServers(scope: "setup" | "settings", servers: PlexServer[]) {
+  const controls = plexControlElements(scope);
+  controls.server.replaceChildren();
+  servers.forEach((server) => controls.server.add(new Option(server.name, server.id)));
+  controls.server.disabled = servers.length === 0;
+  populatePlexConnections(scope, servers);
+}
+
+function selectedPlexConnection(scope: "setup" | "settings") {
+  const controls = plexControlElements(scope);
+  return {
+    serverId: controls.server.value,
+    connectionUri: controls.connection.value,
+  };
 }
 
 function addSelectOptions(select: HTMLSelectElement, options: JsonObject[], labelKey: string, valueKey: string, selected: Array<string | number | undefined> = []) {
@@ -294,16 +562,195 @@ function parseLidarrUrl(value: string) {
   }
 }
 
+function selectedAIProvider() {
+  const form = $<AISettingsForm>("#ai-settings-form");
+  return aiProviderOptions.find((provider) => provider.id === form.provider.value)
+    || aiProviderOptions[0];
+}
+
+function updateAILocalTransportWarning() {
+  const form = $<AISettingsForm>("#ai-settings-form");
+  const provider = selectedAIProvider();
+  const warning = $("#ai-transport-warning");
+  const title = $("#ai-transport-warning-title");
+  const copy = $("#ai-transport-warning-copy");
+  const isLocalProvider = ["lmstudio", "ollama"].includes(provider.id);
+  warning.hidden = !isLocalProvider;
+  if (!isLocalProvider) return;
+
+  const fallbackUrl = provider.id === "lmstudio"
+    ? "http://localhost:1234"
+    : "http://localhost:11434";
+  let parsed: URL;
+  try {
+    parsed = new URL(form.baseUrl.value.trim() || fallbackUrl);
+  } catch {
+    title.textContent = "Review local model transport";
+    copy.textContent = "Enter a valid server URL to see whether prompts and taste-profile data will use encrypted, loopback, or network transport. The model server may log request bodies.";
+    return;
+  }
+  const hostname = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  const loopback = hostname === "localhost"
+    || hostname === "::1"
+    || /^127(?:\.\d{1,3}){3}$/.test(hostname);
+  const encrypted = parsed.protocol === "https:";
+  if (encrypted) {
+    title.textContent = loopback
+      ? "Encrypted loopback model connection"
+      : "Encrypted network model connection";
+    copy.textContent = loopback
+      ? `Melodarr sends prompts and minimized taste-profile data to ${provider.name} over HTTPS on the Melodarr host. The model server may still retain or log request bodies.`
+      : `Melodarr sends prompts and minimized taste-profile data to ${provider.name} over HTTPS. The server may be another device and may retain or log request bodies; “local provider” does not guarantee on-device processing.`;
+  } else {
+    title.textContent = loopback
+      ? "Unencrypted loopback model connection"
+      : "Unencrypted network model connection";
+    copy.textContent = loopback
+      ? `HTTP does not encrypt prompts or taste-profile data. This loopback address confines transport to the Melodarr host, but ${provider.name} may still retain or log request bodies.`
+      : `HTTP sends prompts and taste-profile data unencrypted across the container, host, or LAN route to ${provider.name}. Anyone able to observe that route may read them. Use HTTPS or a trusted isolated network; the model server may retain or log request bodies.`;
+  }
+}
+
+function updateAIProviderFields(useDefaultModel = false) {
+  const form = $<AISettingsForm>("#ai-settings-form");
+  const provider = selectedAIProvider();
+  const previousProvider = aiProviderOptions.find(
+    (option) => option.id === form.dataset.activeProvider,
+  );
+  if (
+    useDefaultModel
+    && (
+      !form.model.value.trim()
+      || form.model.value.trim() === previousProvider?.defaultModel
+    )
+  ) {
+    form.model.value = provider.defaultModel;
+  }
+  form.dataset.activeProvider = provider.id;
+  $("#ai-api-key-field").hidden = !provider.supportsApiKey;
+  form.apiKey.disabled = !provider.supportsApiKey;
+  form.apiKey.required = provider.requiresApiKey
+    && form.dataset.configuredProvider !== provider.id;
+  $("#clear-ai-key").hidden = !provider.supportsApiKey
+    || form.dataset.configuredProvider !== provider.id;
+  const isLocalProvider = ["lmstudio", "ollama"].includes(provider.id);
+  const providerHasStoredKey = form.dataset.configuredProvider === provider.id;
+  $("#ai-base-url-field").hidden = !isLocalProvider;
+  form.baseUrl.disabled = !isLocalProvider;
+  if (provider.id === "lmstudio") {
+    $("#ai-base-url-help").textContent =
+      "The LM Studio server reachable from Melodarr. Melodarr adds /v1/chat/completions.";
+    form.baseUrl.placeholder = "http://host.docker.internal:1234";
+  } else if (provider.id === "ollama") {
+    $("#ai-base-url-help").textContent =
+      "The Ollama server reachable from Melodarr. Melodarr adds /api/chat.";
+    form.baseUrl.placeholder = "http://host.docker.internal:11434";
+  } else {
+    form.baseUrl.placeholder = "";
+  }
+  $("#ai-model-help").textContent = provider.defaultModel
+    ? `Default: ${provider.defaultModel}. You can choose another supported model.`
+    : provider.id === "lmstudio"
+      ? "Enter the exact model identifier shown by LM Studio."
+      : "Enter the exact model installed in Ollama.";
+  form.apiKey.placeholder = providerHasStoredKey
+    ? "Enter a new key to replace the saved key"
+    : provider.id === "lmstudio"
+      ? "Optional LM Studio API token"
+      : "Provider API key";
+  $("#ai-api-key-help").textContent = providerHasStoredKey
+    ? "A key is stored server-side. Enter a new one only to replace it."
+    : provider.id === "lmstudio"
+      ? "Optional unless authentication is enabled in LM Studio 0.4 or newer."
+      : "Stored server-side and never returned to this browser.";
+  updateAILocalTransportWarning();
+}
+
+function populateAISettings(settings: JsonObject, status: JsonObject) {
+  const providers = (status.providers || [])
+    .filter((provider: JsonObject) => provider?.id && provider?.name)
+    .map((provider: JsonObject) => ({
+      id: String(provider.id),
+      name: String(provider.name),
+      defaultModel: String(provider.defaultModel || ""),
+      requiresApiKey: provider.requiresApiKey !== false,
+      supportsApiKey: provider.supportsApiKey === true
+        || provider.requiresApiKey !== false,
+    }));
+  if (providers.length) aiProviderOptions = providers;
+
+  const form = $<AISettingsForm>("#ai-settings-form");
+  const selectedProvider = String(settings.provider || status.provider || aiProviderOptions[0]?.id || "");
+  form.provider.replaceChildren(...aiProviderOptions.map((provider) => (
+    new Option(provider.name, provider.id, false, provider.id === selectedProvider)
+  )));
+  form.provider.value = selectedProvider;
+  form.dataset.activeProvider = selectedProvider;
+  const provider = selectedAIProvider();
+  form.model.value = String(settings.model || status.model || provider.defaultModel || "");
+  form.baseUrl.value = String(settings.baseUrl || "");
+  form.apiKey.value = "";
+
+  const hasApiKey = Boolean(
+    settings.apiKeyConfigured
+    ?? settings.hasApiKey
+    ?? (status.configured && provider.requiresApiKey),
+  );
+  const clearButton = $<HTMLButtonElement>("#clear-ai-key");
+  clearButton.hidden = !hasApiKey || !provider.requiresApiKey;
+  clearButton.dataset.configured = hasApiKey ? "true" : "";
+  form.dataset.configuredProvider = hasApiKey ? selectedProvider : "";
+  form.apiKey.placeholder = hasApiKey
+    ? "Enter a new key to replace the saved key"
+    : "Provider API key";
+  $("#ai-api-key-help").textContent = hasApiKey
+    ? "A key is stored server-side. Enter a new one only to replace it."
+    : "Stored server-side and never returned to this browser.";
+  const configured = Boolean(status.configured);
+  $("#ai-settings-state").textContent = configured
+    ? `${provider.name} · ${form.model.value}`
+    : "Not configured";
+  updateAIProviderFields();
+}
+
 async function refreshSettings(loadLidarrOptions = true) {
-  const settings = await api("/api/settings");
+  const [settings, aiStatus] = await Promise.all([
+    api("/api/settings"),
+    api("/api/ai/status").catch(() => ({ configured: false, providers: [] })),
+  ]);
   const { lidarr, plex } = settings;
   lidarrDefaults = lidarr.defaults || {};
+  populateAISettings(settings.ai || {}, aiStatus);
+
+  const lastfmConfigured = Boolean(settings.lastfm?.configured);
+  $("#lastfm-state").textContent = lastfmConfigured ? "API key configured" : "Not configured";
+  const lastfmForm = $<LastfmSettingsForm>("#lastfm-settings");
+  lastfmForm.apiKey.value = "";
+  lastfmForm.apiKey.placeholder = lastfmConfigured
+    ? "Enter a new key to replace the saved key"
+    : "Last.fm API key";
+  $("#clear-lastfm-key").hidden = !lastfmConfigured;
 
   $("#lidarr-state").textContent = lidarr.configured ? `Connected · ${lidarr.url}` : "Not connected";
-  $("#plex-state").textContent = plex.configured ? `Connected · ${plex.url}` : "Not connected";
-  const plexForm = $<AppForm>("#plex-settings");
-  plexForm.url.value = plex.url || "";
-  plexForm.token.value = "";
+  $("#plex-state").textContent = plex.configured
+    ? `Connected · ${plex.serverName || plex.url}`
+    : "Not connected";
+  $("#connect-plex").firstChild!.textContent = plex.configured
+    ? "Reconnect with "
+    : "Sign in with ";
+  const currentPlexConnection = $("#plex-current-connection");
+  currentPlexConnection.hidden = !plex.configured;
+  $("#plex-current-server").textContent =
+    plex.serverName || (plex.configured ? "Plex Media Server" : "");
+  $("#plex-current-url").textContent = plex.url || "";
+  const selectedPlexLibraryIds = new Set(
+    (plex.librarySectionIds || []).map((value: string | number) => String(value)),
+  );
+  const selectedPlexLibraryNames = (plex.libraries || [])
+    .filter((library: JsonObject) => selectedPlexLibraryIds.has(String(library.id)))
+    .map((library: JsonObject) => library.title);
+  $("#plex-current-libraries").textContent =
+    selectedPlexLibraryNames.join(", ") || (plex.configured ? "None selected" : "");
   populatePlexLibraries(plex.libraries || [], plex.librarySectionIds || []);
 
   const form = $<AppForm>("#lidarr-settings");
@@ -353,6 +800,7 @@ function tableCell(row: HTMLTableRowElement, value: string) {
 }
 
 async function refreshMaintenance() {
+  if (currentUser?.role !== "admin") return;
   if (maintenanceRefreshInFlight) return;
   maintenanceRefreshInFlight = true;
   const jobsTable = $<HTMLTableSectionElement>("#jobs-table");
@@ -375,6 +823,20 @@ async function refreshMaintenance() {
         status.textContent = `${job.phase && job.phase !== "idle" ? job.phase : "Running"}${progress}`;
       }
       else if (job.queued) status.textContent = `${job.queued} queued${job.retrying ? ` · ${job.retrying} retrying` : ""}`;
+      else if (job.id === "plex-history" && job.lastError) {
+        status.textContent = `Error · ${job.lastError}`;
+      }
+      else if (job.id === "plex-history" && job.lastCompletedAt) {
+        const userCount = Number(job.users || 0);
+        const stored = Number(job.stored || 0).toLocaleString();
+        const users = userCount.toLocaleString();
+        status.textContent = `${stored} listens · ${users} ${userCount === 1 ? "user" : "users"}`;
+        const timing = [`Last ${new Date(Number(job.lastCompletedAt) * 1000).toLocaleString()}`];
+        if (job.nextExecutionAt) {
+          timing.push(`Next ${new Date(Number(job.nextExecutionAt) * 1000).toLocaleString()}`);
+        }
+        status.title = timing.join(" · ");
+      }
       else if (job.nextExecutionAt) status.textContent = `Next ${new Date(job.nextExecutionAt * 1000).toLocaleString()}`;
       else status.textContent = "Idle";
       statusCell.append(status);
@@ -427,30 +889,76 @@ async function refreshMaintenance() {
 }
 
 function showSettingsPage(page: SettingsPage, updateHistory = true) {
-  document.querySelectorAll<HTMLElement>("[data-settings-page]").forEach((button) => button.classList.toggle("active", button.dataset.settingsPage === page));
-  $("#settings-services").hidden = page !== "services";
-  $("#settings-jobs").hidden = page !== "jobs";
+  if (currentUser?.role !== "admin") {
+    if (maintenanceRefreshTimer !== undefined) window.clearInterval(maintenanceRefreshTimer);
+    maintenanceRefreshTimer = undefined;
+    return;
+  }
+  document.querySelectorAll<HTMLButtonElement>("[data-settings-page]").forEach((button) => {
+    const isCurrent = button.dataset.settingsPage === page;
+    button.classList.toggle("active", isCurrent);
+    button.setAttribute("aria-selected", String(isCurrent));
+    button.tabIndex = isCurrent ? 0 : -1;
+  });
+  document.querySelectorAll<HTMLElement>(".settings-panel").forEach((panel) => {
+    panel.hidden = panel.id !== `settings-${page}`;
+  });
   if (maintenanceRefreshTimer !== undefined) window.clearInterval(maintenanceRefreshTimer);
   maintenanceRefreshTimer = undefined;
   if (page === "jobs") {
     refreshMaintenance();
     maintenanceRefreshTimer = window.setInterval(refreshMaintenance, 10_000);
+  } else if (page === "requests") {
+    refreshAdminRequests();
+  } else if (page === "users") {
+    refreshAdminUsers();
   }
   if (updateHistory) {
-    window.history.pushState({ view: "settings", settings: page }, "", page === "jobs" ? "/settings/jobs" : "/settings");
+    const path = page === "services" ? "/settings" : `/settings/${page}`;
+    window.history.pushState({ view: "settings", settings: page }, "", path);
     resetPageScroll();
   }
 }
 
 function setupNavigation() {
+  let activeAccountUsername = "";
+  let activeAccountRequestPage = 1;
+
+  function setActiveAccountRoute(page: AccountPage | null) {
+    document.querySelectorAll<HTMLAnchorElement>("[data-account-route]").forEach((link) => {
+      const isCurrent = page !== null && link.dataset.accountRoute === page;
+      link.classList.toggle("active", isCurrent);
+      if (isCurrent) link.setAttribute("aria-current", "page");
+      else link.removeAttribute("aria-current");
+    });
+  }
+
+  function isOwnAccountUsername(username: string) {
+    if (!currentUser) return false;
+    const normalizedUsername = username.toLocaleLowerCase();
+    return [currentUser.username, currentUser.plexUsername]
+      .filter(Boolean)
+      .some((candidate) => candidate!.toLocaleLowerCase() === normalizedUsername);
+  }
+
   function showView(view: AppView, updateHistory = true) {
     if (!currentUser || (currentUser.role !== "admin" && !VIEWS_FOR_EVERY_USER.includes(view))) view = "discover";
+    if (view !== "account") {
+      accountRenderGeneration += 1;
+      accountRenderAbort?.abort();
+      accountRenderAbort = undefined;
+    }
     document.querySelectorAll(".nav-link, .view").forEach((element) => element.classList.remove("active"));
     // Account and detail are application views without a matching nav button,
-    // and the header and bottom tab bar both carry a button per view, so this
-    // marks every match rather than using the strict single-element helper.
-    document.querySelectorAll<HTMLElement>(`[data-view="${view}"]`).forEach((button) => button.classList.add("active"));
+    // and the header and bottom tab bar both carry a button per view.
+    document.querySelectorAll<HTMLElement>("[data-view]").forEach((button) => {
+      const isCurrent = button.dataset.view === view;
+      button.classList.toggle("active", isCurrent);
+      if (isCurrent) button.setAttribute("aria-current", "page");
+      else button.removeAttribute("aria-current");
+    });
     $(`#${view}`).classList.add("active");
+    if (view !== "account") setActiveAccountRoute(null);
     if (view === "library") {
       window.dispatchEvent(new Event("melodarr-library-visible"));
     }
@@ -466,10 +974,19 @@ function setupNavigation() {
     resetPageScroll();
   }
 
-  function accountPath(page: AccountPage) {
+  function accountPath(
+    page: AccountPage,
+    username = activeAccountUsername || currentUser?.username || "",
+    requestPage = activeAccountRequestPage,
+  ) {
     if (!currentUser) throw new Error("Account navigation requires an authenticated user.");
-    const username = encodeURIComponent(currentUser.username);
-    return page === "profile" ? `/${username}` : `/${username}/settings/${page}`;
+    const encodedUsername = encodeURIComponent(username);
+    if (page === "profile") return `/${encodedUsername}`;
+    if (page === "requests") {
+      const query = requestPage > 1 ? `?page=${requestPage}` : "";
+      return `/${encodedUsername}/requests${query}`;
+    }
+    return `/${encodedUsername}/settings/${page}`;
   }
 
   function createHistoryItem(item: JsonObject, route: string) {
@@ -540,9 +1057,28 @@ function setupNavigation() {
   async function renderAccount(page: AccountPage) {
     const user = currentUser;
     if (!user) return;
+    const targetUsername = activeAccountUsername || user.username;
+    const targetRequestPage = activeAccountRequestPage;
+    const isOwnAccount = isOwnAccountUsername(targetUsername);
+    const accountApiPath = (path: string) => `${path}?username=${encodeURIComponent(targetUsername)}`;
+    const renderGeneration = ++accountRenderGeneration;
+    accountRenderAbort?.abort();
+    const controller = new AbortController();
+    accountRenderAbort = controller;
+    const isCurrentRender = () => (
+      renderGeneration === accountRenderGeneration
+      && accountRenderAbort === controller
+      && currentUser === user
+      && activeAccountUsername === targetUsername
+    );
     const content = $("#account-content");
     $("#account-title").textContent = page === "profile" ? "Profile" : page.split("-").map((word) => word[0].toUpperCase() + word.slice(1)).join(" ");
-    document.querySelectorAll<HTMLElement>("[data-account-route]").forEach((link) => link.classList.toggle("active", link.dataset.accountRoute === page));
+    setActiveAccountRoute(page);
+    document.querySelectorAll<HTMLElement>("[data-account-owner-only]").forEach((element) => {
+      element.hidden = element.classList.contains("admin-only")
+        ? user.role !== "admin"
+        : !isOwnAccount && user.role !== "admin";
+    });
     content.replaceChildren();
     const message = document.createElement("p");
     message.className = "message";
@@ -550,9 +1086,113 @@ function setupNavigation() {
     content.append(message);
     try {
       if (page === "profile") {
-        const data = await api("/api/account/profile");
+        const data = await api(
+          `/api/account/profile?username=${encodeURIComponent(targetUsername)}&page=1`,
+          { signal: controller.signal },
+        );
+        if (!isCurrentRender()) return;
         content.replaceChildren();
-        [["Artists", data.requests.artist, "artists"], ["Release groups", data.requests["release-group"], "albums"]].forEach(([title, requests, route]) => {
+        const identity = data.user as AdminUserIdentity;
+        const section = document.createElement("section");
+        section.className = "account-section profile-summary";
+        const avatar = createUserAvatar(identity);
+        avatar.classList.add("user-avatar-large");
+        const copy = document.createElement("div");
+        const heading = document.createElement("h2");
+        heading.textContent = adminUserDisplayName(identity);
+        const accountType = document.createElement("p");
+        accountType.textContent = `${identity.userType === "plex" ? "Plex user" : "Local account"} · ${identity.role === "admin" ? "Administrator" : "User"}`;
+        copy.append(heading, accountType);
+        section.append(avatar, copy);
+
+        content.append(section);
+        if (user.role === "admin") {
+          const roleForm = document.createElement("form");
+          roleForm.className = "service-card account-form";
+          roleForm.innerHTML = `
+            <h2>Account access</h2>
+            <label>
+              Role
+              <small class="account-role-help">Controls access to administrative settings.</small>
+              <select name="role">
+                <option value="user">User</option>
+                <option value="admin">Administrator</option>
+              </select>
+            </label>
+            <div class="form-actions">
+              <p class="form-message"></p>
+              <button>Save account access</button>
+            </div>
+          `;
+          const roleSelect = requiredDescendant<HTMLSelectElement>(
+            roleForm,
+            'select[name="role"]',
+          );
+          const roleHelp = requiredDescendant<HTMLElement>(
+            roleForm,
+            ".account-role-help",
+          );
+          const roleMessage = requiredDescendant<HTMLElement>(
+            roleForm,
+            ".form-message",
+          );
+          const saveRole = requiredDescendant<HTMLButtonElement>(
+            roleForm,
+            "button",
+          );
+          const currentSession = user.id !== undefined
+            ? user.id === identity.id
+            : isOwnAccount;
+          roleSelect.value = identity.role;
+          roleSelect.disabled = currentSession;
+          saveRole.disabled = currentSession;
+          if (currentSession) {
+            roleHelp.textContent = "You cannot change your own role while signed in.";
+          }
+          roleForm.addEventListener("submit", async (event) => {
+            event.preventDefault();
+            if (currentSession) return;
+            saveRole.disabled = true;
+            setMessage(roleMessage, "Saving account access…");
+            try {
+              const result = await api<{ user: AdminUserIdentity; message?: string }>(
+                `/api/admin/users/${encodeURIComponent(String(identity.id))}`,
+                {
+                  method: "PATCH",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ role: roleSelect.value }),
+                },
+              );
+              identity.role = result.user.role;
+              roleSelect.value = identity.role;
+              accountType.textContent = `${identity.userType === "plex" ? "Plex user" : "Local account"} · ${identity.role === "admin" ? "Administrator" : "User"}`;
+              adminUsers = adminUsers.map((candidate) => (
+                candidate.id === identity.id
+                  ? { ...candidate, role: identity.role }
+                  : candidate
+              ));
+              setAdminUserStats();
+              setMessage(roleMessage, result.message || "Account access saved.");
+            } catch (error) {
+              setMessage(roleMessage, error.message, true);
+            } finally {
+              saveRole.disabled = false;
+            }
+          });
+          content.append(roleForm);
+        }
+      } else if (page === "requests") {
+        const data = await api(
+          `/api/account/profile?username=${encodeURIComponent(targetUsername)}&page=${encodeURIComponent(targetRequestPage)}`,
+          { signal: controller.signal },
+        );
+        if (!isCurrentRender()) return;
+        content.replaceChildren();
+        const requestGroups: [string, JsonObject[], string][] = [
+          ["Artists", data.requests?.artist || [], "artists"],
+          ["Release groups", data.requests?.["release-group"] || [], "albums"],
+        ];
+        requestGroups.forEach(([title, requests, route]) => {
           const section = document.createElement("section");
           section.className = "account-section";
           const heading = document.createElement("h2"); heading.textContent = title;
@@ -561,67 +1201,181 @@ function setupNavigation() {
           requests.forEach((item: JsonObject) => list.append(createHistoryItem(item, route)));
           section.append(heading, list); content.append(section);
         });
+
+        const pagination = data.pagination || {
+          page: activeAccountRequestPage,
+          pageSize: 100,
+          total: requestGroups.reduce((total, [, requests]) => total + requests.length, 0),
+          totalPages: 1,
+        };
+        const paginationControls = document.createElement("nav");
+        paginationControls.className = "request-pagination";
+        paginationControls.setAttribute("aria-label", "Request history pages");
+        const previous = document.createElement("button");
+        previous.type = "button";
+        previous.className = "outline";
+        previous.textContent = "Previous";
+        previous.disabled = pagination.page <= 1;
+        const status = document.createElement("span");
+        status.textContent = pagination.total
+          ? `Page ${pagination.page.toLocaleString()} of ${pagination.totalPages.toLocaleString()} · ${pagination.total.toLocaleString()} requests`
+          : "No requests";
+        const next = document.createElement("button");
+        next.type = "button";
+        next.className = "outline";
+        next.textContent = "Next";
+        next.disabled = pagination.totalPages === 0 || pagination.page >= pagination.totalPages;
+        const showRequestPage = (nextPage: number) => {
+          showAccountPage?.("requests", true, targetUsername, nextPage);
+        };
+        previous.addEventListener("click", () => showRequestPage(pagination.page - 1));
+        next.addEventListener("click", () => showRequestPage(pagination.page + 1));
+        paginationControls.append(previous, status, next);
+        content.append(paginationControls);
       } else if (page === "general") {
+        const accountSettings = await api(accountApiPath("/api/account/settings"), {
+          signal: controller.signal,
+        });
+        if (!isCurrentRender()) return;
         content.replaceChildren();
         const form = document.createElement("form") as AppForm; form.className = "service-card account-form";
         form.innerHTML = '<h2>General</h2><label>Username<input name="username" autocomplete="username" required></label><label>New password<small>Leave blank to keep your current password.</small><input name="password" type="password" autocomplete="new-password" minlength="12"></label><div class="form-actions"><p class="form-message"></p><button>Save general settings</button></div>';
-        form.username.value = user.username;
+        form.username.value = accountSettings.username;
         form.addEventListener("submit", async (event) => {
           event.preventDefault();
           const formMessage = requiredDescendant<HTMLElement>(form, ".form-message");
           try {
-            const result = await api("/api/account/general", {
+            const result = await api(accountApiPath("/api/account/general"), {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify(Object.fromEntries(new FormData(form))),
             });
-            user.username = result.username;
-            const accountMenu = $<HTMLAnchorElement>("#account-menu");
-            accountMenu.textContent = result.username.slice(0, 1).toUpperCase();
-            accountMenu.href = accountPath("profile");
+            const formStillActive = form.isConnected
+              && activeAccountUsername === targetUsername;
+            if (formStillActive) activeAccountUsername = result.username;
+            if (isOwnAccount) {
+              user.username = result.username;
+              const accountMenu = $<HTMLAnchorElement>("#account-menu");
+              accountMenu.textContent = result.username.slice(0, 1).toUpperCase();
+              accountMenu.href = accountPath("profile");
+            }
             formMessage.textContent = result.message;
-            window.history.replaceState(
-              { account: "general" },
-              "",
-              accountPath("general"),
-            );
+            if (formStillActive) {
+              window.history.replaceState(
+                { account: "general" },
+                "",
+                accountPath("general"),
+              );
+            }
           } catch (error) {
             setMessage(formMessage, error.message, true);
           }
         });
         content.append(form);
       } else if (page === "linked-accounts") {
+        const accountSettings = await api(accountApiPath("/api/account/settings"), {
+          signal: controller.signal,
+        });
+        if (!isCurrentRender()) return;
         content.replaceChildren();
         const form = document.createElement("form") as AppForm; form.className = "service-card account-form";
-        form.innerHTML = '<h2>Linked accounts</h2><fieldset><legend>ListenBrainz</legend><label>Username<small>Used to tailor recommendations. Leave blank to disconnect it.</small><input name="listenbrainzUsername" autocomplete="username" placeholder="your-listenbrainz-name"></label></fieldset><fieldset><legend>Last.fm</legend><label>Username<input name="lastfmUsername" autocomplete="username" placeholder="your-lastfm-name"></label><label>API key<small>Create one in your Last.fm API account. Leave blank to keep your saved key.</small><input name="lastfmApiKey" type="password" autocomplete="off" placeholder="Last.fm API key"></label></fieldset><div class="form-actions"><p class="form-message"></p><button>Save linked accounts</button></div>';
-        form.listenbrainzUsername.value = user.listenbrainzUsername || "";
-        form.lastfmUsername.value = user.lastfmUsername || "";
+        form.innerHTML = `
+          <h2>Linked accounts</h2>
+          <fieldset>
+            <legend>Plex</legend>
+            <div class="linked-account-summary">
+              <img src="/icons/plex.svg" width="42" height="42" alt="">
+              <div>
+                <strong id="account-plex-status"></strong>
+                <small id="account-plex-detail"></small>
+              </div>
+              <button id="account-link-plex" class="plex-button" type="button">
+                Link with <img src="/icons/plex.svg" alt="Plex">
+              </button>
+            </div>
+            <p id="account-plex-message" class="form-message" aria-live="polite"></p>
+          </fieldset>
+          <fieldset>
+            <legend>ListenBrainz</legend>
+            <label>Username<small>Used to tailor recommendations. Leave blank to disconnect it.</small><input name="listenbrainzUsername" autocomplete="username" placeholder="your-listenbrainz-name"></label>
+          </fieldset>
+          <fieldset>
+            <legend>Last.fm</legend>
+            <label>Username<small>Used to tailor recommendations from your Last.fm listening history. An administrator manages the shared API key.</small><input name="lastfmUsername" autocomplete="username" placeholder="your-lastfm-name"></label>
+          </fieldset>
+          <div class="form-actions"><p class="form-message"></p><button>Save linked accounts</button></div>
+        `;
+        let plexLinked = Boolean(accountSettings.plexLinked);
+        let plexUsername = accountSettings.plexUsername || "";
+        let plexEmail = accountSettings.plexEmail || "";
+        form.listenbrainzUsername.value = accountSettings.listenbrainzUsername || "";
+        form.lastfmUsername.value = accountSettings.lastfmUsername || "";
+        const plexStatus = requiredDescendant<HTMLElement>(form, "#account-plex-status");
+        const plexDetail = requiredDescendant<HTMLElement>(form, "#account-plex-detail");
+        const plexButton = requiredDescendant<HTMLButtonElement>(form, "#account-link-plex");
+        const plexMessage = requiredDescendant<HTMLElement>(form, "#account-plex-message");
+        const renderPlexLinkStatus = () => {
+          if (plexLinked) {
+            plexStatus.textContent = plexUsername || plexEmail || "Plex account linked";
+            plexDetail.textContent = "You can sign in with either your local credentials or Plex.";
+            plexButton.hidden = true;
+          } else if (accountSettings.plexConfigured) {
+            plexStatus.textContent = "Not linked";
+            plexDetail.textContent = "Link a Plex account that has access to this server.";
+            plexButton.hidden = false;
+            plexButton.disabled = false;
+          } else {
+            plexStatus.textContent = "Plex is not configured";
+            plexDetail.textContent = "An administrator must connect a Plex server first.";
+            plexButton.hidden = false;
+            plexButton.disabled = true;
+          }
+        };
+        renderPlexLinkStatus();
+        plexButton.addEventListener("click", async () => {
+          plexButton.disabled = true;
+          await startPlexAuthentication("link", plexMessage, async (result) => {
+            plexLinked = true;
+            plexUsername = result.plexUsername || "";
+            plexEmail = result.plexEmail || "";
+            if (isOwnAccount) {
+              user.plexLinked = plexLinked;
+              user.plexUsername = plexUsername;
+              user.plexEmail = plexEmail;
+            }
+            renderPlexLinkStatus();
+            setMessage(plexMessage, result.message);
+          }, targetUsername);
+          if (!plexLinked && accountSettings.plexConfigured) {
+            plexButton.disabled = false;
+          }
+        });
         form.addEventListener("submit", async (event) => {
           event.preventDefault();
           const formMessage = requiredDescendant<HTMLElement>(form, ".form-message");
           setMessage(formMessage, "Saving linked accounts…");
           try {
             const [listenbrainz, lastfm] = await Promise.all([
-              api("/api/account/settings", {
+              api(accountApiPath("/api/account/settings"), {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
                   username: form.listenbrainzUsername.value,
                 }),
               }),
-              api("/api/account/lastfm", {
+              api(accountApiPath("/api/account/lastfm"), {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
                   username: form.lastfmUsername.value,
-                  apiKey: form.lastfmApiKey.value,
                 }),
               }),
             ]);
-            user.listenbrainzUsername = form.listenbrainzUsername.value.trim();
-            user.lastfmUsername = form.lastfmUsername.value.trim();
-            user.lastfmConfigured = Boolean(user.lastfmUsername);
-            form.lastfmApiKey.value = "";
+            if (isOwnAccount) {
+              user.listenbrainzUsername = form.listenbrainzUsername.value.trim();
+              user.lastfmUsername = form.lastfmUsername.value.trim();
+              user.lastfmConfigured = Boolean(user.lastfmUsername);
+            }
             setMessage(
               formMessage,
               `${listenbrainz.message} ${lastfm.message} Recommendations are being refreshed.`,
@@ -659,14 +1413,41 @@ function setupNavigation() {
         });
         content.append(form);
       }
-    } catch (error) { setMessage(message, error.message, true); }
+    } catch (error) {
+      if (error.name !== "AbortError" && isCurrentRender()) {
+        setMessage(message, error.message, true);
+      }
+    } finally {
+      if (accountRenderAbort === controller) accountRenderAbort = undefined;
+    }
   }
 
-  showAccountPage = (page = "profile", updateHistory = true) => {
-    if (!currentUser) return;
+  showAccountPage = (
+    page = "profile",
+    updateHistory = true,
+    username = activeAccountUsername || currentUser?.username,
+    requestPage = 1,
+  ) => {
+    if (!currentUser || !username) return;
+    const isOwnAccount = isOwnAccountUsername(username);
+    if (!isOwnAccount && currentUser.role !== "admin") {
+      showView("discover");
+      return;
+    }
+    activeAccountUsername = username;
+    activeAccountRequestPage = page === "requests" ? Math.max(1, requestPage) : 1;
     showView("account", false);
-    if (updateHistory) window.history.pushState({ account: page }, "", accountPath(page));
-    const allowedPages = ["profile", "general", "linked-accounts"];
+    if (updateHistory) {
+      window.history.pushState(
+        { account: page, username, page: activeAccountRequestPage },
+        "",
+        accountPath(page, username, activeAccountRequestPage),
+      );
+    }
+    const allowedPages: AccountPage[] = ["profile", "requests"];
+    if (isOwnAccount || currentUser.role === "admin") {
+      allowedPages.push("general", "linked-accounts");
+    }
     if (currentUser.role === "admin") allowedPages.push("invitations");
     renderAccount(allowedPages.includes(page) ? page : "profile");
   };
@@ -693,14 +1474,36 @@ function setupNavigation() {
   });
 
   window.addEventListener("popstate", () => {
-    const accountMatch = window.location.pathname.match(/^\/([^/]+)(?:\/settings\/(general|linked-accounts|invitations))?\/?$/);
-    if (accountMatch && currentUser && decodeURIComponent(accountMatch[1]).toLowerCase() === currentUser.username.toLowerCase()) {
-      showAccountPage?.((accountMatch[2] || "profile") as AccountPage, false);
+    if (["/settings", "/settings/requests", "/settings/users", "/settings/jobs"].includes(window.location.pathname)) {
+      if (currentUser?.role !== "admin") {
+        showView("discover", false);
+        window.history.replaceState({ view: "discover" }, "", "/");
+        window.dispatchEvent(new Event("melodarr-home"));
+        return;
+      }
+      showView("settings", false);
+      const page: SettingsPage = window.location.pathname.endsWith("/requests")
+        ? "requests"
+        : window.location.pathname.endsWith("/users")
+          ? "users"
+          : window.location.pathname.endsWith("/jobs") ? "jobs" : "services";
+      showSettingsPage(page, false);
       return;
     }
-    if (window.location.pathname === "/settings" || window.location.pathname === "/settings/jobs") {
-      showView("settings", false);
-      showSettingsPage(window.location.pathname.endsWith("/jobs") ? "jobs" : "services", false);
+    const accountMatch = window.location.pathname.match(
+      /^\/([^/]+)(?:\/(requests)|\/settings\/(general|linked-accounts|invitations))?\/?$/,
+    );
+    const accountUsername = accountMatch ? decodeURIComponent(accountMatch[1]) : "";
+    const canViewAccount = accountMatch && currentUser && (
+      isOwnAccountUsername(accountUsername)
+      || currentUser.role === "admin"
+    );
+    if (accountMatch && canViewAccount) {
+      const accountPage = (accountMatch[2] || accountMatch[3] || "profile") as AccountPage;
+      const requestPage = accountPage === "requests"
+        ? Math.max(1, Number.parseInt(new URLSearchParams(window.location.search).get("page") || "1", 10) || 1)
+        : 1;
+      showAccountPage?.(accountPage, false, accountUsername, requestPage);
       return;
     }
     const view = window.location.pathname.slice(1) || "discover";
@@ -708,7 +1511,7 @@ function setupNavigation() {
   });
 
   const initialView = window.location.pathname.slice(1) || "discover";
-  if (initialView === "settings/jobs") showView("settings", false);
+  if (["settings/requests", "settings/users", "settings/jobs"].includes(initialView)) showView("settings", false);
   else if (["library", "settings"].includes(initialView)) showView(initialView as AppView, false);
 
   document.querySelectorAll<HTMLElement>(".tab-bar .nav-link").forEach((button) => button.addEventListener("click", () => {
@@ -718,19 +1521,314 @@ function setupNavigation() {
   $<HTMLAnchorElement>("#account-menu").addEventListener("click", (event) => {
     if (!currentUser || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
     event.preventDefault();
-    showAccountPage?.("profile");
+    showAccountPage?.("profile", true, currentUser.username);
   });
   document.querySelectorAll<HTMLElement>("[data-account-route]").forEach((link) => link.addEventListener("click", (event) => { event.preventDefault(); showAccountPage?.(link.dataset.accountRoute as AccountPage); }));
   document.querySelector("#account-logout")?.addEventListener("click", () => signOut());
-  document.querySelectorAll<HTMLElement>("[data-settings-page]").forEach((button) => button.addEventListener("click", () => showSettingsPage(button.dataset.settingsPage as SettingsPage)));
+  const settingsTabs = Array.from(document.querySelectorAll<HTMLButtonElement>("[data-settings-page]"));
+  settingsTabs.forEach((button, index) => {
+    button.addEventListener("click", () => showSettingsPage(button.dataset.settingsPage as SettingsPage));
+    button.addEventListener("keydown", (event) => {
+      let nextIndex: number | undefined;
+      if (event.key === "ArrowRight") nextIndex = (index + 1) % settingsTabs.length;
+      else if (event.key === "ArrowLeft") nextIndex = (index - 1 + settingsTabs.length) % settingsTabs.length;
+      else if (event.key === "Home") nextIndex = 0;
+      else if (event.key === "End") nextIndex = settingsTabs.length - 1;
+      if (nextIndex === undefined) return;
+      event.preventDefault();
+      const nextTab = settingsTabs[nextIndex];
+      nextTab.focus();
+      showSettingsPage(nextTab.dataset.settingsPage as SettingsPage);
+    });
+  });
   document.querySelector("#refresh-maintenance")?.addEventListener("click", () => refreshMaintenance());
 }
 
-function applyCurrentUser(user: CurrentUser) {
+async function applyCurrentUser(user: CurrentUser) {
+  sessionExpiryHandled = false;
   currentUser = user;
   document.body.classList.add("authenticated");
+  updateSessionChrome();
+  try {
+    await loadDiscovery();
+    window.dispatchEvent(new Event("melodarr-authenticated"));
+    // Re-evaluate a bookmarked view or detail route only after its API calls
+    // have an authenticated session and the lazy discovery route is ready.
+    window.dispatchEvent(new PopStateEvent("popstate"));
+  } catch (error) {
+    showToast(error.message, true);
+  }
+}
+
+function adminUserDisplayName(user: AdminUserIdentity) {
+  if (user.userType === "plex") {
+    return user.plexUsername || user.username || user.plexEmail || "Plex user";
+  }
+  return user.localUsername || user.username || "Local user";
+}
+
+/** Use the unique local identity for routes; Plex display names may collide. */
+function adminUserRouteUsername(user: AdminUserIdentity) {
+  return user.localUsername || user.username;
+}
+
+function createUserAvatar(user: AdminUserIdentity, large = false) {
+  const avatar = document.createElement("span");
+  avatar.className = `user-avatar${large ? " user-avatar-large" : ""}`;
+  const displayName = adminUserDisplayName(user);
+  avatar.textContent = displayName.slice(0, 1).toLocaleUpperCase() || "?";
+  if (user.plexAvatar) {
+    const image = document.createElement("img");
+    image.src = user.plexAvatar;
+    image.alt = "";
+    image.loading = "lazy";
+    image.decoding = "async";
+    image.addEventListener("error", () => image.remove(), { once: true });
+    avatar.append(image);
+  }
+  return avatar;
+}
+
+function joinedDate(value: number | string) {
+  const numeric = Number(value);
+  const date = Number.isFinite(numeric)
+    ? new Date(numeric * (numeric < 10_000_000_000 ? 1_000 : 1))
+    : new Date(value);
+  return Number.isNaN(date.getTime()) ? undefined : date;
+}
+
+function createAdminRequestPlexBadge(item: AdminRequest) {
+  if (!item.availableInPlex) return undefined;
+  const destination = mobilePlexDestination(
+    String(item.plexUrl || ""),
+    String(item.plexampUrl || ""),
+  );
+  const badge: HTMLElement = destination.url
+    ? document.createElement("a")
+    : document.createElement("span");
+  badge.className = "history-plex admin-request-plex";
+  badge.title = destination.url ? destination.label : "Available in Plex";
+  badge.setAttribute("aria-label", badge.title);
+  if (badge instanceof HTMLAnchorElement) {
+    badge.href = destination.url;
+    if (destination.openInNewTab) {
+      badge.target = "_blank";
+      badge.rel = "noreferrer";
+    }
+  }
+  const icon = document.createElement("img");
+  icon.src = "/icons/plex.svg";
+  icon.alt = "";
+  badge.append(icon);
+  return badge;
+}
+
+function createAdminRequestItem(item: AdminRequest) {
+  const row = document.createElement("article");
+  row.className = "admin-request-item";
+
+  const detail = document.createElement("a");
+  detail.className = "admin-request-detail";
+  const route = item.kind === "artist" ? "artists" : "albums";
+  detail.href = `/${route}/${encodeURIComponent(item.mbid)}`;
+
+  const kind = document.createElement("span");
+  kind.className = `admin-request-kind ${item.kind === "artist" ? "artist" : "release"}`;
+  kind.textContent = item.kind === "artist" ? "Artist" : "Release group";
+
+  const copy = document.createElement("span");
+  copy.className = "history-copy";
+  const title = document.createElement("strong");
+  title.className = "history-title";
+  title.textContent = item.name;
+  copy.append(title);
+  if (item.kind === "release-group") {
+    const releaseType = String(item.release_type || "");
+    const metadata = [
+      item.artist_name,
+      releaseType ? releaseType[0].toUpperCase() + releaseType.slice(1) : "",
+      item.release_date,
+    ].filter(Boolean);
+    if (metadata.length) {
+      const secondary = document.createElement("span");
+      secondary.className = "history-meta";
+      secondary.textContent = metadata.join(" · ");
+      copy.append(secondary);
+    }
+  }
+  detail.append(kind, copy);
+
+  const requester = document.createElement("div");
+  requester.className = "admin-request-requester";
+  const requesterCopy = document.createElement("span");
+  const requesterName = document.createElement("a");
+  requesterName.className = "admin-request-requester-link";
+  requesterName.href = `/${encodeURIComponent(adminUserRouteUsername(item.requester))}`;
+  requesterName.textContent = adminUserDisplayName(item.requester);
+  const requesterMeta = document.createElement("small");
+  const requestedAtDate = joinedDate(item.created_at);
+  const accountType = item.requester.userType === "plex" ? "Plex user" : "Local account";
+  if (requestedAtDate) {
+    const requestedAt = document.createElement("time");
+    requestedAt.dateTime = requestedAtDate.toISOString();
+    requestedAt.title = requestedAtDate.toLocaleString();
+    requestedAt.textContent = requestedAtDate.toLocaleDateString();
+    requesterMeta.append(`${accountType} · `, requestedAt);
+  } else {
+    requesterMeta.textContent = accountType;
+  }
+  requesterCopy.append(requesterName, requesterMeta);
+  requester.append(createUserAvatar(item.requester), requesterCopy);
+
+  row.append(detail, requester);
+  const plexBadge = createAdminRequestPlexBadge(item);
+  if (plexBadge) row.append(plexBadge);
+  return row;
+}
+
+function setAdminRequestStats() {
+  $("#admin-requests-total").textContent = adminRequestsPagination.total.toLocaleString();
+  $("#admin-requests-artists").textContent = adminRequests
+    .filter((item) => item.kind === "artist").length.toLocaleString();
+  $("#admin-requests-releases").textContent = adminRequests
+    .filter((item) => item.kind === "release-group").length.toLocaleString();
+}
+
+function renderAdminRequestPagination() {
+  const pagination = $("#admin-requests-pagination");
+  const previous = $<HTMLButtonElement>("#admin-requests-previous");
+  const next = $<HTMLButtonElement>("#admin-requests-next");
+  const pageLabel = $("#admin-requests-page");
+  const { page, totalPages } = adminRequestsPagination;
+  pagination.hidden = totalPages <= 1;
+  previous.disabled = page <= 1;
+  next.disabled = totalPages === 0 || page >= totalPages;
+  pageLabel.textContent = `Page ${page.toLocaleString()} of ${Math.max(totalPages, 1).toLocaleString()}`;
+}
+
+function renderAdminRequests() {
+  const list = $("#admin-requests-list");
+  const search = $<HTMLInputElement>("#admin-requests-search");
+  const kind = $<HTMLSelectElement>("#admin-requests-type").value;
+  const query = normalizeSearch(search.value);
+  const visibleRequests = adminRequests.filter((item) => {
+    if (kind !== "all" && item.kind !== kind) return false;
+    if (!query) return true;
+    return normalizeSearch([
+      item.name,
+      item.artist_name,
+      item.release_type,
+      item.release_date,
+      adminUserDisplayName(item.requester),
+      item.requester.localUsername,
+      item.requester.plexEmail,
+    ].filter(Boolean).join(" ")).includes(query);
+  });
+  list.replaceChildren();
+
+  if (!visibleRequests.length) {
+    const empty = document.createElement("p");
+    empty.className = "message admin-request-empty";
+    empty.textContent = adminRequests.length
+      ? "No requests match the current filters."
+      : "No requests have been made yet.";
+    list.append(empty);
+  } else {
+    visibleRequests.forEach((item) => list.append(createAdminRequestItem(item)));
+  }
+
+  const filtered = query || kind !== "all";
+  const { page, pageSize, total } = adminRequestsPagination;
+  const firstResult = total ? ((page - 1) * pageSize) + 1 : 0;
+  const lastResult = total ? firstResult + adminRequests.length - 1 : 0;
+  setMessage(
+    $("#admin-requests-message"),
+    filtered
+      ? `${visibleRequests.length.toLocaleString()} of ${adminRequests.length.toLocaleString()} requests on this page.`
+      : total
+        ? `Showing ${firstResult.toLocaleString()}–${lastResult.toLocaleString()} of ${total.toLocaleString()} requests.`
+        : "No requests.",
+  );
+  renderAdminRequestPagination();
+}
+
+async function refreshAdminRequests(page = adminRequestsPagination.page) {
+  const request = ++adminRequestsRequest;
+  const list = $("#admin-requests-list");
+  list.replaceChildren(skeletonBlock("admin-request-item", 6));
+  setMessage($("#admin-requests-message"), "Loading requests…");
+  $<HTMLButtonElement>("#admin-requests-previous").disabled = true;
+  $<HTMLButtonElement>("#admin-requests-next").disabled = true;
+  try {
+    const result = await api<{
+      requests: AdminRequest[];
+      pagination: AdminRequestPagination;
+    }>(`/api/admin/requests?page=${encodeURIComponent(page)}`);
+    if (request !== adminRequestsRequest) return;
+    adminRequests = result.requests || [];
+    adminRequestsPagination = result.pagination || {
+      page,
+      pageSize: 100,
+      total: adminRequests.length,
+      totalPages: adminRequests.length ? 1 : 0,
+    };
+    setAdminRequestStats();
+    renderAdminRequests();
+  } catch (error) {
+    if (request !== adminRequestsRequest) return;
+    adminRequests = [];
+    adminRequestsPagination = {
+      page,
+      pageSize: 100,
+      total: 0,
+      totalPages: 0,
+    };
+    setAdminRequestStats();
+    renderAdminRequestPagination();
+    list.replaceChildren();
+    const errorState = document.createElement("div");
+    errorState.className = "admin-request-load-error";
+    const copy = document.createElement("p");
+    copy.className = "message error";
+    copy.textContent = error.message;
+    const retry = document.createElement("button");
+    retry.type = "button";
+    retry.className = "outline";
+    retry.textContent = "Try again";
+    retry.addEventListener("click", () => refreshAdminRequests());
+    errorState.append(copy, retry);
+    list.append(errorState);
+    setMessage($("#admin-requests-message"), "Requests could not be loaded.", true);
+  }
+}
+
+function setupAdminRequests() {
+  $("#refresh-admin-requests").addEventListener("click", () => refreshAdminRequests());
+  $("#admin-requests-previous").addEventListener("click", () => {
+    if (adminRequestsPagination.page <= 1) return;
+    refreshAdminRequests(adminRequestsPagination.page - 1);
+  });
+  $("#admin-requests-next").addEventListener("click", () => {
+    if (adminRequestsPagination.page >= adminRequestsPagination.totalPages) return;
+    refreshAdminRequests(adminRequestsPagination.page + 1);
+  });
+  $<HTMLInputElement>("#admin-requests-search").addEventListener(
+    "input",
+    () => renderAdminRequests(),
+  );
+  $<HTMLSelectElement>("#admin-requests-type").addEventListener(
+    "change",
+    () => renderAdminRequests(),
+  );
+}
+
+function updateSessionChrome() {
+  if (!currentUser) return;
+  const user = currentUser;
   const isAdmin = user.role === "admin";
-  document.querySelectorAll<HTMLElement>(".admin-only").forEach((element) => { element.hidden = !isAdmin; });
+  document.querySelectorAll<HTMLElement>(".admin-only").forEach((element) => {
+    element.hidden = !isAdmin;
+  });
   const status = $("#status");
   status.textContent = `Signed in as ${user.username}${isAdmin ? " · Administrator" : ""}`;
   status.className = "status ready";
@@ -738,19 +1836,273 @@ function applyCurrentUser(user: CurrentUser) {
   accountMenu.textContent = user.username.slice(0, 1).toUpperCase();
   accountMenu.href = `/${encodeURIComponent(user.username)}`;
   accountMenu.setAttribute("aria-label", `Open settings for ${user.username}`);
-  window.dispatchEvent(new Event("melodarr-authenticated"));
-  // Re-evaluate a bookmarked view or detail route only after its API calls
-  // have an authenticated session.
-  window.dispatchEvent(new PopStateEvent("popstate"));
+}
+
+function isCurrentSessionUser(user: AdminUser) {
+  if (!currentUser) return false;
+  if (currentUser.id !== undefined) return currentUser.id === user.id;
+  const currentName = currentUser.username.toLocaleLowerCase();
+  return [user.username, user.localUsername, user.plexUsername]
+    .filter(Boolean)
+    .some((name) => name!.toLocaleLowerCase() === currentName);
+}
+
+function renderAdminUsers() {
+  const table = $<HTMLTableSectionElement>("#users-table");
+  const query = normalizeSearch($<HTMLInputElement>("#users-search").value);
+  const visibleUsers = adminUsers.filter((user) => normalizeSearch([
+    adminUserDisplayName(user),
+    user.localUsername,
+    user.plexEmail,
+    user.userType,
+    user.role,
+  ].filter(Boolean).join(" ")).includes(query));
+  table.replaceChildren();
+
+  if (!visibleUsers.length) {
+    const row = document.createElement("tr");
+    const empty = tableCell(
+      row,
+      adminUsers.length ? `No users match “${$<HTMLInputElement>("#users-search").value.trim()}”.` : "No users have joined Melodarr yet.",
+    );
+    empty.className = "table-empty";
+    empty.colSpan = 6;
+    table.append(row);
+    return;
+  }
+
+  visibleUsers.forEach((user) => {
+    const row = document.createElement("tr");
+    const identityCell = tableCell(row, "");
+    identityCell.dataset.label = "Username";
+    const identity = document.createElement("div");
+    identity.className = "user-identity";
+    const copy = document.createElement("span");
+    const name = document.createElement("strong");
+    name.textContent = adminUserDisplayName(user);
+    copy.append(name);
+    const secondaryParts = user.userType === "plex"
+      ? [user.localUsername ? `Local: ${user.localUsername}` : "", user.plexEmail]
+      : [];
+    const secondaryText = secondaryParts.filter(Boolean).join(" · ");
+    if (secondaryText) {
+      const secondary = document.createElement("small");
+      secondary.textContent = secondaryText;
+      copy.append(secondary);
+    }
+    identity.append(createUserAvatar(user), copy);
+    identityCell.append(identity);
+
+    const requests = tableCell(row, "");
+    requests.dataset.label = "Requests";
+    requests.className = "user-request-count";
+    const requestLink = document.createElement("a");
+    requestLink.href = `/${encodeURIComponent(adminUserRouteUsername(user))}/requests`;
+    requestLink.textContent = Number(user.requestCount || 0).toLocaleString();
+    requestLink.setAttribute(
+      "aria-label",
+      `View requests from ${adminUserDisplayName(user)}`,
+    );
+    requests.append(requestLink);
+
+    const typeCell = tableCell(row, "");
+    typeCell.dataset.label = "User type";
+    const type = document.createElement("span");
+    type.className = `user-badge user-type ${user.userType}`;
+    type.textContent = user.userType === "plex" ? "Plex user" : "Local account";
+    typeCell.append(type);
+
+    const roleCell = tableCell(row, "");
+    roleCell.dataset.label = "Role";
+    const role = document.createElement("span");
+    role.className = `user-badge user-role ${user.role}`;
+    role.textContent = user.role === "admin" ? "Administrator" : "User";
+    roleCell.append(role);
+
+    const joinedCell = tableCell(row, "");
+    joinedCell.dataset.label = "Joined";
+    const date = joinedDate(user.joinedAt);
+    if (date) {
+      const time = document.createElement("time");
+      time.dateTime = date.toISOString();
+      time.textContent = date.toLocaleDateString(undefined, {
+        year: "numeric",
+        month: "short",
+        day: "numeric",
+      });
+      joinedCell.append(time);
+    } else {
+      joinedCell.textContent = "Unknown";
+    }
+
+    const actionCell = tableCell(row, "");
+    actionCell.className = "user-actions";
+    const actionButtons = document.createElement("div");
+    actionButtons.className = "user-action-buttons";
+    const edit = document.createElement("a");
+    edit.className = "outline edit-user";
+    const routeUsername = adminUserRouteUsername(user);
+    edit.href = `/${encodeURIComponent(routeUsername)}`;
+    edit.textContent = "Edit";
+    edit.setAttribute("aria-label", `Edit settings for ${routeUsername}`);
+    edit.addEventListener("click", (event) => {
+      if (
+        event.button !== 0
+        || event.metaKey
+        || event.ctrlKey
+        || event.shiftKey
+        || event.altKey
+      ) return;
+      event.preventDefault();
+      showAccountPage?.("profile", true, routeUsername);
+    });
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "outline delete-user";
+    remove.textContent = "Delete";
+    remove.setAttribute("aria-label", `Delete ${adminUserDisplayName(user)}`);
+    const currentSession = isCurrentSessionUser(user);
+    remove.disabled = currentSession;
+    if (currentSession) {
+      remove.title = "You cannot delete your own account.";
+    }
+    remove.addEventListener("click", () => deleteAdminUser(user, remove));
+    actionButtons.append(edit, remove);
+    actionCell.append(actionButtons);
+    table.append(row);
+  });
+}
+
+function setAdminUserStats() {
+  $("#users-total").textContent = adminUsers.length.toLocaleString();
+  $("#users-plex").textContent = adminUsers.filter((user) => user.userType === "plex").length.toLocaleString();
+  $("#users-local").textContent = adminUsers.filter((user) => user.userType === "local").length.toLocaleString();
+}
+
+async function refreshAdminUsers() {
+  const request = ++adminUsersRequest;
+  const table = $<HTMLTableSectionElement>("#users-table");
+  const message = $("#users-message");
+  table.innerHTML = '<tr><td colspan="6" class="table-empty">Loading users…</td></tr>';
+  setMessage(message, "");
+  try {
+    const result = await api<{ users: AdminUser[] }>("/api/admin/users");
+    if (request !== adminUsersRequest) return;
+    adminUsers = result.users || [];
+    setAdminUserStats();
+    renderAdminUsers();
+    setMessage(
+      message,
+      `${adminUsers.length.toLocaleString()} ${adminUsers.length === 1 ? "user" : "users"}.`,
+    );
+  } catch (error) {
+    if (request !== adminUsersRequest) return;
+    adminUsers = [];
+    setAdminUserStats();
+    table.replaceChildren();
+    const row = document.createElement("tr");
+    const cell = tableCell(row, "");
+    cell.colSpan = 6;
+    cell.className = "table-empty user-load-error";
+    const copy = document.createElement("span");
+    copy.textContent = error.message;
+    const retry = document.createElement("button");
+    retry.type = "button";
+    retry.className = "outline";
+    retry.textContent = "Try again";
+    retry.addEventListener("click", () => refreshAdminUsers());
+    cell.append(copy, retry);
+    table.append(row);
+    setMessage(message, "Users could not be loaded.", true);
+  }
+}
+
+async function deleteAdminUser(user: AdminUser, button: HTMLButtonElement) {
+  const displayName = adminUserDisplayName(user);
+  if (!window.confirm(
+    `Delete ${displayName}? This permanently removes their account, request history, invitations, and queued work. This cannot be undone.`,
+  )) return;
+
+  const originalLabel = button.textContent;
+  button.disabled = true;
+  button.textContent = "Deleting…";
+  try {
+    await api(`/api/admin/users/${encodeURIComponent(String(user.id))}`, {
+      method: "DELETE",
+    });
+    adminUsers = adminUsers.filter((candidate) => candidate.id !== user.id);
+    setAdminUserStats();
+    renderAdminUsers();
+    const message = `Deleted ${displayName}.`;
+    setMessage($("#users-message"), message);
+    showToast(message);
+  } catch (error) {
+    setMessage($("#users-message"), error.message, true);
+    showToast(error.message, true);
+    if (button.isConnected) {
+      button.disabled = false;
+      button.textContent = originalLabel;
+    }
+  }
+}
+
+function setupAdminUsers() {
+  $("#refresh-users").addEventListener("click", () => refreshAdminUsers());
+  $<HTMLInputElement>("#users-search").addEventListener("input", () => renderAdminUsers());
+}
+
+function showSetupPanel(
+  panel: "choice" | "plex-login" | "local-account" | "plex-server",
+) {
+  const panelIds = {
+    choice: "setup-choice",
+    "plex-login": "setup-plex-login",
+    "local-account": "setup-local-account",
+    "plex-server": "setup-plex-server",
+  };
+  Object.values(panelIds).forEach((id) => {
+    $(`#${id}`).hidden = id !== panelIds[panel];
+  });
+  const step = panel === "choice" ? 1 : panel === "plex-server" ? 3 : 2;
+  const localPath = panel === "local-account";
+  document.querySelectorAll<HTMLElement>("[data-setup-step]").forEach((item) => {
+    const itemStep = Number(item.dataset.setupStep);
+    item.hidden = localPath && itemStep === 3;
+    item.classList.toggle("active", itemStep === step);
+    item.classList.toggle("completed", itemStep < step);
+  });
+  const secondLabel = document.querySelector<HTMLElement>(
+    '[data-setup-step="2"] strong',
+  );
+  if (secondLabel) secondLabel.textContent = localPath ? "Admin account" : "Sign in";
 }
 
 async function showAuth({ resetPath = false } = {}) {
+  accountRenderGeneration += 1;
+  accountRenderAbort?.abort();
+  accountRenderAbort = undefined;
+  adminUsersRequest += 1;
+  adminRequestsRequest += 1;
+  if (maintenanceRefreshTimer !== undefined) window.clearInterval(maintenanceRefreshTimer);
+  maintenanceRefreshTimer = undefined;
   currentUser = undefined;
   document.body.classList.remove("authenticated");
+  const authCard = $("#auth-card");
+  const setupWizard = $("#setup-wizard");
   const loginForm = $("#login-form");
   const registerForm = $("#register-form");
+  const plexLoginOption = $("#plex-login-option");
+  loginForm.reset();
+  registerForm.reset();
+  setMessage(requiredDescendant(loginForm, ".form-message"), "");
+  setMessage(requiredDescendant(registerForm, ".form-message"), "");
+  setMessage(requiredDescendant(plexLoginOption, ".form-message"), "");
+  $<HTMLButtonElement>("#plex-login").disabled = false;
   loginForm.hidden = true;
   registerForm.hidden = true;
+  plexLoginOption.hidden = true;
+  authCard.hidden = false;
+  setupWizard.hidden = true;
   if (resetPath) window.history.replaceState({}, "", "/");
 
   const parameters = new URLSearchParams(window.location.search);
@@ -761,10 +2113,9 @@ async function showAuth({ resetPath = false } = {}) {
     if (status.firstAccount) {
       invitationToken = "";
       window.history.replaceState({ setup: true }, "", "/setup");
-      $("#auth-title").innerHTML = "Create your<br><em>owner account.</em>";
-      $("#auth-intro").textContent = "Set up the first Melodarr administrator account.";
-      $("#register-title").textContent = "Create owner account";
-      registerForm.hidden = false;
+      authCard.hidden = true;
+      setupWizard.hidden = false;
+      showSetupPanel("choice");
     } else if (invitationToken && status.invitationValid) {
       $("#auth-title").innerHTML = "You’re<br><em>invited.</em>";
       $("#auth-intro").textContent = "Create your account using this one-time invitation.";
@@ -780,6 +2131,7 @@ async function showAuth({ resetPath = false } = {}) {
         : "Sign in to discover and request music.";
       invitationToken = "";
       loginForm.hidden = false;
+      plexLoginOption.hidden = !status.plexConfigured;
     }
   } catch (error) {
     $("#auth-intro").textContent = error.message;
@@ -800,7 +2152,7 @@ async function completeAuthentication(endpoint: string, form: HTMLFormElement, m
       // soon as it has been consumed.
       window.history.replaceState({ view: "discover" }, "", "/");
     }
-    applyCurrentUser(user);
+    await applyCurrentUser(user);
     form.reset();
     if (user.role === "admin") await refreshSettings(window.location.pathname.startsWith("/settings"));
   } catch (error) {
@@ -811,6 +2163,7 @@ async function completeAuthentication(endpoint: string, form: HTMLFormElement, m
 function setupAuth() {
   const loginForm = $<AppForm>("#login-form");
   const registerForm = $<AppForm>("#register-form");
+  const setupLocalForm = $<AppForm>("#setup-local-form");
   loginForm.addEventListener("submit", (event) => {
     event.preventDefault();
     completeAuthentication(
@@ -829,6 +2182,135 @@ function setupAuth() {
       { invitationToken },
     );
   });
+  setupLocalForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    completeAuthentication(
+      "/api/auth/register",
+      setupLocalForm,
+      requiredDescendant(setupLocalForm, ".form-message"),
+    );
+  });
+
+  $("#setup-choose-plex").addEventListener("click", () => showSetupPanel("plex-login"));
+  $("#setup-skip-plex").addEventListener("click", () => showSetupPanel("local-account"));
+  document.querySelectorAll<HTMLElement>("[data-setup-back]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const destination = button.dataset.setupBack;
+      if (destination === "plex-login") showSetupPanel("plex-login");
+      else showSetupPanel("choice");
+    });
+  });
+
+  const setupPlexButton = $<HTMLButtonElement>("#setup-plex-login-button");
+  const setupPlexMessage = $("#setup-plex-login .form-message");
+  const setupPlexServerMessage =
+    document.querySelector<HTMLElement>("#setup-plex-message")
+    || document.querySelector<HTMLElement>("#setup-plex-server .form-message")
+    || $<HTMLElement>("#setup-plex-server .message");
+  setupPlexButton.addEventListener("click", async () => {
+    setupPlexButton.disabled = true;
+    await startPlexAuthentication("server", setupPlexMessage, async (result) => {
+      setupPlexFlowToken = result.flowToken;
+      setupPlexServers = result.servers;
+      populatePlexServers("setup", setupPlexServers);
+      $("#setup-plex-account").textContent =
+        `Signed in as ${result.account.username || result.account.email}. Choose how Melodarr should reach your server.`;
+      showSetupPanel("plex-server");
+      setMessage(setupPlexServerMessage, "");
+    });
+    setupPlexButton.disabled = false;
+  });
+
+  const regularPlexButton = $<HTMLButtonElement>("#plex-login");
+  const regularPlexMessage = $("#plex-login-option .form-message");
+  regularPlexButton.addEventListener("click", async () => {
+    regularPlexButton.disabled = true;
+    await startPlexAuthentication("login", regularPlexMessage, async (result) => {
+      window.history.replaceState({ view: "discover" }, "", "/");
+      await applyCurrentUser(result as CurrentUser);
+      if (result.role === "admin") await refreshSettings();
+    });
+    regularPlexButton.disabled = false;
+  });
+
+  const resetSetupPlexLibraries = () => {
+    $("#setup-plex-libraries").disabled = true;
+    $<HTMLButtonElement>("#setup-finish-plex").disabled = true;
+  };
+  plexControlElements("setup").server.addEventListener("change", () => {
+    populatePlexConnections("setup", setupPlexServers);
+    resetSetupPlexLibraries();
+  });
+  plexControlElements("setup").connection.addEventListener(
+    "change",
+    resetSetupPlexLibraries,
+  );
+
+  const inspectButton = $<HTMLButtonElement>("#setup-test-plex");
+  inspectButton.addEventListener("click", async () => {
+    inspectButton.disabled = true;
+    setMessage(setupPlexServerMessage, "Connecting to Plex…");
+    try {
+      const result = await api("/api/auth/plex/inspect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          flowToken: setupPlexFlowToken,
+          ...selectedPlexConnection("setup"),
+        }),
+      });
+      populateOptionPicker(
+        $("#setup-plex-library-sections"),
+        result.libraries,
+        "title",
+        "id",
+        result.libraries.map((library: JsonObject) => library.id),
+      );
+      $("#setup-plex-libraries").disabled = false;
+      $<HTMLButtonElement>("#setup-finish-plex").disabled = false;
+      setMessage(setupPlexServerMessage, result.message);
+    } catch (error) {
+      $("#setup-plex-libraries").disabled = true;
+      $<HTMLButtonElement>("#setup-finish-plex").disabled = true;
+      setMessage(setupPlexServerMessage, error.message, true);
+    } finally {
+      inspectButton.disabled = false;
+    }
+  });
+
+  const finishButton = $<HTMLButtonElement>("#setup-finish-plex");
+  finishButton.addEventListener("click", async () => {
+    const selectedIds = selectedOptionPickerValues("#setup-plex-library-sections");
+    if (!selectedIds.length) {
+      setMessage(
+        setupPlexServerMessage,
+        "Select at least one Plex music library.",
+        true,
+      );
+      return;
+    }
+    finishButton.disabled = true;
+    setMessage(
+      setupPlexServerMessage,
+      "Saving Plex and creating your administrator…",
+    );
+    try {
+      const user = await api<CurrentUser>("/api/auth/plex/complete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          flowToken: setupPlexFlowToken,
+          librarySectionIds: selectedIds,
+        }),
+      });
+      window.history.replaceState({ view: "discover" }, "", "/");
+      await applyCurrentUser(user);
+      await refreshSettings();
+    } catch (error) {
+      setMessage(setupPlexServerMessage, error.message, true);
+      finishButton.disabled = false;
+    }
+  });
   $("#logout").addEventListener("click", () => signOut());
 }
 
@@ -837,7 +2319,10 @@ async function signOut() {
   try {
     await api("/api/auth/logout", { method: "POST" });
   } finally {
-    showAuth({ resetPath: true });
+    if (!sessionExpiryHandled) {
+      window.dispatchEvent(new Event("melodarr-signed-out"));
+      void showAuth({ resetPath: true });
+    }
   }
 }
 
@@ -896,58 +2381,218 @@ function setupLidarrSettings() {
   });
 }
 
-function setupPlexSettings() {
-  const form = $<AppForm>("#plex-settings");
-  const testButton = $("#test-plex");
+function setupLastfmSettings() {
+  const form = $<LastfmSettingsForm>("#lastfm-settings");
+  const saveButton = $<HTMLButtonElement>("#save-lastfm-key");
+  const clearButton = $<HTMLButtonElement>("#clear-lastfm-key");
   const message = requiredDescendant<HTMLElement>(form, ".form-message");
+
+  const saveApiKey = async (apiKey: string, successMessage: string) => {
+    saveButton.disabled = true;
+    clearButton.disabled = true;
+    form.setAttribute("aria-busy", "true");
+    setMessage(message, apiKey ? "Saving Last.fm API key…" : "Clearing Last.fm API key…");
+    try {
+      const result = await api("/api/settings/lastfm", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ apiKey }),
+      });
+      form.apiKey.value = "";
+      setMessage(message, result.message || successMessage);
+      await refreshSettings(false);
+      window.dispatchEvent(new Event("melodarr-recommendations-changed"));
+    } catch (error) {
+      setMessage(message, error.message, true);
+    } finally {
+      saveButton.disabled = false;
+      clearButton.disabled = false;
+      form.removeAttribute("aria-busy");
+    }
+  };
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const apiKey = form.apiKey.value.trim();
+    if (!apiKey) {
+      setMessage(message, "Enter a Last.fm API key to save.", true);
+      form.apiKey.focus();
+      return;
+    }
+    await saveApiKey(apiKey, "Last.fm API key saved.");
+  });
+
+  clearButton.addEventListener("click", async () => {
+    if (!window.confirm(
+      "Clear the shared Last.fm API key? Personalized Last.fm recommendations will stop for every user until a new key is saved.",
+    )) return;
+    await saveApiKey("", "Last.fm API key cleared.");
+  });
+}
+
+function setupAISettings() {
+  const form = $<AISettingsForm>("#ai-settings-form");
+  const saveButton = $<HTMLButtonElement>("#save-ai-settings");
+  const clearButton = $<HTMLButtonElement>("#clear-ai-key");
+  const message = requiredDescendant<HTMLElement>(form, ".form-message");
+
+  form.provider.addEventListener("change", () => updateAIProviderFields(true));
+  form.baseUrl.addEventListener("input", updateAILocalTransportWarning);
+
+  const save = async (clearApiKey = false) => {
+    const provider = selectedAIProvider();
+    const model = form.model.value.trim();
+    const apiKey = form.apiKey.value.trim();
+    if (!model) {
+      setMessage(message, "Enter the model this provider should use.", true);
+      form.model.focus();
+      return;
+    }
+    if (
+      provider.requiresApiKey
+      && !apiKey
+      && form.dataset.configuredProvider !== provider.id
+      && !clearApiKey
+    ) {
+      setMessage(message, `Enter an API key for ${provider.name}.`, true);
+      form.apiKey.focus();
+      return;
+    }
+
+    const body: JsonObject = {
+      provider: provider.id,
+      model,
+    };
+    if (["lmstudio", "ollama"].includes(provider.id)) {
+      body.baseUrl = form.baseUrl.value.trim();
+    }
+    if (apiKey) body.apiKey = apiKey;
+    if (clearApiKey) body.clearApiKey = true;
+
+    saveButton.disabled = true;
+    clearButton.disabled = true;
+    form.setAttribute("aria-busy", "true");
+    setMessage(message, clearApiKey ? "Clearing the saved AI key…" : "Saving AI provider…");
+    try {
+      const result = await api("/api/settings/ai", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      form.apiKey.value = "";
+      setMessage(message, result.message || (
+        clearApiKey ? "AI API key cleared." : "AI recommendation provider saved."
+      ));
+      await refreshSettings(false);
+      window.dispatchEvent(new Event("melodarr-ai-settings-changed"));
+    } catch (error) {
+      setMessage(message, error.message, true);
+    } finally {
+      saveButton.disabled = false;
+      clearButton.disabled = false;
+      form.removeAttribute("aria-busy");
+    }
+  };
+
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    save();
+  });
+  clearButton.addEventListener("click", () => {
+    if (!window.confirm(
+      "Clear the saved AI API key? AI recommendations will pause until a provider is configured again.",
+    )) return;
+    save(true);
+  });
+}
+
+function setupPlexSettings() {
+  const card = $("#plex-settings");
+  const connectButton = $<HTMLButtonElement>("#connect-plex");
+  const testButton = $<HTMLButtonElement>("#settings-test-plex");
+  const saveButton = $<HTMLButtonElement>("#settings-save-plex");
+  const message = requiredDescendant<HTMLElement>(card, ".form-message");
+
+  plexControlElements("settings").server.addEventListener("change", () => {
+    populatePlexConnections("settings", settingsPlexServers);
+    $("#plex-libraries").disabled = true;
+    saveButton.disabled = true;
+  });
+  plexControlElements("settings").connection.addEventListener("change", () => {
+    $("#plex-libraries").disabled = true;
+    saveButton.disabled = true;
+  });
+
+  connectButton.addEventListener("click", async () => {
+    connectButton.disabled = true;
+    await startPlexAuthentication("server", message, async (result) => {
+      settingsPlexFlowToken = result.flowToken;
+      settingsPlexServers = result.servers;
+      populatePlexServers("settings", settingsPlexServers);
+      $("#plex-current-connection").hidden = true;
+      $("#plex-settings-config").hidden = false;
+      $("#plex-libraries").disabled = true;
+      saveButton.disabled = true;
+      setMessage(
+        message,
+        `Signed in as ${result.account.username || result.account.email}. Choose a server connection.`,
+      );
+    });
+    connectButton.disabled = false;
+  });
 
   testButton.addEventListener("click", async () => {
     testButton.disabled = true;
-    setMessage(message, "Testing Plex connection…");
+    setMessage(message, "Connecting to Plex…");
     try {
-      const result = await api("/api/settings/plex/test", {
+      const result = await api("/api/auth/plex/inspect", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(Object.fromEntries(new FormData(form))),
+        body: JSON.stringify({
+          flowToken: settingsPlexFlowToken,
+          ...selectedPlexConnection("settings"),
+        }),
       });
-      const current = selectedOptionPickerValues("#plex-library-sections");
-      populatePlexLibraries(result.libraries, current.length ? current : result.libraries.map((library: JsonObject) => library.id));
+      populatePlexLibraries(
+        result.libraries,
+        result.libraries.map((library: JsonObject) => library.id),
+      );
+      saveButton.disabled = false;
       setMessage(message, result.message);
     } catch (error) {
       $("#plex-libraries").disabled = true;
+      saveButton.disabled = true;
       setMessage(message, error.message, true);
     } finally {
       testButton.disabled = false;
     }
   });
 
-  form.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const submitButton = requiredDescendant<HTMLButtonElement>(form, "fieldset button");
+  saveButton.addEventListener("click", async () => {
     const selectedIds = selectedOptionPickerValues("#plex-library-sections");
     if (!selectedIds.length) {
       setMessage(message, "Select at least one Plex music library.", true);
       return;
     }
-    const body: JsonObject = Object.fromEntries(new FormData(form));
-    body.librarySectionIds = selectedIds;
-    submitButton.disabled = true;
+    saveButton.disabled = true;
     setMessage(message, "Saving Plex libraries…");
 
     try {
-      const result = await api("/api/settings/plex", {
+      const user = await api<CurrentUser>("/api/auth/plex/complete", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+        body: JSON.stringify({
+          flowToken: settingsPlexFlowToken,
+          librarySectionIds: selectedIds,
+        }),
       });
-      populatePlexLibraries(result.libraries, result.librarySectionIds);
-      requiredDescendant<HTMLInputElement>(form, "[name=token]").value = "";
-      setMessage(message, result.message);
+      currentUser = user;
+      $("#plex-settings-config").hidden = true;
+      setMessage(message, "Connected to Plex; full music-library scan queued.");
       await refreshSettings();
     } catch (error) {
       setMessage(message, error.message, true);
-    } finally {
-      submitButton.disabled = false;
+      saveButton.disabled = false;
     }
   });
 }
@@ -1187,6 +2832,7 @@ function setupLibrary() {
     }
     loadButton.disabled = true;
     loadButton.textContent = "Loading…";
+    results.setAttribute("aria-busy", "true");
     artworkObserver?.disconnect();
     deferredArtwork.clear();
     artworkQueue.length = 0;
@@ -1219,8 +2865,9 @@ function setupLibrary() {
       results.replaceChildren();
       loadState = "error";
       loadButton.textContent = "Retry";
-      setMessage($("#library-message"), error.message, true);
+      setMessage($("#library-message"), `We couldn’t load your Plex library. ${error.message}`, true);
     } finally {
+      results.removeAttribute("aria-busy");
       loadButton.disabled = false;
       if (loadState === "loaded") loadButton.textContent = "Reload";
     }
@@ -1230,9 +2877,14 @@ function setupLibrary() {
   window.addEventListener("melodarr-library-visible", () => loadLibrary());
 }
 
+setupTheme();
 setupNavigation();
+setupAdminRequests();
+setupAdminUsers();
 setupStandalonePullToRefresh();
 setupLidarrSettings();
+setupLastfmSettings();
+setupAISettings();
 setupPlexSettings();
 setupLibrary();
 setupAuth();
@@ -1242,7 +2894,7 @@ api<CurrentUser>("/api/auth/me")
     if (["/setup", "/register"].includes(window.location.pathname)) {
       window.history.replaceState({ view: "discover" }, "", "/");
     }
-    applyCurrentUser(user);
+    await applyCurrentUser(user);
     if (user.role === "admin") await refreshSettings(window.location.pathname === "/settings");
   })
   .catch(() => showAuth());

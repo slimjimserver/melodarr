@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - develop
     paths:
       - 'backend/**'
       - 'frontend/**'
@@ -79,11 +80,13 @@ jobs:
           username: slimjimserver
           password: ${{ secrets.DOCKER_HUB_TOKEN }}
 
-      - name: Publish main image
-        if: github.event_name != 'release' && github.ref == 'refs/heads/main'
+      - name: Publish branch image
+        if: github.event_name != 'release' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+        env:
+          BRANCH_TAG: ${{ github.ref_name }}
         run: |
-          docker tag "$IMAGE_NAME:$GITHUB_SHA" "$IMAGE_NAME:main"
-          docker push "$IMAGE_NAME:main"
+          docker tag "$IMAGE_NAME:$GITHUB_SHA" "$IMAGE_NAME:$BRANCH_TAG"
+          docker push "$IMAGE_NAME:$BRANCH_TAG"
 
       - name: Publish release image
         if: github.event_name == 'release'
