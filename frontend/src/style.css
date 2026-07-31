@@ -838,7 +838,7 @@ button,
   .intro { line-height: 1.55; }
 
   .search { border-radius: 14px; }
-  .search select { flex-basis: 116px; }
+  .search select { min-width: 0; flex-basis: 152px; }
   .search button { min-height: 50px; }
 
   .recommendations { margin-top: 48px; }
@@ -861,7 +861,7 @@ button,
 }
 
 @media (max-width: 430px) {
-  .search select { flex-basis: 108px; }
+  .search select { flex-basis: 144px; }
   .search input { padding: 0 14px; }
   .recommendations-heading .outline { width: 100%; }
   .artist-card { align-items: flex-start; flex-wrap: wrap; }
