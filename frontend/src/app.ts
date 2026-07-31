@@ -875,11 +875,15 @@ async function refreshMaintenance() {
 }
 
 function showSettingsPage(page: SettingsPage, updateHistory = true) {
-  document.querySelectorAll<HTMLElement>("[data-settings-page]").forEach((button) => button.classList.toggle("active", button.dataset.settingsPage === page));
-  $("#settings-services").hidden = page !== "services";
-  $("#settings-requests").hidden = page !== "requests";
-  $("#settings-users").hidden = page !== "users";
-  $("#settings-jobs").hidden = page !== "jobs";
+  document.querySelectorAll<HTMLButtonElement>("[data-settings-page]").forEach((button) => {
+    const isCurrent = button.dataset.settingsPage === page;
+    button.classList.toggle("active", isCurrent);
+    button.setAttribute("aria-selected", String(isCurrent));
+    button.tabIndex = isCurrent ? 0 : -1;
+  });
+  document.querySelectorAll<HTMLElement>(".settings-panel").forEach((panel) => {
+    panel.hidden = panel.id !== `settings-${page}`;
+  });
   if (maintenanceRefreshTimer !== undefined) window.clearInterval(maintenanceRefreshTimer);
   maintenanceRefreshTimer = undefined;
   if (page === "jobs") {
@@ -901,6 +905,15 @@ function setupNavigation() {
   let activeAccountUsername = "";
   let activeAccountRequestPage = 1;
 
+  function setActiveAccountRoute(page: AccountPage | null) {
+    document.querySelectorAll<HTMLAnchorElement>("[data-account-route]").forEach((link) => {
+      const isCurrent = page !== null && link.dataset.accountRoute === page;
+      link.classList.toggle("active", isCurrent);
+      if (isCurrent) link.setAttribute("aria-current", "page");
+      else link.removeAttribute("aria-current");
+    });
+  }
+
   function isOwnAccountUsername(username: string) {
     if (!currentUser) return false;
     const normalizedUsername = username.toLocaleLowerCase();
@@ -921,6 +934,7 @@ function setupNavigation() {
       else button.removeAttribute("aria-current");
     });
     $(`#${view}`).classList.add("active");
+    if (view !== "account") setActiveAccountRoute(null);
     if (view === "library") {
       window.dispatchEvent(new Event("melodarr-library-visible"));
     }
@@ -1026,7 +1040,7 @@ function setupNavigation() {
     );
     const content = $("#account-content");
     $("#account-title").textContent = page === "profile" ? "Profile" : page.split("-").map((word) => word[0].toUpperCase() + word.slice(1)).join(" ");
-    document.querySelectorAll<HTMLElement>("[data-account-route]").forEach((link) => link.classList.toggle("active", link.dataset.accountRoute === page));
+    setActiveAccountRoute(page);
     document.querySelectorAll<HTMLElement>("[data-account-owner-only]").forEach((element) => {
       element.hidden = element.classList.contains("admin-only")
         ? user.role !== "admin"
@@ -1452,7 +1466,22 @@ function setupNavigation() {
   });
   document.querySelectorAll<HTMLElement>("[data-account-route]").forEach((link) => link.addEventListener("click", (event) => { event.preventDefault(); showAccountPage?.(link.dataset.accountRoute as AccountPage); }));
   document.querySelector("#account-logout")?.addEventListener("click", () => signOut());
-  document.querySelectorAll<HTMLElement>("[data-settings-page]").forEach((button) => button.addEventListener("click", () => showSettingsPage(button.dataset.settingsPage as SettingsPage)));
+  const settingsTabs = Array.from(document.querySelectorAll<HTMLButtonElement>("[data-settings-page]"));
+  settingsTabs.forEach((button, index) => {
+    button.addEventListener("click", () => showSettingsPage(button.dataset.settingsPage as SettingsPage));
+    button.addEventListener("keydown", (event) => {
+      let nextIndex: number | undefined;
+      if (event.key === "ArrowRight") nextIndex = (index + 1) % settingsTabs.length;
+      else if (event.key === "ArrowLeft") nextIndex = (index - 1 + settingsTabs.length) % settingsTabs.length;
+      else if (event.key === "Home") nextIndex = 0;
+      else if (event.key === "End") nextIndex = settingsTabs.length - 1;
+      if (nextIndex === undefined) return;
+      event.preventDefault();
+      const nextTab = settingsTabs[nextIndex];
+      nextTab.focus();
+      showSettingsPage(nextTab.dataset.settingsPage as SettingsPage);
+    });
+  });
   document.querySelector("#refresh-maintenance")?.addEventListener("click", () => refreshMaintenance());
 }
 

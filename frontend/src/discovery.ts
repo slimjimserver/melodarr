@@ -1552,7 +1552,7 @@
   function updateSearchSubmitState() {
     searchSubmit.disabled = isAISearchMode()
       ? !aiConfigured || !searchInput.value.trim() || Boolean(aiAbort)
-      : false;
+      : searchInput.value.trim().length < 2;
   }
 
   function applySearchMode(type: string) {
@@ -1572,6 +1572,8 @@
     }
     updateSearchSubmitState();
   }
+
+  applySearchMode(activeSearchType);
 
   function searchResultMessage(type: string, count: number) {
     const noun = copyForSearchType(type).noun;
@@ -1625,7 +1627,7 @@
       searchAbort = undefined;
       $("#search-form").classList.remove("searching");
       results.replaceChildren();
-      $("#search-message").textContent = query ? "Type at least two characters so we can find a good match." : "";
+      $("#search-message").textContent = "";
       return;
     }
 
@@ -1683,8 +1685,8 @@
   const searchDebounceMilliseconds = 450;
   searchInput.addEventListener("input", () => {
     clearTimeout(searchDebounce);
+    updateSearchSubmitState();
     if (isAISearchMode()) {
-      updateSearchSubmitState();
       return;
     }
     searchDebounce = setTimeout(runSearch, searchDebounceMilliseconds);

@@ -224,14 +224,14 @@
         <p>Connect the services Melodarr uses, then choose the defaults for new requests. Credentials are stored in this app’s local settings file.</p>
       </div>
 
-      <nav class="settings-tabs" aria-label="Settings sections">
-        <button class="active" type="button" data-settings-page="services">Services</button>
-        <button type="button" data-settings-page="requests">Requests</button>
-        <button type="button" data-settings-page="users">Users</button>
-        <button type="button" data-settings-page="jobs">Jobs &amp; Cache</button>
-      </nav>
+      <div class="settings-tabs" role="tablist" aria-label="Settings sections">
+        <button id="settings-tab-services" class="active" type="button" role="tab" aria-selected="true" aria-controls="settings-services" data-settings-page="services">Services</button>
+        <button id="settings-tab-requests" type="button" role="tab" aria-selected="false" aria-controls="settings-requests" tabindex="-1" data-settings-page="requests">Requests</button>
+        <button id="settings-tab-users" type="button" role="tab" aria-selected="false" aria-controls="settings-users" tabindex="-1" data-settings-page="users">Users</button>
+        <button id="settings-tab-jobs" type="button" role="tab" aria-selected="false" aria-controls="settings-jobs" tabindex="-1" data-settings-page="jobs">Jobs &amp; Cache</button>
+      </div>
 
-      <div id="settings-services" class="settings-stack settings-panel">
+      <div id="settings-services" class="settings-stack settings-panel" role="tabpanel" aria-labelledby="settings-tab-services" tabindex="0">
         <section class="settings-section">
           <div class="service-intro"><img class="service-icon" src="/icons/plex.svg" width="42" height="42" loading="lazy" decoding="async" alt="Plex"><div><h2>Plex library</h2><p>Detect artists you already own and open them directly in Plex.</p></div><span id="plex-state" class="service-state">Not connected</span></div>
           <div id="plex-settings" class="service-card plex-connect-card">
@@ -366,7 +366,7 @@
         </section>
       </div>
 
-      <div id="settings-requests" class="settings-stack settings-panel" hidden>
+      <div id="settings-requests" class="settings-stack settings-panel" role="tabpanel" aria-labelledby="settings-tab-requests" tabindex="0" hidden>
         <section class="settings-section admin-requests-section">
           <div class="admin-requests-heading">
             <div>
@@ -407,7 +407,7 @@
         </section>
       </div>
 
-      <div id="settings-users" class="settings-stack settings-panel" hidden>
+      <div id="settings-users" class="settings-stack settings-panel" role="tabpanel" aria-labelledby="settings-tab-users" tabindex="0" hidden>
         <section class="settings-section users-section">
           <div class="users-heading">
             <div>
@@ -448,7 +448,7 @@
         </section>
       </div>
 
-      <div id="settings-jobs" class="settings-stack settings-panel" hidden>
+      <div id="settings-jobs" class="settings-stack settings-panel" role="tabpanel" aria-labelledby="settings-tab-jobs" tabindex="0" hidden>
         <section class="settings-section maintenance-section">
           <div class="maintenance-heading">
             <div><h2>Jobs</h2><p>Background maintenance runs automatically, and can also be triggered here without changing its schedule.</p></div>
@@ -456,7 +456,8 @@
           </div>
           <div class="maintenance-table-wrap">
             <table class="maintenance-table">
-              <thead><tr><th>Job name</th><th>Type</th><th>Schedule</th><th>Status</th><th></th></tr></thead>
+              <caption class="sr-only">Background maintenance jobs</caption>
+              <thead><tr><th scope="col">Job name</th><th scope="col">Type</th><th scope="col">Schedule</th><th scope="col">Status</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
               <tbody id="jobs-table"><tr><td colspan="5" class="table-empty">Loading jobs…</td></tr></tbody>
             </table>
           </div>
@@ -469,7 +470,8 @@
           </div>
           <div class="maintenance-table-wrap">
             <table class="maintenance-table">
-              <thead><tr><th>Cache name</th><th>Entries</th><th>Expired / misses</th><th>Size</th><th>Latest expiry</th><th></th></tr></thead>
+              <caption class="sr-only">Application caches</caption>
+              <thead><tr><th scope="col">Cache name</th><th scope="col">Entries</th><th scope="col">Expired / misses</th><th scope="col">Size</th><th scope="col">Latest expiry</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
               <tbody id="cache-table"><tr><td colspan="6" class="table-empty">Loading caches…</td></tr></tbody>
             </table>
           </div>

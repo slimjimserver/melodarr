@@ -6,7 +6,7 @@
   --surface: rgba(255, 250, 243, .82);
   --surface-hover: #fffdf9;
   --foreground: #2d2925;
-  --foreground-muted: #6f675f;
+  --foreground-muted: #6d655d;
   --foreground-subtle: #554e47;
   --accent: #a8442d;
   --accent-bright: #8d3523;
@@ -871,6 +871,17 @@ button,
   .settings-fields { gap: 14px; }
 }
 
+@media (max-width: 360px) {
+  .search { display: grid; grid-template-columns: minmax(0, 1fr); }
+  .search select { width: 100%; min-width: 0; height: 50px; border-right: 0; border-bottom: 1px solid var(--border); }
+  .search input { width: 100%; height: 52px; }
+  .search button { width: 100%; }
+
+  .settings-tabs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; border-bottom: 0; overflow: visible; }
+  .settings-tabs button { min-width: 0; min-height: 44px; border: 1px solid var(--border); border-radius: 10px; padding: 8px 6px; line-height: 1.2; }
+  .settings-tabs button.active { border-color: var(--accent-bright); }
+}
+
 /* Theme control and palettes. Midnight intentionally restores Melodarr's
    original indigo-on-charcoal colorway while retaining the lighter DOM,
    accessibility, and rendering improvements shared by both themes. */
@@ -1097,9 +1108,41 @@ button,
   header { gap: 18px; padding-right: 24px; padding-left: 24px; }
   .status { display: none; }
   .theme-label { display: none; }
-  .theme-toggle { width: 44px; padding: 0; }
+  .theme-toggle { width: 44px; min-width: 44px; height: 44px; flex: 0 0 44px; padding: 0; }
 }
 
 @media (max-width: 700px) {
   header { padding-right: 14px; padding-left: 14px; }
+
+  .maintenance-table-wrap { overflow: visible; border: 0; background: transparent; }
+  .maintenance-table, .maintenance-table tbody { display: block; }
+  .maintenance-table thead { display: none; }
+  .maintenance-table tbody { display: grid; gap: 11px; }
+  .maintenance-table tr { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); overflow: hidden; border: 1px solid var(--border); border-radius: 13px; background: var(--surface); }
+  .maintenance-table td { display: grid; min-width: 0; gap: 5px; border-bottom: 0; padding: 10px 13px; overflow-wrap: anywhere; text-align: left; white-space: normal; }
+  .maintenance-table td::before { color: var(--foreground-muted); font-size: 9px; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; }
+  .maintenance-table td:first-child { grid-column: 1 / -1; border-bottom: 1px solid var(--border); padding-top: 13px; padding-bottom: 13px; }
+  .maintenance-table td:last-child { grid-column: 1 / -1; border-top: 1px solid var(--border); padding-top: 10px; padding-bottom: 13px; text-align: left; }
+  .maintenance-table td:last-child button { width: 100%; min-height: 44px; }
+  .maintenance-table td[colspan] { display: block; grid-column: 1 / -1; border: 0; padding: 24px 16px; text-align: center; }
+  .maintenance-table td[colspan]::before { display: none; }
+  .maintenance-table .job-status { white-space: normal; }
+
+  #jobs-table td:nth-child(1)::before { content: "Job name"; }
+  #jobs-table td:nth-child(2)::before { content: "Type"; }
+  #jobs-table td:nth-child(3)::before { content: "Schedule"; }
+  #jobs-table td:nth-child(4) { grid-column: 1 / -1; }
+  #jobs-table td:nth-child(4)::before { content: "Status"; }
+  #jobs-table td:nth-child(5)::before { content: "Action"; }
+
+  #cache-table td:nth-child(1)::before { content: "Cache name"; }
+  #cache-table td:nth-child(2)::before { content: "Entries"; }
+  #cache-table td:nth-child(3)::before { content: "Expired / misses"; }
+  #cache-table td:nth-child(4)::before { content: "Size"; }
+  #cache-table td:nth-child(5)::before { content: "Latest expiry"; }
+  #cache-table td:nth-child(6)::before { content: "Action"; }
+}
+
+@media (max-width: 360px) {
+  header { gap: 8px; padding-right: 8px; padding-left: 8px; }
 }
