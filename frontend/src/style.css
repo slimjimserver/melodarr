@@ -326,6 +326,7 @@ button.ai-result-art { cursor: pointer; }
 #detail-title { width: 100%; max-width: 100%; overflow-wrap: anywhere; padding: .04em .04em .1em 0; font-size: clamp(44px, 6vw, 68px); line-height: 1.02; }
 #detail .outline { margin-bottom: 30px; }
 .detail-cover { width: 280px; aspect-ratio: 1; border: 1px solid var(--border); border-radius: 16px; overflow: hidden; background: var(--background-elevated); box-shadow: 0 16px 40px rgba(0, 0, 0, .32); }
+.detail-cover.anime-cover { aspect-ratio: 2 / 3; }
 .detail-cover img { display: block; width: 100%; height: 100%; object-fit: cover; }
 .artist-meta { margin: 0 0 25px; border-radius: 14px; color: var(--foreground-subtle); padding: 18px 20px; font-size: 14px; line-height: 1.65; }
 .artist-meta strong { color: var(--foreground); }
@@ -371,6 +372,66 @@ button.ai-result-art { cursor: pointer; }
 .artist-card > .plex-availability { margin-left: auto; }
 .release-group-request { min-width: 92px; margin-left: 8px; }
 .release-group-request:disabled, .request-artist:disabled { border-color: rgba(50, 108, 74, .3); background: rgba(50, 108, 74, .08); color: var(--success); cursor: default; box-shadow: none; }
+
+/* Anime pages keep show metadata and requestable MusicBrainz candidates in
+   one scan path: theme identity on the left, mapping state on the right. */
+.anime-meta { display: grid; gap: 10px; }
+.anime-meta p { margin: 0; }
+.anime-series-links a { color: var(--accent-bright); font-weight: 700; text-underline-offset: 3px; }
+.anime-resource-links { display: flex; flex-wrap: wrap; gap: 7px; }
+.anime-resource-links a, .anime-recording-link { color: var(--accent-bright); font-size: 12px; font-weight: 650; text-underline-offset: 3px; }
+.anime-resource-links a { min-height: 36px; align-content: center; border: 1px solid var(--border); border-radius: 999px; padding: 6px 11px; text-decoration: none; }
+.anime-theme-section { display: grid; gap: 12px; margin: 34px 0 0; }
+.anime-theme-section > h2 { margin: 0 0 3px; font-size: 23px; letter-spacing: -.025em; }
+.anime-theme-card { display: grid; grid-template-columns: minmax(180px, .8fr) minmax(0, 1.2fr); gap: 20px; border: 1px solid var(--border); border-radius: 15px; background: var(--surface); padding: 18px; box-shadow: 0 8px 25px rgba(68, 50, 38, .05); }
+.anime-theme-heading { min-width: 0; }
+.anime-theme-sequence, .anime-mapping-status, .anime-recommended { display: inline-flex; width: fit-content; align-items: center; border-radius: 999px; font-size: 10px; font-weight: 750; letter-spacing: .035em; }
+.anime-theme-sequence { margin-bottom: 9px; background: var(--accent-glow); color: var(--accent-bright); padding: 5px 8px; text-transform: uppercase; }
+.anime-theme-heading h3 { margin: 0; overflow-wrap: anywhere; font-size: 18px; line-height: 1.25; }
+.anime-theme-artists { margin: 6px 0 0; color: var(--foreground-subtle); font-size: 13px; font-weight: 620; }
+.anime-theme-facts { margin: 11px 0 0; color: var(--foreground-muted); font-size: 12px; line-height: 1.5; }
+.anime-theme-mapping { display: grid; min-width: 0; align-content: start; gap: 10px; border-left: 1px solid var(--border); padding-left: 20px; }
+.anime-mapping-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
+.anime-mapping-status { border: 1px solid var(--border); background: var(--background-elevated); color: var(--foreground-muted); padding: 5px 8px; }
+.anime-mapping-provenance { color: var(--foreground-muted); font-size: 10px; font-weight: 650; }
+.anime-mapping-resolved .anime-mapping-status { border-color: rgba(50, 108, 74, .3); background: rgba(50, 108, 74, .08); color: var(--success); }
+.anime-mapping-ambiguous .anime-mapping-status { border-color: rgba(149, 103, 23, .32); background: rgba(194, 141, 45, .11); color: #76500f; }
+.anime-mapping-failed .anime-mapping-status { border-color: rgba(164, 52, 52, .35); background: rgba(164, 52, 52, .08); color: var(--danger); }
+.anime-release-candidates { display: grid; gap: 8px; }
+.anime-release-candidate { padding: 10px 11px; box-shadow: none; }
+.anime-release-candidate .artist-info h2 { font-size: 13px; }
+.anime-release-candidate .artist-info p { font-size: 11px; }
+.anime-release-candidate .request { min-height: 36px; }
+.anime-recommended { flex: none; background: var(--accent-glow); color: var(--accent-bright); padding: 5px 8px; }
+.anime-mapping-confirmation { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; }
+.anime-mapping-confirmation button { min-height: 38px; border: 1px solid var(--success); border-radius: 9px; background: rgba(50, 108, 74, .08); color: var(--success); padding: 8px 11px; font-size: 12px; font-weight: 750; cursor: pointer; }
+.anime-mapping-confirmation button:hover:not(:disabled) { background: rgba(50, 108, 74, .14); }
+.anime-mapping-confirmation button:disabled { cursor: wait; opacity: .65; }
+.anime-mapping-confirmation span { color: var(--foreground-muted); font-size: 11px; }
+.anime-mapping-confirmation span.error { color: var(--danger); }
+.anime-mapping-editor { border-top: 1px solid var(--border); padding-top: 9px; }
+.anime-mapping-editor summary { width: fit-content; color: var(--foreground-subtle); cursor: pointer; font-size: 11px; font-weight: 700; text-underline-offset: 3px; }
+.anime-mapping-editor[open] summary { margin-bottom: 10px; color: var(--accent-bright); }
+.anime-mapping-editor form { display: grid; gap: 9px; }
+.anime-mapping-editor label { display: grid; gap: 5px; color: var(--foreground-muted); font-size: 10px; font-weight: 700; }
+.anime-mapping-editor input { width: 100%; min-width: 0; height: 38px; padding: 8px 10px; font-size: 12px; }
+.anime-mapping-editor-actions { display: flex; flex-wrap: wrap; gap: 7px; }
+.anime-mapping-editor-actions button { min-height: 34px; padding: 6px 10px; font-size: 11px; }
+.anime-mapping-unlink { border-color: rgba(164, 52, 52, .3); background: rgba(164, 52, 52, .06); color: var(--danger); }
+.anime-mapping-editor-message { min-height: 16px; margin: 0; color: var(--foreground-muted); font-size: 11px; }
+.anime-mapping-editor-message.error { color: var(--danger); }
+.anime-series-meta { margin-bottom: 18px; }
+.anime-series-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 14px; }
+.anime-series-card { display: grid; min-width: 0; overflow: hidden; border: 1px solid var(--border); border-radius: 15px; background: var(--surface); color: var(--foreground); text-decoration: none; box-shadow: 0 8px 25px rgba(68, 50, 38, .05); transition: transform .2s var(--ease-out), border-color .2s var(--ease-out), box-shadow .2s var(--ease-out); }
+.anime-series-card:hover { border-color: var(--border-hover); box-shadow: 0 14px 34px rgba(68, 50, 38, .1); transform: translateY(-2px); }
+.anime-series-card:focus-visible { outline: 2px solid var(--accent-bright); outline-offset: 3px; }
+.anime-series-artwork { display: grid; aspect-ratio: 2 / 3; overflow: hidden; place-items: center; border-bottom: 1px solid var(--border); background: linear-gradient(135deg, #e3ad8f, #c97459 54%, #8375a8); }
+.anime-series-artwork img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.anime-series-artwork-fallback { color: rgba(255, 255, 255, .88); font-size: 54px; font-weight: 760; }
+.anime-series-card-info { display: grid; align-content: start; gap: 5px; padding: 14px 15px 16px; }
+.anime-series-card-info h2 { margin: 0; overflow-wrap: anywhere; font-size: 16px; line-height: 1.25; }
+.anime-series-card-info p { margin: 0; color: var(--foreground-subtle); font-size: 12px; line-height: 1.4; }
+.anime-series-card-info span { width: fit-content; margin-top: 4px; border-radius: 999px; background: var(--accent-glow); color: var(--accent-bright); padding: 5px 8px; font-size: 10px; font-weight: 750; }
 
 /* Loading placeholders. A shimmering block communicates the shape of what is
    coming, which reads better than a bare "Loading…" line on a phone. */
@@ -718,6 +779,28 @@ details summary { margin-bottom: 17px; color: var(--accent-bright); cursor: poin
 
   .detail-heading { gap: 22px; }
   .detail-cover { width: min(280px, 100%); }
+  .anime-theme-card { grid-template-columns: 1fr; padding: 15px; }
+  .anime-theme-mapping { border-top: 1px solid var(--border); border-left: 0; padding-top: 15px; padding-left: 0; }
+  .anime-release-candidate {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "content content"
+      "recommendation action";
+    align-items: center;
+    gap: 10px 12px;
+  }
+  .anime-release-candidate > .card-open { grid-area: content; width: 100%; align-items: flex-start; }
+  .anime-release-candidate .artist-info h2,
+  .anime-release-candidate .artist-info p { overflow-wrap: anywhere; line-height: 1.35; }
+  .anime-release-candidate > .anime-recommended { grid-area: recommendation; }
+  .anime-release-candidate.artist-card > .release-group-request {
+    grid-area: action;
+    justify-self: end;
+    margin-left: 0;
+  }
+  .anime-series-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+  .anime-series-card-info { padding: 12px; }
   .service-intro { grid-template-columns: 42px minmax(0, 1fr); }
   .service-state { grid-column: 2; justify-self: start; }
   #detail-title { font-size: clamp(32px, 11vw, 50px); }

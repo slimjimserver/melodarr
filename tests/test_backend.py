@@ -66,6 +66,7 @@ from backend.storage import (
     write_settings_file,
 )
 from backend import worker
+from backend.workers import anime_metadata as anime_metadata_worker
 from backend.workers import artist_metadata as artist_metadata_worker
 from backend.workers import lidarr_searches as lidarr_search_worker
 from backend.workers import lidarr_library as lidarr_library_worker
@@ -129,6 +130,17 @@ class DatabaseTestCase(unittest.TestCase):
         detail_cache.invalidate_all()
         with detail_cache._key_locks_lock:
             detail_cache._key_locks.clear()
+        with anime_metadata_worker.queue_lock:
+            anime_metadata_worker.queued_themes.clear()
+            anime_metadata_worker.active_theme_keys.clear()
+            anime_metadata_worker.job_state.update(
+                running=False,
+                queued=0,
+                completed=0,
+                total=0,
+                lastCompletedAt=None,
+            )
+        anime_metadata_worker.wake_requested.clear()
         with artist_metadata_worker.queue_lock:
             artist_metadata_worker.queued_artist_ids.clear()
             artist_metadata_worker.active_artist_phases.clear()
@@ -197,8 +209,8 @@ class ApplicationFactoryTests(DatabaseTestCase):
             for method in rule.methods
             if method not in {"HEAD", "OPTIONS"}
         }
-        self.assertEqual(len(rules), 69)
-        self.assertEqual(len(route_methods), 69)
+        self.assertEqual(len(rules), 77)
+        self.assertEqual(len(route_methods), 77)
 
     def test_factory_applies_test_configuration(self):
         self.assertTrue(self.app.config["TESTING"])
@@ -336,6 +348,7 @@ class WorkerEntrypointTests(unittest.TestCase):
         self, init_db, run, thread_class
     ):
         calls = []
+        anime_metadata_thread = Mock()
         artist_metadata_thread = Mock()
         lidarr_thread = Mock()
         plex_thread = Mock()
@@ -344,6 +357,7 @@ class WorkerEntrypointTests(unittest.TestCase):
         listening_profile_thread = Mock()
         lidarr_library_thread = Mock()
         thread_class.side_effect = [
+            anime_metadata_thread,
             artist_metadata_thread,
             lidarr_thread,
             lidarr_library_thread,
@@ -356,7 +370,12 @@ class WorkerEntrypointTests(unittest.TestCase):
         run.side_effect = lambda *_args: calls.append("recommendations")
         worker.main()
         self.assertEqual(calls, ["database", "recommendations"])
-        self.assertEqual(thread_class.call_count, 7)
+        self.assertEqual(thread_class.call_count, 8)
+        thread_class.assert_any_call(
+            target=anime_metadata_worker.run,
+            name="anime-musicbrainz-resolution",
+            daemon=True,
+        )
         thread_class.assert_any_call(
             target=artist_metadata_worker.run,
             name="musicbrainz-artist-revalidation",
@@ -400,6 +419,7 @@ class WorkerEntrypointTests(unittest.TestCase):
         plex_metadata_thread.start.assert_called_once_with()
         plex_history_thread.start.assert_called_once_with()
         listening_profile_thread.start.assert_called_once_with()
+        anime_metadata_thread.start.assert_called_once_with()
         artist_metadata_thread.start.assert_called_once_with()
         run.assert_called_once_with(worker.RECOMMENDATION_STARTUP_DEADLINE)
 
@@ -5743,6 +5763,30 @@ class LastFmDiscoveryTests(DatabaseTestCase):
 
 
 class DiscoveryRoutesTests(DatabaseTestCase):
+    @patch("backend.routes.discovery.animethemes.search")
+    def test_anime_search_uses_the_anime_provider(self, search):
+        search.return_value = [{
+            "id": 2028,
+            "slug": "naruto",
+            "name": "Naruto",
+            "year": 2002,
+            "season": "Fall",
+            "format": "TV",
+            "coverArt": "",
+        }]
+
+        response = self.client.get(
+            "/api/search?q=naruto&type=anime",
+            headers={"X-CSRF-Token": self.register()},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), {
+            "results": search.return_value,
+            "type": "anime",
+        })
+        search.assert_called_once_with("naruto")
+
     @patch("backend.routes.discovery.plex.cached_library_index")
     @patch("backend.routes.discovery.get_service")
     @patch("backend.routes.discovery.musicbrainz.search")

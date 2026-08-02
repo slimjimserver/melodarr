@@ -3,6 +3,7 @@ from threading import Thread
 
 if __package__:
     from .storage import init_db
+    from .workers import anime_metadata as anime_metadata_worker
     from .workers import artist_metadata as artist_metadata_worker
     from .workers import lidarr_searches as lidarr_search_worker
     from .workers import lidarr_library as lidarr_library_worker
@@ -13,6 +14,7 @@ if __package__:
     from .workers import recommendations as recommendation_worker
 else:  # Support `python backend/worker.py` for local development.
     from storage import init_db
+    from workers import anime_metadata as anime_metadata_worker
     from workers import artist_metadata as artist_metadata_worker
     from workers import lidarr_searches as lidarr_search_worker
     from workers import lidarr_library as lidarr_library_worker
@@ -33,6 +35,12 @@ LISTENING_PROFILE_STARTUP_DELAY = 90
 def main():
     """Initialize storage and start background jobs in a controlled sequence."""
     init_db()
+    anime_metadata_thread = Thread(
+        target=anime_metadata_worker.run,
+        name="anime-musicbrainz-resolution",
+        daemon=True,
+    )
+    anime_metadata_thread.start()
     artist_metadata_thread = Thread(
         target=artist_metadata_worker.run,
         name="musicbrainz-artist-revalidation",

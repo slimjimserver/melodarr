@@ -11,7 +11,7 @@ if __package__ == "backend.routes":
     from ..media_urls import artist_cover_art, release_group_cover_art
     from ..responses import api_error
     from ..security import current_user, login_required
-    from ..services import lastfm, musicbrainz, plex
+    from ..services import animethemes, lastfm, musicbrainz, plex
     from ..storage import (
         get_lastfm_api_key,
         get_recommendation_cache,
@@ -22,7 +22,7 @@ else:  # Support the existing `python backend/app.py` entry point.
     from media_urls import artist_cover_art, release_group_cover_art
     from responses import api_error
     from security import current_user, login_required
-    from services import lastfm, musicbrainz, plex
+    from services import animethemes, lastfm, musicbrainz, plex
     from storage import get_lastfm_api_key, get_recommendation_cache, get_service
 
 
@@ -393,8 +393,17 @@ def search():
     search_type = request.args.get("type", "artist")
     if len(query) < 2:
         return api_error("Enter at least two characters.")
-    if search_type not in {"artist", "album", "track"}:
-        return api_error("Search type must be artist, album, or track.")
+    if search_type not in {"artist", "album", "track", "anime"}:
+        return api_error("Search type must be artist, album, track, or anime.")
+    if search_type == "anime":
+        try:
+            return jsonify({"results": animethemes.search(query), "type": search_type})
+        except ValueError as exc:
+            return api_error(str(exc))
+        except requests.RequestException:
+            return api_error(
+                "AnimeThemes could not be reached. Try again shortly.", 502
+            )
     try:
         response = musicbrainz.search(query, search_type, plain_search=True)
     except requests.RequestException:

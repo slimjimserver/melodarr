@@ -668,6 +668,103 @@ def _delete_legacy_orphans(connection):
         )
 
 
+def _migrate_anime_song_mapping_schema(connection):
+    """Upgrade pre-release registry tables without losing local corrections."""
+    parent = connection.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'anime_song_mappings'"
+    ).fetchone()
+    if parent is None:
+        return
+    target = connection.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'anime_song_mapping_targets'"
+    ).fetchone()
+    target_columns = {
+        row["name"]
+        for row in connection.execute(
+            "PRAGMA table_info(anime_song_mapping_targets)"
+        )
+    } if target else set()
+    if "'rejected'" in (parent["sql"] or "") and (
+        not target or "mapping_scope" in target_columns
+    ):
+        return
+
+    connection.execute("DROP INDEX IF EXISTS anime_song_mapping_one_preferred")
+    connection.execute("""
+        CREATE TABLE anime_song_mappings_v2 (
+            song_id INTEGER PRIMARY KEY CHECK(song_id > 0),
+            title_snapshot TEXT NOT NULL,
+            artists_json TEXT NOT NULL,
+            status TEXT NOT NULL
+                CHECK(status IN ('proposed', 'confirmed', 'rejected')),
+            provenance TEXT NOT NULL,
+            mapping_scope TEXT NOT NULL,
+            schema_version INTEGER NOT NULL CHECK(schema_version > 0),
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+    """)
+    connection.execute(
+        "INSERT INTO anime_song_mappings_v2 "
+        "(song_id, title_snapshot, artists_json, status, provenance, "
+        "mapping_scope, schema_version, created_at, updated_at) "
+        "SELECT song_id, title_snapshot, artists_json, status, provenance, "
+        "mapping_scope, schema_version, created_at, updated_at "
+        "FROM anime_song_mappings"
+    )
+    connection.execute("""
+        CREATE TABLE anime_song_mapping_targets_v2 (
+            song_id INTEGER NOT NULL
+                REFERENCES anime_song_mappings_v2(song_id) ON DELETE CASCADE,
+            release_group_mbid TEXT NOT NULL,
+            recording_mbids_json TEXT NOT NULL DEFAULT '[]',
+            artist_mbids_json TEXT NOT NULL DEFAULT '[]',
+            release_group_title TEXT NOT NULL,
+            artist_name TEXT NOT NULL,
+            primary_type TEXT NOT NULL,
+            first_release_date TEXT NOT NULL,
+            mapping_scope TEXT NOT NULL,
+            is_preferred INTEGER NOT NULL DEFAULT 0
+                CHECK(is_preferred IN (0, 1)),
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY(song_id, release_group_mbid)
+        )
+    """)
+    if target:
+        target_scope = (
+            "COALESCE(target.mapping_scope, parent.mapping_scope, 'unknown')"
+            if "mapping_scope" in target_columns
+            else "COALESCE(parent.mapping_scope, 'unknown')"
+        )
+        connection.execute(
+            "INSERT INTO anime_song_mapping_targets_v2 "
+            "(song_id, release_group_mbid, recording_mbids_json, "
+            "artist_mbids_json, release_group_title, artist_name, "
+            "primary_type, first_release_date, mapping_scope, is_preferred, "
+            "created_at, updated_at) "
+            "SELECT target.song_id, target.release_group_mbid, "
+            "target.recording_mbids_json, target.artist_mbids_json, "
+            "target.release_group_title, target.artist_name, "
+            f"target.primary_type, target.first_release_date, {target_scope}, "
+            "target.is_preferred, target.created_at, target.updated_at "
+            "FROM anime_song_mapping_targets AS target "
+            "JOIN anime_song_mappings AS parent "
+            "ON parent.song_id = target.song_id"
+        )
+        connection.execute("DROP TABLE anime_song_mapping_targets")
+    connection.execute("DROP TABLE anime_song_mappings")
+    connection.execute(
+        "ALTER TABLE anime_song_mappings_v2 RENAME TO anime_song_mappings"
+    )
+    connection.execute(
+        "ALTER TABLE anime_song_mapping_targets_v2 "
+        "RENAME TO anime_song_mapping_targets"
+    )
+
+
 def init_db():
     """Create current tables and migrate legacy service settings to JSON."""
     legacy_settings = {}
@@ -814,6 +911,45 @@ def init_db():
                 used_at REAL
             )
         """)
+        _migrate_anime_song_mapping_schema(connection)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS anime_song_mappings (
+                song_id INTEGER PRIMARY KEY CHECK(song_id > 0),
+                title_snapshot TEXT NOT NULL,
+                artists_json TEXT NOT NULL,
+                status TEXT NOT NULL
+                    CHECK(status IN ('proposed', 'confirmed', 'rejected')),
+                provenance TEXT NOT NULL,
+                mapping_scope TEXT NOT NULL,
+                schema_version INTEGER NOT NULL CHECK(schema_version > 0),
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+        """)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS anime_song_mapping_targets (
+                song_id INTEGER NOT NULL
+                    REFERENCES anime_song_mappings(song_id) ON DELETE CASCADE,
+                release_group_mbid TEXT NOT NULL,
+                recording_mbids_json TEXT NOT NULL DEFAULT '[]',
+                artist_mbids_json TEXT NOT NULL DEFAULT '[]',
+                release_group_title TEXT NOT NULL,
+                artist_name TEXT NOT NULL,
+                primary_type TEXT NOT NULL,
+                first_release_date TEXT NOT NULL,
+                mapping_scope TEXT NOT NULL,
+                is_preferred INTEGER NOT NULL DEFAULT 0
+                    CHECK(is_preferred IN (0, 1)),
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY(song_id, release_group_mbid)
+            )
+        """)
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "anime_song_mapping_one_preferred "
+            "ON anime_song_mapping_targets(song_id) WHERE is_preferred = 1"
+        )
         _migrate_pending_lidarr_searches(connection)
         # Release-group requests always use RefreshAlbum. Convert work queued
         # by versions that conditionally selected RefreshArtist as well.

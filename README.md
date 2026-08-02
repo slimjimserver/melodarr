@@ -25,6 +25,7 @@ Melodarr uses MusicBrainz for music metadata and can use ListenBrainz and Last.f
 ## 3. Features
 
 - Search MusicBrainz for artists and albums, then browse discographies, releases, and tracklists.
+- Search AnimeThemes for an anime's openings, endings, episode ranges, and related series, then request conservatively matched MusicBrainz releases through Lidarr. Administrators can confirm the recommended automatic recording match or supply a correction; the selected recording, artist, and release-group MBIDs are stored permanently in the local SQLite registry ahead of the disposable API cache.
 - Request a complete artist or an individual release group through Lidarr.
 - Apply Lidarr root folder, quality profile, metadata profile, monitoring, tag, and automatic-search defaults.
 - Discover personalized artists and albums from linked ListenBrainz and Last.fm accounts.

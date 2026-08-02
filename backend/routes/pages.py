@@ -76,6 +76,8 @@ blueprint.add_url_rule("/<username>/settings/<section>", view_func=frontend_inde
 blueprint.add_url_rule("/artists/<mbid>", view_func=frontend_index)
 blueprint.add_url_rule("/albums/<mbid>", view_func=frontend_index)
 blueprint.add_url_rule("/releases/<mbid>", view_func=frontend_index)
+blueprint.add_url_rule("/anime/<slug>", view_func=frontend_index)
+blueprint.add_url_rule("/series/<slug>", view_func=frontend_index)
 
 
 @blueprint.get("/icons/<path:filename>")
