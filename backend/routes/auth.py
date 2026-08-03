@@ -24,10 +24,9 @@ if __package__ == "backend.routes":
         user_payload,
     )
     from ..services import plex, plex_auth
-    from ..storage import clear_listening_profiles, db, get_service, save_service
+    from ..storage import db, get_service, save_service
     from ..workers import plex as plex_worker
     from ..workers import plex_history as plex_history_worker
-    from ..workers import listening_profiles as listening_profile_worker
 else:  # Support the existing `python backend/app.py` entry point.
     from api_cache import clear_cache
     from detail_cache import invalidate_all as invalidate_detail_payloads
@@ -40,10 +39,9 @@ else:  # Support the existing `python backend/app.py` entry point.
         user_payload,
     )
     from services import plex, plex_auth
-    from storage import clear_listening_profiles, db, get_service, save_service
+    from storage import db, get_service, save_service
     from workers import plex as plex_worker
     from workers import plex_history as plex_history_worker
-    from workers import listening_profiles as listening_profile_worker
 
 
 blueprint = Blueprint("auth", __name__)
@@ -243,7 +241,6 @@ def _finish_plex_login(account, resources):
         return api_error("That Plex account is already linked to another user.", 409)
     if created:
         plex_history_worker.request_full_sync()
-        listening_profile_worker.request_refresh()
     return start_session(user, remember=True)
 
 
@@ -315,7 +312,6 @@ def _finish_plex_link(flow, account, resources):
         "credentials or Plex."
     )
     plex_history_worker.request_full_sync()
-    listening_profile_worker.request_refresh()
     return jsonify(payload)
 
 
@@ -708,11 +704,9 @@ def complete_plex_server():
 
     clear_cache("plex-library")
     clear_cache("plex-guid")
-    clear_listening_profiles()
     invalidate_detail_payloads()
     plex_worker.request_full_scan()
     plex_history_worker.request_full_sync()
-    listening_profile_worker.request_refresh()
     return start_session(user, remember=True)
 
 

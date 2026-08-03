@@ -10,10 +10,14 @@ from werkzeug.utils import safe_join
 
 if __package__:
     from .api_cache import init_cache_db, migrate_legacy_cache
-    from .config import FRONTEND_ROOT, load_session_secret
+    from .config import (
+        FRONTEND_ROOT,
+        assert_test_storage_isolation,
+        load_session_secret,
+    )
     from .routes.account import blueprint as account_blueprint
     from .routes.admin import blueprint as admin_blueprint
-    from .routes.ai import blueprint as ai_blueprint
+    from .routes.anime import blueprint as anime_blueprint
     from .routes.artwork import blueprint as artwork_blueprint
     from .routes.auth import blueprint as auth_blueprint
     from .routes.discovery import blueprint as discovery_blueprint
@@ -26,10 +30,10 @@ if __package__:
     from .storage import init_db
 else:  # Support the existing `python backend/app.py` entry point.
     from api_cache import init_cache_db, migrate_legacy_cache
-    from config import FRONTEND_ROOT, load_session_secret
+    from config import FRONTEND_ROOT, assert_test_storage_isolation, load_session_secret
     from routes.account import blueprint as account_blueprint
     from routes.admin import blueprint as admin_blueprint
-    from routes.ai import blueprint as ai_blueprint
+    from routes.anime import blueprint as anime_blueprint
     from routes.artwork import blueprint as artwork_blueprint
     from routes.auth import blueprint as auth_blueprint
     from routes.discovery import blueprint as discovery_blueprint
@@ -129,7 +133,7 @@ def cache_static_assets(response):
 BLUEPRINTS = (
     account_blueprint,
     admin_blueprint,
-    ai_blueprint,
+    anime_blueprint,
     artwork_blueprint,
     auth_blueprint,
     discovery_blueprint,
@@ -143,6 +147,10 @@ BLUEPRINTS = (
 
 def create_app(config=None):
     """Construct and configure a Melodarr Flask application."""
+    if config and config.get("TESTING"):
+        # This must precede load_session_secret, init_cache_db, and init_db: all
+        # can write to paths captured when backend.config was first imported.
+        assert_test_storage_isolation()
     app = Flask(
         __name__,
         static_folder=os.path.join(FRONTEND_ROOT, "static"),

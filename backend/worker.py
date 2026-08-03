@@ -3,20 +3,20 @@ from threading import Thread
 
 if __package__:
     from .storage import init_db
+    from .workers import anime_metadata as anime_metadata_worker
     from .workers import artist_metadata as artist_metadata_worker
     from .workers import lidarr_searches as lidarr_search_worker
     from .workers import lidarr_library as lidarr_library_worker
-    from .workers import listening_profiles as listening_profile_worker
     from .workers import plex as plex_worker
     from .workers import plex_history as plex_history_worker
     from .workers import plex_metadata as plex_metadata_worker
     from .workers import recommendations as recommendation_worker
 else:  # Support `python backend/worker.py` for local development.
     from storage import init_db
+    from workers import anime_metadata as anime_metadata_worker
     from workers import artist_metadata as artist_metadata_worker
     from workers import lidarr_searches as lidarr_search_worker
     from workers import lidarr_library as lidarr_library_worker
-    from workers import listening_profiles as listening_profile_worker
     from workers import plex as plex_worker
     from workers import plex_history as plex_history_worker
     from workers import plex_metadata as plex_metadata_worker
@@ -27,12 +27,17 @@ LIDARR_LIBRARY_STARTUP_DELAY = 10
 PLEX_LIBRARY_STARTUP_DELAY = 30
 PLEX_HISTORY_STARTUP_DELAY = 60
 RECOMMENDATION_STARTUP_DEADLINE = 120
-LISTENING_PROFILE_STARTUP_DELAY = 90
 
 
 def main():
     """Initialize storage and start background jobs in a controlled sequence."""
     init_db()
+    anime_metadata_thread = Thread(
+        target=anime_metadata_worker.run,
+        name="anime-musicbrainz-resolution",
+        daemon=True,
+    )
+    anime_metadata_thread.start()
     artist_metadata_thread = Thread(
         target=artist_metadata_worker.run,
         name="musicbrainz-artist-revalidation",
@@ -72,13 +77,6 @@ def main():
         daemon=True,
     )
     plex_history_thread.start()
-    listening_profile_thread = Thread(
-        target=listening_profile_worker.run,
-        args=(LISTENING_PROFILE_STARTUP_DELAY,),
-        name="listening-profile-refresh",
-        daemon=True,
-    )
-    listening_profile_thread.start()
     recommendation_worker.run(RECOMMENDATION_STARTUP_DEADLINE)
 
 

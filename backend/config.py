@@ -1,6 +1,7 @@
 """Application paths, service endpoints, and runtime configuration."""
 
 import os
+import tempfile
 from tempfile import NamedTemporaryFile
 
 
@@ -36,7 +37,6 @@ LISTENBRAINZ_METADATA_CACHE_TTL = 6 * 60 * 60
 LASTFM_CACHE_TTL = 60 * 60
 RECOMMENDATION_REFRESH_INTERVAL = 12 * 60 * 60
 RECOMMENDATION_RETRY_INTERVAL = 5 * 60
-LISTENING_PROFILE_REFRESH_INTERVAL = 24 * 60 * 60
 PLEX_RECENT_SCAN_INTERVAL = 5 * 60
 PLEX_FULL_SCAN_INTERVAL = 12 * 60 * 60
 PLEX_LIBRARY_CACHE_TTL = 30 * 24 * 60 * 60
@@ -80,6 +80,54 @@ SECRET_KEY_FILE = _path_from_environment(
     "MELODARR_SECRET_KEY_FILE",
     os.path.join(os.path.dirname(os.path.abspath(DATABASE)), "session-secret.key"),
 )
+
+
+def assert_test_storage_isolation():
+    """Fail closed unless all mutable test paths use a registered temp root."""
+    registered_root = os.getenv("MELODARR_TEST_ROOT")
+    if not registered_root or not registered_root.strip():
+        raise RuntimeError(
+            "TESTING requires MELODARR_TEST_ROOT to register an isolated "
+            "temporary directory."
+        )
+
+    root = os.path.realpath(os.path.abspath(registered_root))
+    temporary_root = os.path.realpath(os.path.abspath(tempfile.gettempdir()))
+    try:
+        root_is_temporary = (
+            root != temporary_root
+            and os.path.commonpath((temporary_root, root)) == temporary_root
+        )
+    except ValueError:
+        root_is_temporary = False
+    if not root_is_temporary:
+        raise RuntimeError(
+            "MELODARR_TEST_ROOT must be a dedicated directory beneath the "
+            "operating system temporary directory."
+        )
+
+    paths = {
+        "DATABASE": DATABASE,
+        "CACHE_DATABASE": CACHE_DATABASE,
+        "SETTINGS_FILE": SETTINGS_FILE,
+        "ARTWORK_CACHE_DIRECTORY": ARTWORK_CACHE_DIRECTORY,
+        "SECRET_KEY_FILE": SECRET_KEY_FILE,
+    }
+    unsafe = {}
+    for name, path in paths.items():
+        resolved = os.path.realpath(os.path.abspath(path))
+        try:
+            contained = resolved != root and os.path.commonpath((root, resolved)) == root
+        except ValueError:
+            contained = False
+        if not contained:
+            unsafe[name] = path
+    if unsafe:
+        details = ", ".join(f"{name}={path!r}" for name, path in unsafe.items())
+        raise RuntimeError(
+            "TESTING refused to use mutable paths outside MELODARR_TEST_ROOT: "
+            f"{details}"
+        )
 
 
 def load_session_secret():

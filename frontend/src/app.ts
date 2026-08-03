@@ -93,21 +93,6 @@ type LastfmSettingsForm = HTMLFormElement & {
   apiKey: HTMLInputElement;
 };
 
-type AISettingsForm = HTMLFormElement & {
-  provider: HTMLSelectElement;
-  model: HTMLInputElement;
-  apiKey: HTMLInputElement;
-  baseUrl: HTMLInputElement;
-};
-
-interface AIProviderOption {
-  id: string;
-  name: string;
-  defaultModel: string;
-  requiresApiKey: boolean;
-  supportsApiKey: boolean;
-}
-
 interface PlexConnection extends JsonObject {
   uri: string;
   local: boolean;
@@ -191,13 +176,6 @@ let discoveryLoad: Promise<void> | undefined;
 let accountRenderGeneration = 0;
 let accountRenderAbort: AbortController | undefined;
 let sessionExpiryHandled = false;
-let aiProviderOptions: AIProviderOption[] = [
-  { id: "openai", name: "OpenAI", defaultModel: "gpt-5.6-sol", requiresApiKey: true, supportsApiKey: true },
-  { id: "anthropic", name: "Claude", defaultModel: "claude-sonnet-5", requiresApiKey: true, supportsApiKey: true },
-  { id: "gemini", name: "Gemini", defaultModel: "gemini-3.6-flash", requiresApiKey: true, supportsApiKey: true },
-  { id: "lmstudio", name: "LM Studio", defaultModel: "", requiresApiKey: false, supportsApiKey: true },
-  { id: "ollama", name: "Ollama", defaultModel: "", requiresApiKey: false, supportsApiKey: false },
-];
 // Plex holdings tell a requester what is already available, so the library is
 // readable by every account. Settings remains administrator-only.
 const VIEWS_FOR_EVERY_USER = ["discover", "detail", "library", "account"];
@@ -562,165 +540,10 @@ function parseLidarrUrl(value: string) {
   }
 }
 
-function selectedAIProvider() {
-  const form = $<AISettingsForm>("#ai-settings-form");
-  return aiProviderOptions.find((provider) => provider.id === form.provider.value)
-    || aiProviderOptions[0];
-}
-
-function updateAILocalTransportWarning() {
-  const form = $<AISettingsForm>("#ai-settings-form");
-  const provider = selectedAIProvider();
-  const warning = $("#ai-transport-warning");
-  const title = $("#ai-transport-warning-title");
-  const copy = $("#ai-transport-warning-copy");
-  const isLocalProvider = ["lmstudio", "ollama"].includes(provider.id);
-  warning.hidden = !isLocalProvider;
-  if (!isLocalProvider) return;
-
-  const fallbackUrl = provider.id === "lmstudio"
-    ? "http://localhost:1234"
-    : "http://localhost:11434";
-  let parsed: URL;
-  try {
-    parsed = new URL(form.baseUrl.value.trim() || fallbackUrl);
-  } catch {
-    title.textContent = "Review local model transport";
-    copy.textContent = "Enter a valid server URL to see whether prompts and taste-profile data will use encrypted, loopback, or network transport. The model server may log request bodies.";
-    return;
-  }
-  const hostname = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  const loopback = hostname === "localhost"
-    || hostname === "::1"
-    || /^127(?:\.\d{1,3}){3}$/.test(hostname);
-  const encrypted = parsed.protocol === "https:";
-  if (encrypted) {
-    title.textContent = loopback
-      ? "Encrypted loopback model connection"
-      : "Encrypted network model connection";
-    copy.textContent = loopback
-      ? `Melodarr sends prompts and minimized taste-profile data to ${provider.name} over HTTPS on the Melodarr host. The model server may still retain or log request bodies.`
-      : `Melodarr sends prompts and minimized taste-profile data to ${provider.name} over HTTPS. The server may be another device and may retain or log request bodies; “local provider” does not guarantee on-device processing.`;
-  } else {
-    title.textContent = loopback
-      ? "Unencrypted loopback model connection"
-      : "Unencrypted network model connection";
-    copy.textContent = loopback
-      ? `HTTP does not encrypt prompts or taste-profile data. This loopback address confines transport to the Melodarr host, but ${provider.name} may still retain or log request bodies.`
-      : `HTTP sends prompts and taste-profile data unencrypted across the container, host, or LAN route to ${provider.name}. Anyone able to observe that route may read them. Use HTTPS or a trusted isolated network; the model server may retain or log request bodies.`;
-  }
-}
-
-function updateAIProviderFields(useDefaultModel = false) {
-  const form = $<AISettingsForm>("#ai-settings-form");
-  const provider = selectedAIProvider();
-  const previousProvider = aiProviderOptions.find(
-    (option) => option.id === form.dataset.activeProvider,
-  );
-  if (
-    useDefaultModel
-    && (
-      !form.model.value.trim()
-      || form.model.value.trim() === previousProvider?.defaultModel
-    )
-  ) {
-    form.model.value = provider.defaultModel;
-  }
-  form.dataset.activeProvider = provider.id;
-  $("#ai-api-key-field").hidden = !provider.supportsApiKey;
-  form.apiKey.disabled = !provider.supportsApiKey;
-  form.apiKey.required = provider.requiresApiKey
-    && form.dataset.configuredProvider !== provider.id;
-  $("#clear-ai-key").hidden = !provider.supportsApiKey
-    || form.dataset.configuredProvider !== provider.id;
-  const isLocalProvider = ["lmstudio", "ollama"].includes(provider.id);
-  const providerHasStoredKey = form.dataset.configuredProvider === provider.id;
-  $("#ai-base-url-field").hidden = !isLocalProvider;
-  form.baseUrl.disabled = !isLocalProvider;
-  if (provider.id === "lmstudio") {
-    $("#ai-base-url-help").textContent =
-      "The LM Studio server reachable from Melodarr. Melodarr adds /v1/chat/completions.";
-    form.baseUrl.placeholder = "http://host.docker.internal:1234";
-  } else if (provider.id === "ollama") {
-    $("#ai-base-url-help").textContent =
-      "The Ollama server reachable from Melodarr. Melodarr adds /api/chat.";
-    form.baseUrl.placeholder = "http://host.docker.internal:11434";
-  } else {
-    form.baseUrl.placeholder = "";
-  }
-  $("#ai-model-help").textContent = provider.defaultModel
-    ? `Default: ${provider.defaultModel}. You can choose another supported model.`
-    : provider.id === "lmstudio"
-      ? "Enter the exact model identifier shown by LM Studio."
-      : "Enter the exact model installed in Ollama.";
-  form.apiKey.placeholder = providerHasStoredKey
-    ? "Enter a new key to replace the saved key"
-    : provider.id === "lmstudio"
-      ? "Optional LM Studio API token"
-      : "Provider API key";
-  $("#ai-api-key-help").textContent = providerHasStoredKey
-    ? "A key is stored server-side. Enter a new one only to replace it."
-    : provider.id === "lmstudio"
-      ? "Optional unless authentication is enabled in LM Studio 0.4 or newer."
-      : "Stored server-side and never returned to this browser.";
-  updateAILocalTransportWarning();
-}
-
-function populateAISettings(settings: JsonObject, status: JsonObject) {
-  const providers = (status.providers || [])
-    .filter((provider: JsonObject) => provider?.id && provider?.name)
-    .map((provider: JsonObject) => ({
-      id: String(provider.id),
-      name: String(provider.name),
-      defaultModel: String(provider.defaultModel || ""),
-      requiresApiKey: provider.requiresApiKey !== false,
-      supportsApiKey: provider.supportsApiKey === true
-        || provider.requiresApiKey !== false,
-    }));
-  if (providers.length) aiProviderOptions = providers;
-
-  const form = $<AISettingsForm>("#ai-settings-form");
-  const selectedProvider = String(settings.provider || status.provider || aiProviderOptions[0]?.id || "");
-  form.provider.replaceChildren(...aiProviderOptions.map((provider) => (
-    new Option(provider.name, provider.id, false, provider.id === selectedProvider)
-  )));
-  form.provider.value = selectedProvider;
-  form.dataset.activeProvider = selectedProvider;
-  const provider = selectedAIProvider();
-  form.model.value = String(settings.model || status.model || provider.defaultModel || "");
-  form.baseUrl.value = String(settings.baseUrl || "");
-  form.apiKey.value = "";
-
-  const hasApiKey = Boolean(
-    settings.apiKeyConfigured
-    ?? settings.hasApiKey
-    ?? (status.configured && provider.requiresApiKey),
-  );
-  const clearButton = $<HTMLButtonElement>("#clear-ai-key");
-  clearButton.hidden = !hasApiKey || !provider.requiresApiKey;
-  clearButton.dataset.configured = hasApiKey ? "true" : "";
-  form.dataset.configuredProvider = hasApiKey ? selectedProvider : "";
-  form.apiKey.placeholder = hasApiKey
-    ? "Enter a new key to replace the saved key"
-    : "Provider API key";
-  $("#ai-api-key-help").textContent = hasApiKey
-    ? "A key is stored server-side. Enter a new one only to replace it."
-    : "Stored server-side and never returned to this browser.";
-  const configured = Boolean(status.configured);
-  $("#ai-settings-state").textContent = configured
-    ? `${provider.name} · ${form.model.value}`
-    : "Not configured";
-  updateAIProviderFields();
-}
-
 async function refreshSettings(loadLidarrOptions = true) {
-  const [settings, aiStatus] = await Promise.all([
-    api("/api/settings"),
-    api("/api/ai/status").catch(() => ({ configured: false, providers: [] })),
-  ]);
+  const settings = await api("/api/settings");
   const { lidarr, plex } = settings;
   lidarrDefaults = lidarr.defaults || {};
-  populateAISettings(settings.ai || {}, aiStatus);
 
   const lastfmConfigured = Boolean(settings.lastfm?.configured);
   $("#lastfm-state").textContent = lastfmConfigured ? "API key configured" : "Not configured";
@@ -2430,82 +2253,6 @@ function setupLastfmSettings() {
   });
 }
 
-function setupAISettings() {
-  const form = $<AISettingsForm>("#ai-settings-form");
-  const saveButton = $<HTMLButtonElement>("#save-ai-settings");
-  const clearButton = $<HTMLButtonElement>("#clear-ai-key");
-  const message = requiredDescendant<HTMLElement>(form, ".form-message");
-
-  form.provider.addEventListener("change", () => updateAIProviderFields(true));
-  form.baseUrl.addEventListener("input", updateAILocalTransportWarning);
-
-  const save = async (clearApiKey = false) => {
-    const provider = selectedAIProvider();
-    const model = form.model.value.trim();
-    const apiKey = form.apiKey.value.trim();
-    if (!model) {
-      setMessage(message, "Enter the model this provider should use.", true);
-      form.model.focus();
-      return;
-    }
-    if (
-      provider.requiresApiKey
-      && !apiKey
-      && form.dataset.configuredProvider !== provider.id
-      && !clearApiKey
-    ) {
-      setMessage(message, `Enter an API key for ${provider.name}.`, true);
-      form.apiKey.focus();
-      return;
-    }
-
-    const body: JsonObject = {
-      provider: provider.id,
-      model,
-    };
-    if (["lmstudio", "ollama"].includes(provider.id)) {
-      body.baseUrl = form.baseUrl.value.trim();
-    }
-    if (apiKey) body.apiKey = apiKey;
-    if (clearApiKey) body.clearApiKey = true;
-
-    saveButton.disabled = true;
-    clearButton.disabled = true;
-    form.setAttribute("aria-busy", "true");
-    setMessage(message, clearApiKey ? "Clearing the saved AI key…" : "Saving AI provider…");
-    try {
-      const result = await api("/api/settings/ai", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      form.apiKey.value = "";
-      setMessage(message, result.message || (
-        clearApiKey ? "AI API key cleared." : "AI recommendation provider saved."
-      ));
-      await refreshSettings(false);
-      window.dispatchEvent(new Event("melodarr-ai-settings-changed"));
-    } catch (error) {
-      setMessage(message, error.message, true);
-    } finally {
-      saveButton.disabled = false;
-      clearButton.disabled = false;
-      form.removeAttribute("aria-busy");
-    }
-  };
-
-  form.addEventListener("submit", (event) => {
-    event.preventDefault();
-    save();
-  });
-  clearButton.addEventListener("click", () => {
-    if (!window.confirm(
-      "Clear the saved AI API key? AI recommendations will pause until a provider is configured again.",
-    )) return;
-    save(true);
-  });
-}
-
 function setupPlexSettings() {
   const card = $("#plex-settings");
   const connectButton = $<HTMLButtonElement>("#connect-plex");
@@ -2884,7 +2631,6 @@ setupAdminUsers();
 setupStandalonePullToRefresh();
 setupLidarrSettings();
 setupLastfmSettings();
-setupAISettings();
 setupPlexSettings();
 setupLibrary();
 setupAuth();

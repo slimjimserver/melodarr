@@ -23,14 +23,12 @@ if __package__ == "backend.routes":
     from ..storage import (
         db,
         count_request_history,
-        delete_listening_profile,
         delete_recommendation_cache,
         get_lastfm_api_key,
         get_request_history,
         get_service,
     )
     from ..workers import recommendations as recommendation_worker
-    from ..workers import listening_profiles as listening_profile_worker
 else:  # Support the existing `python backend/app.py` entry point.
     from responses import api_error, request_json_object
     from security import (
@@ -43,14 +41,12 @@ else:  # Support the existing `python backend/app.py` entry point.
     from storage import (
         db,
         count_request_history,
-        delete_listening_profile,
         delete_recommendation_cache,
         get_lastfm_api_key,
         get_request_history,
         get_service,
     )
     from workers import recommendations as recommendation_worker
-    from workers import listening_profiles as listening_profile_worker
 
 
 blueprint = Blueprint("account", __name__)
@@ -81,11 +77,7 @@ def _requested_page():
 
 def _recommendation_inputs_changed(user_id):
     delete_recommendation_cache(user_id)
-    # A deliberate unlink must stop the old provider slice from reaching AI
-    # immediately; stale preservation is reserved for transient outages.
-    delete_listening_profile(user_id)
     recommendation_worker.request_refresh()
-    listening_profile_worker.request_refresh()
 
 
 def _profile_plex_index():

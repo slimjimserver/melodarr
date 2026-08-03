@@ -9,12 +9,10 @@ if __package__ == "backend.routes":
     from ..detail_cache import invalidate_all as invalidate_detail_payloads
     from ..responses import api_error, request_json_object
     from ..security import admin_required, login_required
-    from ..services import ai_providers, lastfm, lidarr
+    from ..services import lastfm, lidarr
     from ..storage import (
         clear_recommendation_cache,
-        clear_listening_profiles,
         get_service,
-        listening_profile_stats,
         pending_lidarr_search_stats,
         plex_listen_stats,
         recommendation_cache_stats,
@@ -26,19 +24,16 @@ if __package__ == "backend.routes":
     from ..workers import plex_history as plex_history_worker
     from ..workers import plex_metadata as plex_metadata_worker
     from ..workers import recommendations as recommendation_worker
-    from ..workers import listening_profiles as listening_profile_worker
 else:  # Support the existing `python backend/app.py` entry point.
     from api_cache import cache_stats, clear_cache
     from artwork_cache import artwork_cache_stats, clear_artwork_cache
     from detail_cache import invalidate_all as invalidate_detail_payloads
     from responses import api_error, request_json_object
     from security import admin_required, login_required
-    from services import ai_providers, lastfm, lidarr
+    from services import lastfm, lidarr
     from storage import (
         clear_recommendation_cache,
-        clear_listening_profiles,
         get_service,
-        listening_profile_stats,
         pending_lidarr_search_stats,
         plex_listen_stats,
         recommendation_cache_stats,
@@ -50,7 +45,6 @@ else:  # Support the existing `python backend/app.py` entry point.
     from workers import plex_history as plex_history_worker
     from workers import plex_metadata as plex_metadata_worker
     from workers import recommendations as recommendation_worker
-    from workers import listening_profiles as listening_profile_worker
 
 
 blueprint = Blueprint("settings", __name__)
@@ -78,12 +72,10 @@ def health():
 @blueprint.get("/api/settings")
 @admin_required
 def settings():
-    ai_config = get_service("ai")
     lidarr_config = get_service("lidarr")
     plex_config = get_service("plex")
     lastfm_config = get_service("lastfm") or {}
     return jsonify({
-        "ai": ai_providers.administrative_status(ai_config),
         "lidarr": {
             "configured": bool(lidarr_config),
             "url": lidarr_config.get("url", "") if lidarr_config else "",
@@ -137,7 +129,6 @@ def maintenance():
         })
 
     recommendation_status = recommendation_worker.status()
-    listening_profile_status = listening_profile_worker.status()
     lidarr_status = lidarr_search_worker.status()
     lidarr_library_status = lidarr_library_worker.status()
     plex_recent_status = plex_worker.status("recent")
@@ -146,7 +137,6 @@ def maintenance():
     plex_metadata_status = plex_metadata_worker.status()
     lidarr_queue = pending_lidarr_search_stats()
     recommendations = recommendation_cache_stats()
-    listening_profiles = listening_profile_stats()
     artwork = artwork_cache_stats()
     return jsonify({
         "jobs": [
@@ -156,14 +146,6 @@ def maintenance():
                 "type": "process",
                 "schedule": "Every 12 hours",
                 **recommendation_status,
-            },
-            {
-                "id": "listening-profiles",
-                "name": "AI Listening Profiles",
-                "type": "process",
-                "schedule": "Every 24 hours and after account changes",
-                **listening_profiles,
-                **listening_profile_status,
             },
             {
                 "id": "lidarr-followups",
@@ -240,9 +222,6 @@ def run_job(job_id):
     if job_id == "recommendations":
         recommendation_worker.request_refresh()
         return jsonify({"message": "Recommendation refresh queued."})
-    if job_id == "listening-profiles":
-        listening_profile_worker.request_refresh()
-        return jsonify({"message": "AI listening-profile refresh queued."})
     if job_id == "lidarr-followups":
         lidarr_search_worker.request_work()
         return jsonify({"message": "Lidarr follow-up check queued."})
@@ -373,10 +352,8 @@ def configure_lastfm():
 
     clear_cache("lastfm")
     clear_recommendation_cache()
-    clear_listening_profiles()
     invalidate_detail_payloads()
     recommendation_worker.request_refresh()
-    listening_profile_worker.request_refresh()
     return jsonify({"message": message})
 
 

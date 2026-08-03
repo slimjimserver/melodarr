@@ -1,5 +1,10 @@
 """High-value backend regression tests using Flask's built-in test client."""
 
+if __package__:
+    from ._test_environment import TEST_DATA, TEST_ROOT
+else:  # Support direct execution: python tests/test_backend.py
+    from _test_environment import TEST_DATA, TEST_ROOT
+
 import gzip
 import io
 import json
@@ -14,18 +19,6 @@ from urllib.parse import parse_qs, urlparse
 from unittest.mock import Mock, patch
 
 from werkzeug.security import check_password_hash, generate_password_hash
-
-# Application paths are resolved when backend.config is first imported. Keep
-# every test artifact outside the repository and disable daemon workers before
-# importing the application package.
-TEST_DATA = tempfile.TemporaryDirectory(prefix="melodarr-tests-")
-os.environ.update({
-    "MELODARR_DATABASE": os.path.join(TEST_DATA.name, "melodarr.db"),
-    "MELODARR_CACHE_DATABASE": os.path.join(TEST_DATA.name, "cache", "metadata.db"),
-    "MELODARR_SETTINGS": os.path.join(TEST_DATA.name, "settings.json"),
-    "MELODARR_SECRET_KEY_FILE": os.path.join(TEST_DATA.name, "session-secret.key"),
-    "MELODARR_ARTWORK_CACHE": os.path.join(TEST_DATA.name, "artwork"),
-})
 
 import requests
 from PIL import Image
@@ -66,10 +59,10 @@ from backend.storage import (
     write_settings_file,
 )
 from backend import worker
+from backend.workers import anime_metadata as anime_metadata_worker
 from backend.workers import artist_metadata as artist_metadata_worker
 from backend.workers import lidarr_searches as lidarr_search_worker
 from backend.workers import lidarr_library as lidarr_library_worker
-from backend.workers import listening_profiles as listening_profile_worker
 from backend.workers import plex as plex_worker
 from backend.workers import plex_history as plex_history_worker
 from backend.workers import plex_metadata as plex_metadata_worker
@@ -129,6 +122,17 @@ class DatabaseTestCase(unittest.TestCase):
         detail_cache.invalidate_all()
         with detail_cache._key_locks_lock:
             detail_cache._key_locks.clear()
+        with anime_metadata_worker.queue_lock:
+            anime_metadata_worker.queued_themes.clear()
+            anime_metadata_worker.active_theme_keys.clear()
+            anime_metadata_worker.job_state.update(
+                running=False,
+                queued=0,
+                completed=0,
+                total=0,
+                lastCompletedAt=None,
+            )
+        anime_metadata_worker.wake_requested.clear()
         with artist_metadata_worker.queue_lock:
             artist_metadata_worker.queued_artist_ids.clear()
             artist_metadata_worker.active_artist_phases.clear()
@@ -170,7 +174,6 @@ class DatabaseTestCase(unittest.TestCase):
             connection.execute("DELETE FROM plex_auth_flows")
             connection.execute("DELETE FROM pending_lidarr_searches")
             connection.execute("DELETE FROM recommendation_cache")
-            connection.execute("DELETE FROM listening_profiles")
             connection.execute("DELETE FROM plex_listens")
             connection.execute("DELETE FROM request_history")
             connection.execute("DELETE FROM account_invitations")
@@ -197,8 +200,8 @@ class ApplicationFactoryTests(DatabaseTestCase):
             for method in rule.methods
             if method not in {"HEAD", "OPTIONS"}
         }
-        self.assertEqual(len(rules), 69)
-        self.assertEqual(len(route_methods), 69)
+        self.assertEqual(len(rules), 74)
+        self.assertEqual(len(route_methods), 74)
 
     def test_factory_applies_test_configuration(self):
         self.assertTrue(self.app.config["TESTING"])
@@ -284,6 +287,97 @@ class PlexListenStorageTests(DatabaseTestCase):
 
 
 class SettingsStorageTests(DatabaseTestCase):
+    def test_upgrade_removes_legacy_ai_data_without_touching_user_data(self):
+        with tempfile.TemporaryDirectory(prefix="melodarr-ai-removal-") as directory:
+            database = os.path.join(directory, "melodarr.db")
+            settings_path = os.path.join(directory, "settings.json")
+            with (
+                patch.object(storage_module, "DATABASE", database),
+                patch.object(storage_module, "SETTINGS_FILE", settings_path),
+            ):
+                storage_module.init_db()
+                with storage_module.db() as connection:
+                    user_id = connection.execute(
+                        "INSERT INTO users "
+                        "(username, password_hash, role, created_at) "
+                        "VALUES ('upgrade-user', 'hash', 'user', 1)"
+                    ).lastrowid
+                    connection.execute(
+                        "INSERT INTO request_history "
+                        "(user_id, kind, mbid, name, created_at) "
+                        "VALUES (?, 'artist', 'artist-mbid', 'Kept Artist', 2)",
+                        (user_id,),
+                    )
+                    connection.execute(
+                        "INSERT INTO plex_listens "
+                        "(server_id, history_key, user_id, artist_rating_key, "
+                        "album_rating_key, played_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            "server-1",
+                            "history-1",
+                            user_id,
+                            "artist-1",
+                            "album-1",
+                            3,
+                        ),
+                    )
+                    connection.execute(
+                        "CREATE TABLE listening_profiles "
+                        "(user_id INTEGER PRIMARY KEY, value TEXT NOT NULL)"
+                    )
+                    connection.execute(
+                        "INSERT INTO listening_profiles (user_id, value) "
+                        "VALUES (?, ?)",
+                        (user_id, '{"private":"taste-data"}'),
+                    )
+                storage_module.write_settings_file({
+                    "ai": {
+                        "provider": "openai",
+                        "apiKey": "legacy-ai-secret",
+                    },
+                    "lidarr": {"url": "http://lidarr:8686"},
+                    "lastfm": {"apiKey": "shared-lastfm-key"},
+                    "plex": {
+                        "url": "http://plex:32400",
+                        "token": "preserved-plex-token",
+                        "machineIdentifier": "server-1",
+                    },
+                })
+
+                storage_module.init_db()
+
+                with storage_module.db() as connection:
+                    profile_table = connection.execute(
+                        "SELECT 1 FROM sqlite_master "
+                        "WHERE type = 'table' AND name = 'listening_profiles'"
+                    ).fetchone()
+                    user = connection.execute(
+                        "SELECT username FROM users WHERE id = ?", (user_id,)
+                    ).fetchone()
+                    request = connection.execute(
+                        "SELECT name FROM request_history WHERE user_id = ?",
+                        (user_id,),
+                    ).fetchone()
+                    listen = connection.execute(
+                        "SELECT history_key FROM plex_listens WHERE user_id = ?",
+                        (user_id,),
+                    ).fetchone()
+                settings = storage_module.load_settings_file()
+
+            self.assertIsNone(profile_table)
+            self.assertEqual(user["username"], "upgrade-user")
+            self.assertEqual(request["name"], "Kept Artist")
+            self.assertEqual(listen["history_key"], "history-1")
+            self.assertNotIn("ai", settings)
+            self.assertEqual(settings["lidarr"], {"url": "http://lidarr:8686"})
+            self.assertEqual(settings["lastfm"], {"apiKey": "shared-lastfm-key"})
+            self.assertEqual(settings["plex"], {
+                "url": "http://plex:32400",
+                "token": "preserved-plex-token",
+                "machineIdentifier": "server-1",
+            })
+            self.assertNotIn("legacy-ai-secret", json.dumps(settings))
+
     def test_parallel_service_saves_preserve_unrelated_settings(self):
         write_barrier = Barrier(2)
         real_write = storage_module.write_settings_file
@@ -336,27 +430,32 @@ class WorkerEntrypointTests(unittest.TestCase):
         self, init_db, run, thread_class
     ):
         calls = []
+        anime_metadata_thread = Mock()
         artist_metadata_thread = Mock()
         lidarr_thread = Mock()
         plex_thread = Mock()
         plex_metadata_thread = Mock()
         plex_history_thread = Mock()
-        listening_profile_thread = Mock()
         lidarr_library_thread = Mock()
         thread_class.side_effect = [
+            anime_metadata_thread,
             artist_metadata_thread,
             lidarr_thread,
             lidarr_library_thread,
             plex_thread,
             plex_metadata_thread,
             plex_history_thread,
-            listening_profile_thread,
         ]
         init_db.side_effect = lambda: calls.append("database")
         run.side_effect = lambda *_args: calls.append("recommendations")
         worker.main()
         self.assertEqual(calls, ["database", "recommendations"])
         self.assertEqual(thread_class.call_count, 7)
+        thread_class.assert_any_call(
+            target=anime_metadata_worker.run,
+            name="anime-musicbrainz-resolution",
+            daemon=True,
+        )
         thread_class.assert_any_call(
             target=artist_metadata_worker.run,
             name="musicbrainz-artist-revalidation",
@@ -388,18 +487,12 @@ class WorkerEntrypointTests(unittest.TestCase):
             name="plex-listening-history",
             daemon=True,
         )
-        thread_class.assert_any_call(
-            target=listening_profile_worker.run,
-            args=(worker.LISTENING_PROFILE_STARTUP_DELAY,),
-            name="listening-profile-refresh",
-            daemon=True,
-        )
         lidarr_thread.start.assert_called_once_with()
         lidarr_library_thread.start.assert_called_once_with()
         plex_thread.start.assert_called_once_with()
         plex_metadata_thread.start.assert_called_once_with()
         plex_history_thread.start.assert_called_once_with()
-        listening_profile_thread.start.assert_called_once_with()
+        anime_metadata_thread.start.assert_called_once_with()
         artist_metadata_thread.start.assert_called_once_with()
         run.assert_called_once_with(worker.RECOMMENDATION_STARTUP_DEADLINE)
 
@@ -431,71 +524,6 @@ class WorkerEntrypointTests(unittest.TestCase):
             recommendation_worker.run(initial_delay=120)
 
         wait.assert_called_once_with(120)
-
-    def test_listening_profile_refresh_request_wakes_sleeping_worker(self):
-        listening_profile_worker.refresh_requested.clear()
-        listening_profile_worker.request_refresh()
-        self.assertTrue(listening_profile_worker.refresh_requested.is_set())
-        listening_profile_worker.refresh_requested.clear()
-
-    @patch(
-        "backend.workers.listening_profiles.refresh_all_profiles",
-        return_value=False,
-    )
-    @patch("backend.workers.listening_profiles.time.time", return_value=100)
-    def test_listening_profiles_run_daily_after_success(self, current_time, refresh):
-        waits = []
-
-        def wait(timeout):
-            waits.append(timeout)
-            if len(waits) == 2:
-                raise _StopWorker()
-            return False
-
-        listening_profile_worker.refresh_requested.clear()
-        with patch.object(
-            listening_profile_worker.refresh_requested,
-            "wait",
-            side_effect=wait,
-        ):
-            with self.assertRaises(_StopWorker):
-                listening_profile_worker.run(initial_delay=0)
-
-        refresh.assert_called_once_with()
-        self.assertEqual(waits, [0, 24 * 60 * 60])
-
-    @patch(
-        "backend.workers.listening_profiles.refresh_all_profiles",
-        return_value=True,
-    )
-    @patch("backend.workers.listening_profiles.time.time", return_value=100)
-    def test_listening_profiles_retry_soon_after_partial_outage(
-        self,
-        current_time,
-        refresh,
-    ):
-        waits = []
-
-        def wait(timeout):
-            waits.append(timeout)
-            if len(waits) == 2:
-                raise _StopWorker()
-            return False
-
-        listening_profile_worker.refresh_requested.clear()
-        with patch.object(
-            listening_profile_worker.refresh_requested,
-            "wait",
-            side_effect=wait,
-        ):
-            with self.assertRaises(_StopWorker):
-                listening_profile_worker.run(initial_delay=0)
-
-        refresh.assert_called_once_with()
-        self.assertEqual(
-            waits,
-            [0, listening_profile_worker.RETRY_INTERVAL],
-        )
 
     @patch(
         "backend.workers.recommendations.refresh_recommendation_cache",
@@ -1269,12 +1297,6 @@ class LidarrSearchQueueTests(DatabaseTestCase):
         self.assertFalse(
             storage_module.save_recommendation_cache(user_id, {"private": True})
         )
-        self.assertFalse(
-            storage_module.save_listening_profile(
-                user_id,
-                {"private": True},
-            )
-        )
         self.assertEqual(
             insert_plex_listens([
                 {
@@ -1291,7 +1313,6 @@ class LidarrSearchQueueTests(DatabaseTestCase):
         with db() as connection:
             for table in (
                 "recommendation_cache",
-                "listening_profiles",
                 "plex_listens",
             ):
                 self.assertEqual(
@@ -2002,7 +2023,7 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertEqual(config["workers"], 1)
         self.assertEqual(config["worker_class"], "gthread")
         self.assertEqual(config["threads"], 16)
-        self.assertEqual(config["timeout"], 600)
+        self.assertEqual(config["timeout"], 60)
         self.assertFalse(config["preload_app"])
         self.assertTrue(config["control_socket_disable"])
 
@@ -2045,37 +2066,6 @@ class DeploymentConfigTests(unittest.TestCase):
         config["post_worker_init"](gunicorn_worker)
         start_thread.assert_called_once_with()
         gunicorn_worker.log.info.assert_called_once_with("Background workers started")
-
-
-    def test_ai_ui_discloses_prompt_profile_and_local_transport_risks(self):
-        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        paths = {
-            "html": os.path.join(
-                project_root, "frontend", "static", "index.html"
-            ),
-            "app": os.path.join(project_root, "frontend", "src", "app.ts"),
-            "discovery": os.path.join(
-                project_root, "frontend", "src", "discovery.ts"
-            ),
-        }
-        content = {}
-        for name, path in paths.items():
-            with open(path, encoding="utf-8") as file:
-                content[name] = file.read()
-
-        self.assertNotIn('id="ai-data-disclosure-copy"', content["html"])
-        self.assertIn('id="ai-transport-warning"', content["html"])
-        settings_copy = content["html"].split(
-            '<div class="ai-privacy-note">', 1
-        )[1].split("</div>", 1)[0]
-        self.assertIn("does not inspect or redact prompt text", settings_copy)
-        self.assertIn("credentials, API keys, secrets", settings_copy)
-        self.assertIn("may be retained or logged", settings_copy)
-        self.assertIn("Unencrypted loopback model connection", content["app"])
-        self.assertIn("Unencrypted network model connection", content["app"])
-        self.assertIn("does not guarantee on-device processing", content["app"])
-        self.assertNotIn("aiDataDisclosure", content["discovery"])
-
 
 class AuthenticationTests(DatabaseTestCase):
     def login_non_admin(self, username="local-listener"):
@@ -3768,9 +3758,8 @@ class SettingsMaintenanceTests(DatabaseTestCase):
     @patch("backend.routes.settings.plex_worker.request_recent_scan")
     @patch("backend.routes.settings.lidarr_search_worker.request_work")
     @patch("backend.routes.settings.recommendation_worker.request_refresh")
-    @patch("backend.routes.settings.listening_profile_worker.request_refresh")
     def test_jobs_are_listed_and_can_be_manually_queued(
-        self, request_profiles, request_refresh, request_work, request_recent, request_full,
+        self, request_refresh, request_work, request_recent, request_full,
         request_enrichment, request_lidarr_scan, request_history,
     ):
         token = self.register()
@@ -3780,7 +3769,6 @@ class SettingsMaintenanceTests(DatabaseTestCase):
             [job["id"] for job in response.get_json()["jobs"]],
             [
                 "recommendations",
-                "listening-profiles",
                 "lidarr-followups",
                 "lidarr-library",
                 "plex-recent",
@@ -3794,7 +3782,6 @@ class SettingsMaintenanceTests(DatabaseTestCase):
             [job["name"] for job in job_rows],
             [
                 "Recommendation Refresh",
-                "AI Listening Profiles",
                 "Lidarr Search Follow-Ups",
                 "Lidarr Library Scan",
                 "Plex Recently Added Scan",
@@ -3806,10 +3793,6 @@ class SettingsMaintenanceTests(DatabaseTestCase):
         jobs = {job["id"]: job for job in job_rows}
         self.assertEqual(jobs["lidarr-library"]["schedule"], "Every 4 minutes")
         self.assertEqual(jobs["plex-history"]["schedule"], "Every 24 hours")
-        self.assertEqual(
-            jobs["listening-profiles"]["schedule"],
-            "Every 24 hours and after account changes",
-        )
 
         recommendation = self.client.post(
             "/api/settings/jobs/recommendations/run",
@@ -3835,16 +3818,11 @@ class SettingsMaintenanceTests(DatabaseTestCase):
             "/api/settings/jobs/plex-metadata/run",
             headers={"X-CSRF-Token": token},
         )
-        profiles = self.client.post(
-            "/api/settings/jobs/listening-profiles/run",
-            headers={"X-CSRF-Token": token},
-        )
         history = self.client.post(
             "/api/settings/jobs/plex-history/run",
             headers={"X-CSRF-Token": token},
         )
         self.assertEqual(recommendation.status_code, 200)
-        self.assertEqual(profiles.status_code, 200)
         self.assertEqual(lidarr.status_code, 200)
         self.assertEqual(lidarr_library.status_code, 200)
         self.assertEqual(recent.status_code, 200)
@@ -4059,11 +4037,10 @@ class LastFmLinkingTests(DatabaseTestCase):
                 ("test-user",),
             ).fetchone()
 
-    @patch("backend.routes.account.listening_profile_worker.request_refresh")
     @patch("backend.routes.account.recommendation_worker.request_refresh")
     @patch("backend.routes.account.lastfm.get")
     def test_user_saves_only_a_username_with_the_shared_key(
-        self, lastfm_get, request_refresh, request_profiles
+        self, lastfm_get, request_refresh
     ):
         save_service("lastfm", {"apiKey": "admin-shared-key"})
         token = self.register()
@@ -4093,7 +4070,6 @@ class LastFmLinkingTests(DatabaseTestCase):
         self.assertNotIn("admin-shared-key", account.get_data(as_text=True))
         self.assertNotIn("apiKey", account.get_data(as_text=True))
         request_refresh.assert_called_once_with()
-        request_profiles.assert_called_once_with()
 
     @patch("backend.routes.account.lastfm.get")
     def test_username_requires_an_admin_configured_shared_key(self, lastfm_get):
@@ -4108,11 +4084,10 @@ class LastFmLinkingTests(DatabaseTestCase):
         self.assertIsNone(self.saved_lastfm_fields()["lastfm_username"])
         lastfm_get.assert_not_called()
 
-    @patch("backend.routes.account.listening_profile_worker.request_refresh")
     @patch("backend.routes.account.recommendation_worker.request_refresh")
     @patch("backend.routes.account.lastfm.get")
     def test_user_can_clear_their_username_without_supplying_a_key(
-        self, lastfm_get, request_refresh, request_profiles
+        self, lastfm_get, request_refresh
     ):
         save_service("lastfm", {"apiKey": "admin-shared-key"})
         token = self.register()
@@ -4139,7 +4114,6 @@ class LastFmLinkingTests(DatabaseTestCase):
         self.assertIsNone(saved["lastfm_api_key"])
         lastfm_get.assert_not_called()
         request_refresh.assert_called_once_with()
-        request_profiles.assert_called_once_with()
 
 
 class ApiCacheTests(DatabaseTestCase):
@@ -5743,6 +5717,30 @@ class LastFmDiscoveryTests(DatabaseTestCase):
 
 
 class DiscoveryRoutesTests(DatabaseTestCase):
+    @patch("backend.routes.discovery.animethemes.search")
+    def test_anime_search_uses_the_anime_provider(self, search):
+        search.return_value = [{
+            "id": 2028,
+            "slug": "naruto",
+            "name": "Naruto",
+            "year": 2002,
+            "season": "Fall",
+            "format": "TV",
+            "coverArt": "",
+        }]
+
+        response = self.client.get(
+            "/api/search?q=naruto&type=anime",
+            headers={"X-CSRF-Token": self.register()},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), {
+            "results": search.return_value,
+            "type": "anime",
+        })
+        search.assert_called_once_with("naruto")
+
     @patch("backend.routes.discovery.plex.cached_library_index")
     @patch("backend.routes.discovery.get_service")
     @patch("backend.routes.discovery.musicbrainz.search")
@@ -7690,40 +7688,46 @@ class ArtworkVariantTests(DatabaseTestCase):
         response.close()
 
     def test_stale_cleanup_keeps_variants_of_current_plex_artists(self):
-        os.makedirs(ARTWORK_CACHE_DIRECTORY, exist_ok=True)
-        kept = artwork_cache.plex_artist_artwork_key(
-            "server-1", "100", "/thumb/100/new"
-        )
-        old_version = artwork_cache.plex_artist_artwork_key(
-            "server-1", "100", "/thumb/100/old"
-        )
-        removed = artwork_cache.plex_artist_artwork_key(
-            "server-1", "200", "/thumb/200"
-        )
-        names = [
-            f"{kept}.jpg",
-            f"{kept}@thumb.webp",
-            f"{kept}@card.webp",
-            f"{old_version}.jpg",
-            f"{old_version}@card.webp",
-            f"{removed}.jpg",
-            f"{removed}@thumb.webp",
-        ]
-        for name in names:
-            with open(os.path.join(ARTWORK_CACHE_DIRECTORY, name), "wb") as file:
-                file.write(b"image")
-
-        deleted = artwork_cache.remove_stale_plex_artist_artwork({kept})
-
-        self.assertEqual(deleted, 4)
-        for name in names[:3]:
-            self.assertTrue(
-                os.path.isfile(os.path.join(ARTWORK_CACHE_DIRECTORY, name)), name
+        with tempfile.TemporaryDirectory(
+            prefix="melodarr-stale-artwork-"
+        ) as artwork_directory, patch.object(
+            artwork_cache,
+            "ARTWORK_CACHE_DIRECTORY",
+            artwork_directory,
+        ):
+            kept = artwork_cache.plex_artist_artwork_key(
+                "server-1", "100", "/thumb/100/new"
             )
-        for name in names[3:]:
-            self.assertFalse(
-                os.path.exists(os.path.join(ARTWORK_CACHE_DIRECTORY, name)), name
+            old_version = artwork_cache.plex_artist_artwork_key(
+                "server-1", "100", "/thumb/100/old"
             )
+            removed = artwork_cache.plex_artist_artwork_key(
+                "server-1", "200", "/thumb/200"
+            )
+            names = [
+                f"{kept}.jpg",
+                f"{kept}@thumb.webp",
+                f"{kept}@card.webp",
+                f"{old_version}.jpg",
+                f"{old_version}@card.webp",
+                f"{removed}.jpg",
+                f"{removed}@thumb.webp",
+            ]
+            for name in names:
+                with open(os.path.join(artwork_directory, name), "wb") as file:
+                    file.write(b"image")
+
+            deleted = artwork_cache.remove_stale_plex_artist_artwork({kept})
+
+            self.assertEqual(deleted, 4)
+            for name in names[:3]:
+                self.assertTrue(
+                    os.path.isfile(os.path.join(artwork_directory, name)), name
+                )
+            for name in names[3:]:
+                self.assertFalse(
+                    os.path.exists(os.path.join(artwork_directory, name)), name
+                )
 
     @patch("backend.routes.artwork.cached_artwork")
     @patch("backend.routes.artwork.plex.cached_library_index")

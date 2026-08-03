@@ -1,5 +1,5 @@
 (() => {
-  type DetailKind = "artist" | "release-group" | "release";
+  type DetailKind = "artist" | "release-group" | "release" | "anime" | "series";
   type DetailReference = { kind: DetailKind; id: string };
   type DetailOrigin = { view: "discover" | "library"; scrollY: number };
   type ArtworkItem = { image: HTMLImageElement; source: string; fallback: HTMLElement };
@@ -23,6 +23,13 @@
     data: JsonObject;
     timer?: ReturnType<typeof setTimeout>;
   };
+  type AnimeResolutionWatcher = {
+    slug: string;
+    data: JsonObject;
+    attempts: number;
+    maxAttempts: number;
+    timer?: ReturnType<typeof setTimeout>;
+  };
 
   const $ = <T extends Element = AppElement>(selector: string): T => {
     const element = document.querySelector<T>(selector);
@@ -40,10 +47,6 @@
   let recommendationPoll: ReturnType<typeof setTimeout> | undefined;
   let recommendationRequestVersion = 0;
   let recommendationAbort: AbortController | undefined;
-  let aiRequestVersion = 0;
-  let aiAbort: AbortController | undefined;
-  let aiConfigured = false;
-  let aiProviderLabel = "AI";
   let searchRequestVersion = 0;
   let searchDebounce: ReturnType<typeof setTimeout>;
   let searchAbort: AbortController | undefined;
@@ -51,6 +54,7 @@
   const detailUpgrades = new Map<string, Promise<JsonObject>>();
   let artistRevalidation: ArtistRevalidation | undefined;
   let detailAvailabilityWatcher: DetailAvailabilityWatcher | undefined;
+  let animeResolutionWatcher: AnimeResolutionWatcher | undefined;
   const detailCacheMaxEntries = 32;
   const detailPrefetchTtl = 2 * 60 * 1000;
   const detailOpenedTtl = 15 * 60 * 1000;
@@ -209,6 +213,7 @@
     if (id !== "detail") {
       stopArtistRevalidation();
       stopDetailAvailability();
+      stopAnimeResolution();
       currentDetailData = undefined;
     }
     document.querySelectorAll(".view, .nav-link").forEach((element) => element.classList.remove("active"));
@@ -284,7 +289,13 @@
   }
 
   function detailPath(kind: DetailKind, id: string) {
-    const route: Record<DetailKind, string> = { artist: "artists", "release-group": "albums", release: "releases" };
+    const route: Record<DetailKind, string> = {
+      artist: "artists",
+      "release-group": "albums",
+      release: "releases",
+      anime: "anime",
+      series: "series",
+    };
     return `/${route[kind]}/${encodeURIComponent(id)}`;
   }
 
@@ -370,8 +381,11 @@
     } as DetailRequest;
     const query = prefetch ? "?prefetch=1" : "";
     const timeout = prefetch ? 30_000 : kind === "artist" ? 120_000 : 60_000;
+    const endpoint = kind === "anime" || kind === "series"
+      ? `/api/${kind}/${encodeURIComponent(id)}`
+      : `/api/music/${kind}/${encodeURIComponent(id)}`;
     entry.promise = getJson(
-      `/api/music/${kind}/${encodeURIComponent(id)}${query}`,
+      `${endpoint}${query}`,
       timeout,
     )
       .then((data) => {
@@ -528,6 +542,7 @@
   function showDetail(kind: DetailKind, id: string, addToHistory = true, updateHistory = true) {
     stopArtistRevalidation();
     stopDetailAvailability();
+    stopAnimeResolution();
     currentDetailData = undefined;
     const activeView = document.querySelector<HTMLElement>(".view.active")?.id;
     if (addToHistory && currentDetail && activeView === "detail") {
@@ -548,8 +563,15 @@
       );
     }
     const previous = detailHistory.at(-1);
+    const previousLabel = previous?.kind === "artist"
+      ? "artist"
+      : previous?.kind === "release-group"
+        ? "album"
+        : previous?.kind === "anime"
+          ? "anime"
+          : previous?.kind === "series" ? "series" : "release";
     $("#back-to-search").textContent = previous
-      ? `← Back to ${previous.kind === "artist" ? "artist" : previous.kind === "release-group" ? "album" : "release"}`
+      ? `← Back to ${previousLabel}`
       : detailOrigin.view === "library" ? "← Back to library" : "← Back to search";
     showView("detail");
     const detailResults = $("#detail-results");
@@ -558,10 +580,15 @@
     $("#detail-title").textContent = "";
     $("#detail-eyebrow").textContent = "";
     $("#detail-subtitle").textContent = "";
-    resetDetailCover(kind !== "release");
+    $("#detail-cover").classList.toggle("anime-cover", kind === "anime");
+    resetDetailCover(kind !== "release" && kind !== "series");
     $("#detail-message").textContent = kind === "artist"
       ? "Loading artist and discography…"
-      : kind === "release-group" ? "Loading album and release information…" : "Loading release…";
+      : kind === "release-group"
+        ? "Loading album and release information…"
+        : kind === "anime"
+          ? "Loading anime themes…"
+          : kind === "series" ? "Loading related anime…" : "Loading release…";
 
     loadDetail(kind, id)
       .then((data) => {
@@ -576,8 +603,9 @@
       })
       .catch((error) => {
         if (currentDetail?.kind !== kind || currentDetail?.id !== id) return;
+        const provider = kind === "anime" || kind === "series" ? "AnimeThemes" : "MusicBrainz";
         $("#detail-message").textContent = error.name === "AbortError"
-          ? "MusicBrainz is taking a little longer than usual. Please try again in a moment."
+          ? `${provider} is taking a little longer than usual. Please try again in a moment.`
           : `We couldn’t load this page just now. ${error.message}`;
         const retry = document.createElement("button");
         retry.className = "outline";
@@ -1405,11 +1433,714 @@
     return container;
   }
 
+  function animeThemeKind(theme: JsonObject) {
+    const type = String(theme.type || "").toLowerCase();
+    if (type === "op" || type.startsWith("open")) return "opening";
+    if (type === "ed" || type.startsWith("end")) return "ending";
+    return "other";
+  }
+
+  function animeThemeLabel(theme: JsonObject) {
+    if (theme.label) return String(theme.label);
+    const kind = animeThemeKind(theme);
+    const prefix = kind === "opening" ? "Opening" : kind === "ending" ? "Ending" : "Theme";
+    return theme.sequence === undefined || theme.sequence === null || theme.sequence === ""
+      ? prefix
+      : `${prefix} ${theme.sequence}`;
+  }
+
+  function formatEpisodeRange(value: JsonObject | number | string) {
+    if (typeof value === "number" || typeof value === "string") return String(value);
+    const start = value.start ?? value.from ?? value.begin;
+    const end = value.end ?? value.to ?? value.stop;
+    if (start !== undefined && end !== undefined && String(start) !== String(end)) {
+      return `${start}–${end}`;
+    }
+    return String(start ?? end ?? value.label ?? "");
+  }
+
+  function animeEpisodes(episodes: unknown) {
+    if (!episodes) return "";
+    let range = "";
+    if (Array.isArray(episodes)) {
+      const numeric = episodes.every((episode) => Number.isFinite(Number(episode)))
+        ? episodes.map(Number).sort((first, second) => first - second)
+        : [];
+      if (numeric.length) {
+        const ranges: string[] = [];
+        let start = numeric[0];
+        let end = numeric[0];
+        numeric.slice(1).forEach((episode) => {
+          if (episode === end + 1) {
+            end = episode;
+          } else {
+            ranges.push(start === end ? String(start) : `${start}–${end}`);
+            start = episode;
+            end = episode;
+          }
+        });
+        ranges.push(start === end ? String(start) : `${start}–${end}`);
+        range = ranges.join(", ");
+      } else {
+        range = episodes.map(formatEpisodeRange).filter(Boolean).join(", ");
+      }
+    } else if (typeof episodes === "object") {
+      range = formatEpisodeRange(episodes as JsonObject);
+    } else {
+      range = String(episodes).trim();
+    }
+    if (!range) return "";
+    if (/^episodes?\b/i.test(range)) return range;
+    return `${range.includes(",") || range.includes("–") || range.includes("-") ? "Episodes" : "Episode"} ${range}`;
+  }
+
+  function animeArtistNames(song: JsonObject) {
+    return (song.artists || [])
+      .map((artist: JsonObject | string) => typeof artist === "string" ? artist : artist.name)
+      .filter(Boolean)
+      .join(", ");
+  }
+
+  function animeMappingState(mapping: JsonObject | undefined, unavailable = false) {
+    const state = String(mapping?.state || mapping?.status || "").toLowerCase();
+    if (["resolved", "matched", "mapped"].includes(state)) return "resolved";
+    if (["ambiguous", "candidates", "choose"].includes(state)) return "ambiguous";
+    if (["unmatched", "not-found", "not_found", "none"].includes(state)) return "unmatched";
+    if (["failed", "error"].includes(state)) return "failed";
+    return unavailable ? "unavailable" : "pending";
+  }
+
+  function createAnimeReleaseCandidate(candidate: JsonObject, recommended = false) {
+    const id = String(candidate.id || "");
+    const description = [
+      candidate.artist,
+      candidate.type,
+      ...(candidate.secondaryTypes || []),
+      candidate.date,
+    ].filter(Boolean).join(" · ");
+    const card = createCard(
+      releaseGroupDisplayTitle(candidate),
+      description,
+      id ? () => showDetail("release-group", id) : undefined,
+      candidate.coverArt,
+      id ? "release-group" : undefined,
+      id,
+    );
+    card.classList.add("anime-release-candidate");
+    if (recommended) {
+      const badge = document.createElement("span");
+      badge.className = "anime-recommended";
+      badge.textContent = "Recommended";
+      card.append(badge);
+    }
+    if (id) {
+      const requestButton = document.createElement("button");
+      requestButton.className = "request release-group-request";
+      requestButton.type = "button";
+      if (candidate.fullyAvailableInLidarr) {
+        requestButton.textContent = "Available";
+        requestButton.disabled = true;
+      } else {
+        requestButton.textContent = candidate.availableInLidarr ? "Search missing" : "Request";
+        requestButton.addEventListener("click", (event) => {
+          event.stopPropagation();
+          requestReleaseGroup({ id, button: requestButton });
+        });
+      }
+      card.append(requestButton);
+    }
+    return card;
+  }
+
+  function animeMappingProvenance(mapping: JsonObject | undefined, state: string) {
+    const provenance = String(
+      mapping?.registryProvenance || mapping?.provenance || "",
+    ).toLowerCase();
+    const method = String(mapping?.matchMethod || "").toLowerCase();
+    const review = String(
+      mapping?.registryStatus || mapping?.mappingStatus || "",
+    ).toLowerCase();
+    if (provenance === "manual-confirmation") return "Automatic match · confirmed";
+    if (provenance === "manual") {
+      return review === "confirmed" ? "Manual · confirmed" : "Manual mapping";
+    }
+    if (mapping?.mappingSource === "local") {
+      return `Local registry${review ? ` · ${review}` : ""}`;
+    }
+    if (mapping?.mappingSource === "seed") return "Verified catalog mapping";
+    if (method === "recording-search") return "Automatic · recording match";
+    if (method === "artist-discography-title") return "Automatic · artist/title match";
+    if (state === "resolved" || state === "ambiguous") return "Automatic match";
+    return "Automatic lookup";
+  }
+
+  function updateAnimeThemeMapping(theme: JsonObject, payload: JsonObject) {
+    theme.mapping = payload.mapping || {};
+    if (
+      currentDetail?.kind === "anime"
+      && currentDetailData
+      && (currentDetailData.themes || []).includes(theme)
+    ) {
+      currentDetailData.resolutionUnavailable = false;
+      renderAnimeDetail(currentDetailData);
+    }
+    if (payload.message) showToast(String(payload.message));
+  }
+
+  function createAnimeMappingEditor(theme: JsonObject, mapping: JsonObject | undefined) {
+    if (currentUser?.role !== "admin" || !theme.id || !theme.song?.id) return null;
+    const details = document.createElement("details");
+    details.className = "anime-mapping-editor";
+    const summary = document.createElement("summary");
+    const localMapping = mapping?.mappingSource === "local";
+    const seedMapping = mapping?.mappingSource === "seed";
+    summary.textContent = localMapping
+      ? "Correct mapping"
+      : mapping?.releaseGroups?.length ? "Override mapping" : "Link release group";
+
+    const form = document.createElement("form");
+    const label = document.createElement("label");
+    label.textContent = "MusicBrainz release group";
+    const input = document.createElement("input");
+    input.name = "releaseGroup";
+    input.required = true;
+    input.autocomplete = "off";
+    input.placeholder = "Release-group URL or MBID";
+    input.value = String(
+      mapping?.preferredReleaseGroupId
+      || mapping?.releaseGroups?.[0]?.id
+      || "",
+    );
+    label.append(input);
+
+    const message = document.createElement("p");
+    message.className = "anime-mapping-editor-message";
+    message.setAttribute("role", "status");
+    const actions = document.createElement("div");
+    actions.className = "anime-mapping-editor-actions";
+    const save = document.createElement("button");
+    save.type = "submit";
+    save.textContent = localMapping ? "Save correction" : "Save mapping";
+    actions.append(save);
+
+    const endpoint = `/api/anime/${encodeURIComponent(String(currentDetail?.id || ""))}`
+      + `/themes/${encodeURIComponent(String(theme.id))}/mapping`;
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      save.disabled = true;
+      message.classList.remove("error");
+      message.textContent = "Verifying with MusicBrainz…";
+      try {
+        const payload = await api(endpoint, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ releaseGroup: input.value.trim() }),
+        });
+        updateAnimeThemeMapping(theme, payload);
+      } catch (error) {
+        message.classList.add("error");
+        message.textContent = error.message;
+        save.disabled = false;
+      }
+    });
+
+    if (localMapping || seedMapping) {
+      const unlink = document.createElement("button");
+      unlink.type = "button";
+      unlink.className = "anime-mapping-unlink";
+      unlink.textContent = seedMapping ? "Suppress" : "Unlink";
+      unlink.addEventListener("click", async () => {
+        const prompt = seedMapping
+          ? "Suppress this built-in mapping on this Melodarr instance?"
+          : "Remove this local anime theme mapping?";
+        if (!window.confirm(prompt)) return;
+        unlink.disabled = true;
+        save.disabled = true;
+        message.classList.remove("error");
+        message.textContent = "Removing local mapping…";
+        try {
+          const payload = await api(endpoint, { method: "DELETE" });
+          updateAnimeThemeMapping(theme, payload);
+        } catch (error) {
+          message.classList.add("error");
+          message.textContent = error.message;
+          unlink.disabled = false;
+          save.disabled = false;
+        }
+      });
+      actions.append(unlink);
+    }
+    form.append(label, actions, message);
+    details.append(summary, form);
+    return details;
+  }
+
+  function createAnimeMapping(theme: JsonObject, unavailable = false) {
+    const mapping = theme.mapping as JsonObject | undefined;
+    const state = animeMappingState(mapping, unavailable);
+    const container = document.createElement("div");
+    container.className = `anime-theme-mapping anime-mapping-${state}`;
+    const status = document.createElement("span");
+    status.className = "anime-mapping-status";
+    status.setAttribute("role", "status");
+    status.textContent = state === "resolved"
+      ? "Matched"
+      : state === "ambiguous"
+        ? "Choose a release"
+        : state === "unmatched"
+          ? "No MusicBrainz match"
+          : state === "failed"
+            ? "Matching failed"
+            : state === "unavailable" ? "Not mapped yet" : "Matching with MusicBrainz…";
+    const summary = document.createElement("div");
+    summary.className = "anime-mapping-summary";
+    const provenance = document.createElement("span");
+    provenance.className = "anime-mapping-provenance";
+    provenance.textContent = animeMappingProvenance(mapping, state);
+    summary.append(status, provenance);
+    container.append(summary);
+
+    if (mapping?.recordingId) {
+      const recording = document.createElement("a");
+      recording.className = "anime-recording-link";
+      recording.href = `https://musicbrainz.org/recording/${encodeURIComponent(mapping.recordingId)}`;
+      recording.target = "_blank";
+      recording.rel = "noreferrer";
+      recording.textContent = mapping.recordingTitle
+        ? `Recording: ${mapping.recordingTitle}`
+        : "Open MusicBrainz recording";
+      container.append(recording);
+    }
+
+    const directGroups = (mapping?.releaseGroups || mapping?.candidates || []) as JsonObject[];
+    const recordingGroups = (mapping?.recordingCandidates || [])
+      .flatMap((candidate: JsonObject) => candidate.releaseGroups || []) as JsonObject[];
+    const groups = [...directGroups, ...recordingGroups].filter(
+      (group, index, all) => group?.id && all.findIndex((candidate) => candidate?.id === group.id) === index,
+    );
+    let recommendedId = "";
+    if (groups.length) {
+      const candidates = document.createElement("div");
+      candidates.className = "anime-release-candidates";
+      recommendedId = String(
+        mapping?.recommendedReleaseGroupId
+        || mapping?.recommended?.id
+        || (state === "resolved" ? groups[0]?.id : ""),
+      );
+      groups.forEach((group) => candidates.append(
+        createAnimeReleaseCandidate(group, Boolean(recommendedId) && String(group.id) === recommendedId),
+      ));
+      container.append(candidates);
+    }
+    const automaticMatchMethod = String(mapping?.matchMethod || "");
+    const canConfirmAutomatic = currentUser?.role === "admin"
+      && state === "resolved"
+      && (
+        automaticMatchMethod === "recording-search"
+        || automaticMatchMethod === "artist-discography-title"
+      )
+      && (
+        automaticMatchMethod !== "recording-search"
+        || Boolean(mapping?.recordingId)
+      )
+      && Boolean(recommendedId)
+      && !mapping?.mappingSource;
+    if (canConfirmAutomatic) {
+      const confirmation = document.createElement("div");
+      confirmation.className = "anime-mapping-confirmation";
+      const confirm = document.createElement("button");
+      confirm.type = "button";
+      confirm.textContent = "Confirm recommended match";
+      const confirmationMessage = document.createElement("span");
+      confirmationMessage.setAttribute("role", "status");
+      confirm.addEventListener("click", async () => {
+        confirm.disabled = true;
+        confirmationMessage.classList.remove("error");
+        confirmationMessage.textContent = "Saving recommended MusicBrainz mapping…";
+        const endpoint = `/api/anime/${encodeURIComponent(String(currentDetail?.id || ""))}`
+          + `/themes/${encodeURIComponent(String(theme.id))}/mapping`;
+        try {
+          const payload = await api(endpoint, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              confirmAutomatic: true,
+              releaseGroup: recommendedId,
+            }),
+          });
+          updateAnimeThemeMapping(theme, payload);
+        } catch (error) {
+          confirmationMessage.classList.add("error");
+          confirmationMessage.textContent = error.message;
+          confirm.disabled = false;
+        }
+      });
+      confirmation.append(confirm, confirmationMessage);
+      container.append(confirmation);
+    }
+    const editor = createAnimeMappingEditor(theme, mapping);
+    if (editor) container.append(editor);
+    return container;
+  }
+
+  function createAnimeThemeCard(theme: JsonObject, unavailable = false) {
+    const card = document.createElement("article");
+    card.className = "anime-theme-card";
+    const heading = document.createElement("div");
+    heading.className = "anime-theme-heading";
+    const sequence = document.createElement("span");
+    sequence.className = "anime-theme-sequence";
+    sequence.textContent = animeThemeLabel(theme);
+    const title = document.createElement("h3");
+    title.textContent = String(theme.song?.title || "Untitled theme");
+    const artists = document.createElement("p");
+    artists.className = "anime-theme-artists";
+    artists.textContent = animeArtistNames(theme.song || {}) || "Unknown artist";
+    heading.append(sequence, title, artists);
+    const notes = Array.isArray(theme.notes)
+      ? theme.notes.filter(Boolean).join("; ")
+      : String(theme.notes || "").trim();
+    const facts = [animeEpisodes(theme.episodes), notes].filter(Boolean);
+    if (facts.length) {
+      const metadata = document.createElement("p");
+      metadata.className = "anime-theme-facts";
+      metadata.textContent = facts.join(" · ");
+      heading.append(metadata);
+    }
+    card.append(heading, createAnimeMapping(theme, unavailable));
+    return card;
+  }
+
+  function animeResourceEntries(resources: unknown) {
+    if (Array.isArray(resources)) return resources as JsonObject[];
+    if (!resources || typeof resources !== "object") return [];
+    return Object.entries(resources as JsonObject).map(([name, value]) => (
+      typeof value === "string" ? { name, url: value } : { name, ...value }
+    ));
+  }
+
+  function safeAnimeResourceUrl(resource: JsonObject) {
+    const value = String(resource.url || resource.link || "");
+    try {
+      const url = new URL(value);
+      const hostname = url.hostname.toLowerCase();
+      const isMyAnimeList = hostname === "myanimelist.net"
+        || hostname.endsWith(".myanimelist.net");
+      return url.protocol === "https:" && isMyAnimeList
+        ? url.href
+        : "";
+    } catch {
+      return "";
+    }
+  }
+
+  function animeSeriesEntries(series: unknown) {
+    const entries = Array.isArray(series) ? series : series ? [series] : [];
+    return entries.map((entry) => typeof entry === "string" ? { name: entry } : entry)
+      .filter((entry) => entry && (entry.name || entry.title));
+  }
+
+  function appendAnimeSeriesLinks(container: Element, series: unknown) {
+    const entries = animeSeriesEntries(series);
+    if (!entries.length) return;
+    const seriesCopy = document.createElement("p");
+    seriesCopy.className = "anime-series-links";
+    seriesCopy.append("Series: ");
+    entries.forEach((entry: JsonObject, index: number) => {
+      if (index) seriesCopy.append(", ");
+      const name = String(entry.name || entry.title);
+      const slug = String(entry.slug || "");
+      if (!slug) {
+        seriesCopy.append(name);
+        return;
+      }
+      const link = document.createElement("a");
+      link.href = detailPath("series", slug);
+      link.textContent = name;
+      link.addEventListener("click", (event) => {
+        event.preventDefault();
+        showDetail("series", slug);
+      });
+      addDetailPrefetch(link, "series", slug);
+      seriesCopy.append(link);
+    });
+    container.append(seriesCopy);
+  }
+
+  function animeExternalLinks(data: JsonObject) {
+    const links = animeResourceEntries(data.resources)
+      .map((resource) => ({ resource, url: safeAnimeResourceUrl(resource) }))
+      .filter(({ resource, url }) => (
+        url && String(resource.name || resource.site || "").toLowerCase() === "myanimelist"
+      ))
+      .map(({ url }) => ({ label: "MyAnimeList", url }));
+    const slug = String(data.slug || "");
+    if (slug) {
+      links.push({
+        label: "AnimeThemes",
+        url: `https://animethemes.moe/anime/${encodeURIComponent(slug)}`,
+      });
+    }
+    return links.filter((link, index, all) => (
+      all.findIndex((candidate) => candidate.url === link.url) === index
+    ));
+  }
+
+  function appendAnimeExternalLinks(container: Element, links: Array<{ label: string; url: string }>) {
+    if (!links.length) return;
+    const wrapper = document.createElement("div");
+    wrapper.className = "anime-resource-links";
+    links.forEach(({ label, url }) => {
+      const link = document.createElement("a");
+      link.href = url;
+      link.target = "_blank";
+      link.rel = "noreferrer";
+      link.textContent = label;
+      wrapper.append(link);
+    });
+    container.append(wrapper);
+  }
+
+  function renderAnimeDetail(data: JsonObject) {
+    const results = $("#detail-results");
+    results.replaceChildren();
+    $("#detail-eyebrow").textContent = "ANIME THEMES";
+    $("#detail-title").textContent = String(data.name || "Anime");
+    $("#detail-subtitle").textContent = [data.format, data.season, data.year]
+      .filter(Boolean)
+      .join(" · ");
+    if (data.coverArt) loadDetailCover(data.coverArt, `Cover art for ${data.name}`);
+    else resetDetailCover();
+
+    const meta = document.createElement("section");
+    meta.className = "artist-meta anime-meta";
+    const facts = document.createElement("strong");
+    facts.textContent = `AnimeThemes ID: ${data.id}`;
+    meta.append(facts);
+    appendAnimeSeriesLinks(meta, data.series);
+    appendAnimeExternalLinks(meta, animeExternalLinks(data));
+    results.append(meta);
+
+    const grouped: Record<string, Array<{ theme: JsonObject; index: number }>> = {
+      opening: [], ending: [], other: [],
+    };
+    (data.themes || []).forEach((theme: JsonObject, index: number) => {
+      grouped[animeThemeKind(theme)].push({ theme, index });
+    });
+    const sequenceOrder = (first: { theme: JsonObject; index: number }, second: { theme: JsonObject; index: number }) => {
+      const firstSequence = Number(first.theme.sequence);
+      const secondSequence = Number(second.theme.sequence);
+      if (Number.isFinite(firstSequence) && Number.isFinite(secondSequence) && firstSequence !== secondSequence) {
+        return firstSequence - secondSequence;
+      }
+      return first.index - second.index;
+    };
+    const sectionLabels: Record<string, string> = {
+      opening: "Openings", ending: "Endings", other: "Other themes",
+    };
+    Object.entries(grouped).forEach(([kind, themes]) => {
+      if (!themes.length) return;
+      themes.sort(sequenceOrder);
+      const section = document.createElement("section");
+      section.className = "anime-theme-section";
+      const heading = document.createElement("h2");
+      heading.textContent = `${sectionLabels[kind]} (${themes.length})`;
+      section.append(heading, ...themes.map(({ theme }) => (
+        createAnimeThemeCard(theme, Boolean(data.resolutionUnavailable))
+      )));
+      results.append(section);
+    });
+    if (!(data.themes || []).length) {
+      const empty = document.createElement("p");
+      empty.className = "message";
+      empty.textContent = "No opening or ending themes are listed for this anime yet.";
+      results.append(empty);
+    }
+  }
+
+  function renderAnimeSeriesDetail(data: JsonObject) {
+    const results = $("#detail-results");
+    results.replaceChildren();
+    resetDetailCover();
+    $("#detail-eyebrow").textContent = "ANIME SERIES";
+    $("#detail-title").textContent = String(data.name || "Anime series");
+    const anime = Array.isArray(data.anime) ? data.anime : [];
+    $("#detail-subtitle").textContent = `${anime.length} related anime`;
+
+    const meta = document.createElement("section");
+    meta.className = "artist-meta anime-meta anime-series-meta";
+    const copy = document.createElement("p");
+    copy.textContent = "Related productions and their opening and ending catalogs.";
+    meta.append(copy);
+    const slug = String(data.slug || currentDetail?.id || "");
+    if (slug) {
+      appendAnimeExternalLinks(meta, [{
+        label: "AnimeThemes",
+        url: `https://animethemes.moe/series/${encodeURIComponent(slug)}`,
+      }]);
+    }
+    results.append(meta);
+
+    if (!anime.length) {
+      const empty = document.createElement("p");
+      empty.className = "message";
+      empty.textContent = "No related anime are listed for this series yet.";
+      results.append(empty);
+      return;
+    }
+
+    const grid = document.createElement("section");
+    grid.className = "anime-series-grid";
+    anime.forEach((entry: JsonObject) => {
+      const animeSlug = String(entry.slug || "");
+      if (!animeSlug) return;
+      const name = String(entry.name || "Anime");
+      const link = document.createElement("a");
+      link.className = "anime-series-card";
+      link.href = detailPath("anime", animeSlug);
+      link.addEventListener("click", (event) => {
+        event.preventDefault();
+        showDetail("anime", animeSlug);
+      });
+      addDetailPrefetch(link, "anime", animeSlug);
+
+      const artwork = document.createElement("div");
+      artwork.className = "anime-series-artwork";
+      const fallback = document.createElement("div");
+      fallback.className = "anime-series-artwork-fallback";
+      fallback.textContent = name.slice(0, 1).toUpperCase();
+      if (entry.coverArt) {
+        const image = document.createElement("img");
+        image.alt = `Cover art for ${name}`;
+        image.decoding = "async";
+        loadArtworkWhenNear(image, String(entry.coverArt), fallback);
+        artwork.append(image);
+      } else {
+        artwork.append(fallback);
+      }
+
+      const info = document.createElement("div");
+      info.className = "anime-series-card-info";
+      const heading = document.createElement("h2");
+      heading.textContent = name;
+      const metadata = document.createElement("p");
+      metadata.textContent = [entry.format, entry.season, entry.year]
+        .filter(Boolean)
+        .join(" · ");
+      const themeCount = Number(entry.themeCount || 0);
+      const themes = document.createElement("span");
+      themes.textContent = `${themeCount} ${themeCount === 1 ? "theme" : "themes"}`;
+      info.append(heading, metadata, themes);
+      link.append(artwork, info);
+      grid.append(link);
+    });
+    results.append(grid);
+  }
+
+  function stopAnimeResolution() {
+    if (animeResolutionWatcher?.timer) clearTimeout(animeResolutionWatcher.timer);
+    animeResolutionWatcher = undefined;
+  }
+
+  function animeHasMappings(data: JsonObject) {
+    return (data.themes || []).some((theme: JsonObject) => theme.mapping);
+  }
+
+  function applyAnimeResolution(watcher: AnimeResolutionWatcher, payload: JsonObject) {
+    const mappings = payload.mappings || {};
+    let changed = false;
+    (watcher.data.themes || []).forEach((theme: JsonObject) => {
+      const mapping = mappings[String(theme.id)];
+      if (!mapping) return;
+      if (JSON.stringify(theme.mapping) !== JSON.stringify(mapping)) {
+        theme.mapping = mapping;
+        changed = true;
+      }
+    });
+    if (changed && currentDetail?.kind === "anime" && currentDetail.id === watcher.slug) {
+      watcher.data.resolutionUnavailable = false;
+      renderAnimeDetail(watcher.data);
+    }
+    const status = String(payload.status || "").toLowerCase();
+    if (payload.polling === true) return true;
+    if (["pending", "queued", "running", "resolving"].includes(status)) return true;
+    return false;
+  }
+
+  function markAnimeResolutionUnavailable(watcher: AnimeResolutionWatcher) {
+    watcher.data.resolutionUnavailable = true;
+    if (currentDetail?.kind === "anime" && currentDetail.id === watcher.slug) {
+      renderAnimeDetail(watcher.data);
+    }
+  }
+
+  async function pollAnimeResolution(watcher: AnimeResolutionWatcher) {
+    if (animeResolutionWatcher !== watcher) return;
+    watcher.attempts += 1;
+    try {
+      const payload = await getJson(
+        `/api/anime/${encodeURIComponent(watcher.slug)}/resolution`,
+        30_000,
+      );
+      if (animeResolutionWatcher !== watcher) return;
+      const polling = applyAnimeResolution(watcher, payload);
+      if (polling && watcher.attempts < watcher.maxAttempts) {
+        watcher.timer = setTimeout(() => pollAnimeResolution(watcher), 2_000);
+      } else if (polling || !animeHasMappings(watcher.data)) {
+        markAnimeResolutionUnavailable(watcher);
+      }
+    } catch {
+      if (animeResolutionWatcher === watcher) markAnimeResolutionUnavailable(watcher);
+    }
+  }
+
+  function startAnimeResolution(data: JsonObject) {
+    stopAnimeResolution();
+    const slug = String(data.slug || currentDetail?.id || "");
+    if (!slug || !(data.themes || []).length) return;
+    const themeCount = (data.themes || []).length;
+    const watcher: AnimeResolutionWatcher = {
+      slug,
+      data,
+      attempts: 0,
+      // MusicBrainz is intentionally rate-limited. Larger anime catalogs need
+      // a longer polling window so their background mappings can finish.
+      maxAttempts: Math.max(30, Math.min(300, themeCount * 4)),
+    };
+    animeResolutionWatcher = watcher;
+    postJson(`/api/anime/${encodeURIComponent(slug)}/resolve`, {})
+      .then((payload) => {
+        if (animeResolutionWatcher !== watcher) return;
+        const polling = applyAnimeResolution(watcher, payload);
+        if (!polling && animeHasMappings(watcher.data)) {
+          animeResolutionWatcher = undefined;
+          return;
+        }
+        watcher.timer = setTimeout(() => pollAnimeResolution(watcher), 1_000);
+      })
+      .catch(() => {
+        if (animeResolutionWatcher === watcher) {
+          watcher.timer = setTimeout(() => pollAnimeResolution(watcher), 1_000);
+        }
+      });
+  }
+
   function renderDetail(kind: DetailKind, data: JsonObject) {
     const results = $("#detail-results");
     currentDetailData = data;
     results.replaceChildren();
     $("#detail-message").textContent = "";
+
+    if (kind === "anime") {
+      renderAnimeDetail(data);
+      startAnimeResolution(data);
+      return;
+    }
+
+    if (kind === "series") {
+      renderAnimeSeriesDetail(data);
+      return;
+    }
 
     if (kind === "artist") {
       $("#detail-eyebrow").textContent = "ARTIST DISCOGRAPHY";
@@ -1531,10 +2262,7 @@
     artist: { placeholder: "Search artists…", noun: "artist" },
     album: { placeholder: "Search albums…", noun: "album" },
     track: { placeholder: "Search tracks…", noun: "release group" },
-    ai: {
-      placeholder: "Ask for music based on your listening history…",
-      noun: "recommendation",
-    },
+    anime: { placeholder: "Search anime titles…", noun: "anime title" },
   } as const;
 
   function copyForSearchType(type: string) {
@@ -1547,31 +2275,18 @@
   let activeSearchType = searchType.value;
   let searchTypePointerActive = false;
 
-  function isAISearchMode() {
-    return searchType.value === "ai";
-  }
-
   function updateSearchSubmitState() {
-    searchSubmit.disabled = isAISearchMode()
-      ? !aiConfigured || !searchInput.value.trim() || Boolean(aiAbort)
-      : searchInput.value.trim().length < 2;
+    searchSubmit.disabled = searchInput.value.trim().length < 2;
   }
 
   function applySearchMode(type: string) {
-    const aiMode = type === "ai";
-    $("#ai-recommendations").hidden = !aiMode;
     searchInput.placeholder = copyForSearchType(type).placeholder;
     searchInput.setAttribute(
       "aria-label",
-      aiMode ? "Ask for personalized music recommendations" : `Search ${type}s`,
+      type === "anime" ? "Search anime titles" : `Search ${type}s`,
     );
-    if (aiMode) {
-      searchInput.maxLength = 500;
-      searchSubmit.textContent = "Ask AI";
-    } else {
-      searchInput.removeAttribute("maxlength");
-      searchSubmit.textContent = "Search";
-    }
+    searchInput.removeAttribute("maxlength");
+    searchSubmit.textContent = "Search";
     updateSearchSubmitState();
   }
 
@@ -1595,45 +2310,24 @@
 
   searchType.addEventListener("change", (event) => {
     const type = (event.target as HTMLSelectElement).value;
-    const crossedAIBoundary = type === "ai" || activeSearchType === "ai";
     activeSearchType = type;
     searchRequestVersion += 1;
     searchAbort?.abort();
     searchAbort = undefined;
     clearTimeout(searchDebounce);
-    if (crossedAIBoundary) {
-      aiRequestVersion += 1;
-      aiAbort?.abort();
-      aiAbort = undefined;
-      searchInput.value = "";
-      const results = $("#results");
-      results.replaceChildren();
-      results.classList.remove("ai-result-list");
-      results.removeAttribute("aria-busy");
-      results.setAttribute("aria-label", "Search results");
-      $("#search-message").textContent = "";
-      $("#ai-message").textContent = "";
-    }
     applySearchMode(type);
-    if (type === "ai") {
-      refreshAIStatus();
-    } else if (searchInput.value.trim().length >= 2) {
+    if (searchInput.value.trim().length >= 2) {
       runSearch();
     }
     if (searchTypePointerActive) searchType.blur();
   });
 
   async function runSearch() {
-    if (isAISearchMode()) {
-      await askAI();
-      return;
-    }
     const requestVersion = ++searchRequestVersion;
     searchAbort?.abort();
     const query = searchInput.value.trim();
     const type = searchType.value;
     const results = $("#results");
-    results.classList.remove("ai-result-list");
     results.setAttribute("aria-label", "Search results");
 
     if (query.length < 2) {
@@ -1646,7 +2340,9 @@
 
     const controller = new AbortController();
     searchAbort = controller;
-    $("#search-message").textContent = "Looking through MusicBrainz…";
+    $("#search-message").textContent = type === "anime"
+      ? "Looking through anime themes…"
+      : "Looking through MusicBrainz…";
     $("#search-form").classList.add("searching");
     results.setAttribute("aria-busy", "true");
     results.replaceChildren(skeletonBlock("skeleton-card", 5));
@@ -1662,7 +2358,9 @@
         ? searchResultMessage(type, data.results.length)
         : "We couldn’t find a match. Try a different spelling or search type.";
       data.results.forEach((result: JsonObject) => {
-        const description = type === "artist"
+        const description = type === "anime"
+          ? [result.format, result.season, result.year].filter(Boolean).join(" · ")
+          : type === "artist"
           ? [result.type, result.country, result.disambiguation].filter(Boolean).join(" · ")
           : [
             result.artist,
@@ -1674,15 +2372,26 @@
               ? `Matched track: ${result.matchedTrack}`
               : "",
           ].filter(Boolean).join(" · ");
-        results.append(type === "artist"
-          ? (result.plex ? createPlexArtistCard(result, description, result.plex) : createSearchArtistCard(result, description))
-          : createCard(releaseGroupDisplayTitle(result), description, () => showDetail("release-group", result.id)));
+        if (type === "anime") {
+          results.append(createCard(
+            String(result.name || "Anime"),
+            description,
+            () => showDetail("anime", String(result.slug || result.id)),
+            result.coverArt,
+            "anime",
+            String(result.slug || result.id),
+          ));
+        } else {
+          results.append(type === "artist"
+            ? (result.plex ? createPlexArtistCard(result, description, result.plex) : createSearchArtistCard(result, description))
+            : createCard(releaseGroupDisplayTitle(result), description, () => showDetail("release-group", result.id)));
+        }
       });
     } catch (error) {
       if (requestVersion !== searchRequestVersion) return;
       results.replaceChildren();
       $("#search-message").textContent = error.name === "AbortError"
-        ? "MusicBrainz is taking a little longer than usual. Please try again in a moment."
+        ? `${type === "anime" ? "Anime theme search" : "MusicBrainz"} is taking a little longer than usual. Please try again in a moment.`
         : `We couldn’t finish that search. ${error.message}`;
     } finally {
       if (requestVersion === searchRequestVersion) {
@@ -1699,328 +2408,13 @@
   searchInput.addEventListener("input", () => {
     clearTimeout(searchDebounce);
     updateSearchSubmitState();
-    if (isAISearchMode()) {
-      return;
-    }
     searchDebounce = setTimeout(runSearch, searchDebounceMilliseconds);
   });
 
   $("#search-form").addEventListener("submit", (event) => {
     event.preventDefault();
     clearTimeout(searchDebounce);
-    if (isAISearchMode()) askAI();
-    else runSearch();
-  });
-
-  function aiProviderName(status: JsonObject) {
-    const provider = (status.providers || [])
-      .find((option: JsonObject) => String(option.id) === String(status.provider));
-    const names: Record<string, string> = {
-      openai: "OpenAI",
-      anthropic: "Claude",
-      gemini: "Gemini",
-      lmstudio: "LM Studio",
-      ollama: "Ollama",
-    };
-    return String(provider?.name || names[String(status.provider)] || aiProviderLabel);
-  }
-
-  async function refreshAIStatus() {
-    const readiness = $("#ai-readiness");
-    const readinessCopy = $("#ai-readiness-copy");
-    const settingsLink = $("#ai-settings-link");
-    settingsLink.hidden = true;
-    readiness.className = "ai-readiness";
-    readinessCopy.textContent = "Checking your recommendation setup…";
-    try {
-      const status = await getJson("/api/ai/status", 15_000);
-      aiConfigured = Boolean(status.configured);
-      const provider = aiProviderName(status);
-      aiProviderLabel = provider;
-      $("#ai-provider-badge").textContent = aiConfigured
-        ? `${provider} · ${status.model || "configured"}`
-        : "Setup needed";
-      readiness.classList.toggle("ready", aiConfigured);
-      readiness.classList.toggle("error", !aiConfigured);
-      readinessCopy.textContent = aiConfigured
-        ? `${provider} is configured. Melodarr will show only MusicBrainz-verified results.`
-        : currentUser?.role === "admin"
-          ? "Choose an AI provider to start listening-history-grounded discovery."
-          : "An administrator needs to configure an AI provider before you can ask for recommendations.";
-      settingsLink.hidden = aiConfigured || currentUser?.role !== "admin";
-      updateSearchSubmitState();
-    } catch {
-      aiConfigured = false;
-      $("#ai-provider-badge").textContent = "Unavailable";
-      readiness.classList.add("error");
-      readinessCopy.textContent = "We couldn’t check the AI provider just now. Try again in a moment.";
-      updateSearchSubmitState();
-    }
-  }
-
-  function aiRecommendationKind(item: JsonObject): "artist" | "release-group" {
-    return item.kind === "artist" ? "artist" : "release-group";
-  }
-
-  function aiRecommendationId(item: JsonObject) {
-    return String(item.id || item.mbid || "");
-  }
-
-  function aiEvidence(item: JsonObject) {
-    const evidence: string[] = [];
-    if (item.unheard === true) evidence.push("Not in listen history");
-    if (item.availableInPlex === false) evidence.push("New to your library");
-    if (item.recommendationSource) evidence.push(String(item.recommendationSource));
-    const supplied = Array.isArray(item.evidence)
-      ? item.evidence
-      : Array.isArray(item.basedOn) ? item.basedOn : [];
-    supplied.forEach((entry: unknown) => {
-      const value = typeof entry === "string"
-        ? entry
-        : typeof entry === "object" && entry
-          ? String((entry as JsonObject).label || (entry as JsonObject).name || "")
-          : "";
-      if (value && !evidence.includes(value)) evidence.push(value);
-    });
-    return evidence.slice(0, 3);
-  }
-
-  function createAIRecommendationCard(item: JsonObject, index: number) {
-    const kind = aiRecommendationKind(item);
-    const id = aiRecommendationId(item);
-    const titleText = String(item.name || item.title || "Untitled recommendation");
-    const card = document.createElement("article");
-    card.className = "ai-recommendation-card";
-
-    const fallback = document.createElement("div");
-    fallback.className = "ai-result-art";
-    const art = id ? document.createElement("button") : fallback;
-    if (id) {
-      art.className = "ai-result-art";
-      (art as HTMLButtonElement).type = "button";
-      art.setAttribute("aria-label", `Open details for ${titleText}`);
-      if (item.coverArt) {
-        const image = document.createElement("img");
-        image.alt = "";
-        image.loading = "lazy";
-        image.decoding = "async";
-        loadArtworkWhenNear(image, String(item.coverArt), fallback);
-        art.append(image);
-      }
-      art.addEventListener("click", () => showDetail(kind, id));
-      addDetailPrefetch(art, kind, id);
-    }
-
-    const body = document.createElement("div");
-    body.className = "ai-result-body";
-    const top = document.createElement("div");
-    top.className = "ai-result-topline";
-    const title = document.createElement("h4");
-    title.textContent = titleText;
-    top.append(title);
-
-    const meta = document.createElement("p");
-    meta.className = "ai-result-meta";
-    meta.textContent = [
-      item.artist,
-      kind === "artist" ? item.type || "Artist" : item.type || "Album",
-      item.date,
-    ].filter(Boolean).join(" · ");
-    const reason = document.createElement("p");
-    reason.className = "ai-reason";
-    reason.textContent = String(item.reason || "Selected as a grounded match for this request.");
-    body.append(top, meta, reason);
-
-    const evidence = aiEvidence(item);
-    if (evidence.length) {
-      const evidenceRow = document.createElement("div");
-      evidenceRow.className = "ai-evidence";
-      evidence.forEach((value) => {
-        const tag = document.createElement("span");
-        tag.textContent = value;
-        evidenceRow.append(tag);
-      });
-      body.append(evidenceRow);
-    }
-
-    const actions = document.createElement("div");
-    actions.className = "ai-result-actions";
-    if (id) {
-      const details = document.createElement("button");
-      details.type = "button";
-      details.textContent = "View details";
-      details.addEventListener("click", () => showDetail(kind, id));
-      actions.append(details);
-    }
-
-    const plexUrl = String(item.plexUrl || item.plex?.url || "");
-    if (item.availableInPlex && plexUrl) {
-      const destination = mobilePlexDestination(
-        plexUrl,
-        String(item.plexampUrl || item.plex?.plexampUrl || ""),
-      );
-      const plex = document.createElement("a");
-      plex.href = destination.url;
-      plex.textContent = destination.label;
-      if (destination.openInNewTab) {
-        plex.target = "_blank";
-        plex.rel = "noopener noreferrer";
-      }
-      actions.append(plex);
-    } else if (id) {
-      const request = document.createElement("button");
-      request.type = "button";
-      request.className = "ai-request-action";
-      if (item.availableInLidarr) {
-        request.textContent = "In Lidarr";
-        request.disabled = true;
-      } else if (item.requested) {
-        request.textContent = "Requested";
-        request.disabled = true;
-      } else {
-        request.textContent = "Add to Lidarr";
-        request.addEventListener("click", () => {
-          if (kind === "artist") {
-            openRequestDialog({ ...item, id, name: titleText }, $("#ai-message"));
-          } else {
-            requestReleaseGroup({ id, button: request });
-          }
-        });
-      }
-      actions.append(request);
-    }
-    card.style.setProperty("--ai-result-index", String(index));
-    card.append(art, body, actions);
-    return card;
-  }
-
-  function renderAIRecommendations(data: JsonObject, prompt: string) {
-    const resultsContainer = $("#results");
-    resultsContainer.replaceChildren();
-    resultsContainer.classList.add("ai-result-list");
-    resultsContainer.setAttribute("aria-label", "AI recommendation results");
-    const recommendations = Array.isArray(data.recommendations)
-      ? data.recommendations
-      : [];
-    if (!recommendations.length) {
-      $("#ai-message").textContent = "No MusicBrainz-verified music matched that request. Try widening the mood, era, or style.";
-      return;
-    }
-
-    const heading = document.createElement("div");
-    heading.className = "ai-response-heading";
-    const copy = document.createElement("div");
-    const title = document.createElement("h3");
-    title.textContent = "A grounded shortlist";
-    const summary = document.createElement("p");
-    summary.textContent = `Verified, new-to-library possibilities for “${prompt}”`;
-    copy.append(title, summary);
-
-    const grounding = document.createElement("div");
-    grounding.className = "ai-grounding";
-    const historyCount = Number(data.grounding?.historyItemCount || 0);
-    const playedArtistCount = Number(data.grounding?.playedArtistCount || 0);
-    const candidateCount = Number(data.grounding?.candidateCount || 0);
-    const queryTags = Array.isArray(data.grounding?.queryTags)
-      ? data.grounding.queryTags.map(String).filter(Boolean).slice(0, 3)
-      : [];
-    [
-      queryTags.length ? `Matched: ${queryTags.join(" · ")}` : "",
-      playedArtistCount
-        ? `${playedArtistCount.toLocaleString()} listening-history artists`
-        : "",
-      historyCount ? `${historyCount.toLocaleString()} prior requests considered` : "",
-      candidateCount ? `${candidateCount.toLocaleString()} query-matched candidates` : "",
-      [aiProviderName(data), data.model].filter(Boolean).join(" · "),
-    ].filter(Boolean).forEach((value) => {
-      const tag = document.createElement("span");
-      tag.textContent = value;
-      grounding.append(tag);
-    });
-    heading.append(copy, grounding);
-
-    const results = document.createElement("div");
-    results.className = "ai-results";
-    recommendations.forEach((item: JsonObject, index: number) => {
-      results.append(createAIRecommendationCard(item, index));
-    });
-    resultsContainer.append(heading, results);
-    $("#ai-message").textContent =
-      `${recommendations.length} ${recommendations.length === 1 ? "match" : "matches"} selected from query-matched MusicBrainz results.`;
-  }
-
-  async function askAI() {
-    const prompt = searchInput.value.trim();
-    if (!prompt) return;
-    if (aiAbort) {
-      setMessage($("#ai-message"), "Melodarr AI is already working on your recommendation.");
-      return;
-    }
-    if (!aiConfigured) {
-      setMessage($("#ai-message"), "An AI provider needs to be configured first.", true);
-      return;
-    }
-
-    const requestVersion = ++aiRequestVersion;
-    const controller = new AbortController();
-    aiAbort = controller;
-    searchSubmit.disabled = true;
-    $("#search-message").textContent = "";
-    const resultsContainer = $("#results");
-    resultsContainer.classList.add("ai-result-list");
-    resultsContainer.setAttribute("aria-label", "AI recommendation results");
-    resultsContainer.setAttribute("aria-busy", "true");
-    const loading = document.createElement("div");
-    loading.className = "ai-results";
-    loading.append(
-      skeletonBlock("skeleton-card", 1),
-      skeletonBlock("skeleton-card", 1),
-      skeletonBlock("skeleton-card", 1),
-      skeletonBlock("skeleton-card", 1),
-    );
-    resultsContainer.replaceChildren(loading);
-    setMessage($("#ai-message"), "Interpreting your request, searching music catalogs, and checking your listening history…");
-    try {
-      const data = await api("/api/ai/recommendations", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt, limit: 8 }),
-        signal: controller.signal,
-      });
-      if (requestVersion !== aiRequestVersion) return;
-      renderAIRecommendations(data, prompt);
-    } catch (error) {
-      if (requestVersion !== aiRequestVersion) return;
-      resultsContainer.replaceChildren();
-      setMessage(
-        $("#ai-message"),
-        error.name === "AbortError"
-          ? "That recommendation request was stopped."
-          : `We couldn’t finish that recommendation. ${error.message}`,
-        true,
-      );
-    } finally {
-      if (requestVersion === aiRequestVersion) {
-        aiAbort = undefined;
-        resultsContainer.removeAttribute("aria-busy");
-        updateSearchSubmitState();
-      }
-    }
-  }
-
-  document.querySelectorAll<HTMLButtonElement>("[data-ai-prompt]").forEach((button) => {
-    button.addEventListener("click", () => {
-      searchInput.value = button.dataset.aiPrompt || "";
-      updateSearchSubmitState();
-      searchInput.focus();
-    });
-  });
-  $("#ai-settings-link").addEventListener("click", () => {
-    const settings = document.querySelector<HTMLButtonElement>(".nav-link[data-view=settings]");
-    settings?.click();
-    window.requestAnimationFrame(() => {
-      document.querySelector("#ai-settings")?.scrollIntoView({ behavior: "smooth", block: "start" });
-    });
+    runSearch();
   });
 
   async function loadRecommendations(button: HTMLButtonElement) {
@@ -2089,10 +2483,8 @@
   });
   window.addEventListener("melodarr-authenticated", () => {
     loadRecommendations($("#load-recommendations"));
-    refreshAIStatus();
   });
   window.addEventListener("melodarr-recommendations-changed", () => loadRecommendations($("#load-recommendations")));
-  window.addEventListener("melodarr-ai-settings-changed", () => refreshAIStatus());
   window.addEventListener("melodarr-lidarr-settings-changed", () => {
     lidarrExternalUrlVersion += 1;
     lidarrExternalUrl = undefined;
@@ -2100,10 +2492,8 @@
   });
   window.addEventListener("melodarr-signed-out", () => {
     recommendationRequestVersion += 1;
-    aiRequestVersion += 1;
     searchRequestVersion += 1;
     recommendationAbort?.abort();
-    aiAbort?.abort();
     searchAbort?.abort();
     clearTimeout(recommendationPoll);
     clearTimeout(searchDebounce);
@@ -2114,9 +2504,7 @@
     detailHistory.length = 0;
     requestedArtist = undefined;
     $("#recommendation-results").replaceChildren();
-    $("#ai-message").textContent = "";
     $("#results").replaceChildren();
-    $("#results").classList.remove("ai-result-list");
     $("#results").removeAttribute("aria-busy");
     $("#results").setAttribute("aria-label", "Search results");
   });
@@ -2162,9 +2550,7 @@
     activeSearchType = "artist";
     applySearchMode(activeSearchType);
     $("#search-message").textContent = "";
-    $("#ai-message").textContent = "";
     $("#results").replaceChildren();
-    $("#results").classList.remove("ai-result-list");
     $("#results").removeAttribute("aria-busy");
     $("#results").setAttribute("aria-label", "Search results");
     // Recommendation cards remain current through their own refresh events.
@@ -2172,9 +2558,15 @@
   });
 
   function showDetailFromLocation() {
-    const match = window.location.pathname.match(/^\/(artists|albums|releases)\/([^/]+)$/);
+    const match = window.location.pathname.match(/^\/(artists|albums|releases|anime|series)\/([^/]+)$/);
     if (!match) return false;
-    const routes: Record<string, DetailKind> = { artists: "artist", albums: "release-group", releases: "release" };
+    const routes: Record<string, DetailKind> = {
+      artists: "artist",
+      albums: "release-group",
+      releases: "release",
+      anime: "anime",
+      series: "series",
+    };
     const kind = routes[match[1]];
     const stateOrigin = window.history.state?.detailOrigin as DetailOrigin | undefined;
     detailOrigin = stateOrigin?.view === "library"
@@ -2185,7 +2577,7 @@
     if (Array.isArray(stateHistory)) {
       stateHistory.forEach((entry: DetailReference) => {
         if (
-          ["artist", "release-group", "release"].includes(entry?.kind)
+          ["artist", "release-group", "release", "anime", "series"].includes(entry?.kind)
           && typeof entry.id === "string"
         ) {
           detailHistory.push(entry);
@@ -2201,6 +2593,7 @@
     currentDetail = null;
     currentDetailData = undefined;
     stopDetailAvailability();
+    stopAnimeResolution();
     detailHistory.length = 0;
   });
   window.addEventListener("melodarr-open-detail", (event) => {
