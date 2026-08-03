@@ -1,5 +1,10 @@
 """Focused tests for conservative anime-song MusicBrainz resolution."""
 
+if __package__:
+    from ._test_environment import TEST_ROOT
+else:  # Support direct execution: python tests/test_anime_resolver.py
+    from _test_environment import TEST_ROOT
+
 import os
 import tempfile
 import unittest

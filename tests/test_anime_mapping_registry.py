@@ -1,5 +1,10 @@
 """Durability and invariants for curated AnimeThemes song mappings."""
 
+if __package__:
+    from ._test_environment import TEST_ROOT
+else:  # Support direct execution: python tests/test_anime_mapping_registry.py
+    from _test_environment import TEST_ROOT
+
 import os
 import sqlite3
 import tempfile

@@ -1,5 +1,10 @@
 """Regression tests for privacy-scoped Last.fm response retention."""
 
+if __package__:
+    from ._test_environment import TEST_ROOT
+else:  # Support direct execution: python tests/test_lastfm_cache_privacy.py
+    from _test_environment import TEST_ROOT
+
 import json
 import os
 import tempfile
@@ -10,22 +15,6 @@ from unittest.mock import patch
 import requests
 from werkzeug.security import generate_password_hash
 
-
-TEST_DATA = tempfile.TemporaryDirectory(prefix="melodarr-lastfm-cache-tests-")
-os.environ.update({
-    "MELODARR_DATABASE": os.path.join(TEST_DATA.name, "melodarr.db"),
-    "MELODARR_CACHE_DATABASE": os.path.join(
-        TEST_DATA.name,
-        "cache",
-        "metadata.db",
-    ),
-    "MELODARR_SETTINGS": os.path.join(TEST_DATA.name, "settings.json"),
-    "MELODARR_SECRET_KEY_FILE": os.path.join(
-        TEST_DATA.name,
-        "session-secret.key",
-    ),
-    "MELODARR_ARTWORK_CACHE": os.path.join(TEST_DATA.name, "artwork"),
-})
 
 from backend.api_cache import cache_db, cache_key
 from backend.application import create_app
@@ -58,7 +47,6 @@ class LastfmCachePrivacyTests(unittest.TestCase):
             connection.execute("DELETE FROM plex_auth_flows")
             connection.execute("DELETE FROM pending_lidarr_searches")
             connection.execute("DELETE FROM recommendation_cache")
-            connection.execute("DELETE FROM listening_profiles")
             connection.execute("DELETE FROM plex_listens")
             connection.execute("DELETE FROM request_history")
             connection.execute("DELETE FROM account_invitations")

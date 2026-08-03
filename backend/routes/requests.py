@@ -15,7 +15,6 @@ if __package__ == "backend.routes":
     )
     from ..workers import lidarr_searches as lidarr_search_worker
     from ..workers import lidarr_library as lidarr_library_worker
-    from ..workers import listening_profiles as listening_profile_worker
 else:  # Support the existing `python backend/app.py` entry point.
     from responses import api_error, request_json_object
     from security import current_user, login_required
@@ -28,7 +27,6 @@ else:  # Support the existing `python backend/app.py` entry point.
     )
     from workers import lidarr_searches as lidarr_search_worker
     from workers import lidarr_library as lidarr_library_worker
-    from workers import listening_profiles as listening_profile_worker
 
 
 blueprint = Blueprint("requests", __name__)
@@ -104,7 +102,6 @@ def request_artist():
         added = lidarr.add_artist(artist)
         if added.status_code == 400 and "already" in added.text.lower():
             record_request(current_user()["id"], "artist", mbid, artist.get("artistName", "Artist"))
-            listening_profile_worker.request_refresh()
             lidarr_library_worker.request_scan()
             return jsonify({"message": "This artist is already in Lidarr.", "alreadyExists": True})
         added.raise_for_status()
@@ -116,7 +113,6 @@ def request_artist():
         })
         editor_update.raise_for_status()
         record_request(current_user()["id"], "artist", mbid, artist.get("artistName", "Artist"))
-        listening_profile_worker.request_refresh()
         lidarr_library_worker.request_scan()
         return jsonify({"message": f"{artist.get('artistName', 'Artist')} was sent to Lidarr.", "artist": created_artist}), 201
     except (ValueError, TypeError):
@@ -145,7 +141,6 @@ def request_release_group():
             mbid,
             pending["name"],
         )
-        listening_profile_worker.request_refresh()
         return jsonify({
             "message": (
                 f"{pending['name']} is already queued. Its album search will start "
@@ -211,7 +206,6 @@ def request_release_group():
                     created_album.get("title", album.get("title", "Release group")),
                     **_release_history_metadata(created_album, album),
                 )
-                listening_profile_worker.request_refresh()
                 lidarr_library_worker.request_scan()
                 return jsonify({"message": "This release group is already fully available in Lidarr.", "alreadyExists": True})
         else:
@@ -236,7 +230,6 @@ def request_release_group():
             title,
             **_release_history_metadata(created_album, album),
         )
-        listening_profile_worker.request_refresh()
         lidarr_search_worker.request_work()
         lidarr_library_worker.request_scan()
         return jsonify({

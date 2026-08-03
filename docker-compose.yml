@@ -4,8 +4,6 @@ services:
     container_name: melodarr
     ports:
       - "5056:5056"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     user: "1000:1000"
     volumes:
       - ./data:/app/data

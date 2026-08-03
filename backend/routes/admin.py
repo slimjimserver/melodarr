@@ -17,12 +17,10 @@ if __package__ == "backend.routes":
     from ..services import lastfm
     from ..storage import (
         db,
-        delete_listening_profile,
         delete_recommendation_cache,
         get_lastfm_api_key,
     )
     from ..workers import recommendations as recommendation_worker
-    from ..workers import listening_profiles as listening_profile_worker
 else:  # Support the existing `python backend/app.py` entry point.
     from routes.account import (
         _profile_history_item,
@@ -34,12 +32,10 @@ else:  # Support the existing `python backend/app.py` entry point.
     from services import lastfm
     from storage import (
         db,
-        delete_listening_profile,
         delete_recommendation_cache,
         get_lastfm_api_key,
     )
     from workers import recommendations as recommendation_worker
-    from workers import listening_profiles as listening_profile_worker
 
 
 blueprint = Blueprint("admin", __name__)
@@ -344,9 +340,7 @@ def update_user(user_id):
 
     if recommendation_inputs_changed:
         delete_recommendation_cache(user_id)
-        delete_listening_profile(user_id)
         recommendation_worker.request_refresh()
-        listening_profile_worker.request_refresh()
 
     return jsonify({
         "message": "User settings saved.",
@@ -402,9 +396,6 @@ def delete_user(user_id):
         )
         connection.execute(
             "DELETE FROM recommendation_cache WHERE user_id = ?", (user_id,)
-        )
-        connection.execute(
-            "DELETE FROM listening_profiles WHERE user_id = ?", (user_id,)
         )
         connection.execute(
             "DELETE FROM plex_listens WHERE user_id = ?", (user_id,)

@@ -1,5 +1,10 @@
 """Focused regression coverage for Anime discovery frontend wiring."""
 
+if __package__:
+    from ._test_environment import TEST_ROOT
+else:  # Support direct execution: python tests/test_anime_frontend.py
+    from _test_environment import TEST_ROOT
+
 import os
 import unittest
 

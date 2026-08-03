@@ -338,101 +338,6 @@ def recommendation_cache_stats():
     return dict(row)
 
 
-def listening_profile_users():
-    """Return only the fields needed by the private profile refresh worker."""
-    with db() as connection:
-        return connection.execute(
-            "SELECT id, listenbrainz_username, lastfm_username, plex_id "
-            "FROM users ORDER BY id"
-        ).fetchall()
-
-
-def get_listening_profile(user_id):
-    """Return one user's durable listening profile without exposing another."""
-    with db() as connection:
-        return connection.execute(
-            "SELECT value, refreshed_at, last_attempted_at, last_error "
-            "FROM listening_profiles WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()
-
-
-def save_listening_profile(
-    user_id,
-    value,
-    *,
-    refreshed_at=None,
-    last_attempted_at=None,
-    last_error=None,
-):
-    """Atomically replace one user's profile after a complete build pass."""
-    refreshed_at = time.time() if refreshed_at is None else float(refreshed_at)
-    last_attempted_at = (
-        refreshed_at if last_attempted_at is None else float(last_attempted_at)
-    )
-    with db() as connection:
-        cursor = connection.execute(
-            "INSERT OR REPLACE INTO listening_profiles "
-            "(user_id, value, refreshed_at, last_attempted_at, last_error) "
-            "SELECT ?, ?, ?, ?, ? WHERE EXISTS "
-            "(SELECT 1 FROM users WHERE id = ?)",
-            (
-                user_id,
-                json.dumps(value, ensure_ascii=False, separators=(",", ":")),
-                refreshed_at,
-                last_attempted_at,
-                str(last_error)[:500] if last_error else None,
-                user_id,
-            ),
-        )
-        return bool(cursor.rowcount)
-
-
-def record_listening_profile_failure(user_id, error, *, attempted_at=None):
-    """Record a failed pass while retaining the last known-good profile value."""
-    with db() as connection:
-        connection.execute(
-            "UPDATE listening_profiles SET last_attempted_at = ?, last_error = ? "
-            "WHERE user_id = ?",
-            (
-                time.time() if attempted_at is None else float(attempted_at),
-                str(error)[:500],
-                user_id,
-            ),
-        )
-
-
-def delete_listening_profile(user_id):
-    """Remove profile data when a user is removed or explicitly invalidated."""
-    with db() as connection:
-        cursor = connection.execute(
-            "DELETE FROM listening_profiles WHERE user_id = ?",
-            (user_id,),
-        )
-        return cursor.rowcount
-
-
-def clear_listening_profiles():
-    """Remove all profiles after a deliberate shared-provider reconfiguration."""
-    with db() as connection:
-        cursor = connection.execute("DELETE FROM listening_profiles")
-        return cursor.rowcount
-
-
-def listening_profile_stats():
-    """Summarize durable profiles without returning any private taste data."""
-    with db() as connection:
-        row = connection.execute(
-            "SELECT COUNT(*) AS entries, "
-            "COALESCE(SUM(LENGTH(CAST(value AS BLOB))), 0) AS value_bytes, "
-            "MIN(refreshed_at) AS oldest_refresh, "
-            "MAX(refreshed_at) AS newest_refresh, "
-            "COALESCE(SUM(CASE WHEN last_error IS NOT NULL THEN 1 ELSE 0 END), 0) "
-            "AS errors FROM listening_profiles"
-        ).fetchone()
-    return dict(row)
-
-
 def clear_recommendation_cache():
     """Invalidate assembled recommendations for every user."""
     with db() as connection:
@@ -639,7 +544,6 @@ def _delete_legacy_orphans(connection):
         ("plex_auth_flows", "user_id"),
         ("request_history", "user_id"),
         ("recommendation_cache", "user_id"),
-        ("listening_profiles", "user_id"),
         ("plex_listens", "user_id"),
         ("account_invitations", "created_by"),
     ):
@@ -773,6 +677,10 @@ def init_db():
         # WAL lets request threads read account and queue state while a
         # background worker commits unrelated updates.
         connection.execute("PRAGMA journal_mode = WAL")
+        # AI recommendations were removed. This intentionally deletes only the
+        # obsolete derived profiles; every account, request, and library table
+        # remains untouched.
+        connection.execute("DROP TABLE IF EXISTS listening_profiles")
         connection.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -873,15 +781,6 @@ def init_db():
             )
         """)
         connection.execute("""
-            CREATE TABLE IF NOT EXISTS listening_profiles (
-                user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-                value TEXT NOT NULL,
-                refreshed_at REAL NOT NULL,
-                last_attempted_at REAL NOT NULL,
-                last_error TEXT
-            )
-        """)
-        connection.execute("""
             CREATE TABLE IF NOT EXISTS plex_listens (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 server_id TEXT NOT NULL,
@@ -971,6 +870,10 @@ def init_db():
     settings_changed = settings is None
     if settings is None:
         settings = legacy_settings
+    # Remove only the retired AI provider configuration and credentials.
+    if "ai" in settings:
+        del settings["ai"]
+        settings_changed = True
     lastfm_config = settings.get("lastfm")
     if (
         legacy_lastfm_api_key
