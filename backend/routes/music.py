@@ -12,7 +12,7 @@ if __package__ == "backend.routes":
     from ..media_urls import artist_large_cover_art, release_group_cover_art
     from ..responses import api_error
     from ..security import login_required
-    from ..services import lidarr, musicbrainz, plex
+    from ..services import anime_theme_links, lidarr, musicbrainz, plex
     from ..storage import get_service
     from ..workers import artist_metadata as artist_metadata_worker
 else:
@@ -20,7 +20,7 @@ else:
     from media_urls import artist_large_cover_art, release_group_cover_art
     from responses import api_error
     from security import login_required
-    from services import lidarr, musicbrainz, plex
+    from services import anime_theme_links, lidarr, musicbrainz, plex
     from storage import get_service
     from workers import artist_metadata as artist_metadata_worker
 
@@ -467,6 +467,7 @@ def _release_group_detail_payload(mbid, priority, *, cache_only=False):
         "plexReleases": [
             _plex_release_summary(item) for item in plex_releases
         ],
+        "animeThemes": anime_theme_links.links_for_release_group(mbid),
         "releases": releases, "total": len(releases), "nextOffset": None,
         "provisional": False, "metadataSource": "MusicBrainz",
     }
@@ -541,6 +542,7 @@ def _lidarr_release_group_detail_payload(mbid):
         "plexReleases": [
             _plex_release_summary(item) for item in plex_releases
         ],
+        "animeThemes": anime_theme_links.links_for_release_group(mbid),
         "releases": releases,
         "total": len(releases),
         "nextOffset": None,

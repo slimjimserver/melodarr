@@ -19,7 +19,7 @@ if __package__ == "backend.routes":
         login_required,
         resolve_account_user,
     )
-    from ..services import lastfm, listenbrainz, musicbrainz, plex
+    from ..services import anime_theme_links, lastfm, listenbrainz, musicbrainz, plex
     from ..storage import (
         db,
         count_request_history,
@@ -37,7 +37,7 @@ else:  # Support the existing `python backend/app.py` entry point.
         login_required,
         resolve_account_user,
     )
-    from services import lastfm, listenbrainz, musicbrainz, plex
+    from services import anime_theme_links, lastfm, listenbrainz, musicbrainz, plex
     from storage import (
         db,
         count_request_history,
@@ -116,8 +116,38 @@ def _cached_release_group_metadata(mbid):
     }
 
 
-def _profile_history_item(row, plex_index):
+def _explicit_anime_history_link(item):
+    if not item.get("anime_slug") or not item.get("theme_id"):
+        return None
+    return {
+        "animeSlug": item["anime_slug"],
+        "animeName": item.get("anime_name") or "Anime",
+        "animePath": f"/anime/{item['anime_slug']}#theme-{item['theme_id']}",
+        "themeId": item["theme_id"],
+        "themeLabel": item.get("theme_label") or "Theme",
+        "themeType": "",
+        "sequence": None,
+        "songId": item.get("song_id"),
+        "songTitle": item.get("song_title") or "",
+    }
+
+
+def _profile_history_item(row, plex_index, anime_link_cache=None):
     item = dict(row)
+    explicit_anime_link = _explicit_anime_history_link(item)
+    if explicit_anime_link:
+        anime_links = [explicit_anime_link]
+    elif item["kind"] == "release-group":
+        anime_link_cache = anime_link_cache if anime_link_cache is not None else {}
+        if item["mbid"] not in anime_link_cache:
+            anime_link_cache[item["mbid"]] = (
+                anime_theme_links.links_for_release_group(item["mbid"])
+            )
+        anime_links = anime_link_cache[item["mbid"]]
+    else:
+        anime_links = []
+    item["animeThemes"] = anime_links
+    item["animePath"] = anime_links[0]["animePath"] if anime_links else ""
     plex_item = None
     if item["kind"] == "artist":
         plex_item = plex_index.get("artistsByMbid", {}).get(item["mbid"])
@@ -241,12 +271,15 @@ def account_profile():
     total = count_request_history(user["id"])
     history = {"artist": [], "release-group": []}
     plex_index = _profile_plex_index()
+    anime_link_cache = {}
     for row in get_request_history(
         user["id"],
         limit=REQUESTS_PAGE_SIZE,
         offset=(page - 1) * REQUESTS_PAGE_SIZE,
     ):
-        history[row["kind"]].append(_profile_history_item(row, plex_index))
+        history[row["kind"]].append(
+            _profile_history_item(row, plex_index, anime_link_cache)
+        )
     return jsonify({
         "username": user["username"],
         "user": _profile_user_payload(user),

@@ -43,6 +43,8 @@ _PRIMARY_TYPE_RANK = {
     "broadcast": 3,
     "other": 4,
 }
+_LOW_PRIORITY_SECONDARY_TYPES = {"compilation", "live", "djmix"}
+_UNKNOWN_ARTIST_NAMES = {"unknown", "unknownartist"}
 _VERSION_MARKERS = (
     "live",
     "cover",
@@ -145,6 +147,13 @@ def _artist_names(theme):
         if name and normalize_text(name) not in {normalize_text(item) for item in names}:
             names.append(name)
     return names
+
+
+def _has_missing_artist_credit(artists):
+    """Return whether artist credits are absent or explicitly unknown."""
+    return not artists or any(
+        normalize_text(name) in _UNKNOWN_ARTIST_NAMES for name in artists
+    )
 
 
 def theme_mapping_key(theme):
@@ -612,12 +621,12 @@ def _release_group_rank(release, recording):
     secondary = [normalize_text(value) for value in group.get("secondary-types") or []]
     status = normalize_text(release.get("status"))
     status_rank = 0 if status == "official" else (1 if not status else 2)
-    compilation_rank = 1 if "compilation" in secondary else 0
+    secondary_rank = int(bool(_LOW_PRIORITY_SECONDARY_TYPES.intersection(secondary)))
     primary = str(group.get("primary-type") or "other").casefold()
     return (
-        status_rank,
-        compilation_rank,
         _PRIMARY_TYPE_RANK.get(primary, 5),
+        status_rank,
+        secondary_rank,
         str(release.get("date") or recording.get("first-release-date") or "9999"),
         str(group.get("id") or ""),
     )
@@ -701,11 +710,11 @@ def _release_group_card(group):
 
 def _release_group_entity_rank(group):
     secondary = [normalize_text(value) for value in group.get("secondary-types") or []]
-    compilation_rank = 1 if "compilation" in secondary else 0
+    secondary_rank = int(bool(_LOW_PRIORITY_SECONDARY_TYPES.intersection(secondary)))
     primary = str(group.get("primary-type") or "other").casefold()
     return (
-        compilation_rank,
         _PRIMARY_TYPE_RANK.get(primary, 5),
+        secondary_rank,
         str(group.get("first-release-date") or "9999"),
         str(group.get("id") or ""),
     )
@@ -778,7 +787,77 @@ def _combined_release_groups(recording_candidates):
     for candidate in recording_candidates:
         for group in candidate.get("releaseGroups") or []:
             groups.setdefault(group["id"], group)
-    return list(groups.values())[:MAX_RELEASE_GROUP_CANDIDATES]
+    ranked = sorted(
+        groups.values(),
+        key=lambda group: (
+            _PRIMARY_TYPE_RANK.get(str(group.get("type") or "other").casefold(), 5),
+            int(
+                bool(
+                    _LOW_PRIORITY_SECONDARY_TYPES.intersection(
+                        normalize_text(value)
+                        for value in group.get("secondaryTypes") or []
+                    )
+                )
+            ),
+            str(group.get("date") or "9999"),
+            str(group.get("id") or ""),
+        ),
+    )
+    return ranked[:MAX_RELEASE_GROUP_CANDIDATES]
+
+
+def _title_only_candidates(theme, title):
+    """Return safe user-selectable candidates when artist credits are unknown.
+
+    An exact title alone is never enough to resolve a theme automatically.  It
+    only supplies candidates that a user can propose and an admin can confirm.
+    """
+    response = _search(f"recording:{_lucene_phrase(title)}", "recording")
+    target_titles = _title_comparison_keys(title)
+    recordings = {}
+    for recording in response.get("recordings") or []:
+        if not isinstance(recording, dict) or not recording.get("id"):
+            continue
+        if target_titles.isdisjoint(_title_names(recording)):
+            continue
+        if _has_version_marker(recording):
+            continue
+        recording_id = str(recording["id"])
+        previous = recordings.get(recording_id)
+        if previous is None or _score(recording) > _score(previous):
+            recordings[recording_id] = recording
+
+    exact = sorted(
+        recordings.values(),
+        key=lambda item: (
+            -_score(item),
+            0 if _release_groups(item) else 1,
+            str(item.get("first-release-date") or "9999"),
+            str(item.get("id") or ""),
+        ),
+    )
+    candidates = [_recording_candidate(item) for item in exact]
+    requestable = [
+        item for item in candidates if item["releaseGroups"]
+    ][:MAX_RECORDING_CANDIDATES]
+    if requestable:
+        return _result(
+            theme,
+            "ambiguous",
+            "missing-artist",
+            confidence=0,
+            matchMethod="title-only-recording-search",
+            releaseGroups=_combined_release_groups(requestable),
+            recordingCandidates=requestable,
+        )
+    if candidates:
+        return _result(
+            theme,
+            "unmatched",
+            "no-requestable-release",
+            recordingCandidates=candidates[:MAX_RECORDING_CANDIDATES],
+        )
+    return _result(theme, "unmatched", "missing-artist")
 
 
 def _resolve_theme_live(theme):
@@ -787,12 +866,12 @@ def _resolve_theme_live(theme):
     source_artists = _artist_names(theme)
     if not title:
         return _result(theme, "unmatched", "missing-title")
-    if not source_artists:
-        return _result(theme, "unmatched", "missing-artist")
-    if len(source_artists) > MAX_SOURCE_ARTISTS:
-        return _result(theme, "unmatched", "too-many-artists")
 
     try:
+        if _has_missing_artist_credit(source_artists):
+            return _title_only_candidates(theme, title)
+        if len(source_artists) > MAX_SOURCE_ARTISTS:
+            return _result(theme, "unmatched", "too-many-artists")
         source_candidates = [_artist_candidates(name) for name in source_artists]
         if any(not candidates for candidates in source_candidates):
             return _result(theme, "unmatched", "artist-not-found")
@@ -892,6 +971,7 @@ def _resolve_theme_live(theme):
                 theme,
                 "ambiguous",
                 "multiple-exact-recordings",
+                matchMethod="recording-search",
                 releaseGroups=_combined_release_groups(requestable),
                 recordingCandidates=requestable,
             )

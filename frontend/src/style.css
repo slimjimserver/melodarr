@@ -264,35 +264,49 @@ h1 em { font-style: normal; }
 .release-group-request { min-width: 92px; margin-left: 8px; }
 .release-group-request:disabled, .request-artist:disabled { border-color: rgba(50, 108, 74, .3); background: rgba(50, 108, 74, .08); color: var(--success); cursor: default; box-shadow: none; }
 
-/* Anime pages keep show metadata and requestable MusicBrainz candidates in
-   one scan path: theme identity on the left, mapping state on the right. */
+/* Anime themes reuse the discography index and collapsible sections, while
+   keeping each mounted theme compact enough for quick opening/ending review. */
 .anime-meta { display: grid; gap: 10px; }
 .anime-meta p { margin: 0; }
 .anime-series-links a { color: var(--accent-bright); font-weight: 700; text-underline-offset: 3px; }
 .anime-resource-links { display: flex; flex-wrap: wrap; gap: 7px; }
-.anime-resource-links a, .anime-recording-link { color: var(--accent-bright); font-size: 12px; font-weight: 650; text-underline-offset: 3px; }
-.anime-resource-links a { min-height: 36px; align-content: center; border: 1px solid var(--border); border-radius: 999px; padding: 6px 11px; text-decoration: none; }
-.anime-theme-section { display: grid; gap: 12px; margin: 34px 0 0; }
-.anime-theme-section > h2 { margin: 0 0 3px; font-size: 23px; letter-spacing: -.025em; }
-.anime-theme-card { display: grid; grid-template-columns: minmax(180px, .8fr) minmax(0, 1.2fr); gap: 20px; border: 1px solid var(--border); border-radius: 15px; background: var(--surface); padding: 18px; box-shadow: 0 8px 25px rgba(68, 50, 38, .05); }
+.anime-recording-link { color: var(--accent-bright); font-size: 12px; font-weight: 650; text-underline-offset: 3px; }
+.anime-resource-links .anime-resource-icon { width: 44px; height: 44px; min-height: 44px; border-color: var(--border); border-radius: 10px; padding: 9px; }
+.anime-theme-controls { display: flex; justify-content: flex-end; margin: -10px 0 14px; }
+.anime-theme-controls .anime-manage-mappings { min-height: 40px; }
+.anime-theme-section { display: block; margin: 0; scroll-margin-top: 84px; }
+.anime-theme-section > summary { display: list-item; }
+.anime-theme-card { display: grid; grid-template-columns: minmax(170px, .72fr) minmax(0, 1.28fr); gap: 14px; scroll-margin-top: 86px; border: 1px solid var(--border); border-radius: 13px; background: var(--surface); padding: 13px 14px; box-shadow: 0 5px 18px rgba(68, 50, 38, .045); }
+.anime-theme-card + .anime-theme-card { margin-top: 9px; }
 .anime-theme-heading { min-width: 0; }
 .anime-theme-sequence, .anime-mapping-status, .anime-recommended { display: inline-flex; width: fit-content; align-items: center; border-radius: 999px; font-size: 10px; font-weight: 750; letter-spacing: .035em; }
-.anime-theme-sequence { margin-bottom: 9px; background: var(--accent-glow); color: var(--accent-bright); padding: 5px 8px; text-transform: uppercase; }
-.anime-theme-heading h3 { margin: 0; overflow-wrap: anywhere; font-size: 18px; line-height: 1.25; }
+.anime-theme-sequence { margin-bottom: 7px; background: var(--accent-glow); color: var(--accent-bright); padding: 4px 7px; text-transform: uppercase; }
+.anime-theme-heading h3 { margin: 0; overflow-wrap: anywhere; font-size: 16px; line-height: 1.25; }
 .anime-theme-artists { margin: 6px 0 0; color: var(--foreground-subtle); font-size: 13px; font-weight: 620; }
-.anime-theme-facts { margin: 11px 0 0; color: var(--foreground-muted); font-size: 12px; line-height: 1.5; }
-.anime-theme-mapping { display: grid; min-width: 0; align-content: start; gap: 10px; border-left: 1px solid var(--border); padding-left: 20px; }
+.anime-theme-facts { margin: 8px 0 0; color: var(--foreground-muted); font-size: 12px; line-height: 1.45; }
+.anime-theme-mapping { display: grid; min-width: 0; align-content: start; gap: 9px; border-left: 1px solid var(--border); padding-left: 14px; }
 .anime-mapping-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
 .anime-mapping-status { border: 1px solid var(--border); background: var(--background-elevated); color: var(--foreground-muted); padding: 5px 8px; }
 .anime-mapping-provenance { color: var(--foreground-muted); font-size: 10px; font-weight: 650; }
 .anime-mapping-resolved .anime-mapping-status { border-color: rgba(50, 108, 74, .3); background: rgba(50, 108, 74, .08); color: var(--success); }
 .anime-mapping-ambiguous .anime-mapping-status { border-color: rgba(149, 103, 23, .32); background: rgba(194, 141, 45, .11); color: #76500f; }
 .anime-mapping-failed .anime-mapping-status { border-color: rgba(164, 52, 52, .35); background: rgba(164, 52, 52, .08); color: var(--danger); }
+.anime-mapping-candidates { border-top: 1px solid var(--border); padding-top: 8px; }
+.anime-mapping-candidates > summary,
+.anime-mapping-proposals > summary { width: fit-content; color: var(--foreground-subtle); cursor: pointer; font-size: 11px; font-weight: 700; }
+.anime-mapping-candidates[open] > summary,
+.anime-mapping-proposals[open] > summary { margin-bottom: 9px; color: var(--accent-bright); }
 .anime-release-candidates { display: grid; gap: 8px; }
-.anime-release-candidate { padding: 10px 11px; box-shadow: none; }
-.anime-release-candidate .artist-info h2 { font-size: 13px; }
-.anime-release-candidate .artist-info p { font-size: 11px; }
-.anime-release-candidate .request { min-height: 36px; }
+.anime-release-candidate { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; grid-template-areas: "content content content" "recommendation action plex" "confirmation confirmation confirmation"; align-items: center; gap: 8px 10px; padding: 10px 11px; box-shadow: none; }
+.anime-release-candidate > .card-open { grid-area: content; width: 100%; }
+.anime-release-candidate .artist-info h2 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.anime-release-candidate .artist-info p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.anime-release-candidate > .anime-recommended { grid-area: recommendation; }
+.anime-release-candidate.artist-card > .release-group-request { grid-area: action; justify-self: end; min-height: 36px; margin-left: 0; }
+.anime-release-candidate > .anime-candidate-plex { grid-area: plex; }
+.anime-candidate-plex { flex: 0 0 38px; width: 38px; height: 38px; padding: 8px; }
+.anime-candidates-toggle { justify-self: start; min-height: 36px; }
+.anime-candidate-confirm { grid-area: confirmation; justify-self: start; min-height: 36px; border: 1px solid var(--success); border-radius: 8px; background: rgba(50, 108, 74, .08); color: var(--success); padding: 7px 10px; font-size: 11px; font-weight: 750; cursor: pointer; }
 .anime-recommended { flex: none; background: var(--accent-glow); color: var(--accent-bright); padding: 5px 8px; }
 .anime-mapping-confirmation { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; }
 .anime-mapping-confirmation button { min-height: 38px; border: 1px solid var(--success); border-radius: 9px; background: rgba(50, 108, 74, .08); color: var(--success); padding: 8px 11px; font-size: 12px; font-weight: 750; cursor: pointer; }
@@ -304,13 +318,34 @@ h1 em { font-style: normal; }
 .anime-mapping-editor summary { width: fit-content; color: var(--foreground-subtle); cursor: pointer; font-size: 11px; font-weight: 700; text-underline-offset: 3px; }
 .anime-mapping-editor[open] summary { margin-bottom: 10px; color: var(--accent-bright); }
 .anime-mapping-editor form { display: grid; gap: 9px; }
-.anime-mapping-editor label { display: grid; gap: 5px; color: var(--foreground-muted); font-size: 10px; font-weight: 700; }
+.anime-mapping-field { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 5px 10px; }
+.anime-mapping-editor label { grid-column: 1 / -1; color: var(--foreground-muted); font-size: 10px; font-weight: 700; }
 .anime-mapping-editor input { width: 100%; min-width: 0; height: 38px; padding: 8px 10px; font-size: 12px; }
+.anime-musicbrainz-search { min-height: 38px; align-content: center; color: var(--accent-bright); font-size: 11px; font-weight: 700; text-underline-offset: 3px; white-space: nowrap; }
 .anime-mapping-editor-actions { display: flex; flex-wrap: wrap; gap: 7px; }
 .anime-mapping-editor-actions button { min-height: 34px; padding: 6px 10px; font-size: 11px; }
 .anime-mapping-unlink { border-color: rgba(164, 52, 52, .3); background: rgba(164, 52, 52, .06); color: var(--danger); }
 .anime-mapping-editor-message { min-height: 16px; margin: 0; color: var(--foreground-muted); font-size: 11px; }
 .anime-mapping-editor-message.error { color: var(--danger); }
+.anime-mapping-proposals { border-top: 1px solid var(--border); padding-top: 9px; }
+.anime-mapping-proposal { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 10px; border-top: 1px solid var(--border); padding: 9px 0; }
+.anime-mapping-proposal > div:first-child { display: grid; min-width: 0; gap: 3px; }
+.anime-mapping-proposal strong { overflow-wrap: anywhere; font-size: 12px; }
+.anime-mapping-proposal span { color: var(--foreground-muted); font-size: 10px; }
+.anime-mapping-proposal-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+.anime-mapping-proposal-actions a,
+.anime-mapping-proposal-actions button { min-height: 34px; align-content: center; border-radius: 8px; padding: 6px 9px; font-size: 10px; }
+.anime-mapping-proposal-actions a { border: 1px solid var(--border); color: var(--accent-bright); text-decoration: none; }
+.release-anime-themes { display: grid; gap: 10px; margin: 0 0 18px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); padding: 15px; }
+.release-anime-themes h2 { margin: 0; font-size: 16px; letter-spacing: -.02em; }
+.release-anime-theme-list { display: grid; gap: 7px; }
+.release-anime-theme-link { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid var(--border); border-radius: 10px; color: var(--foreground); padding: 10px 12px; text-decoration: none; transition: border-color .18s var(--ease-out), background .18s var(--ease-out); }
+.release-anime-theme-link > span:first-child { display: grid; min-width: 0; gap: 3px; }
+.release-anime-theme-link strong,
+.release-anime-theme-link span span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.release-anime-theme-link strong { font-size: 13px; }
+.release-anime-theme-link span span { color: var(--foreground-muted); font-size: 11px; }
+.release-anime-theme-arrow { flex: none; color: var(--accent-bright); font-weight: 750; }
 .anime-series-meta { margin-bottom: 18px; }
 .anime-series-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 14px; }
 .anime-series-card { display: grid; min-width: 0; overflow: hidden; border: 1px solid var(--border); border-radius: 15px; background: var(--surface); color: var(--foreground); text-decoration: none; box-shadow: 0 8px 25px rgba(68, 50, 38, .05); transition: transform .2s var(--ease-out), border-color .2s var(--ease-out), box-shadow .2s var(--ease-out); }
@@ -504,8 +539,10 @@ dialog::backdrop { background: rgba(48, 39, 32, .52); }
 .history-item { display: flex; align-items: center; border: 1px solid var(--border); border-radius: 11px; background: rgba(255, 250, 243, .7); color: var(--foreground); overflow: hidden; transition: border-color .2s var(--ease-out), background .2s var(--ease-out); }
 .history-detail { display: flex; flex: 1; align-items: center; justify-content: space-between; min-width: 0; gap: 16px; color: var(--foreground); padding: 11px 15px; text-decoration: none; }
 .history-copy { display: grid; min-width: 0; gap: 4px; }
-.history-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
+.history-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; font-weight: 700; }
+.history-resource-link { color: var(--foreground); text-decoration-color: var(--border-hover); text-underline-offset: 3px; }
 .history-meta { overflow: hidden; color: var(--foreground-muted); text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.history-anime-context { overflow: hidden; color: var(--accent-bright); text-overflow: ellipsis; text-decoration-color: var(--border-hover); text-underline-offset: 3px; white-space: nowrap; font-size: 11px; font-weight: 650; }
 .history-request-date { flex: 0 0 auto; color: var(--foreground-muted); white-space: nowrap; font-size: 12px; }
 .history-plex { display: inline-flex; flex: 0 0 auto; align-items: center; justify-content: center; width: 32px; height: 32px; margin-right: 11px; border: 1px solid rgba(229, 160, 13, .3); border-radius: 8px; background: rgba(229, 160, 13, .06); padding: 7px; }
 .history-plex img { display: block; width: 100%; height: 100%; object-fit: contain; }
@@ -542,6 +579,8 @@ details summary { margin-bottom: 17px; color: var(--accent-bright); cursor: poin
   .logout:hover, .outline:hover, .secondary-action:hover, .account-menu:hover { border-color: var(--border-hover); background: var(--surface-hover); color: var(--foreground); transform: translateY(-1px); }
   .auth-form button:hover, .search button:hover, .request:hover, .request-artist:hover, .service-card button:hover, .dialog-actions button:last-child:hover { background: var(--accent-bright); box-shadow: 0 7px 18px rgba(132, 49, 33, .2); transform: translateY(-1px); }
   .artist-detail-link:hover { color: var(--accent-bright); }
+  .release-anime-theme-link:hover { border-color: var(--border-hover); background: var(--surface-hover); }
+  .anime-candidate-confirm:hover:not(:disabled) { background: rgba(50, 108, 74, .14); }
   .recommendation-card:hover .recommendation-art { border-color: var(--accent-bright); box-shadow: 0 10px 25px rgba(0, 0, 0, .35), 0 0 0 2px rgba(94, 106, 210, .22); transform: translateY(-2px); }
   .recommendation-request:hover { border-color: var(--accent); background: rgba(94, 106, 210, .22); }
   .artist-card:hover, .service-card:hover { border-color: var(--border-hover); background: #fffdf9; box-shadow: 0 14px 34px rgba(68, 50, 38, .1); transform: translateY(-2px); }
@@ -634,26 +673,16 @@ details summary { margin-bottom: 17px; color: var(--accent-bright); cursor: poin
   .recommendation-art, .skeleton-art { width: 132px; flex-basis: 132px; height: 132px; }
   .detail-heading { gap: 22px; }
   .detail-cover { width: min(280px, 100%); }
+  .detail-cover.anime-cover { width: min(116px, 34vw); justify-self: start; border-radius: 12px; }
   .anime-theme-card { grid-template-columns: 1fr; padding: 15px; }
   .anime-theme-mapping { border-top: 1px solid var(--border); border-left: 0; padding-top: 15px; padding-left: 0; }
-  .anime-release-candidate {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
-    grid-template-areas:
-      "content content"
-      "recommendation action";
-    align-items: center;
-    gap: 10px 12px;
-  }
   .anime-release-candidate > .card-open { grid-area: content; width: 100%; align-items: flex-start; }
   .anime-release-candidate .artist-info h2,
-  .anime-release-candidate .artist-info p { overflow-wrap: anywhere; line-height: 1.35; }
-  .anime-release-candidate > .anime-recommended { grid-area: recommendation; }
-  .anime-release-candidate.artist-card > .release-group-request {
-    grid-area: action;
-    justify-self: end;
-    margin-left: 0;
-  }
+  .anime-release-candidate .artist-info p { overflow: visible; text-overflow: clip; overflow-wrap: anywhere; white-space: normal; line-height: 1.35; }
+  .anime-mapping-field { grid-template-columns: 1fr; }
+  .anime-musicbrainz-search { min-height: 32px; }
+  .anime-mapping-proposal { grid-template-columns: 1fr; }
+  .anime-mapping-proposal-actions { justify-content: flex-start; }
   .anime-series-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
   .anime-series-card-info { padding: 12px; }
   .service-intro { grid-template-columns: 42px minmax(0, 1fr); }
@@ -934,6 +963,7 @@ button,
 }
 :root[data-theme="midnight"] .recommendation-request { background: var(--surface); }
 :root[data-theme="midnight"] .service-icon-link { border-color: rgba(94, 106, 210, .5); }
+:root[data-theme="midnight"] .anime-resource-animethemes img { filter: invert(1); }
 :root[data-theme="midnight"] .plex-availability {
   border-color: rgba(229, 174, 61, .45);
   background: rgba(229, 174, 61, .1);

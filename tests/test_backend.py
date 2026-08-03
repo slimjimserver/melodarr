@@ -43,7 +43,14 @@ from backend.api_cache import (
 )
 from backend.application import create_app
 from backend.config import ARTWORK_CACHE_DIRECTORY
-from backend.services import lidarr, musicbrainz, plex, plex_auth, plex_history
+from backend.services import (
+    anime_theme_links,
+    lidarr,
+    musicbrainz,
+    plex,
+    plex_auth,
+    plex_history,
+)
 from backend.storage import (
     db,
     enqueue_lidarr_search,
@@ -200,8 +207,8 @@ class ApplicationFactoryTests(DatabaseTestCase):
             for method in rule.methods
             if method not in {"HEAD", "OPTIONS"}
         }
-        self.assertEqual(len(rules), 74)
-        self.assertEqual(len(route_methods), 74)
+        self.assertEqual(len(rules), 77)
+        self.assertEqual(len(route_methods), 77)
 
     def test_factory_applies_test_configuration(self):
         self.assertTrue(self.app.config["TESTING"])
@@ -3087,6 +3094,17 @@ class AdminUsersTests(DatabaseTestCase):
                     ),
                 ],
             )
+        anime_theme_links.sync_anime_theme_mapping(
+            {"slug": "anime", "name": "Admin Anime"},
+            {
+                "id": 5,
+                "label": "Ending 1",
+                "type": "ED",
+                "sequence": 1,
+                "song": {"id": 6, "title": "Ending Song"},
+            },
+            {"state": "resolved", "releaseGroups": [{"id": "release-1"}]},
+        )
         profile_plex_index.return_value = {
             "artistsByMbid": {
                 "artist-1": {
@@ -3129,6 +3147,7 @@ class AdminUsersTests(DatabaseTestCase):
         self.assertEqual(release["release_type"], "Album")
         self.assertEqual(release["release_date"], "2024-02-03")
         self.assertEqual(release["created_at"], 300)
+        self.assertEqual(release["animeThemes"][0]["animePath"], "/anime/anime#theme-5")
         self.assertTrue(release["availableInPlex"])
         self.assertEqual(release["plexUrl"], "https://app.plex.tv/album")
         self.assertEqual(
@@ -4547,14 +4566,23 @@ class LidarrRequestTests(DatabaseTestCase):
 
         response = self.client.post(
             "/api/request/release-group",
-            json={"mbid": self.album_mbid},
+            json={
+                "mbid": self.album_mbid,
+                "animeSlug": "naruto",
+                "animeName": "Naruto",
+                "themeId": 1477,
+                "themeLabel": "Opening 2",
+                "songId": 1477,
+                "songTitle": "Haruka Kanata",
+            },
             headers={"X-CSRF-Token": login.get_json()["csrfToken"]},
         )
 
         self.assertEqual(response.status_code, 202)
         with db() as connection:
             listener_history = connection.execute(
-                "SELECT name FROM request_history "
+                "SELECT name, anime_slug, anime_name, theme_id, theme_label, "
+                "song_id, song_title FROM request_history "
                 "WHERE user_id = ? AND mbid = ?",
                 (listener_id, self.album_mbid),
             ).fetchall()
@@ -4562,6 +4590,9 @@ class LidarrRequestTests(DatabaseTestCase):
             [row["name"] for row in listener_history],
             ["Already Queued Album"],
         )
+        self.assertEqual(listener_history[0]["anime_slug"], "naruto")
+        self.assertEqual(listener_history[0]["theme_id"], 1477)
+        self.assertEqual(listener_history[0]["song_title"], "Haruka Kanata")
 
     @patch("backend.routes.requests.lidarr.lookup_album")
     @patch("backend.routes.requests.get_service", return_value=None)
@@ -4640,7 +4671,15 @@ class LidarrRequestTests(DatabaseTestCase):
 
         response = self.client.post(
             "/api/request/release-group",
-            json={"mbid": self.album_mbid},
+            json={
+                "mbid": self.album_mbid,
+                "animeSlug": "naruto",
+                "animeName": "Naruto",
+                "themeId": 1477,
+                "themeLabel": "Opening 2",
+                "songId": 1477,
+                "songTitle": "Haruka Kanata",
+            },
             headers={"X-CSRF-Token": self.register()},
         )
 
@@ -4656,6 +4695,12 @@ class LidarrRequestTests(DatabaseTestCase):
             "artist_name": "Test Artist",
             "release_type": "Album",
             "release_date": "2020-03-18",
+            "anime_slug": "naruto",
+            "anime_name": "Naruto",
+            "theme_id": 1477,
+            "theme_label": "Opening 2",
+            "song_id": 1477,
+            "song_title": "Haruka Kanata",
         })
         self.assertEqual(response.get_json()["refreshType"], "album")
         request_work.assert_called_once_with()
@@ -4701,6 +4746,64 @@ class LidarrRequestTests(DatabaseTestCase):
             (self.album_mbid, 77, 44, "Existing Album"),
         )
         request_work.assert_called_once_with()
+
+    @patch("backend.routes.requests.record_request")
+    @patch("backend.routes.requests.lidarr.albums_by_release_group")
+    @patch("backend.routes.requests.lidarr.add_album")
+    @patch("backend.routes.requests.lidarr.lookup_album")
+    @patch("backend.routes.requests.get_service")
+    def test_fully_available_album_history_preserves_anime_context(
+        self, get_service, lookup_album, add_album, albums_by_release_group,
+        record_history
+    ):
+        get_service.return_value = self.lidarr_config()
+        lookup_album.return_value = Response(payload=[{
+            "title": "Theme Single",
+            "foreignAlbumId": self.album_mbid,
+            "artist": {"artistName": "Theme Artist"},
+            "albumType": "Single",
+            "releaseDate": "2026-01-02T00:00:00Z",
+        }])
+        add_album.return_value = Response(400, text="Album already exists")
+        albums_by_release_group.return_value = Response(payload=[{
+            "id": 77,
+            "artistId": 44,
+            "foreignAlbumId": self.album_mbid,
+            "title": "Theme Single",
+            "artist": {"artistName": "Theme Artist"},
+            "statistics": {"totalTrackCount": 3, "trackFileCount": 3},
+        }])
+
+        response = self.client.post(
+            "/api/request/release-group",
+            json={
+                "mbid": self.album_mbid,
+                "animeSlug": "naruto",
+                "animeName": "Naruto",
+                "themeId": 1477,
+                "themeLabel": "Opening 2",
+                "songId": 1477,
+                "songTitle": "Haruka Kanata",
+            },
+            headers={"X-CSRF-Token": self.register()},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["alreadyExists"])
+        self.assertEqual(record_history.call_args.args[1:4], (
+            "release-group", self.album_mbid, "Theme Single"
+        ))
+        self.assertEqual(record_history.call_args.kwargs, {
+            "artist_name": "Theme Artist",
+            "release_type": "Single",
+            "release_date": "2026-01-02",
+            "anime_slug": "naruto",
+            "anime_name": "Naruto",
+            "theme_id": 1477,
+            "theme_label": "Opening 2",
+            "song_id": 1477,
+            "song_title": "Haruka Kanata",
+        })
 
     @patch("backend.routes.requests.lidarr_search_worker.request_work")
     @patch("backend.routes.requests.enqueue_lidarr_search")
@@ -4997,7 +5100,9 @@ class AccountProfileTests(DatabaseTestCase):
             connection.execute(
                 "INSERT INTO request_history "
                 "(user_id, kind, mbid, name, artist_name, release_type, "
-                "release_date, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "release_date, anime_slug, anime_name, theme_id, theme_label, "
+                "song_id, song_title, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     user_id,
                     "release-group",
@@ -5006,9 +5111,29 @@ class AccountProfileTests(DatabaseTestCase):
                     "Stray Kids",
                     "Album",
                     "2020-03-18",
+                    "naruto",
+                    "Naruto",
+                    1477,
+                    "Opening 2",
+                    1477,
+                    "Haruka Kanata",
                     1000,
                 ),
             )
+        anime_theme_links.sync_anime_theme_mapping(
+            {"slug": "other-anime", "name": "Other Anime"},
+            {
+                "id": 8,
+                "label": "Ending 1",
+                "type": "ED",
+                "sequence": 1,
+                "song": {"id": 9, "title": "Other Song"},
+            },
+            {
+                "state": "resolved",
+                "releaseGroups": [{"id": self.release_group_mbid}],
+            },
+        )
         get_service.return_value = {"url": "http://plex", "token": "token"}
         cached_library_index.return_value = {
             "artistsByMbid": {},
@@ -5038,6 +5163,17 @@ class AccountProfileTests(DatabaseTestCase):
         self.assertEqual(item["artist_name"], "Stray Kids")
         self.assertEqual(item["release_type"], "Album")
         self.assertEqual(item["release_date"], "2020-03-18")
+        self.assertEqual(item["anime_slug"], "naruto")
+        self.assertEqual(item["anime_name"], "Naruto")
+        self.assertEqual(item["theme_id"], 1477)
+        self.assertEqual(item["theme_label"], "Opening 2")
+        self.assertEqual(item["song_id"], 1477)
+        self.assertEqual(item["song_title"], "Haruka Kanata")
+        self.assertEqual(item["animePath"], "/anime/naruto#theme-1477")
+        self.assertEqual(
+            [link["animeSlug"] for link in item["animeThemes"]],
+            ["naruto"],
+        )
         self.assertTrue(item["availableInPlex"])
         self.assertEqual(item["plexUrl"], "https://app.plex.tv/album")
         self.assertEqual(
@@ -5067,6 +5203,20 @@ class AccountProfileTests(DatabaseTestCase):
                     1000,
                 ),
             )
+        anime_theme_links.sync_anime_theme_mapping(
+            {"slug": "legacy-anime", "name": "Legacy Anime"},
+            {
+                "id": 10,
+                "label": "Opening 1",
+                "type": "OP",
+                "sequence": 1,
+                "song": {"id": 11, "title": "Legacy Song"},
+            },
+            {
+                "state": "resolved",
+                "releaseGroups": [{"id": self.release_group_mbid}],
+            },
+        )
         musicbrainz_get.return_value = {
             "artist-credit": [{"name": "Legacy Artist"}],
             "primary-type": "EP",
@@ -5080,6 +5230,8 @@ class AccountProfileTests(DatabaseTestCase):
         self.assertEqual(item["artist_name"], "Legacy Artist")
         self.assertEqual(item["release_type"], "EP")
         self.assertEqual(item["release_date"], "2019-04-05")
+        self.assertEqual(item["animePath"], "/anime/legacy-anime#theme-10")
+        self.assertEqual(item["animeThemes"][0]["songTitle"], "Legacy Song")
         self.assertFalse(item["availableInPlex"])
         self.assertTrue(musicbrainz_get.call_args.kwargs["cache_only"])
 
@@ -6238,6 +6390,17 @@ class MusicRoutesTests(DatabaseTestCase):
             },
             {"releases": [], "release-count": 0},
         ]
+        anime_theme_links.sync_anime_theme_mapping(
+            {"slug": "anime", "name": "Example Anime"},
+            {
+                "id": 99,
+                "label": "Opening 1",
+                "type": "OP",
+                "sequence": 1,
+                "song": {"id": 100, "title": "Theme Song"},
+            },
+            {"state": "resolved", "releaseGroups": [{"id": "group-id"}]},
+        )
 
         response = self.client.get(
             "/api/music/release-group/group-id",
@@ -6245,6 +6408,17 @@ class MusicRoutesTests(DatabaseTestCase):
         )
 
         self.assertEqual(response.get_json()["romanizedTitle"], "In Full Color")
+        self.assertEqual(response.get_json()["animeThemes"], [{
+            "animeSlug": "anime",
+            "animeName": "Example Anime",
+            "animePath": "/anime/anime#theme-99",
+            "themeId": 99,
+            "themeLabel": "Opening 1",
+            "themeType": "OP",
+            "sequence": 1,
+            "songId": 100,
+            "songTitle": "Theme Song",
+        }])
         self.assertEqual(
             get.call_args_list[0].args[1], "aliases+artist-credits+url-rels"
         )
@@ -6373,6 +6547,17 @@ class MusicRoutesTests(DatabaseTestCase):
             "releases": [{"foreignReleaseId": "release-id"}],
         }])
         plex_snapshot.return_value = {"artists": [], "releaseGroups": []}
+        anime_theme_links.sync_anime_theme_mapping(
+            {"slug": "anime", "name": "Example Anime"},
+            {
+                "id": 99,
+                "label": "Opening 1",
+                "type": "OP",
+                "sequence": 1,
+                "song": {"id": 100, "title": "Theme Song"},
+            },
+            {"state": "resolved", "releaseGroups": [{"id": "group-id"}]},
+        )
 
         response = self.client.get(
             "/api/music/release-group/group-id",
@@ -6384,6 +6569,7 @@ class MusicRoutesTests(DatabaseTestCase):
         self.assertTrue(payload["provisional"])
         self.assertEqual(payload["artistId"], "artist-id")
         self.assertEqual(payload["releases"][0]["id"], "release-id")
+        self.assertEqual(payload["animeThemes"][0]["animePath"], "/anime/anime#theme-99")
         self.assertTrue(all(call.kwargs["cache_only"] for call in get.call_args_list))
 
     @patch("backend.routes.music.musicbrainz.get")

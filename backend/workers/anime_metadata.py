@@ -81,12 +81,30 @@ def status(anime_slug, themes):
     }
 
 
-def request_resolution(anime_slug, themes):
-    """Queue songs absent from both the local registry and resolver cache."""
+def request_resolution(anime_slug, themes, requested_theme_ids=None):
+    """Queue selected missing songs while reporting status for every theme.
+
+    ``None`` preserves the legacy behavior of queueing all unresolved themes.
+    An explicit iterable queues only themes whose ``id`` or stable mapping key
+    appears in it; an empty iterable queues nothing.
+    """
     unique = _unique_themes(themes)
+    selected = unique
+    if requested_theme_ids is not None:
+        if isinstance(requested_theme_ids, (str, int)):
+            requested_theme_ids = [requested_theme_ids]
+        requested = {str(value) for value in requested_theme_ids}
+        selected = {}
+        for theme in themes or []:
+            if not isinstance(theme, dict):
+                continue
+            key = anime_musicbrainz.theme_mapping_key(theme)
+            theme_id = str(theme.get("id") or "")
+            if key in requested or theme_id in requested:
+                selected.setdefault(key, theme)
     missing = {
         key: theme
-        for key, theme in unique.items()
+        for key, theme in selected.items()
         if anime_musicbrainz.stored_mapping(theme) is None
     }
     if missing:

@@ -105,6 +105,7 @@ def get_request_history(user_id, limit=100, offset=0):
     with db() as connection:
         return connection.execute(
             "SELECT kind, mbid, name, artist_name, release_type, release_date, "
+            "anime_slug, anime_name, theme_id, theme_label, song_id, song_title, "
             "created_at FROM request_history "
             "WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
             (user_id, limit, offset),
@@ -129,13 +130,21 @@ def record_request(
     artist_name="",
     release_type="",
     release_date="",
+    anime_slug="",
+    anime_name="",
+    theme_id=None,
+    theme_label="",
+    song_id=None,
+    song_title="",
 ):
     """Record an artist or release-group request for one user."""
     with db() as connection:
         connection.execute(
             "INSERT INTO request_history "
             "(user_id, kind, mbid, name, artist_name, release_type, "
-            "release_date, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "release_date, anime_slug, anime_name, theme_id, theme_label, "
+            "song_id, song_title, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 user_id,
                 kind,
@@ -144,6 +153,12 @@ def record_request(
                 artist_name or None,
                 release_type or None,
                 release_date or None,
+                anime_slug or None,
+                anime_name or None,
+                theme_id,
+                theme_label or None,
+                song_id,
+                song_title or None,
                 time.time(),
             ),
         )
@@ -166,6 +181,12 @@ def enqueue_lidarr_search(
     artist_name="",
     release_type="",
     release_date="",
+    anime_slug="",
+    anime_name="",
+    theme_id=None,
+    theme_label="",
+    song_id=None,
+    song_title="",
 ):
     """Persist a refresh-then-search job and its user-visible request atomically."""
     now = time.time()
@@ -193,8 +214,9 @@ def enqueue_lidarr_search(
         connection.execute(
             "INSERT INTO request_history "
             "(user_id, kind, mbid, name, artist_name, release_type, "
-            "release_date, created_at) "
-            "VALUES (?, 'release-group', ?, ?, ?, ?, ?, ?)",
+            "release_date, anime_slug, anime_name, theme_id, theme_label, "
+            "song_id, song_title, created_at) "
+            "VALUES (?, 'release-group', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 user_id,
                 mbid,
@@ -202,6 +224,12 @@ def enqueue_lidarr_search(
                 artist_name or None,
                 release_type or None,
                 release_date or None,
+                anime_slug or None,
+                anime_name or None,
+                theme_id,
+                theme_label or None,
+                song_id,
+                song_title or None,
                 now,
             ),
         )
@@ -761,6 +789,12 @@ def init_db():
                 artist_name TEXT,
                 release_type TEXT,
                 release_date TEXT,
+                anime_slug TEXT,
+                anime_name TEXT,
+                theme_id INTEGER,
+                theme_label TEXT,
+                song_id INTEGER,
+                song_title TEXT,
                 created_at REAL NOT NULL
             )
         """)
@@ -768,10 +802,21 @@ def init_db():
             row["name"]
             for row in connection.execute("PRAGMA table_info(request_history)")
         }
-        for column in ("artist_name", "release_type", "release_date"):
+        request_optional_columns = {
+            "artist_name": "TEXT",
+            "release_type": "TEXT",
+            "release_date": "TEXT",
+            "anime_slug": "TEXT",
+            "anime_name": "TEXT",
+            "theme_id": "INTEGER",
+            "theme_label": "TEXT",
+            "song_id": "INTEGER",
+            "song_title": "TEXT",
+        }
+        for column, column_type in request_optional_columns.items():
             if column not in request_columns:
                 connection.execute(
-                    f"ALTER TABLE request_history ADD COLUMN {column} TEXT"
+                    f"ALTER TABLE request_history ADD COLUMN {column} {column_type}"
                 )
         connection.execute("""
             CREATE TABLE IF NOT EXISTS recommendation_cache (
@@ -848,6 +893,64 @@ def init_db():
             "CREATE UNIQUE INDEX IF NOT EXISTS "
             "anime_song_mapping_one_preferred "
             "ON anime_song_mapping_targets(song_id) WHERE is_preferred = 1"
+        )
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS anime_mapping_proposals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                submitter_user_id INTEGER NOT NULL
+                    REFERENCES users(id) ON DELETE CASCADE,
+                anime_slug TEXT NOT NULL,
+                anime_name TEXT NOT NULL,
+                theme_id INTEGER NOT NULL CHECK(theme_id > 0),
+                theme_label TEXT NOT NULL,
+                song_id INTEGER NOT NULL CHECK(song_id > 0),
+                song_title TEXT NOT NULL,
+                artists_json TEXT NOT NULL,
+                target_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending', 'approved', 'rejected')),
+                reviewed_by_user_id INTEGER
+                    REFERENCES users(id) ON DELETE SET NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                reviewed_at REAL
+            )
+        """)
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "anime_mapping_proposal_one_pending_per_theme "
+            "ON anime_mapping_proposals"
+            "(submitter_user_id, anime_slug, theme_id) "
+            "WHERE status = 'pending'"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS anime_mapping_proposals_review_queue "
+            "ON anime_mapping_proposals(status, updated_at DESC)"
+        )
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS anime_theme_release_group_links (
+                anime_slug TEXT NOT NULL,
+                anime_name TEXT NOT NULL,
+                theme_id INTEGER NOT NULL CHECK(theme_id > 0),
+                theme_label TEXT NOT NULL,
+                theme_type TEXT NOT NULL,
+                sequence INTEGER,
+                song_id INTEGER CHECK(song_id IS NULL OR song_id > 0),
+                song_title TEXT NOT NULL,
+                release_group_mbid TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY(anime_slug, theme_id, release_group_mbid)
+            )
+        """)
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS anime_theme_links_release_group "
+            "ON anime_theme_release_group_links"
+            "(release_group_mbid, anime_name, theme_id)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS anime_theme_links_theme "
+            "ON anime_theme_release_group_links(anime_slug, theme_id)"
         )
         _migrate_pending_lidarr_searches(connection)
         # Release-group requests always use RefreshAlbum. Convert work queued

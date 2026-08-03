@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from backend import storage
 from backend.services import anime_mapping_registry as registry
+from backend.services import anime_theme_links
 
 
 SHAYOU_GROUP = "6259b4f8-39b2-4b46-98e0-5dd433630abc"
@@ -53,6 +54,133 @@ class AnimeMappingRegistryTests(unittest.TestCase):
         self.addCleanup(database_patch.stop)
         self.addCleanup(settings_patch.stop)
         storage.init_db()
+
+    def _users(self):
+        with storage.db() as connection:
+            submitter_id = connection.execute(
+                "INSERT INTO users "
+                "(username, password_hash, role, created_at) "
+                "VALUES ('listener', 'hash', 'user', 1)"
+            ).lastrowid
+            reviewer_id = connection.execute(
+                "INSERT INTO users "
+                "(username, password_hash, role, created_at) "
+                "VALUES ('reviewer', 'hash', 'admin', 1)"
+            ).lastrowid
+        return submitter_id, reviewer_id
+
+    def _proposal(self, submitter_id, release_group_id=ALTERNATE_GROUP):
+        return registry.submit_mapping_proposal(
+            submitter_id,
+            anime_slug="boku_no_kokoro_no_yabai_yatsu",
+            anime_name="The Dangers in My Heart",
+            theme_id=1477,
+            theme_label="Opening 1",
+            song_id=2451,
+            song_title="Shayou",
+            artists=["Yorushika"],
+            target=target(
+                release_group_id,
+                releaseGroupTitle="Proposed single",
+            ),
+        )
+
+    def test_pending_proposal_does_not_replace_a_confirmed_mapping(self):
+        submitter_id, _ = self._users()
+        confirmed = registry.upsert_mapping(
+            2451,
+            title="Shayou",
+            artists=["Yorushika"],
+            status="confirmed",
+            provenance="admin-review",
+            targets=[target()],
+        )
+
+        proposal = self._proposal(submitter_id)
+
+        self.assertEqual(proposal["status"], "pending")
+        self.assertEqual(proposal["submittedBy"]["username"], "listener")
+        self.assertEqual(proposal["releaseGroupMbid"], ALTERNATE_GROUP)
+        self.assertEqual(
+            proposal["musicBrainzUrl"],
+            f"https://musicbrainz.org/release-group/{ALTERNATE_GROUP}",
+        )
+        self.assertEqual(registry.get_mapping(2451), confirmed)
+
+        revised = self._proposal(submitter_id, SHAYOU_GROUP)
+        self.assertEqual(revised["id"], proposal["id"])
+        self.assertEqual(revised["releaseGroupMbid"], SHAYOU_GROUP)
+        visible = registry.mapping_proposals_for_anime(
+            "boku_no_kokoro_no_yabai_yatsu",
+            submitter_user_id=submitter_id,
+        )
+        self.assertEqual([item["id"] for item in visible], [proposal["id"]])
+
+    def test_approval_atomically_publishes_proposal(self):
+        submitter_id, reviewer_id = self._users()
+        registry.upsert_mapping(
+            2451,
+            title="Old title",
+            artists=["Old artist"],
+            status="confirmed",
+            provenance="admin-review",
+            targets=[target()],
+        )
+        proposal = self._proposal(submitter_id)
+
+        approved = registry.approve_mapping_proposal(proposal["id"], reviewer_id)
+
+        self.assertEqual(approved["status"], "approved")
+        self.assertEqual(approved["reviewedByUserId"], reviewer_id)
+        mapping = registry.get_mapping(2451)
+        self.assertEqual(mapping["status"], "confirmed")
+        self.assertEqual(mapping["provenance"], f"user-proposal:{proposal['id']}")
+        self.assertEqual(
+            mapping["preferredTarget"]["releaseGroupId"],
+            ALTERNATE_GROUP,
+        )
+
+    def test_failed_approval_rolls_back_mapping_and_proposal_state(self):
+        submitter_id, reviewer_id = self._users()
+        original = registry.upsert_mapping(
+            2451,
+            title="Shayou",
+            artists=["Yorushika"],
+            status="confirmed",
+            provenance="admin-review",
+            targets=[target()],
+        )
+        proposal = self._proposal(submitter_id)
+
+        with patch.object(
+            registry,
+            "_insert_targets",
+            side_effect=sqlite3.IntegrityError("simulated approval failure"),
+        ), self.assertRaises(sqlite3.IntegrityError):
+            registry.approve_mapping_proposal(proposal["id"], reviewer_id)
+
+        self.assertEqual(registry.get_mapping(2451), original)
+        self.assertEqual(
+            registry.get_mapping_proposal(proposal["id"])["status"],
+            "pending",
+        )
+
+    def test_rejection_preserves_existing_confirmed_mapping(self):
+        submitter_id, reviewer_id = self._users()
+        confirmed = registry.upsert_mapping(
+            2451,
+            title="Shayou",
+            artists=["Yorushika"],
+            status="confirmed",
+            provenance="admin-review",
+            targets=[target()],
+        )
+        proposal = self._proposal(submitter_id)
+
+        rejected = registry.reject_mapping_proposal(proposal["id"], reviewer_id)
+
+        self.assertEqual(rejected["status"], "rejected")
+        self.assertEqual(registry.get_mapping(2451), confirmed)
 
     def test_upsert_persists_multiple_targets_and_one_preferred_target(self):
         with patch.object(registry.time, "time", return_value=100.5):
@@ -342,6 +470,100 @@ class AnimeMappingRegistryTests(unittest.TestCase):
                 "VALUES (?, ?, '[]', '[]', ?, ?, '', '', 'unknown', 1, 1, 1)",
                 (2451, ALTERNATE_GROUP, "Alternate", "Yorushika"),
             )
+
+
+class AnimeThemeLinkTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory(prefix="melodarr-anime-links-")
+        self.addCleanup(self.directory.cleanup)
+        database = os.path.join(self.directory.name, "melodarr.db")
+        settings = os.path.join(self.directory.name, "settings.json")
+        database_patch = patch.object(storage, "DATABASE", database)
+        settings_patch = patch.object(storage, "SETTINGS_FILE", settings)
+        database_patch.start()
+        settings_patch.start()
+        self.addCleanup(database_patch.stop)
+        self.addCleanup(settings_patch.stop)
+        storage.init_db()
+        self.anime = {"slug": "naruto", "name": "Naruto"}
+        self.theme = {
+            "id": 1477,
+            "label": "Opening 2",
+            "type": "OP",
+            "sequence": 2,
+            "song": {"id": 1477, "title": "Haruka Kanata"},
+        }
+
+    def test_sync_dedupes_resolved_groups_and_supports_multiple_anime(self):
+        mapping = {
+            "state": "resolved",
+            "releaseGroups": [
+                {"id": SHAYOU_GROUP},
+                {"id": SHAYOU_GROUP},
+                {"id": ALTERNATE_GROUP},
+            ],
+        }
+        with patch.object(anime_theme_links.detail_cache, "invalidate") as invalidate:
+            changed = anime_theme_links.sync_anime_theme_mapping(
+                self.anime, self.theme, mapping
+            )
+            unchanged = anime_theme_links.sync_anime_theme_mapping(
+                self.anime, self.theme, mapping
+            )
+            anime_theme_links.sync_anime_theme_mapping(
+                {"slug": "boruto", "name": "Boruto"},
+                {**self.theme, "id": 2000, "label": "Opening 1", "sequence": 1},
+                {"state": "resolved", "releaseGroups": [{"id": SHAYOU_GROUP}]},
+            )
+
+        self.assertTrue(changed)
+        self.assertFalse(unchanged)
+        links = anime_theme_links.links_for_release_group(SHAYOU_GROUP)
+        self.assertEqual([link["animeSlug"] for link in links], ["boruto", "naruto"])
+        naruto = links[1]
+        self.assertEqual(naruto["animePath"], "/anime/naruto#theme-1477")
+        self.assertEqual(naruto["themeType"], "OP")
+        self.assertEqual(naruto["sequence"], 2)
+        self.assertEqual(naruto["songTitle"], "Haruka Kanata")
+        self.assertEqual(invalidate.call_count, 3)
+
+    def test_unresolved_or_proposed_mapping_removes_stale_links(self):
+        with patch.object(anime_theme_links.detail_cache, "invalidate") as invalidate:
+            anime_theme_links.sync_anime_theme_mapping(
+                self.anime,
+                self.theme,
+                {"state": "resolved", "releaseGroups": [{"id": SHAYOU_GROUP}]},
+            )
+            changed = anime_theme_links.sync_anime_theme_mapping(
+                self.anime,
+                self.theme,
+                {
+                    "state": "resolved",
+                    "registryStatus": "proposed",
+                    "releaseGroups": [{"id": ALTERNATE_GROUP}],
+                },
+            )
+
+        self.assertTrue(changed)
+        self.assertEqual(anime_theme_links.links_for_release_group(SHAYOU_GROUP), [])
+        self.assertEqual(anime_theme_links.links_for_release_group(ALTERNATE_GROUP), [])
+        invalidate.assert_any_call(("release-group", SHAYOU_GROUP))
+
+    def test_confirmed_registry_targets_are_supported(self):
+        changed = anime_theme_links.sync_anime_theme_mapping(
+            self.anime,
+            self.theme,
+            {
+                "status": "confirmed",
+                "targets": [{"releaseGroupId": SHAYOU_GROUP}],
+            },
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(
+            anime_theme_links.links_for_release_group(SHAYOU_GROUP)[0]["themeId"],
+            1477,
+        )
 
 
 if __name__ == "__main__":

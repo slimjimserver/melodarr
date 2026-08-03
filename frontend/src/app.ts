@@ -79,7 +79,32 @@ interface AdminRequest {
   availableInPlex: boolean;
   plexUrl?: string;
   plexampUrl?: string;
+  animeSlug?: string;
+  animeName?: string;
+  themeId?: string | number;
+  themeLabel?: string;
+  songId?: string | number;
+  songTitle?: string;
+  anime_slug?: string;
+  anime_name?: string;
+  theme_id?: string | number;
+  theme_label?: string;
+  song_id?: string | number;
+  song_title?: string;
+  animeThemes?: AnimeThemeLink[];
   requester: AdminUserIdentity;
+}
+
+interface AnimeThemeLink {
+  animeSlug?: string;
+  animeName?: string;
+  animePath?: string;
+  themeId?: string | number;
+  themeLabel?: string;
+  themeType?: string;
+  sequence?: string | number | null;
+  songId?: string | number | null;
+  songTitle?: string;
 }
 
 interface AdminRequestPagination {
@@ -743,6 +768,51 @@ function showSettingsPage(page: SettingsPage, updateHistory = true) {
   }
 }
 
+function animeRequestContexts(item: JsonObject) {
+  const slug = String(item.animeSlug || item.anime_slug || "");
+  const explicit = slug
+    ? [{
+        slug,
+        name: String(item.animeName || item.anime_name || "Anime"),
+        path: String(item.animePath || ""),
+        themeId: String(item.themeId || item.theme_id || ""),
+        themeLabel: String(item.themeLabel || item.theme_label || "Theme"),
+      }]
+    : [];
+  const linked = explicit.length ? [] : (item.animeThemes || [])
+    .map((link: JsonObject) => ({
+      slug: String(link.animeSlug || link.anime_slug || ""),
+      name: String(link.animeName || link.anime_name || "Anime"),
+      path: String(link.animePath || link.anime_path || ""),
+      themeId: String(link.themeId || link.theme_id || ""),
+      themeLabel: String(link.themeLabel || link.theme_label || "Theme"),
+    }))
+    .filter((link: JsonObject) => Boolean(link.slug));
+  const seen = new Set<string>();
+  return [...explicit, ...linked].filter((link) => {
+    const key = `${link.slug}:${link.themeId}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function createAnimeHistoryLinks(item: JsonObject) {
+  const contexts = animeRequestContexts(item);
+  if (!contexts.length) return undefined;
+  const links = document.createDocumentFragment();
+  contexts.forEach((context, index) => {
+    if (index) links.append(document.createTextNode(" · "));
+    const link = document.createElement("a");
+    link.className = "history-anime-context";
+    const hash = context.themeId ? `#theme-${encodeURIComponent(context.themeId)}` : "";
+    link.href = context.path || `/anime/${encodeURIComponent(context.slug)}${hash}`;
+    link.textContent = `${context.name} · ${context.themeLabel}`;
+    links.append(link);
+  });
+  return links;
+}
+
 function setupNavigation() {
   let activeAccountUsername = "";
   let activeAccountRequestPage = 1;
@@ -816,14 +886,14 @@ function setupNavigation() {
     const row = document.createElement("article");
     row.className = "history-item";
 
-    const detailLink = document.createElement("a");
+    const detailLink = document.createElement("div");
     detailLink.className = "history-detail";
-    detailLink.href = `/${route}/${encodeURIComponent(item.mbid)}`;
 
     const copy = document.createElement("span");
     copy.className = "history-copy";
-    const title = document.createElement("strong");
-    title.className = "history-title";
+    const title = document.createElement("a");
+    title.className = "history-title history-resource-link";
+    title.href = `/${route}/${encodeURIComponent(item.mbid)}`;
     title.textContent = item.name;
     copy.append(title);
 
@@ -841,6 +911,8 @@ function setupNavigation() {
         copy.append(secondary);
       }
     }
+    const animeLinks = createAnimeHistoryLinks(item);
+    if (animeLinks) copy.append(animeLinks);
 
     const requestedAtDate = new Date(Number(item.created_at) * 1000);
     const requestedAt = document.createElement("time");
@@ -1450,10 +1522,9 @@ function createAdminRequestItem(item: AdminRequest) {
   const row = document.createElement("article");
   row.className = "admin-request-item";
 
-  const detail = document.createElement("a");
+  const detail = document.createElement("div");
   detail.className = "admin-request-detail";
   const route = item.kind === "artist" ? "artists" : "albums";
-  detail.href = `/${route}/${encodeURIComponent(item.mbid)}`;
 
   const kind = document.createElement("span");
   kind.className = `admin-request-kind ${item.kind === "artist" ? "artist" : "release"}`;
@@ -1461,8 +1532,9 @@ function createAdminRequestItem(item: AdminRequest) {
 
   const copy = document.createElement("span");
   copy.className = "history-copy";
-  const title = document.createElement("strong");
-  title.className = "history-title";
+  const title = document.createElement("a");
+  title.className = "history-title history-resource-link";
+  title.href = `/${route}/${encodeURIComponent(item.mbid)}`;
   title.textContent = item.name;
   copy.append(title);
   if (item.kind === "release-group") {
@@ -1479,6 +1551,8 @@ function createAdminRequestItem(item: AdminRequest) {
       copy.append(secondary);
     }
   }
+  const animeLinks = createAnimeHistoryLinks(item);
+  if (animeLinks) copy.append(animeLinks);
   detail.append(kind, copy);
 
   const requester = document.createElement("div");

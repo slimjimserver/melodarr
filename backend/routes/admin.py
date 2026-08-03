@@ -80,6 +80,12 @@ REQUEST_HISTORY_FIELDS = (
     "artist_name",
     "release_type",
     "release_date",
+    "anime_slug",
+    "anime_name",
+    "theme_id",
+    "theme_label",
+    "song_id",
+    "song_title",
     "created_at",
 )
 
@@ -177,6 +183,12 @@ def requests():
                 request_history.artist_name,
                 request_history.release_type,
                 request_history.release_date,
+                request_history.anime_slug,
+                request_history.anime_name,
+                request_history.theme_id,
+                request_history.theme_label,
+                request_history.song_id,
+                request_history.song_title,
                 request_history.created_at,
                 users.username AS local_username,
                 users.role,
@@ -193,6 +205,7 @@ def requests():
         ).fetchall()
 
     plex_index = _profile_plex_index()
+    anime_link_cache = {}
     payload = []
     for row in rows:
         history_item = _profile_history_item(
@@ -201,6 +214,7 @@ def requests():
                 **{field: row[field] for field in REQUEST_HISTORY_FIELDS},
             },
             plex_index,
+            anime_link_cache,
         )
         history_item["requester"] = _requester_payload(row)
         payload.append(history_item)
