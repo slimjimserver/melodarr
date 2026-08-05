@@ -230,6 +230,11 @@ h1 em { font-style: normal; }
 .request-artist { width: fit-content; margin: -10px 0 18px; padding: 10px 14px; font-size: 13px; }
 .detail-actions { display: flex; flex-wrap: wrap; gap: 10px; margin: -10px 0 18px; }
 .detail-actions .request-artist { margin: 0; }
+.download-status { display: grid; gap: 9px; width: min(420px, 100%); margin: -4px 0 18px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); padding: 12px 14px; }
+.download-status > div { display: grid; gap: 2px; }
+.download-status small { color: var(--foreground-muted); overflow-wrap: anywhere; }
+.download-meter { height: 8px; overflow: hidden; border-radius: 999px; background: rgba(90, 112, 79, .18); }
+.download-meter span { display: block; height: 100%; border-radius: inherit; background: var(--success); transition: width .25s ease; }
 .refresh-discography { padding: 10px 14px; font-size: 13px; }
 .discography-layout { display: grid; grid-template-columns: 180px minmax(0, 1fr); gap: 26px; }
 .discography-nav { position: sticky; top: 92px; display: grid; align-self: start; gap: 5px; height: fit-content; border-radius: 12px; padding: 12px; }
@@ -537,6 +542,8 @@ dialog::backdrop { background: rgba(48, 39, 32, .52); }
 .profile-summary h2 { margin-bottom: 4px; }
 .profile-summary p { margin: 0; color: var(--foreground-muted); font-size: 12px; }
 .history-item { display: flex; align-items: center; border: 1px solid var(--border); border-radius: 11px; background: rgba(255, 250, 243, .7); color: var(--foreground); overflow: hidden; transition: border-color .2s var(--ease-out), background .2s var(--ease-out); }
+.request-lifecycle { display: inline-flex; width: fit-content; margin-top: 5px; border-radius: 999px; background: rgba(90, 112, 79, .1); color: var(--success); padding: 3px 7px; font-size: 11px; font-weight: 700; }
+.history-item > .request-lifecycle { margin-right: 10px; }
 .history-detail { display: flex; flex: 1; align-items: center; justify-content: space-between; min-width: 0; gap: 16px; color: var(--foreground); padding: 11px 15px; text-decoration: none; }
 .history-copy { display: grid; min-width: 0; gap: 4px; }
 .history-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; font-weight: 700; }

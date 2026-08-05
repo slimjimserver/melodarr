@@ -787,8 +787,56 @@
 
   function incompleteArtistReleaseGroups(data: JsonObject) {
     return artistReleaseGroups(data).filter(
-      (group) => group.availableInLidarr && !group.fullyAvailableInLidarr,
+      (group) => (group.availableInLidarr && !group.fullyAvailableInLidarr)
+        || ["queued", "downloading"].includes(String(group.requestStatus || "")),
     );
+  }
+
+  function requestStatusLabel(data: JsonObject) {
+    if (data.fullyAvailableInLidarr) return "Available";
+    if (data.requestStatus === "downloading") {
+      return `Downloading ${Number(data.downloadStatus?.progress || 0)}%`;
+    }
+    return "Queued";
+  }
+
+  function renderDownloadStatus(data: JsonObject) {
+    const results = $("#detail-results");
+    results.querySelector(".download-status")?.remove();
+    if (data.requestStatus !== "downloading") return;
+    const status = data.downloadStatus as JsonObject || {};
+    const progress = Math.max(0, Math.min(100, Number(status.progress || 0)));
+    const block = document.createElement("section");
+    block.className = "download-status";
+    block.setAttribute("aria-label", `Download progress ${progress}%`);
+    block.setAttribute("aria-live", "polite");
+    const copy = document.createElement("div");
+    const label = document.createElement("strong");
+    label.textContent = `Downloading ${progress}%`;
+    const detail = [
+      status.status,
+      status.trackedDownloadStatus,
+      status.timeLeft ? `ETA ${status.timeLeft}` : "",
+      status.estimatedCompletionTime ? `Finishes ${status.estimatedCompletionTime}` : "",
+    ]
+      .filter(Boolean).map(String).join(" · ");
+    copy.append(label);
+    if (detail) {
+      const small = document.createElement("small");
+      small.textContent = detail;
+      copy.append(small);
+    }
+    const meter = document.createElement("div");
+    meter.className = "download-meter";
+    meter.setAttribute("role", "progressbar");
+    meter.setAttribute("aria-valuemin", "0");
+    meter.setAttribute("aria-valuemax", "100");
+    meter.setAttribute("aria-valuenow", String(progress));
+    const fill = document.createElement("span");
+    fill.style.width = `${progress}%`;
+    meter.append(fill);
+    block.append(copy, meter);
+    results.querySelector(".detail-availability-action")?.before(block);
   }
 
   function applyArtistReleaseGroupAvailability(
@@ -810,6 +858,8 @@
       group.fullyAvailableInLidarr = Boolean(
         group.fullyAvailableInLidarr || status.fullyAvailableInLidarr,
       );
+      group.requestStatus = status.requestStatus;
+      group.downloadStatus = status.downloadStatus;
       if (status.availableInLidarr) group.availabilityPending = false;
     });
 
@@ -824,6 +874,10 @@
           button.textContent = "Available";
           button.disabled = true;
           button.title = "This release group is fully available in Lidarr";
+        } else if (["queued", "downloading"].includes(String(group.requestStatus || ""))) {
+          button.textContent = requestStatusLabel(group);
+          button.disabled = true;
+          button.title = "This release group is being requested from Lidarr";
         } else if (group.availableInLidarr && !group.availabilityPending) {
           button.textContent = "Search missing";
           button.disabled = false;
@@ -859,10 +913,16 @@
         action.textContent = "Available";
         action.disabled = true;
         action.title = "This release group is fully available in Lidarr";
+      } else if (["queued", "downloading"].includes(String(watcher.data.requestStatus || ""))) {
+        action.textContent = requestStatusLabel(watcher.data);
+        action.disabled = true;
+        action.title = "This release group is being requested from Lidarr";
       } else if (watcher.data.availableInLidarr) {
         action.textContent = "Search missing";
+        action.disabled = false;
       }
     }
+    renderDownloadStatus(watcher.data);
 
     const ownedReleaseIds = new Set(
       (watcher.data.ownedReleaseIds || []).map(String),
@@ -1224,6 +1284,9 @@
       groupRequest.textContent = "Available";
       groupRequest.disabled = true;
       groupRequest.title = "This release group is fully available in Lidarr";
+    } else if (["queued", "downloading"].includes(String(group.requestStatus || ""))) {
+      groupRequest.textContent = requestStatusLabel(group);
+      groupRequest.disabled = true;
     } else {
       groupRequest.textContent = group.availableInLidarr ? "Search missing" : "Request";
       groupRequest.addEventListener("click", (event) => {
@@ -2793,6 +2856,10 @@
         requestButton.textContent = "Available";
         requestButton.disabled = true;
         requestButton.title = "This release group is fully available in Lidarr";
+      } else if (["queued", "downloading"].includes(String(data.requestStatus || ""))) {
+        requestButton.textContent = requestStatusLabel(data);
+        requestButton.disabled = true;
+        requestButton.title = "This release group is being requested from Lidarr";
       } else {
         requestButton.textContent = data.availableInLidarr
           ? "Search missing"
@@ -2804,6 +2871,7 @@
         }));
       }
       results.append(requestButton);
+      renderDownloadStatus(data);
       data.releases.forEach((release: JsonObject) => {
         const card = createCard(
           releaseGroupDisplayTitle(release),

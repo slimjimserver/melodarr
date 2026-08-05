@@ -77,6 +77,8 @@ interface AdminRequest {
   release_date?: string;
   created_at: number | string;
   availableInPlex: boolean;
+  requestStatus?: string;
+  downloadStatus?: { progress?: number };
   plexUrl?: string;
   plexampUrl?: string;
   animeSlug?: string;
@@ -921,6 +923,7 @@ function setupNavigation() {
     requestedAt.textContent = requestedAtDate.toLocaleDateString();
     detailLink.append(copy, requestedAt);
     row.append(detailLink);
+    appendRequestLifecycle(row, item);
 
     if (item.availableInPlex) {
       const destination = mobilePlexDestination(
@@ -1455,6 +1458,18 @@ async function applyCurrentUser(user: CurrentUser) {
   }
 }
 
+function appendRequestLifecycle(container: HTMLElement, item: JsonObject) {
+  const status = String(item.requestStatus || "");
+  if (!status) return;
+  const lifecycle = document.createElement("span");
+  lifecycle.className = `request-lifecycle ${status}`;
+  const progress = Number((item.downloadStatus as JsonObject | undefined)?.progress || 0);
+  lifecycle.textContent = status === "downloading"
+    ? `Downloading ${progress}%`
+    : status[0].toUpperCase() + status.slice(1);
+  container.append(lifecycle);
+}
+
 function adminUserDisplayName(user: AdminUserIdentity) {
   if (user.userType === "plex") {
     return user.plexUsername || user.username || user.plexEmail || "Plex user";
@@ -1553,6 +1568,7 @@ function createAdminRequestItem(item: AdminRequest) {
   }
   const animeLinks = createAnimeHistoryLinks(item);
   if (animeLinks) copy.append(animeLinks);
+  appendRequestLifecycle(copy, item as unknown as JsonObject);
   detail.append(kind, copy);
 
   const requester = document.createElement("div");

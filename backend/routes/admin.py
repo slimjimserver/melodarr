@@ -11,6 +11,7 @@ if __package__ == "backend.routes":
         _profile_history_item,
         _profile_plex_index,
         _requested_page,
+        apply_release_group_lifecycle,
     )
     from ..responses import api_error
     from ..security import admin_required, current_user
@@ -26,6 +27,7 @@ else:  # Support the existing `python backend/app.py` entry point.
         _profile_history_item,
         _profile_plex_index,
         _requested_page,
+        apply_release_group_lifecycle,
     )
     from responses import api_error
     from security import admin_required, current_user
@@ -206,13 +208,15 @@ def requests():
 
     plex_index = _profile_plex_index()
     anime_link_cache = {}
+    lifecycle_rows = [
+        {"id": row["request_id"], **{field: row[field] for field in REQUEST_HISTORY_FIELDS}}
+        for row in rows
+    ]
+    apply_release_group_lifecycle(lifecycle_rows)
     payload = []
-    for row in rows:
+    for row, lifecycle_row in zip(rows, lifecycle_rows):
         history_item = _profile_history_item(
-            {
-                "id": row["request_id"],
-                **{field: row[field] for field in REQUEST_HISTORY_FIELDS},
-            },
+            lifecycle_row,
             plex_index,
             anime_link_cache,
         )

@@ -13,7 +13,7 @@ if __package__ == "backend.routes":
     from ..responses import api_error
     from ..security import login_required
     from ..services import anime_theme_links, lidarr, musicbrainz, plex
-    from ..storage import get_service
+    from ..storage import get_service, pending_lidarr_search_mbids
     from ..workers import artist_metadata as artist_metadata_worker
 else:
     import detail_cache
@@ -21,7 +21,7 @@ else:
     from responses import api_error
     from security import login_required
     from services import anime_theme_links, lidarr, musicbrainz, plex
-    from storage import get_service
+    from storage import get_service, pending_lidarr_search_mbids
     from workers import artist_metadata as artist_metadata_worker
 
 
@@ -82,6 +82,25 @@ def _availability_response(payload):
     return response
 
 
+def _release_group_lifecycle(mbid, lidarr_album=None, download=None, pending=False):
+    """Apply imported > queue > durable follow-up > request lifecycle precedence."""
+    if lidarr_album and lidarr_album.get("fullyAvailable"):
+        return "available", None
+    if download:
+        return "downloading", lidarr.public_download_status(download)
+    if pending:
+        return "queued", None
+    return "requested", None
+
+
+def _download_snapshot():
+    try:
+        return lidarr.cached_download_availability()
+    except Exception:
+        # Live queue status is optional; cache trouble must not fail detail pages.
+        return {}
+
+
 @blueprint.get("/api/music/artist/<mbid>/availability")
 @login_required
 def artist_availability(mbid):
@@ -101,6 +120,8 @@ def artist_availability(mbid):
     lidarr_groups = (
         lidarr.cached_library_availability() if release_group_ids else {}
     )
+    downloads = _download_snapshot() if release_group_ids else {}
+    pending = pending_lidarr_search_mbids(release_group_ids)
     return _availability_response({
         "id": mbid,
         "availableInPlex": available_in_plex,
@@ -110,12 +131,22 @@ def artist_availability(mbid):
         "releaseGroups": {
             release_group_id: {
                 "availableInPlex": release_group_id in plex_groups,
-                "availableInLidarr": release_group_id in lidarr_groups,
+                "availableInLidarr": release_group_id.casefold() in lidarr_groups,
                 "fullyAvailableInLidarr": bool(
-                    lidarr_groups.get(release_group_id, {}).get(
+                    lidarr_groups.get(release_group_id.casefold(), {}).get(
                         "fullyAvailable"
                     )
                 ),
+                "requestStatus": _release_group_lifecycle(
+                    release_group_id, lidarr_groups.get(release_group_id.casefold()),
+                    downloads.get(release_group_id.casefold()),
+                    release_group_id.casefold() in pending,
+                )[0],
+                "downloadStatus": _release_group_lifecycle(
+                    release_group_id, lidarr_groups.get(release_group_id.casefold()),
+                    downloads.get(release_group_id.casefold()),
+                    release_group_id.casefold() in pending,
+                )[1],
             }
             for release_group_id in release_group_ids
         },
@@ -131,16 +162,22 @@ def artist_availability(mbid):
 def release_group_availability(mbid):
     """Return live album completion and Plex editions from local indexes."""
     plex_releases = _plex_release_group_inventory().get(mbid, [])
-    lidarr_album = lidarr.cached_library_availability().get(mbid)
+    lidarr_album = lidarr.cached_library_availability().get(mbid.casefold())
     available_in_plex = bool(plex_releases)
     fully_available_in_lidarr = bool(
         lidarr_album and lidarr_album.get("fullyAvailable")
+    )
+    request_status, download_status = _release_group_lifecycle(
+        mbid, lidarr_album, _download_snapshot().get(mbid.casefold()),
+        mbid.casefold() in pending_lidarr_search_mbids([mbid]),
     )
     return _availability_response({
         "id": mbid,
         "availableInPlex": available_in_plex,
         "availableInLidarr": bool(lidarr_album),
         "fullyAvailableInLidarr": fully_available_in_lidarr,
+        "requestStatus": request_status,
+        "downloadStatus": download_status,
         "plexReleases": [
             _plex_release_summary(item) for item in plex_releases
         ],
@@ -149,7 +186,7 @@ def release_group_availability(mbid):
             for item in plex_releases
             if item.get("musicbrainzReleaseId")
         }),
-        "settled": _availability_settled(
+        "settled": request_status not in {"queued", "downloading"} and _availability_settled(
             available_in_lidarr=fully_available_in_lidarr,
             available_in_plex=available_in_plex,
         ),
@@ -189,6 +226,10 @@ def _artist_detail_payload(
             offset += len(batch)
     plex_groups = _plex_release_group_inventory()
     lidarr_groups = lidarr.cached_library_availability()
+    download_groups = _download_snapshot()
+    pending_groups = pending_lidarr_search_mbids(
+        group.get("id") for group in raw_groups
+    )
     groups = [
         {
             "id": group["id"], "title": group.get("title", "Untitled"),
@@ -199,10 +240,20 @@ def _artist_detail_payload(
             "disambiguation": group.get("disambiguation", ""),
             "coverArt": release_group_cover_art(group["id"]),
             "availableInPlex": group["id"] in plex_groups,
-            "availableInLidarr": group["id"] in lidarr_groups,
+            "availableInLidarr": str(group["id"]).casefold() in lidarr_groups,
             "fullyAvailableInLidarr": bool(
-                lidarr_groups.get(group["id"], {}).get("fullyAvailable")
+                lidarr_groups.get(str(group["id"]).casefold(), {}).get("fullyAvailable")
             ),
+            "requestStatus": _release_group_lifecycle(
+                group["id"], lidarr_groups.get(str(group["id"]).casefold()),
+                download_groups.get(str(group["id"]).casefold()),
+                str(group["id"]).casefold() in pending_groups,
+            )[0],
+            "downloadStatus": _release_group_lifecycle(
+                group["id"], lidarr_groups.get(str(group["id"]).casefold()),
+                download_groups.get(str(group["id"]).casefold()),
+                str(group["id"]).casefold() in pending_groups,
+            )[1],
             "plexReleases": [
                 _plex_release_summary(item) for item in plex_groups.get(group["id"], [])
             ],
@@ -424,7 +475,11 @@ def _release_group_detail_payload(mbid, priority, *, cache_only=False):
             break
         offset += len(batch)
     plex_releases = _plex_release_group_inventory().get(mbid, [])
-    lidarr_album = lidarr.cached_library_availability().get(mbid)
+    lidarr_album = lidarr.cached_library_availability().get(mbid.casefold())
+    request_status, download_status = _release_group_lifecycle(
+        mbid, lidarr_album, _download_snapshot().get(mbid.casefold()),
+        mbid.casefold() in pending_lidarr_search_mbids([mbid]),
+    )
     owned_release_ids = {
         item.get("musicbrainzReleaseId") for item in plex_releases
         if item.get("musicbrainzReleaseId")
@@ -464,6 +519,8 @@ def _release_group_detail_payload(mbid, priority, *, cache_only=False):
         "fullyAvailableInLidarr": bool(
             lidarr_album and lidarr_album.get("fullyAvailable")
         ),
+        "requestStatus": request_status,
+        "downloadStatus": download_status,
         "plexReleases": [
             _plex_release_summary(item) for item in plex_releases
         ],
@@ -491,7 +548,11 @@ def _lidarr_release_group_detail_payload(mbid):
     )
     if not album:
         return None
-    availability = lidarr.album_availability(album)
+    cached_album = lidarr.cached_library_availability().get(mbid.casefold())
+    request_status, download_status = _release_group_lifecycle(
+        mbid, cached_album, _download_snapshot().get(mbid.casefold()),
+        mbid.casefold() in pending_lidarr_search_mbids([mbid]),
+    )
     artist = album.get("artist") or {}
     plex_releases = _plex_release_group_inventory().get(mbid, [])
     owned_release_ids = {
@@ -538,7 +599,11 @@ def _lidarr_release_group_detail_payload(mbid):
         "coverArtLarge": musicbrainz.cover_art_url(mbid, size=500),
         "availableInPlex": bool(plex_releases),
         "availableInLidarr": True,
-        "fullyAvailableInLidarr": availability["fullyAvailable"],
+        "fullyAvailableInLidarr": bool(
+            cached_album and cached_album.get("fullyAvailable")
+        ),
+        "requestStatus": request_status,
+        "downloadStatus": download_status,
         "plexReleases": [
             _plex_release_summary(item) for item in plex_releases
         ],

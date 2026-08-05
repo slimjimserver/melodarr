@@ -19,7 +19,7 @@ if __package__ == "backend.routes":
         login_required,
         resolve_account_user,
     )
-    from ..services import anime_theme_links, lastfm, listenbrainz, musicbrainz, plex
+    from ..services import anime_theme_links, lastfm, listenbrainz, lidarr, musicbrainz, plex
     from ..storage import (
         db,
         count_request_history,
@@ -27,6 +27,7 @@ if __package__ == "backend.routes":
         get_lastfm_api_key,
         get_request_history,
         get_service,
+        pending_lidarr_search_mbids,
     )
     from ..workers import recommendations as recommendation_worker
 else:  # Support the existing `python backend/app.py` entry point.
@@ -37,7 +38,7 @@ else:  # Support the existing `python backend/app.py` entry point.
         login_required,
         resolve_account_user,
     )
-    from services import anime_theme_links, lastfm, listenbrainz, musicbrainz, plex
+    from services import anime_theme_links, lastfm, listenbrainz, lidarr, musicbrainz, plex
     from storage import (
         db,
         count_request_history,
@@ -45,6 +46,7 @@ else:  # Support the existing `python backend/app.py` entry point.
         get_lastfm_api_key,
         get_request_history,
         get_service,
+        pending_lidarr_search_mbids,
     )
     from workers import recommendations as recommendation_worker
 
@@ -189,6 +191,37 @@ def _profile_history_item(row, plex_index, anime_link_cache=None):
     return item
 
 
+def apply_release_group_lifecycle(items):
+    """Decorate request rows from shared snapshots without per-row database reads."""
+    release_ids = [item["mbid"] for item in items if item["kind"] == "release-group"]
+    if not release_ids:
+        return items
+    try:
+        albums = lidarr.cached_library_availability()
+        downloads = lidarr.cached_download_availability()
+    except Exception:
+        # Request history remains available when the short-lived worker cache is not.
+        albums, downloads = {}, {}
+    pending = pending_lidarr_search_mbids(release_ids)
+    for item in items:
+        if item["kind"] != "release-group":
+            continue
+        mbid = str(item["mbid"])
+        album = albums.get(mbid.casefold())
+        download = lidarr.public_download_status(downloads.get(mbid.casefold()))
+        if album and album.get("fullyAvailable"):
+            status, download = "available", None
+        elif download:
+            status = "downloading"
+        elif mbid.casefold() in pending:
+            status = "queued"
+        else:
+            status = "requested"
+        item["requestStatus"] = status
+        item["downloadStatus"] = download
+    return items
+
+
 def _profile_user_payload(user):
     """Return profile identity without authentication or integration secrets."""
     is_plex_user = bool(user["plex_id"])
@@ -272,11 +305,13 @@ def account_profile():
     history = {"artist": [], "release-group": []}
     plex_index = _profile_plex_index()
     anime_link_cache = {}
-    for row in get_request_history(
+    rows = [dict(row) for row in get_request_history(
         user["id"],
         limit=REQUESTS_PAGE_SIZE,
         offset=(page - 1) * REQUESTS_PAGE_SIZE,
-    ):
+    )]
+    apply_release_group_lifecycle(rows)
+    for row in rows:
         history[row["kind"]].append(
             _profile_history_item(row, plex_index, anime_link_cache)
         )

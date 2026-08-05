@@ -14,6 +14,7 @@ import sqlite3
 import tempfile
 import time
 import unittest
+from datetime import timedelta, timezone
 from threading import Barrier, BrokenBarrierError, Event, Thread
 from urllib.parse import parse_qs, urlparse
 from unittest.mock import Mock, patch
@@ -70,6 +71,7 @@ from backend.workers import anime_metadata as anime_metadata_worker
 from backend.workers import artist_metadata as artist_metadata_worker
 from backend.workers import lidarr_searches as lidarr_search_worker
 from backend.workers import lidarr_library as lidarr_library_worker
+from backend.workers import lidarr_downloads as lidarr_download_worker
 from backend.workers import plex as plex_worker
 from backend.workers import plex_history as plex_history_worker
 from backend.workers import plex_metadata as plex_metadata_worker
@@ -433,13 +435,15 @@ class WorkerEntrypointTests(unittest.TestCase):
     @patch("backend.worker.Thread")
     @patch("backend.worker.recommendation_worker.run")
     @patch("backend.worker.init_db")
+    @patch("backend.worker.init_cache_db")
     def test_worker_initializes_storage_and_background_loops(
-        self, init_db, run, thread_class
+        self, init_cache_db, init_db, run, thread_class
     ):
         calls = []
         anime_metadata_thread = Mock()
         artist_metadata_thread = Mock()
         lidarr_thread = Mock()
+        lidarr_download_thread = Mock()
         plex_thread = Mock()
         plex_metadata_thread = Mock()
         plex_history_thread = Mock()
@@ -448,16 +452,18 @@ class WorkerEntrypointTests(unittest.TestCase):
             anime_metadata_thread,
             artist_metadata_thread,
             lidarr_thread,
+            lidarr_download_thread,
             lidarr_library_thread,
             plex_thread,
             plex_metadata_thread,
             plex_history_thread,
         ]
         init_db.side_effect = lambda: calls.append("database")
+        init_cache_db.side_effect = lambda: calls.append("cache")
         run.side_effect = lambda *_args: calls.append("recommendations")
         worker.main()
-        self.assertEqual(calls, ["database", "recommendations"])
-        self.assertEqual(thread_class.call_count, 7)
+        self.assertEqual(calls, ["cache", "database", "recommendations"])
+        self.assertEqual(thread_class.call_count, 8)
         thread_class.assert_any_call(
             target=anime_metadata_worker.run,
             name="anime-musicbrainz-resolution",
@@ -470,6 +476,11 @@ class WorkerEntrypointTests(unittest.TestCase):
         )
         thread_class.assert_any_call(
             target=lidarr_search_worker.run, name="lidarr-search-followups", daemon=True
+        )
+        thread_class.assert_any_call(
+            target=lidarr_download_worker.run,
+            name="lidarr-download-status",
+            daemon=True,
         )
         thread_class.assert_any_call(
             target=lidarr_library_worker.run,
@@ -495,6 +506,7 @@ class WorkerEntrypointTests(unittest.TestCase):
             daemon=True,
         )
         lidarr_thread.start.assert_called_once_with()
+        lidarr_download_thread.start.assert_called_once_with()
         lidarr_library_thread.start.assert_called_once_with()
         plex_thread.start.assert_called_once_with()
         plex_metadata_thread.start.assert_called_once_with()
@@ -1101,11 +1113,12 @@ class LidarrSearchWorkerTests(unittest.TestCase):
         })
         set_refresh.assert_called_once_with([1], 56)
 
+    @patch("backend.workers.lidarr_searches.lidarr_downloads.request_poll")
     @patch("backend.workers.lidarr_searches.set_lidarr_search_command")
     @patch("backend.workers.lidarr_searches.lidarr.start_command")
     @patch("backend.workers.lidarr_searches.lidarr.command")
     def test_completed_refresh_queues_album_search(
-        self, command, start_command, set_search
+        self, command, start_command, set_search, request_poll
     ):
         command.return_value = Response(200, {"status": "completed"})
         start_command.return_value = Response(201, {"id": 66})
@@ -1126,6 +1139,7 @@ class LidarrSearchWorkerTests(unittest.TestCase):
             "albumIds": [33],
         })
         set_search.assert_called_once_with(1, 66)
+        request_poll.assert_called_once_with()
 
     @patch("backend.workers.lidarr_searches.set_lidarr_search_command")
     @patch("backend.workers.lidarr_searches.lidarr.start_command")
@@ -3189,6 +3203,40 @@ class AdminUsersTests(DatabaseTestCase):
         self.assertNotIn("never-return-this-plex-id", serialized)
         self.assertNotIn("password_hash", serialized)
 
+    def test_admin_requests_include_safe_download_lifecycle_and_requester(self):
+        self.register()
+        requester_id = self.add_user(
+            "download-requester", plex_id="plex-private", plex_username="Plex Requester"
+        )
+        with db() as connection:
+            connection.execute(
+                "INSERT INTO request_history (user_id, kind, mbid, name, created_at) "
+                "VALUES (?, 'release-group', 'admin-group', 'Admin Album', 100)",
+                (requester_id,),
+            )
+        with (
+            patch("backend.routes.admin._profile_plex_index", return_value={
+                "artistsByMbid": {}, "releaseGroupsByMbid": {},
+            }),
+            patch("backend.routes.account.lidarr.cached_library_availability", return_value={}),
+            patch("backend.routes.account.lidarr.cached_download_availability", return_value={
+                "admin-group": {"progress": 70, "status": "downloading",
+                                "indexer": "private", "downloadClient": "private"},
+            }),
+            patch("backend.routes.account.pending_lidarr_search_mbids", return_value={"admin-group"}),
+        ):
+            response = self.client.get("/api/admin/requests")
+
+        self.assertEqual(response.status_code, 200)
+        item = next(value for value in response.get_json()["requests"] if value["mbid"] == "admin-group")
+        self.assertEqual(item["requestStatus"], "downloading")
+        self.assertEqual(item["downloadStatus"], {"progress": 70, "status": "downloading"})
+        self.assertEqual(item["requester"]["id"], requester_id)
+        self.assertEqual(item["requester"]["username"], "Plex Requester")
+        serialized = response.get_data(as_text=True)
+        self.assertNotIn("private", serialized)
+        self.assertNotIn("plex-private", serialized)
+
     @patch(
         "backend.routes.admin._profile_plex_index",
         return_value={"artistsByMbid": {}, "releaseGroupsByMbid": {}},
@@ -5182,6 +5230,41 @@ class AccountProfileTests(DatabaseTestCase):
         )
         musicbrainz_get.assert_not_called()
 
+    def test_profile_release_history_includes_private_safe_download_lifecycle(self):
+        self.register()
+        with db() as connection:
+            user_id = connection.execute(
+                "SELECT id FROM users WHERE username = 'test-user'"
+            ).fetchone()["id"]
+            connection.execute(
+                "INSERT INTO request_history (user_id, kind, mbid, name, created_at) "
+                "VALUES (?, 'release-group', 'profile-group', 'Profile Album', 100)",
+                (user_id,),
+            )
+        with (
+            patch("backend.routes.account.get_service", return_value=None),
+            patch("backend.routes.account.lidarr.cached_library_availability", return_value={}),
+            patch("backend.routes.account.lidarr.cached_download_availability", return_value={
+                "profile-group": {"progress": 20,
+                                  "status": {"title": "private nested status"},
+                                  "trackedDownloadStatus": {"id": "private nested tracked status"},
+                                  "trackedDownloadState": ["private nested state"],
+                                  "timeLeft": ("private nested time",),
+                                  "estimatedCompletionTime": {"path": "private nested eta"},
+                                  "downloadId": 4, "title": "private", "path": "private"},
+            }),
+            patch("backend.routes.account.pending_lidarr_search_mbids", return_value={"profile-group"}),
+        ):
+            response = self.client.get("/api/account/profile")
+
+        self.assertEqual(response.status_code, 200)
+        item = response.get_json()["requests"]["release-group"][0]
+        self.assertEqual(item["requestStatus"], "downloading")
+        self.assertEqual(item["downloadStatus"], {"progress": 20})
+        serialized = response.get_data(as_text=True)
+        for forbidden in ("downloadId", "private", "path", "nested"):
+            self.assertNotIn(forbidden, serialized)
+
     @patch("backend.routes.account.musicbrainz.get")
     @patch("backend.routes.account.get_service", return_value=None)
     def test_profile_backfills_legacy_rows_from_cached_musicbrainz_only(
@@ -5434,6 +5517,132 @@ class AccountProfileTests(DatabaseTestCase):
 
         self.assertEqual(response.status_code, 404)
         self.assertEqual(response.get_json()["error"], "User not found.")
+
+
+class LidarrDownloadStatusTests(unittest.TestCase):
+    @patch("backend.services.lidarr._request")
+    def test_queue_fetches_paginated_records(self, request):
+        request.side_effect = [
+            Response(200, {"records": [{"albumId": 1}] * 1000, "totalRecords": 1001}),
+            Response(200, {"records": [{"albumId": 2}], "totalRecords": 1001}),
+        ]
+
+        records = lidarr.queue_records({"url": "http://lidarr", "apiKey": "key"})
+
+        self.assertEqual(len(records), 1001)
+        self.assertEqual(request.call_args_list[0].kwargs["params"]["page"], 1)
+        self.assertEqual(request.call_args_list[1].kwargs["params"]["page"], 2)
+
+    @patch("backend.services.lidarr._request")
+    def test_queue_continues_after_a_short_page_when_total_records_remain(self, request):
+        request.side_effect = [
+            Response(200, {"records": [{"albumId": 1}] * 100, "totalRecords": 101}),
+            Response(200, {"records": [{"albumId": 2}], "totalRecords": 101}),
+        ]
+
+        records = lidarr.queue_records({"url": "http://lidarr", "apiKey": "key"})
+
+        self.assertEqual(len(records), 101)
+        self.assertEqual(request.call_args_list[1].kwargs["params"]["page"], 2)
+
+    def test_duplicate_queue_records_use_weighted_progress_and_stable_state(self):
+        snapshot = lidarr.normalize_download_snapshot([
+            {"album": {"foreignAlbumId": "GROUP"}, "size": 100, "sizeleft": 25,
+             "status": "Downloading", "timeleft": "2 minutes", "downloadId": 1,
+             "title": "private", "indexer": "private", "downloadClient": "private",
+             "outputPath": "private"},
+            {"album": {"foreignAlbumId": "group"}, "size": 300, "sizeleft": 300,
+             "status": "Queued", "timeleft": "3 minutes"},
+        ])
+
+        self.assertEqual(snapshot["albums"]["group"]["progress"], 19)
+        self.assertEqual(snapshot["albums"]["group"]["status"], "queued")
+        self.assertNotIn("id", snapshot["albums"]["group"])
+        serialized = json.dumps(snapshot)
+        for forbidden in ("downloadId", "private", "indexer", "downloadClient", "outputPath"):
+            self.assertNotIn(forbidden, serialized)
+
+    def test_equal_remaining_duplicates_choose_all_safe_fields_stably(self):
+        records = [
+            {"album": {"foreignAlbumId": "group"}, "size": 100, "sizeleft": 50,
+             "status": "downloading", "trackedDownloadStatus": "alpha",
+             "trackedDownloadState": "first", "timeleft": "2 minutes",
+             "estimatedCompletionTime": "tomorrow"},
+            {"album": {"foreignAlbumId": "group"}, "size": 100, "sizeleft": 50,
+             "status": "downloading", "trackedDownloadStatus": "beta",
+             "trackedDownloadState": "second", "timeleft": "2 minutes",
+             "estimatedCompletionTime": "tomorrow"},
+        ]
+
+        forward = lidarr.normalize_download_snapshot(records)
+        reversed_snapshot = lidarr.normalize_download_snapshot(list(reversed(records)))
+
+        self.assertEqual(forward, reversed_snapshot)
+        self.assertEqual(forward["albums"]["group"]["trackedDownloadStatus"], "beta")
+
+    def test_public_download_status_sanitizes_values_without_mutating_cache(self):
+        value = {
+            "progress": 150.6,
+            "status": {"title": "private status"},
+            "trackedDownloadStatus": ["private tracked status"],
+            "trackedDownloadState": ("private tracked state",),
+            "timeLeft": {"path": "private time"},
+            "estimatedCompletionTime": {"downloadId": "private eta"},
+        }
+
+        safe = lidarr.public_download_status(value)
+
+        self.assertEqual(safe, {"progress": 100})
+        self.assertEqual(value["status"], {"title": "private status"})
+        self.assertEqual(lidarr.public_download_status({"progress": -1}), {"progress": 0})
+        self.assertEqual(lidarr.public_download_status({"progress": True}), {})
+        self.assertEqual(lidarr.public_download_status({"progress": float("nan")}), {})
+        self.assertEqual(lidarr.public_download_status({"progress": "50"}), {})
+        serialized = json.dumps(safe)
+        for forbidden in ("private status", "private tracked", "private time", "private eta"):
+            self.assertNotIn(forbidden, serialized)
+
+    def test_public_download_status_formats_eta_in_the_container_timezone(self):
+        with patch(
+            "backend.services.lidarr._container_timezone",
+            return_value=timezone(timedelta(hours=-4)),
+        ):
+            safe = lidarr.public_download_status({
+                "progress": 59,
+                "timeLeft": "00:24:06.4120410",
+                "estimatedCompletionTime": "2026-08-05T20:56:32Z",
+            })
+
+        self.assertEqual(safe["timeLeft"], "00:24:06")
+        self.assertEqual(
+            safe["estimatedCompletionTime"],
+            "08/05/2026 04:56 PM",
+        )
+        self.assertEqual(
+            lidarr.public_download_status({"timeLeft": "1.02:03:04.5"}),
+            {"timeLeft": "26:03:04"},
+        )
+
+    @patch("backend.services.lidarr.set_cache_document")
+    @patch("backend.services.lidarr.cached_library_index", return_value={"albums": {}})
+    @patch("backend.services.lidarr.queue_records", return_value=[])
+    def test_successful_empty_poll_clears_snapshot(self, records, index, set_document):
+        lidarr.refresh_download_snapshot({"url": "http://lidarr", "apiKey": "key"})
+
+        self.assertEqual(set_document.call_args.args[2], {"albums": {}})
+
+    @patch("backend.services.lidarr.set_cache_document")
+    @patch("backend.services.lidarr.cached_library_index", return_value={"albums": {}})
+    @patch("backend.services.lidarr.queue_records", side_effect=requests.RequestException())
+    def test_failed_poll_keeps_the_prior_snapshot_until_expiry(self, records, index, set_document):
+        with self.assertRaises(requests.RequestException):
+            lidarr.refresh_download_snapshot({"url": "http://lidarr", "apiKey": "key"})
+
+        set_document.assert_not_called()
+
+    @patch("backend.services.lidarr.get_cache_document", return_value=["invalid"])
+    def test_malformed_cached_download_document_degrades_to_empty(self, get_document):
+        self.assertEqual(lidarr.cached_download_availability(), {})
 
 
 class LidarrClientTests(unittest.TestCase):
@@ -6202,6 +6411,8 @@ class MusicRoutesTests(DatabaseTestCase):
                 "availableInPlex": True,
                 "availableInLidarr": True,
                 "fullyAvailableInLidarr": True,
+                "requestStatus": "available",
+                "downloadStatus": None,
             },
         })
 
@@ -6246,6 +6457,52 @@ class MusicRoutesTests(DatabaseTestCase):
             payload["plexReleases"][0]["url"],
             "https://app.plex.tv/album",
         )
+
+    def test_release_group_availability_uses_safe_lifecycle_precedence(self):
+        self.register()
+        download = {
+            "progress": 45,
+            "status": "downloading",
+            "trackedDownloadStatus": "ok",
+            "trackedDownloadState": "downloading",
+            "timeLeft": "00:05:00.1234567",
+            "estimatedCompletionTime": "2026-08-05T20:56:32Z",
+            "downloadId": 17,
+            "title": "private title",
+            "indexer": "private indexer",
+            "downloadClient": "private client",
+            "path": "private path",
+        }
+        with (
+            patch("backend.routes.music._plex_release_group_inventory", return_value={}),
+            patch("backend.routes.music.lidarr.cached_library_availability") as albums,
+            patch("backend.routes.music.lidarr.cached_download_availability") as downloads,
+            patch("backend.routes.music.pending_lidarr_search_mbids") as pending,
+        ):
+            albums.return_value = {"group-id": {"fullyAvailable": True}}
+            downloads.return_value = {"group-id": download}
+            pending.return_value = {"group-id"}
+            available = self.client.get("/api/music/release-group/group-id/availability")
+            available_payload = available.get_json()
+            self.assertEqual(available_payload["requestStatus"], "available")
+            self.assertIsNone(available_payload["downloadStatus"])
+
+            albums.return_value = {"group-id": {"fullyAvailable": False}}
+            pending.return_value = {"group-id"}
+            downloading = self.client.get("/api/music/release-group/group-id/availability")
+            downloading_payload = downloading.get_json()
+            self.assertEqual(downloading_payload["requestStatus"], "downloading")
+            self.assertEqual(set(downloading_payload["downloadStatus"]), {
+                "progress", "status", "trackedDownloadStatus", "trackedDownloadState",
+                "timeLeft", "estimatedCompletionTime",
+            })
+            serialized = downloading.get_data(as_text=True)
+            for forbidden in ("downloadId", "private title", "private indexer", "private client", "private path"):
+                self.assertNotIn(forbidden, serialized)
+
+            downloads.return_value = {}
+            queued = self.client.get("/api/music/release-group/group-id/availability")
+            self.assertEqual(queued.get_json()["requestStatus"], "queued")
 
     @patch("backend.routes.music.musicbrainz.get")
     def test_completed_artist_payload_uses_shared_cache_and_etag(self, get):

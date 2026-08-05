@@ -2,21 +2,25 @@
 from threading import Thread
 
 if __package__:
+    from .api_cache import init_cache_db
     from .storage import init_db
     from .workers import anime_metadata as anime_metadata_worker
     from .workers import artist_metadata as artist_metadata_worker
     from .workers import lidarr_searches as lidarr_search_worker
     from .workers import lidarr_library as lidarr_library_worker
+    from .workers import lidarr_downloads as lidarr_download_worker
     from .workers import plex as plex_worker
     from .workers import plex_history as plex_history_worker
     from .workers import plex_metadata as plex_metadata_worker
     from .workers import recommendations as recommendation_worker
 else:  # Support `python backend/worker.py` for local development.
+    from api_cache import init_cache_db
     from storage import init_db
     from workers import anime_metadata as anime_metadata_worker
     from workers import artist_metadata as artist_metadata_worker
     from workers import lidarr_searches as lidarr_search_worker
     from workers import lidarr_library as lidarr_library_worker
+    from workers import lidarr_downloads as lidarr_download_worker
     from workers import plex as plex_worker
     from workers import plex_history as plex_history_worker
     from workers import plex_metadata as plex_metadata_worker
@@ -31,6 +35,7 @@ RECOMMENDATION_STARTUP_DEADLINE = 120
 
 def main():
     """Initialize storage and start background jobs in a controlled sequence."""
+    init_cache_db()
     init_db()
     anime_metadata_thread = Thread(
         target=anime_metadata_worker.run,
@@ -50,6 +55,12 @@ def main():
         daemon=True,
     )
     lidarr_thread.start()
+    lidarr_download_thread = Thread(
+        target=lidarr_download_worker.run,
+        name="lidarr-download-status",
+        daemon=True,
+    )
+    lidarr_download_thread.start()
     lidarr_library_thread = Thread(
         target=lidarr_library_worker.run,
         args=(LIDARR_LIBRARY_STARTUP_DELAY,),

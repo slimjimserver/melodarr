@@ -243,6 +243,21 @@ def pending_lidarr_search(mbid):
         ).fetchone()
 
 
+def pending_lidarr_search_mbids(mbids):
+    """Return pending release groups in one bounded query for history pages."""
+    normalized = {str(mbid).casefold() for mbid in mbids if mbid}
+    if not normalized:
+        return set()
+    placeholders = ", ".join("?" for _ in normalized)
+    with db() as connection:
+        rows = connection.execute(
+            "SELECT mbid FROM pending_lidarr_searches "
+            f"WHERE lower(mbid) IN ({placeholders})",
+            tuple(normalized),
+        ).fetchall()
+    return {str(row["mbid"]).casefold() for row in rows}
+
+
 def due_lidarr_searches(limit=20):
     with db() as connection:
         return connection.execute(
