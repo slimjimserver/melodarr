@@ -3085,6 +3085,49 @@ class AdminUsersTests(DatabaseTestCase):
             local_user_id,
         )
 
+    def test_admin_reads_canonical_target_despite_own_plex_name_collision(self):
+        self.register()
+        target_id = self.add_user("target-user")
+        with db() as connection:
+            connection.execute(
+                "UPDATE users SET plex_username = ? WHERE username = ?",
+                ("target-user", "test-user"),
+            )
+
+        response = self.client.get("/api/account/profile?username=target-user")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["user"]["id"], target_id)
+
+    def test_admin_updates_canonical_target_despite_own_plex_name_collision(self):
+        csrf_token = self.register()
+        target_id = self.add_user("target-user")
+        with db() as connection:
+            connection.execute(
+                "UPDATE users SET plex_username = ? WHERE username = ?",
+                ("target-user", "test-user"),
+            )
+
+        response = self.client.post(
+            "/api/account/general?username=target-user",
+            json={"username": "renamed-target", "password": ""},
+            headers={"X-CSRF-Token": csrf_token},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["username"], "renamed-target")
+        with db() as connection:
+            admin = connection.execute(
+                "SELECT username FROM users WHERE username = 'test-user'"
+            ).fetchone()
+            target = connection.execute(
+                "SELECT username FROM users WHERE id = ?",
+                (target_id,),
+            ).fetchone()
+        self.assertIsNotNone(admin)
+        self.assertEqual(admin["username"], "test-user")
+        self.assertEqual(target["username"], "renamed-target")
+
     @patch("backend.routes.admin._profile_plex_index")
     def test_admin_request_list_includes_metadata_availability_and_requesters(
         self, profile_plex_index

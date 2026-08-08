@@ -799,6 +799,8 @@ details summary { margin-bottom: 17px; color: var(--accent-bright); cursor: poin
 }
 .skip-link:focus { transform: none; }
 
+#main-content:focus { outline: none; }
+
 :where(button, a, input, select, summary, [role="link"]):focus-visible {
   outline: 3px solid rgba(168, 68, 45, .42);
   outline-offset: 3px;

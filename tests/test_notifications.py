@@ -4,6 +4,7 @@ else:
     from _test_environment import TEST_ROOT
 
 import os
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -89,6 +90,50 @@ class NotificationStorageTests(unittest.TestCase):
         with storage.db() as connection:
             row = connection.execute("SELECT status,attempts,lease_token FROM notification_deliveries").fetchone()
         self.assertEqual((row["status"], row["attempts"], row["lease_token"]), ("pending", 0, None))
+
+    def test_run_recovers_after_transient_claim_failure_without_logging_error_details(self):
+        with patch.object(
+            notification_worker,
+            "claim_due_delivery",
+            side_effect=[sqlite3.OperationalError("claim secret"), None],
+        ), patch.object(notification_worker.wake_requested, "wait", side_effect=[False, KeyboardInterrupt]) as wait, patch.object(
+            notification_worker,
+            "process_one",
+            wraps=notification_worker.process_one,
+        ) as process_one, self.assertLogs(notification_worker.logger, level="WARNING") as logs:
+            with self.assertRaises(KeyboardInterrupt):
+                notification_worker.run()
+        self.assertEqual(process_one.call_count, 2)
+        self.assertEqual(
+            [call.args[0] for call in wait.call_args_list],
+            [notification_worker.FAILURE_BACKOFF_INITIAL_SECONDS, notification_worker.POLL_INTERVAL],
+        )
+        self.assertIn("Notification delivery worker pass failed; retrying after 1 seconds", logs.output[0])
+        self.assertNotIn("claim secret", logs.output[0])
+
+    def test_run_survives_completion_persistence_failure_and_leaves_lease_reclaimable(self):
+        with storage.db() as connection:
+            event = connection.execute("INSERT INTO notification_events (release_mbid,generation,artist_mbid,artist_name,release_title,created_at) VALUES ('11111111-1111-1111-1111-111111111111',1,'','Artist','Album',0)")
+            connection.execute("INSERT INTO notification_deliveries (event_id,user_id,channel,email_target,status,attempts,next_attempt_at,created_at,updated_at) VALUES (?,?,'email','u@example.test','pending',0,0,0,0)", (event.lastrowid, self.user_id))
+        with patch.object(notification_worker, "_email") as email, patch.object(
+            notification_worker,
+            "complete_delivery",
+            side_effect=sqlite3.OperationalError("completion secret"),
+        ), patch.object(notification_worker.wake_requested, "wait", side_effect=[False, KeyboardInterrupt]) as wait, patch.object(
+            notification_worker,
+            "process_one",
+            wraps=notification_worker.process_one,
+        ) as process_one, self.assertLogs(notification_worker.logger, level="WARNING") as logs:
+            with self.assertRaises(KeyboardInterrupt):
+                notification_worker.run()
+        self.assertEqual(process_one.call_count, 2)
+        self.assertEqual([call.args[0] for call in wait.call_args_list], [notification_worker.FAILURE_BACKOFF_INITIAL_SECONDS, notification_worker.POLL_INTERVAL])
+        email.assert_called_once()
+        self.assertNotIn("completion secret", logs.output[0])
+        with storage.db() as connection:
+            row = connection.execute("SELECT status, attempts, lease_token FROM notification_deliveries").fetchone()
+        self.assertEqual((row["status"], row["attempts"]), ("leased", 1))
+        self.assertIsNotNone(row["lease_token"])
 
     def test_provider_and_enable_device_contracts_are_explicit(self):
         root = Path(__file__).parents[1]
@@ -458,10 +503,16 @@ class NotificationRouteTests(unittest.TestCase):
         self.assertTrue(all(call.kwargs["test"] for call in push.call_args_list))
 
     def test_service_worker_has_root_headers(self):
-        with self.client.get("/service-worker.js") as response:
-            self.assertEqual(response.status_code, 200)
-            self.assertEqual(response.mimetype, "application/javascript")
-            self.assertEqual(response.headers.get("Cache-Control"), "no-cache")
+        with tempfile.TemporaryDirectory() as directory:
+            static = Path(directory, "static")
+            static.mkdir()
+            (static / "service-worker.js").write_text("self.addEventListener('install', () => {});", encoding="utf-8")
+            with patch("backend.application.FRONTEND_ROOT", directory):
+                app = create_app({"TESTING": True, "SECRET_KEY": "service-worker-route"})
+                with app.test_client() as client, client.get("/service-worker.js") as response:
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.mimetype, "application/javascript")
+                    self.assertEqual(response.headers.get("Cache-Control"), "no-cache")
 
 
 if __name__ == "__main__":

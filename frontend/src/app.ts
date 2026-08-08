@@ -233,6 +233,10 @@ function resetPageScroll() {
   window.scrollTo({ top: 0, left: 0, behavior: "auto" });
 }
 
+function focusMainContent() {
+  $<HTMLElement>("#main-content").focus();
+}
+
 /**
  * Restore pull-to-refresh for installed PWAs, where the browser's own gesture
  * is not consistently exposed. It only activates from the document top so it
@@ -901,7 +905,10 @@ function setupNavigation() {
   function isOwnAccountUsername(username: string) {
     if (!currentUser) return false;
     const normalizedUsername = username.toLocaleLowerCase();
-    return [currentUser.username, currentUser.plexUsername]
+    const selfNames = currentUser.role === "admin"
+      ? [currentUser.username]
+      : [currentUser.username, currentUser.plexUsername];
+    return selfNames
       .filter(Boolean)
       .some((candidate) => candidate!.toLocaleLowerCase() === normalizedUsername);
   }
@@ -937,6 +944,7 @@ function setupNavigation() {
       window.history.pushState({ view }, "", path);
     }
     resetPageScroll();
+    focusMainContent();
   }
 
   function accountPath(
@@ -1035,7 +1043,6 @@ function setupNavigation() {
     accountRenderAbort = controller;
     const isCurrentRender = () => (
       renderGeneration === accountRenderGeneration
-      && accountRenderAbort === controller
       && currentUser === user
       && activeAccountUsername === targetUsername
     );
@@ -1325,14 +1332,21 @@ function setupNavigation() {
           event.preventDefault();
           const formMessage = requiredDescendant<HTMLElement>(form, ".form-message");
           setMessage(formMessage, "Saving linked accounts…");
+          const submitController = new AbortController();
+          accountRenderAbort?.abort();
+          accountRenderAbort = submitController;
+          const isCurrentSubmit = () => (
+            isCurrentRender() && accountRenderAbort === submitController
+          );
           try {
-            const [listenbrainz, lastfm] = await Promise.all([
+            const outcomes = await Promise.allSettled([
               api(accountApiPath("/api/account/settings"), {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
                   username: form.listenbrainzUsername.value,
                 }),
+                signal: submitController.signal,
               }),
               api(accountApiPath("/api/account/lastfm"), {
                 method: "POST",
@@ -1340,20 +1354,50 @@ function setupNavigation() {
                 body: JSON.stringify({
                   username: form.lastfmUsername.value,
                 }),
+                signal: submitController.signal,
               }),
             ]);
-            if (isOwnAccount) {
-              user.listenbrainzUsername = form.listenbrainzUsername.value.trim();
-              user.lastfmUsername = form.lastfmUsername.value.trim();
-              user.lastfmConfigured = Boolean(user.lastfmUsername);
+            if (!isCurrentSubmit()) return;
+
+            const providerMessages = outcomes.map((outcome, index) => {
+              const provider = index === 0 ? "ListenBrainz" : "Last.fm";
+              if (outcome.status === "fulfilled") return `${provider}: ${outcome.value.message}`;
+              return `${provider}: ${outcome.reason.message || "could not be saved."}`;
+            });
+            const hasProviderFailure = outcomes.some((outcome) => outcome.status === "rejected");
+            const hasProviderSuccess = outcomes.some((outcome) => outcome.status === "fulfilled");
+            let refreshError: Error | undefined;
+            try {
+              const refreshed = await api(accountApiPath("/api/account/settings"), {
+                signal: submitController.signal,
+              });
+              if (!isCurrentSubmit()) return;
+              plexLinked = Boolean(refreshed.plexLinked);
+              plexUsername = refreshed.plexUsername || "";
+              plexEmail = refreshed.plexEmail || "";
+              form.listenbrainzUsername.value = refreshed.listenbrainzUsername || "";
+              form.lastfmUsername.value = refreshed.lastfmUsername || "";
+              if (isOwnAccount) {
+                user.plexLinked = plexLinked;
+                user.plexUsername = plexUsername;
+                user.plexEmail = plexEmail;
+                user.listenbrainzUsername = refreshed.listenbrainzUsername || "";
+                user.lastfmUsername = refreshed.lastfmUsername || "";
+                user.lastfmConfigured = Boolean(refreshed.lastfmConfigured);
+              }
+              renderPlexLinkStatus();
+            } catch (error) {
+              refreshError = error;
             }
-            setMessage(
-              formMessage,
-              `${listenbrainz.message} ${lastfm.message} Recommendations are being refreshed.`,
-            );
-            window.dispatchEvent(new Event("melodarr-recommendations-changed"));
-          } catch (error) {
-            setMessage(formMessage, error.message, true);
+            if (!isCurrentSubmit()) return;
+            if (refreshError) {
+              providerMessages.push(`Account refresh: ${refreshError.message}`);
+            }
+            if (hasProviderSuccess) providerMessages.push("Recommendations are being refreshed.");
+            setMessage(formMessage, providerMessages.join(" "), hasProviderFailure || Boolean(refreshError));
+            if (hasProviderSuccess) window.dispatchEvent(new Event("melodarr-recommendations-changed"));
+          } finally {
+            if (accountRenderAbort === submitController) accountRenderAbort = undefined;
           }
         });
         content.append(form);

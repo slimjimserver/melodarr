@@ -7,6 +7,7 @@ this is the intentional recoverable at-least-once tradeoff.
 
 import html
 import json
+import logging
 import secrets
 import smtplib
 import ssl
@@ -32,6 +33,9 @@ POLL_INTERVAL = 10
 LEASE_SECONDS = 90
 MAX_ATTEMPTS = 6
 WEB_PUSH_TTL_SECONDS = 86400
+FAILURE_BACKOFF_INITIAL_SECONDS = 1
+FAILURE_BACKOFF_MAX_SECONDS = 60
+logger = logging.getLogger(__name__)
 wake_requested = Event()
 
 
@@ -198,8 +202,24 @@ def process_one():
 
 
 def run():
+    failure_backoff = FAILURE_BACKOFF_INITIAL_SECONDS
     while True:
-        while process_one():
-            pass
+        try:
+            while process_one():
+                pass
+        except Exception:
+            # Keep the sole delivery loop alive when claiming, settings reads,
+            # or lease completion has a transient persistence failure. Do not
+            # include exception details here: they can contain provider or
+            # settings data that does not belong in logs.
+            logger.warning(
+                "Notification delivery worker pass failed; retrying after %s seconds",
+                failure_backoff,
+            )
+            wake_requested.wait(failure_backoff)
+            wake_requested.clear()
+            failure_backoff = min(failure_backoff * 2, FAILURE_BACKOFF_MAX_SECONDS)
+            continue
+        failure_backoff = FAILURE_BACKOFF_INITIAL_SECONDS
         wake_requested.wait(POLL_INTERVAL)
         wake_requested.clear()

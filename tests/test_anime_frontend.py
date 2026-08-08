@@ -192,6 +192,81 @@ class AnimeFrontendTests(unittest.TestCase):
         self.assertIn('detailRequests.delete(`release-group:${String(id)}`)', self.discovery)
         self.assertIn(".release-anime-theme-link", self.stylesheet)
 
+    def test_detail_work_is_cancelled_and_generation_guarded_across_sessions(self):
+        self.assertIn("let detailSessionGeneration = 0", self.discovery)
+        self.assertIn("let detailSessionAbort = new AbortController()", self.discovery)
+        self.assertIn("detailSessionAbort.abort()", self.discovery)
+        self.assertIn("detailRequests.clear()", self.discovery)
+        self.assertIn("detailUpgrades.clear()", self.discovery)
+        self.assertIn("animeDetailUi.clear()", self.discovery)
+        self.assertIn("stopAnimeResolution()", self.discovery)
+        self.assertIn("generation !== detailSessionGeneration", self.discovery)
+        self.assertIn("detailSessionAbort.signal", self.discovery)
+        self.assertIn('window.addEventListener("melodarr-authenticated", () => {\n    invalidateAuthenticatedDetailState();', self.discovery)
+        self.assertIn('window.addEventListener("melodarr-signed-out", () => {', self.discovery)
+
+    def test_detail_actions_are_session_bound_and_do_not_reuse_cleared_artist_state(self):
+        self.assertIn("function isCurrentDetailSession(generation: number)", self.discovery)
+        self.assertIn('getJson("/api/lidarr/options", 30_000, detailSessionAbort.signal)', self.discovery)
+        self.assertIn('postJson("/api/request/release-group", {', self.discovery)
+        self.assertIn("}, detailSessionAbort.signal);", self.discovery)
+        self.assertIn("signal: detailSessionAbort.signal", self.discovery)
+        self.assertIn("if (!isCurrentDetailAction(action)) return;", self.discovery)
+        self.assertIn('error.name === "AbortError"', self.discovery)
+        self.assertIn("const artist = requestedArtist;", self.discovery)
+        self.assertIn("const body: JsonObject = { mbid: artist.id };", self.discovery)
+        self.assertIn("currentDetail.id === artist.id", self.discovery)
+
+    def test_detail_actions_are_invalidated_by_same_session_navigation(self):
+        self.assertIn("let detailNavigationGeneration = 0", self.discovery)
+        self.assertIn("type DetailActionContext", self.discovery)
+        self.assertIn("function captureDetailActionContext()", self.discovery)
+        self.assertIn("function isCurrentDetailAction(context: DetailActionContext)", self.discovery)
+        self.assertIn("context.navigationGeneration === detailNavigationGeneration", self.discovery)
+        self.assertIn("function invalidateDetailNavigation()", self.discovery)
+        self.assertIn("detailNavigationGeneration += 1", self.discovery)
+        self.assertIn("invalidateDetailNavigation();\n    stopArtistRevalidation();", self.discovery)
+        self.assertIn('window.addEventListener("melodarr-home", () => {\n    invalidateDetailNavigation();', self.discovery)
+        self.assertIn("if (!isCurrentDetailAction(action)) return;", self.discovery)
+
+    def test_linked_account_saves_report_each_provider_and_refresh_identity(self):
+        self.assertIn("Promise.allSettled([", self.app)
+        self.assertIn('const provider = index === 0 ? "ListenBrainz" : "Last.fm"', self.app)
+        self.assertIn('`${provider}: ${outcome.value.message}`', self.app)
+        self.assertIn('`${provider}: ${outcome.reason.message || "could not be saved."}`', self.app)
+        self.assertIn('const refreshed = await api(accountApiPath("/api/account/settings")', self.app)
+        self.assertIn("user.listenbrainzUsername = refreshed.listenbrainzUsername || \"\"", self.app)
+        self.assertIn("user.lastfmConfigured = Boolean(refreshed.lastfmConfigured)", self.app)
+        self.assertIn('new Event("melodarr-recommendations-changed")', self.app)
+
+    def test_completed_account_render_keeps_its_submit_handler_current(self):
+        self.assertIn("renderGeneration === accountRenderGeneration", self.app)
+        self.assertNotIn("&& accountRenderAbort === controller", self.app)
+        self.assertIn("const submitController = new AbortController()", self.app)
+        self.assertIn("const isCurrentSubmit = () => (", self.app)
+        self.assertIn("isCurrentRender() && accountRenderAbort === submitController", self.app)
+        self.assertIn("signal: submitController.signal", self.app)
+        self.assertIn("if (!isCurrentSubmit()) return;", self.app)
+        self.assertIn(
+            "if (accountRenderAbort === submitController) accountRenderAbort = undefined;",
+            self.app,
+        )
+
+    def test_admin_account_ownership_uses_only_the_canonical_username(self):
+        self.assertIn("function isOwnAccountUsername(username: string)", self.app)
+        self.assertIn('currentUser.role === "admin"', self.app)
+        self.assertIn("? [currentUser.username]", self.app)
+        self.assertIn(": [currentUser.username, currentUser.plexUsername]", self.app)
+        self.assertIn("const isOwnAccount = isOwnAccountUsername(targetUsername);", self.app)
+        self.assertIn("const isOwnAccount = isOwnAccountUsername(username);", self.app)
+
+    def test_view_changes_focus_the_main_landmark(self):
+        self.assertIn('function focusMainContent()', self.app)
+        self.assertIn('$<HTMLElement>("#main-content").focus()', self.app)
+        self.assertIn("focusMainContent();", self.app)
+        self.assertIn('$("#main-content").focus()', self.discovery)
+        self.assertIn("#main-content:focus { outline: none; }", self.stylesheet)
+
     def test_anime_request_context_is_sent_and_history_links_back_to_theme(self):
         for field in (
             "animeSlug", "animeName", "themeId", "themeLabel", "songId", "songTitle"

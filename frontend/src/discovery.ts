@@ -1,6 +1,11 @@
 (() => {
   type DetailKind = "artist" | "release-group" | "release" | "anime" | "series";
   type DetailReference = { kind: DetailKind; id: string };
+  type DetailActionContext = {
+    sessionGeneration: number;
+    navigationGeneration: number;
+    detail?: DetailReference;
+  };
   type DetailOrigin = { view: "discover" | "library"; scrollY: number };
   type ArtworkItem = { image: HTMLImageElement; source: string; fallback: HTMLElement };
   type ArtworkJob = { guard: ReturnType<typeof setTimeout> };
@@ -15,12 +20,14 @@
     artistId: string;
     baselineRefreshAt: number;
     expiresAt: number;
+    generation: number;
     timer?: ReturnType<typeof setTimeout>;
   };
   type DetailAvailabilityWatcher = {
     kind: "artist" | "release-group";
     id: string;
     data: JsonObject;
+    generation: number;
     timer?: ReturnType<typeof setTimeout>;
   };
   type AnimeResolutionWatcher = {
@@ -28,6 +35,7 @@
     data: JsonObject;
     attempts: number;
     maxAttempts: number;
+    generation: number;
     requestedThemeIds: Set<string>;
     observer?: IntersectionObserver;
     timer?: ReturnType<typeof setTimeout>;
@@ -48,6 +56,7 @@
   const detailHistory: DetailReference[] = [];
   let detailOrigin: DetailOrigin = { view: "discover", scrollY: 0 };
   let requestedArtist: JsonObject | undefined;
+  let requestedArtistAction: DetailActionContext | undefined;
   let lidarrExternalUrl: string | undefined;
   let lidarrExternalUrlRequest: Promise<string> | undefined;
   let lidarrExternalUrlVersion = 0;
@@ -59,6 +68,10 @@
   let searchAbort: AbortController | undefined;
   const detailRequests = new Map<string, DetailRequest>();
   const detailUpgrades = new Map<string, Promise<JsonObject>>();
+  const detailPrefetchTimers = new Set<ReturnType<typeof setTimeout>>();
+  let detailSessionGeneration = 0;
+  let detailNavigationGeneration = 0;
+  let detailSessionAbort = new AbortController();
   let artistRevalidation: ArtistRevalidation | undefined;
   let detailAvailabilityWatcher: DetailAvailabilityWatcher | undefined;
   let animeResolutionWatcher: AnimeResolutionWatcher | undefined;
@@ -209,16 +222,50 @@
     return request;
   }
 
-  function postJson(url: string, body: JsonObject): Promise<JsonObject> {
+  function postJson(url: string, body: JsonObject, signal?: AbortSignal): Promise<JsonObject> {
     return api(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      signal,
     });
+  }
+
+  function isCurrentDetailSession(generation: number) {
+    return generation === detailSessionGeneration;
+  }
+
+  function captureDetailActionContext(): DetailActionContext {
+    const detail = currentDetail && $("#detail").classList.contains("active")
+      ? { ...currentDetail }
+      : undefined;
+    return {
+      sessionGeneration: detailSessionGeneration,
+      navigationGeneration: detailNavigationGeneration,
+      detail,
+    };
+  }
+
+  function isCurrentDetailAction(context: DetailActionContext) {
+    if (context.sessionGeneration !== detailSessionGeneration) return false;
+    if (!context.detail) return true;
+    return (
+      context.navigationGeneration === detailNavigationGeneration
+      && $("#detail").classList.contains("active")
+      && currentDetail?.kind === context.detail.kind
+      && currentDetail.id === context.detail.id
+    );
+  }
+
+  function invalidateDetailNavigation() {
+    detailNavigationGeneration += 1;
+    requestedArtist = undefined;
+    requestedArtistAction = undefined;
   }
 
   function showView(id: AppView) {
     if (id !== "detail") {
+      invalidateDetailNavigation();
       stopArtistRevalidation();
       stopDetailAvailability();
       stopAnimeResolution();
@@ -234,6 +281,7 @@
       else button.removeAttribute("aria-current");
     });
     resetPageScroll();
+    $("#main-content").focus();
   }
 
   function createCard(title: string, description: string, onClick?: EventListener, coverArt = "", detailKind?: DetailKind, detailId = "") {
@@ -355,7 +403,13 @@
       .forEach(([key]) => detailRequests.delete(key));
   }
 
-  function storeSettledDetail(key: string, data: JsonObject, prefetch = false) {
+  function storeSettledDetail(
+    key: string,
+    data: JsonObject,
+    prefetch = false,
+    generation = detailSessionGeneration,
+  ) {
+    if (generation !== detailSessionGeneration) return false;
     const now = Date.now();
     detailRequests.set(key, {
       prefetch,
@@ -365,6 +419,7 @@
       lastAccessedAt: now,
     });
     pruneDetailRequests(now);
+    return true;
   }
 
   function loadDetail(kind: DetailKind, id: string, prefetch = false): Promise<JsonObject> {
@@ -387,6 +442,7 @@
       expiresAt: Number.POSITIVE_INFINITY,
       lastAccessedAt: now,
     } as DetailRequest;
+    const generation = detailSessionGeneration;
     const query = prefetch ? "?prefetch=1" : "";
     const timeout = prefetch ? 30_000 : kind === "artist" ? 120_000 : 60_000;
     const endpoint = kind === "anime" || kind === "series"
@@ -395,8 +451,14 @@
     entry.promise = getJson(
       `${endpoint}${query}`,
       timeout,
+      detailSessionAbort.signal,
     )
       .then((data) => {
+        if (generation !== detailSessionGeneration) {
+          const error = new Error("This detail request belongs to a previous session.");
+          error.name = "AbortError";
+          throw error;
+        }
         entry.settled = true;
         const settledAt = Date.now();
         entry.expiresAt = settledAt + (entry.prefetch ? detailPrefetchTtl : detailOpenedTtl);
@@ -415,23 +477,32 @@
   function addDetailPrefetch(element: Element, kind: DetailKind, id: string) {
     let timer: ReturnType<typeof setTimeout>;
     element.addEventListener("pointerenter", () => {
-      timer = setTimeout(() => loadDetail(kind, id, true).catch(() => {}), 200);
+      timer = setTimeout(() => {
+        detailPrefetchTimers.delete(timer);
+        loadDetail(kind, id, true).catch(() => {});
+      }, 200);
+      detailPrefetchTimers.add(timer);
     });
-    element.addEventListener("pointerleave", () => clearTimeout(timer));
+    element.addEventListener("pointerleave", () => {
+      clearTimeout(timer);
+      detailPrefetchTimers.delete(timer);
+    });
     element.addEventListener("focus", () => loadDetail(kind, id, true).catch(() => {}));
   }
 
   function upgradeProvisionalDetail(kind: "artist" | "release-group", id: string) {
     const key = `${kind}:${id}`;
     if (detailUpgrades.has(key)) return;
+    const generation = detailSessionGeneration;
     const upgrade = getJson(
       `/api/music/${kind}/${encodeURIComponent(id)}?complete=1`,
       120_000,
+      detailSessionAbort.signal,
     );
     detailUpgrades.set(key, upgrade);
     upgrade
       .then((data) => {
-        storeSettledDetail(key, data);
+        if (!storeSettledDetail(key, data, false, generation)) return;
         if (currentDetail?.kind !== kind || currentDetail.id !== id) return;
         renderDetail(kind, data);
         $("#detail-message").textContent = kind === "artist"
@@ -439,12 +510,15 @@
           : "Complete release information loaded from MusicBrainz.";
       })
       .catch((error) => {
+        if (generation !== detailSessionGeneration) return;
         if (currentDetail?.kind !== kind || currentDetail.id !== id) return;
         $("#detail-message").textContent = error.name === "AbortError"
           ? "The Lidarr metadata is shown. MusicBrainz is still taking too long to complete this page."
           : `The Lidarr metadata is shown. MusicBrainz enrichment failed: ${error.message}`;
       })
-      .finally(() => detailUpgrades.delete(key));
+      .finally(() => {
+        if (detailUpgrades.get(key) === upgrade) detailUpgrades.delete(key);
+      });
   }
 
   function stopArtistRevalidation() {
@@ -471,12 +545,14 @@
         `/api/music/artist/${encodeURIComponent(watcher.artistId)}`
           + `?complete=1&revision=${encodeURIComponent(refreshedAt)}`,
         120_000,
+        detailSessionAbort.signal,
       );
-      storeSettledDetail(key, data);
+      if (!storeSettledDetail(key, data, false, watcher.generation)) return;
       if (currentDetail?.kind !== "artist" || currentDetail.id !== watcher.artistId) return;
       renderDetail("artist", data);
       $("#detail-message").textContent = "Discography and artist metadata updated from MusicBrainz.";
     } catch (error) {
+      if (watcher.generation !== detailSessionGeneration) return;
       if (currentDetail?.kind === "artist" && currentDetail.id === watcher.artistId) {
         $("#detail-message").textContent = `The cached discography is still shown: ${error.message}`;
       }
@@ -486,14 +562,17 @@
   async function pollArtistRevalidation(watcher: ArtistRevalidation) {
     if (
       artistRevalidation !== watcher
+      || watcher.generation !== detailSessionGeneration
       || currentDetail?.kind !== "artist"
       || currentDetail.id !== watcher.artistId
     ) return;
     try {
       const state = await getJson(
         `/api/music/artist/${encodeURIComponent(watcher.artistId)}/revalidation`,
+        30_000,
+        detailSessionAbort.signal,
       );
-      if (artistRevalidation !== watcher) return;
+      if (artistRevalidation !== watcher || watcher.generation !== detailSessionGeneration) return;
       if (state.status === "refreshing") {
         $("#detail-message").textContent = "MusicBrainz found a discography change; updating metadata…";
       }
@@ -525,13 +604,16 @@
       || currentDetail.id !== data.id
       || artistRevalidation?.artistId === data.id
     ) return;
+    const generation = detailSessionGeneration;
     try {
       const state = await postJson(
         `/api/music/artist/${encodeURIComponent(data.id)}/revalidate`,
         {},
+        detailSessionAbort.signal,
       );
       if (
         !state.polling
+        || generation !== detailSessionGeneration
         || currentDetail?.kind !== "artist"
         || currentDetail.id !== data.id
       ) return;
@@ -539,6 +621,7 @@
         artistId: data.id,
         baselineRefreshAt: Number(state.lastRefreshAt || 0),
         expiresAt: Date.now() + 5 * 60 * 1000,
+        generation,
       };
       artistRevalidation = watcher;
       scheduleArtistRevalidationPoll(watcher);
@@ -548,6 +631,7 @@
   }
 
   function showDetail(kind: DetailKind, id: string, addToHistory = true, updateHistory = true) {
+    invalidateDetailNavigation();
     stopArtistRevalidation();
     stopDetailAvailability();
     stopAnimeResolution();
@@ -563,6 +647,7 @@
       };
     }
     currentDetail = { kind, id };
+    const generation = detailSessionGeneration;
     if (updateHistory) {
       window.history.pushState(
         detailNavigationState(kind, id),
@@ -600,6 +685,7 @@
 
     loadDetail(kind, id)
       .then((data) => {
+        if (generation !== detailSessionGeneration) return;
         if (currentDetail?.kind !== kind || currentDetail?.id !== id) return;
         renderDetail(kind, data);
         if ((kind === "artist" || kind === "release-group") && data.provisional) {
@@ -610,6 +696,7 @@
         }
       })
       .catch((error) => {
+        if (generation !== detailSessionGeneration) return;
         if (currentDetail?.kind !== kind || currentDetail?.id !== id) return;
         const provider = kind === "anime" || kind === "series" ? "AnimeThemes" : "MusicBrainz";
         $("#detail-message").textContent = error.name === "AbortError"
@@ -623,7 +710,11 @@
         detailResults.replaceChildren(retry);
       })
       .finally(() => {
-        if (currentDetail?.kind === kind && currentDetail?.id === id) {
+        if (
+          generation === detailSessionGeneration
+          && currentDetail?.kind === kind
+          && currentDetail?.id === id
+        ) {
           detailResults.removeAttribute("aria-busy");
         }
       });
@@ -947,6 +1038,7 @@
   ) {
     if (
       detailAvailabilityWatcher !== watcher
+      || watcher.generation !== detailSessionGeneration
       || document.visibilityState === "hidden"
     ) return;
     watcher.timer = setTimeout(() => pollDetailAvailability(watcher), delay);
@@ -956,6 +1048,7 @@
     watcher.timer = undefined;
     if (
       detailAvailabilityWatcher !== watcher
+      || watcher.generation !== detailSessionGeneration
       || currentDetail?.kind !== watcher.kind
       || currentDetail.id !== watcher.id
       || !$("#detail").classList.contains("active")
@@ -979,9 +1072,12 @@
       }
       const availability = await getJson(
         `${availabilityUrl.pathname}${availabilityUrl.search}`,
+        30_000,
+        detailSessionAbort.signal,
       );
       if (
         detailAvailabilityWatcher !== watcher
+        || watcher.generation !== detailSessionGeneration
         || currentDetail?.kind !== watcher.kind
         || currentDetail.id !== watcher.id
       ) return;
@@ -998,7 +1094,10 @@
         scheduleDetailAvailability(watcher);
       }
     } catch {
-      if (detailAvailabilityWatcher === watcher) {
+      if (
+        detailAvailabilityWatcher === watcher
+        && watcher.generation === detailSessionGeneration
+      ) {
         scheduleDetailAvailability(watcher, 30_000);
       }
     }
@@ -1015,6 +1114,7 @@
       kind,
       id: String(data.id),
       data,
+      generation: detailSessionGeneration,
     };
     detailAvailabilityWatcher = watcher;
     scheduleDetailAvailability(watcher, delay);
@@ -1037,16 +1137,20 @@
   }
 
   async function openRequestDialog(artist: JsonObject, messageElement: Element = $("#detail-message")) {
+    const action = captureDetailActionContext();
     requestedArtist = artist;
+    requestedArtistAction = action;
     $("#dialog-artist").textContent = artist.name;
     $("#request-message").textContent = "";
 
     try {
-      const options = await getJson("/api/lidarr/options");
+      const options = await getJson("/api/lidarr/options", 30_000, detailSessionAbort.signal);
+      if (!isCurrentDetailAction(action)) return;
       fillRequestSelect($("#request-root-folder"), options.rootFolders, "path", "path");
       fillRequestSelect($("#request-tags"), options.tags, "label", "id");
       $("#request-dialog").showModal();
     } catch (error) {
+      if (!isCurrentDetailAction(action) || error.name === "AbortError") return;
       messageElement.textContent = error.message;
     }
   }
@@ -1056,6 +1160,7 @@
     button: HTMLButtonElement;
     animeContext?: JsonObject;
   }) {
+    const action = captureDetailActionContext();
     const button = releaseGroup.button;
     button.disabled = true;
     button.textContent = "Sending to Lidarr…";
@@ -1063,7 +1168,8 @@
       const result = await postJson("/api/request/release-group", {
         mbid: releaseGroup.id,
         ...(releaseGroup.animeContext || {}),
-      });
+      }, detailSessionAbort.signal);
+      if (!isCurrentDetailAction(action)) return;
       showToast(result.message);
       button.textContent = result.alreadyExists
         ? "Available"
@@ -1089,6 +1195,7 @@
         }
       }
     } catch (error) {
+      if (!isCurrentDetailAction(action) || error.name === "AbortError") return;
       showToast(error.message, true);
       button.textContent = "Request release group";
       button.disabled = false;
@@ -1603,21 +1710,42 @@
 
   function addMuteButton(container: HTMLElement, kind: "artist" | "release-group", mbid: string) {
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(mbid)) return;
+    const action = captureDetailActionContext();
     const bell = document.createElement("button");
     bell.type = "button"; bell.className = "notification-mute"; bell.dataset.notificationMute = "true";
     bell.title = "Mute availability notifications"; bell.setAttribute("aria-label", bell.title); bell.setAttribute("aria-pressed", "false");
     const icon = document.createElement("img"); icon.alt = ""; icon.width = 24; icon.height = 24; icon.decoding = "async"; bell.append(icon);
     bell.disabled = true; container.append(bell);
     const label = (muted: boolean) => { icon.src = muted ? "/icons/bell-snooze.svg" : "/icons/bell-alert.svg"; bell.setAttribute("aria-pressed", String(muted)); bell.dataset.muted = String(muted); };
-    api<{ muted: boolean }>(`/api/account/notifications/mutes/${kind}/${encodeURIComponent(mbid)}`)
-      .then((state) => { label(state.muted); bell.disabled = false; })
-      .catch(() => bell.remove());
+    api<{ muted: boolean }>(`/api/account/notifications/mutes/${kind}/${encodeURIComponent(mbid)}`, {
+      signal: detailSessionAbort.signal,
+    })
+      .then((state) => {
+        if (!isCurrentDetailAction(action)) return;
+        label(state.muted);
+        bell.disabled = false;
+      })
+      .catch(() => {
+        if (isCurrentDetailAction(action)) bell.remove();
+      });
     bell.addEventListener("click", async (event) => {
       event.preventDefault(); event.stopPropagation();
+      const action = captureDetailActionContext();
       const muted = bell.dataset.muted !== "true"; bell.disabled = true;
-      try { const state = await api<{ muted: boolean }>(`/api/account/notifications/mutes/${kind}/${encodeURIComponent(mbid)}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ muted }) }); label(state.muted); }
+      try {
+        const state = await api<{ muted: boolean }>(`/api/account/notifications/mutes/${kind}/${encodeURIComponent(mbid)}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ muted }),
+          signal: detailSessionAbort.signal,
+        });
+        if (!isCurrentDetailAction(action)) return;
+        label(state.muted);
+      }
       catch { /* Keep the last known state; the account page exposes details. */ }
-      finally { bell.disabled = false; }
+      finally {
+        if (isCurrentDetailAction(action)) bell.disabled = false;
+      }
     });
   }
 
@@ -1854,16 +1982,20 @@
       save.disabled = true;
       message.classList.remove("error");
       message.textContent = isAdmin ? "Verifying with MusicBrainz…" : "Submitting suggestion…";
+      const action = captureDetailActionContext();
       try {
         const payload = isAdmin
           ? await api(endpoint, {
               method: "PUT",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ releaseGroup: input.value.trim() }),
+              signal: detailSessionAbort.signal,
             })
-          : await postJson(endpoint, { releaseGroup: input.value.trim() });
+          : await postJson(endpoint, { releaseGroup: input.value.trim() }, detailSessionAbort.signal);
+        if (!isCurrentDetailAction(action)) return;
         updateAnimeThemeMapping(theme, payload);
       } catch (error) {
+        if (!isCurrentDetailAction(action) || error.name === "AbortError") return;
         message.classList.add("error");
         message.textContent = error.message;
         save.disabled = false;
@@ -1884,10 +2016,16 @@
         save.disabled = true;
         message.classList.remove("error");
         message.textContent = "Removing local mapping…";
+        const action = captureDetailActionContext();
         try {
-          const payload = await api(endpoint, { method: "DELETE" });
+          const payload = await api(endpoint, {
+            method: "DELETE",
+            signal: detailSessionAbort.signal,
+          });
+          if (!isCurrentDetailAction(action)) return;
           updateAnimeThemeMapping(theme, payload);
         } catch (error) {
+          if (!isCurrentDetailAction(action) || error.name === "AbortError") return;
           message.classList.add("error");
           message.textContent = error.message;
           unlink.disabled = false;
@@ -1963,15 +2101,18 @@
       const finish = async (approved: boolean) => {
         approve.disabled = true;
         reject.disabled = true;
+        const action = captureDetailActionContext();
         try {
           const payload = approved
-            ? await postJson(`${proposalEndpoint}/approve`, {})
-            : await api(proposalEndpoint, { method: "DELETE" });
+            ? await postJson(`${proposalEndpoint}/approve`, {}, detailSessionAbort.signal)
+            : await api(proposalEndpoint, { method: "DELETE", signal: detailSessionAbort.signal });
+          if (!isCurrentDetailAction(action)) return;
           if (payload.proposals === undefined) {
             theme.proposals = proposals.filter((candidate) => candidate !== proposal);
           }
           updateAnimeThemeMapping(theme, payload);
         } catch (error) {
+          if (!isCurrentDetailAction(action) || error.name === "AbortError") return;
           approve.disabled = false;
           reject.disabled = false;
           showToast(error.message, true);
@@ -2042,6 +2183,7 @@
     ) => {
       button.disabled = true;
       button.textContent = "Confirming…";
+      const action = captureDetailActionContext();
       const endpoint = `/api/anime/${encodeURIComponent(String(currentDetail?.id || ""))}`
         + `/themes/${encodeURIComponent(String(theme.id))}/mapping`;
       try {
@@ -2052,9 +2194,12 @@
             confirmAutomatic: true,
             releaseGroup: releaseGroupId,
           }),
+          signal: detailSessionAbort.signal,
         });
+        if (!isCurrentDetailAction(action)) return;
         updateAnimeThemeMapping(theme, payload);
       } catch (error) {
+        if (!isCurrentDetailAction(action) || error.name === "AbortError") return;
         button.disabled = false;
         button.textContent = failureLabel;
         showToast(error.message, true);
@@ -2135,6 +2280,7 @@
         confirm.disabled = true;
         confirmationMessage.classList.remove("error");
         confirmationMessage.textContent = "Saving recommended MusicBrainz mapping…";
+        const action = captureDetailActionContext();
         const endpoint = `/api/anime/${encodeURIComponent(String(currentDetail?.id || ""))}`
           + `/themes/${encodeURIComponent(String(theme.id))}/mapping`;
         try {
@@ -2145,9 +2291,12 @@
               confirmAutomatic: true,
               releaseGroup: recommendedId,
             }),
+            signal: detailSessionAbort.signal,
           });
+          if (!isCurrentDetailAction(action)) return;
           updateAnimeThemeMapping(theme, payload);
         } catch (error) {
+          if (!isCurrentDetailAction(action) || error.name === "AbortError") return;
           confirmationMessage.classList.add("error");
           confirmationMessage.textContent = error.message;
           confirm.disabled = false;
@@ -2673,7 +2822,11 @@
   }
 
   function scheduleAnimeResolutionPoll(watcher: AnimeResolutionWatcher, delay = 1_000) {
-    if (animeResolutionWatcher !== watcher || watcher.timer) return;
+    if (
+      animeResolutionWatcher !== watcher
+      || watcher.generation !== detailSessionGeneration
+      || watcher.timer
+    ) return;
     watcher.timer = setTimeout(() => {
       watcher.timer = undefined;
       pollAnimeResolution(watcher);
@@ -2681,14 +2834,21 @@
   }
 
   async function pollAnimeResolution(watcher: AnimeResolutionWatcher) {
-    if (animeResolutionWatcher !== watcher) return;
+    if (
+      animeResolutionWatcher !== watcher
+      || watcher.generation !== detailSessionGeneration
+    ) return;
     watcher.attempts += 1;
     try {
       const payload = await getJson(
         `/api/anime/${encodeURIComponent(watcher.slug)}/resolution`,
         30_000,
+        detailSessionAbort.signal,
       );
-      if (animeResolutionWatcher !== watcher) return;
+      if (
+        animeResolutionWatcher !== watcher
+        || watcher.generation !== detailSessionGeneration
+      ) return;
       const polling = applyAnimeResolution(watcher, payload);
       if (polling && watcher.attempts < watcher.maxAttempts) {
         scheduleAnimeResolutionPoll(watcher, 2_000);
@@ -2696,12 +2856,19 @@
         markAnimeResolutionUnavailable(watcher);
       }
     } catch {
-      if (animeResolutionWatcher === watcher) markAnimeResolutionUnavailable(watcher);
+      if (
+        animeResolutionWatcher === watcher
+        && watcher.generation === detailSessionGeneration
+      ) markAnimeResolutionUnavailable(watcher);
     }
   }
 
   function requestAnimeThemeResolution(watcher: AnimeResolutionWatcher, themeId: string) {
-    if (animeResolutionWatcher !== watcher || watcher.requestedThemeIds.has(themeId)) return;
+    if (
+      animeResolutionWatcher !== watcher
+      || watcher.generation !== detailSessionGeneration
+      || watcher.requestedThemeIds.has(themeId)
+    ) return;
     watcher.requestedThemeIds.add(themeId);
     const theme = (watcher.data.themes || [])
       .find((candidate: JsonObject) => String(candidate.id) === themeId);
@@ -2709,14 +2876,20 @@
     watcher.attempts = 0;
     postJson(`/api/anime/${encodeURIComponent(watcher.slug)}/resolve`, {
       themeIds: [themeId],
-    })
+    }, detailSessionAbort.signal)
       .then((payload) => {
-        if (animeResolutionWatcher !== watcher) return;
+        if (
+          animeResolutionWatcher !== watcher
+          || watcher.generation !== detailSessionGeneration
+        ) return;
         const polling = applyAnimeResolution(watcher, payload);
         if (polling) scheduleAnimeResolutionPoll(watcher);
       })
       .catch(() => {
-        if (animeResolutionWatcher !== watcher) return;
+        if (
+          animeResolutionWatcher !== watcher
+          || watcher.generation !== detailSessionGeneration
+        ) return;
         if (theme) theme.resolutionUnavailable = true;
         renderAnimeDetail(watcher.data);
       });
@@ -2758,6 +2931,7 @@
       // MusicBrainz is intentionally rate-limited. Larger anime catalogs need
       // a longer polling window so their background mappings can finish.
       maxAttempts: Math.max(30, Math.min(300, themeCount * 4)),
+      generation: detailSessionGeneration,
       requestedThemeIds: new Set(
         (data.themes || [])
           .filter((theme: JsonObject) => (
@@ -2819,17 +2993,21 @@
         refreshButton.disabled = true;
         refreshButton.textContent = "Refreshing…";
         $("#detail-message").textContent = "Refreshing the complete discography from MusicBrainz…";
+        const action = captureDetailActionContext();
         try {
           const refreshed = await postJson(
             `/api/music/artist/${encodeURIComponent(data.id)}/refresh`,
             {},
+            detailSessionAbort.signal,
           );
-          storeSettledDetail(`artist:${data.id}`, refreshed);
+          if (!storeSettledDetail(`artist:${data.id}`, refreshed, false, action.sessionGeneration)) return;
+          if (!isCurrentDetailAction(action)) return;
           if (currentDetail?.kind === "artist" && currentDetail?.id === data.id) {
             renderDetail("artist", refreshed);
             $("#detail-message").textContent = "Discography refreshed from MusicBrainz.";
           }
         } catch (error) {
+          if (!isCurrentDetailAction(action) || error.name === "AbortError") return;
           $("#detail-message").textContent = error.message;
           refreshButton.disabled = false;
           refreshButton.textContent = "Refresh discography";
@@ -3165,7 +3343,37 @@
   $("#load-recommendations").addEventListener("click", () => {
     loadRecommendations($("#load-recommendations"));
   });
+  function invalidateAuthenticatedDetailState() {
+    detailSessionGeneration += 1;
+    invalidateDetailNavigation();
+    detailSessionAbort.abort();
+    detailSessionAbort = new AbortController();
+    detailPrefetchTimers.forEach((timer) => clearTimeout(timer));
+    detailPrefetchTimers.clear();
+    detailRequests.clear();
+    detailUpgrades.clear();
+    stopArtistRevalidation();
+    stopDetailAvailability();
+    stopAnimeResolution();
+    animeDetailUi.clear();
+    currentDetail = null;
+    currentDetailData = undefined;
+    detailHistory.length = 0;
+    detailOrigin = { view: "discover", scrollY: 0 };
+    lidarrExternalUrlVersion += 1;
+    lidarrExternalUrl = undefined;
+    lidarrExternalUrlRequest = undefined;
+    resetDetailCover();
+    $("#detail-results").replaceChildren();
+    $("#detail-results").removeAttribute("aria-busy");
+    $("#detail-title").textContent = "";
+    $("#detail-eyebrow").textContent = "";
+    $("#detail-subtitle").textContent = "";
+    $("#detail-message").textContent = "";
+  }
+
   window.addEventListener("melodarr-authenticated", () => {
+    invalidateAuthenticatedDetailState();
     loadRecommendations($("#load-recommendations"));
   });
   window.addEventListener("melodarr-recommendations-changed", () => loadRecommendations($("#load-recommendations")));
@@ -3181,12 +3389,7 @@
     searchAbort?.abort();
     clearTimeout(recommendationPoll);
     clearTimeout(searchDebounce);
-    stopArtistRevalidation();
-    stopDetailAvailability();
-    currentDetail = null;
-    currentDetailData = undefined;
-    detailHistory.length = 0;
-    requestedArtist = undefined;
+    invalidateAuthenticatedDetailState();
     $("#recommendation-results").replaceChildren();
     $("#results").replaceChildren();
     $("#results").removeAttribute("aria-busy");
@@ -3221,6 +3424,7 @@
   });
 
   window.addEventListener("melodarr-home", () => {
+    invalidateDetailNavigation();
     currentDetail = null;
     currentDetailData = undefined;
     stopDetailAvailability();
@@ -3228,7 +3432,6 @@
     searchRequestVersion += 1;
     clearTimeout(searchDebounce);
     searchAbort?.abort();
-    requestedArtist = undefined;
     $("#search-form").classList.remove("searching");
     $("#search-form").reset();
     activeSearchType = "artist";
@@ -3274,6 +3477,7 @@
 
   window.addEventListener("popstate", () => {
     if (showDetailFromLocation()) return;
+    invalidateDetailNavigation();
     currentDetail = null;
     currentDetailData = undefined;
     stopDetailAvailability();
@@ -3299,8 +3503,10 @@
   $("#request-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     const advanced = $("#request-dialog details");
-    if (!requestedArtist) return;
-    const body: JsonObject = { mbid: requestedArtist.id };
+    const artist = requestedArtist;
+    if (!artist) return;
+    const action = requestedArtistAction || captureDetailActionContext();
+    const body: JsonObject = { mbid: artist.id };
     if (advanced.open) {
       body.rootFolderPath = $("#request-root-folder").value;
       body.tags = [...$("#request-tags").selectedOptions].map((option) => Number(option.value));
@@ -3308,17 +3514,19 @@
     }
 
     try {
-      const result = await postJson("/api/request", body);
+      const result = await postJson("/api/request", body, detailSessionAbort.signal);
+      if (!isCurrentDetailAction(action)) return;
       $("#request-dialog").close();
       showToast(result.message);
       if (
         currentDetail?.kind === "artist"
-        && currentDetail.id === requestedArtist.id
+        && currentDetail.id === artist.id
         && currentDetailData
       ) {
         startDetailAvailability("artist", currentDetailData, 0);
       }
     } catch (error) {
+      if (!isCurrentDetailAction(action) || error.name === "AbortError") return;
       $("#request-message").textContent = error.message;
     }
   });
