@@ -1574,6 +1574,12 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn('theme = "midnight"', theme_typescript)
         self.assertIn(':root[data-theme="midnight"]', stylesheet)
         self.assertIn(':root[data-theme="warm"]', stylesheet)
+        self.assertEqual(stylesheet.count("--requested:"), 2)
+        self.assertIn(
+            ".request-lifecycle.requested { background: var(--requested-surface); "
+            "color: var(--requested); }",
+            stylesheet,
+        )
 
     def test_detail_navigation_and_mobile_back_to_top_preserve_context(self):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
