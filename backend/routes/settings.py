@@ -160,14 +160,14 @@ def maintenance():
                 "id": "lidarr-library",
                 "name": "Lidarr Library Scan",
                 "type": "process",
-                "schedule": "Every 4 minutes",
+                "schedule": "Every 2 minutes",
                 **lidarr_library_status,
             },
             {
                 "id": "plex-recent",
                 "name": "Plex Recently Added Scan",
                 "type": "process",
-                "schedule": "Every 5 minutes",
+                "schedule": "Every 3 minutes",
                 **plex_recent_status,
             },
             {

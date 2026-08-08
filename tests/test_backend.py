@@ -3884,7 +3884,10 @@ class SettingsMaintenanceTests(DatabaseTestCase):
             ],
         )
         jobs = {job["id"]: job for job in job_rows}
-        self.assertEqual(jobs["lidarr-library"]["schedule"], "Every 4 minutes")
+        self.assertEqual(backend_config.LIDARR_LIBRARY_SCAN_INTERVAL, 2 * 60)
+        self.assertEqual(backend_config.PLEX_RECENT_SCAN_INTERVAL, 3 * 60)
+        self.assertEqual(jobs["lidarr-library"]["schedule"], "Every 2 minutes")
+        self.assertEqual(jobs["plex-recent"]["schedule"], "Every 3 minutes")
         self.assertEqual(jobs["plex-history"]["schedule"], "Every 24 hours")
 
         recommendation = self.client.post(
