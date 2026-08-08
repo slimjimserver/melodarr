@@ -9,6 +9,7 @@ import requests
 
 if __package__ == "backend.workers":
     from ..services import lidarr
+    from . import lidarr_downloads
     from ..storage import (
         complete_lidarr_search,
         defer_lidarr_search,
@@ -19,6 +20,7 @@ if __package__ == "backend.workers":
     )
 else:
     from services import lidarr
+    from workers import lidarr_downloads
     from storage import (
         complete_lidarr_search,
         defer_lidarr_search,
@@ -80,6 +82,7 @@ def _start_album_search(job):
         })
         search.raise_for_status()
         set_lidarr_search_command(job["id"], search.json()["id"])
+        lidarr_downloads.request_poll()
         logger.info(
             "Queued Lidarr album search for %s after metadata refresh completed",
             job["name"],

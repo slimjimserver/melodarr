@@ -108,13 +108,14 @@ def release_group(
     sort_name="Yorushika",
     date="2023-05-08",
     primary_type="Single",
+    secondary_types=(),
 ):
     return {
         "id": group_id,
         "title": title,
         "first-release-date": date,
         "primary-type": primary_type,
-        "secondary-types": [],
+        "secondary-types": list(secondary_types),
         "aliases": [],
         "artist-credit": [
             {
@@ -431,6 +432,44 @@ class AnimeMusicBrainzResolverTests(unittest.TestCase):
         self.assertIn("alias:", search.call_args_list[0].args[0])
         self.musicbrainz_get.assert_not_called()
 
+    def test_release_groups_prioritize_singles_and_lower_special_editions(self):
+        groups = anime_musicbrainz._release_groups(
+            recording(
+                releases=[
+                    release("group-album", "Album", primary_type="Album"),
+                    release("group-ep", "EP", primary_type="EP"),
+                    release("group-single", "Single"),
+                    release(
+                        "group-compilation",
+                        "Compilation single",
+                        secondary_types=("Compilation",),
+                    ),
+                    release(
+                        "group-live",
+                        "Live single",
+                        secondary_types=("Live",),
+                    ),
+                    release(
+                        "group-dj-mix",
+                        "DJ-mix single",
+                        secondary_types=("DJ-mix",),
+                    ),
+                ]
+            )
+        )
+
+        self.assertEqual(
+            [group["id"] for group in groups],
+            [
+                "group-single",
+                "group-compilation",
+                "group-dj-mix",
+                "group-live",
+                "group-ep",
+                "group-album",
+            ],
+        )
+
     @patch("backend.services.anime_musicbrainz.musicbrainz.search")
     def test_shayou_resolves_by_exact_artist_discography_romanization(self, search):
         artist_id = "dfc6a151-3792-4695-8fda-f64723eaa788"
@@ -576,6 +615,7 @@ class AnimeMusicBrainzResolverTests(unittest.TestCase):
         mapping = anime_musicbrainz.resolve_theme(theme())
 
         self.assertEqual(mapping["state"], "ambiguous")
+        self.assertEqual(mapping["matchMethod"], "recording-search")
         self.assertEqual(mapping["recordingId"], "")
         self.assertEqual(
             {item["recordingId"] for item in mapping["recordingCandidates"]},
@@ -606,12 +646,115 @@ class AnimeMusicBrainzResolverTests(unittest.TestCase):
         self.assertEqual(mapping["reason"], "no-exact-recording")
 
     @patch("backend.services.anime_musicbrainz.musicbrainz.search")
-    def test_missing_artist_uses_no_provider_requests(self, search):
+    def test_missing_artist_searches_exact_title_without_artist_lookup(self, search):
+        search.return_value = {"recordings": []}
+
         mapping = anime_musicbrainz.resolve_theme(theme(artists=()))
 
         self.assertEqual(mapping["state"], "unmatched")
         self.assertEqual(mapping["reason"], "missing-artist")
-        search.assert_not_called()
+        search.assert_called_once_with(
+            'recording:"Haruka Kanata"',
+            "recording",
+            priority="background",
+        )
+
+    @patch("backend.services.anime_musicbrainz.musicbrainz.search")
+    def test_unknown_artist_exact_title_is_candidate_only_and_never_resolved(
+        self,
+        search,
+    ):
+        search.return_value = {
+            "recordings": [
+                recording(
+                    score=100,
+                    releases=[release("group-single", "Haruka Kanata")],
+                )
+            ]
+        }
+
+        mapping = anime_musicbrainz.resolve_theme(theme(artists=("Unknown Artist",)))
+
+        self.assertEqual(mapping["state"], "ambiguous")
+        self.assertEqual(mapping["reason"], "missing-artist")
+        self.assertEqual(mapping["matchMethod"], "title-only-recording-search")
+        self.assertEqual(mapping["confidence"], 0)
+        self.assertEqual(mapping["recordingId"], "")
+        self.assertEqual(mapping["artistIds"], [])
+        self.assertEqual(mapping["releaseGroups"][0]["id"], "group-single")
+        self.assertEqual(
+            mapping["recordingCandidates"][0]["recordingId"],
+            "recording-1",
+        )
+        self.assertNotIn("arid:", search.call_args.args[0])
+
+    @patch("backend.services.anime_musicbrainz.musicbrainz.search")
+    def test_title_only_search_filters_versions_and_caps_high_collision_results(
+        self,
+        search,
+    ):
+        search.return_value = {
+            "recordings": [
+                recording(
+                    recording_id="recording-live",
+                    disambiguation="live version",
+                ),
+                *[
+                    recording(
+                        recording_id=f"recording-{index}",
+                        artist_name=f"Artist {index}",
+                        artist_id=f"artist-{index}",
+                        score=100 - index,
+                        releases=[release(f"group-{index}", "Haruka Kanata")],
+                    )
+                    for index in range(7)
+                ],
+            ]
+        }
+
+        mapping = anime_musicbrainz.resolve_theme(theme(artists=()))
+
+        self.assertEqual(mapping["state"], "ambiguous")
+        self.assertEqual(mapping["recordingId"], "")
+        self.assertEqual(
+            len(mapping["recordingCandidates"]),
+            anime_musicbrainz.MAX_RECORDING_CANDIDATES,
+        )
+        self.assertNotIn(
+            "recording-live",
+            {candidate["recordingId"] for candidate in mapping["recordingCandidates"]},
+        )
+
+    @patch("backend.services.anime_musicbrainz.musicbrainz.search")
+    def test_title_only_search_finds_requestable_result_below_unusable_hits(
+        self,
+        search,
+    ):
+        search.return_value = {
+            "recordings": [
+                *[
+                    recording(
+                        recording_id=f"unusable-{index}",
+                        score=100 - index,
+                        releases=[],
+                    )
+                    for index in range(anime_musicbrainz.MAX_RECORDING_CANDIDATES)
+                ],
+                recording(
+                    recording_id="requestable",
+                    score=50,
+                    releases=[release("requestable-group", "Haruka Kanata")],
+                ),
+            ]
+        }
+
+        mapping = anime_musicbrainz.resolve_theme(theme(artists=()))
+
+        self.assertEqual(mapping["state"], "ambiguous")
+        self.assertEqual(
+            [candidate["recordingId"] for candidate in mapping["recordingCandidates"]],
+            ["requestable"],
+        )
 
     @patch("backend.services.anime_musicbrainz.musicbrainz.search")
     def test_provider_failure_has_a_safe_short_lived_state(self, search):
@@ -700,6 +843,57 @@ class AnimeMusicBrainzResolverTests(unittest.TestCase):
         anime_metadata.request_resolution("naruto", [first])
         with anime_metadata.queue_lock:
             self.assertFalse(anime_metadata.queued_themes)
+
+    def test_worker_explicit_ids_queue_only_selected_but_report_all_themes(self):
+        first = theme(song_id="song-1")
+        second = {
+            **theme(song_id="song-2", title="Second Song"),
+            "id": "theme-2",
+        }
+
+        result = anime_metadata.request_resolution(
+            "naruto",
+            [first, second],
+            requested_theme_ids=["theme-2"],
+        )
+
+        first_key = anime_musicbrainz.theme_mapping_key(first)
+        second_key = anime_musicbrainz.theme_mapping_key(second)
+        self.assertEqual(result["total"], 2)
+        self.assertEqual(result["queued"], 1)
+        self.assertFalse(result["mappings"][first_key]["queued"])
+        self.assertTrue(result["mappings"][second_key]["queued"])
+        with anime_metadata.queue_lock:
+            self.assertEqual(set(anime_metadata.queued_themes), {second_key})
+
+    def test_worker_explicit_mapping_key_selects_theme_and_empty_list_queues_none(self):
+        first = theme(song_id="song-1")
+        second = {
+            **theme(song_id="song-2", title="Second Song"),
+            "id": "theme-2",
+        }
+        second_key = anime_musicbrainz.theme_mapping_key(second)
+
+        empty = anime_metadata.request_resolution(
+            "naruto",
+            [first, second],
+            requested_theme_ids=[],
+        )
+
+        self.assertEqual(empty["total"], 2)
+        self.assertEqual(empty["queued"], 0)
+        self.assertFalse(empty["polling"])
+        with anime_metadata.queue_lock:
+            self.assertFalse(anime_metadata.queued_themes)
+
+        selected = anime_metadata.request_resolution(
+            "naruto",
+            [first, second],
+            requested_theme_ids=[second_key],
+        )
+        self.assertEqual(selected["queued"], 1)
+        with anime_metadata.queue_lock:
+            self.assertEqual(set(anime_metadata.queued_themes), {second_key})
 
 
 class AnimeMusicBrainzRegistryIntegrationTests(unittest.TestCase):

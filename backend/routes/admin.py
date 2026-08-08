@@ -11,6 +11,7 @@ if __package__ == "backend.routes":
         _profile_history_item,
         _profile_plex_index,
         _requested_page,
+        apply_release_group_lifecycle,
     )
     from ..responses import api_error
     from ..security import admin_required, current_user
@@ -26,6 +27,7 @@ else:  # Support the existing `python backend/app.py` entry point.
         _profile_history_item,
         _profile_plex_index,
         _requested_page,
+        apply_release_group_lifecycle,
     )
     from responses import api_error
     from security import admin_required, current_user
@@ -80,6 +82,12 @@ REQUEST_HISTORY_FIELDS = (
     "artist_name",
     "release_type",
     "release_date",
+    "anime_slug",
+    "anime_name",
+    "theme_id",
+    "theme_label",
+    "song_id",
+    "song_title",
     "created_at",
 )
 
@@ -177,6 +185,12 @@ def requests():
                 request_history.artist_name,
                 request_history.release_type,
                 request_history.release_date,
+                request_history.anime_slug,
+                request_history.anime_name,
+                request_history.theme_id,
+                request_history.theme_label,
+                request_history.song_id,
+                request_history.song_title,
                 request_history.created_at,
                 users.username AS local_username,
                 users.role,
@@ -193,14 +207,18 @@ def requests():
         ).fetchall()
 
     plex_index = _profile_plex_index()
+    anime_link_cache = {}
+    lifecycle_rows = [
+        {"id": row["request_id"], **{field: row[field] for field in REQUEST_HISTORY_FIELDS}}
+        for row in rows
+    ]
+    apply_release_group_lifecycle(lifecycle_rows)
     payload = []
-    for row in rows:
+    for row, lifecycle_row in zip(rows, lifecycle_rows):
         history_item = _profile_history_item(
-            {
-                "id": row["request_id"],
-                **{field: row[field] for field in REQUEST_HISTORY_FIELDS},
-            },
+            lifecycle_row,
             plex_index,
+            anime_link_cache,
         )
         history_item["requester"] = _requester_payload(row)
         payload.append(history_item)

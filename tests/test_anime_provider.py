@@ -290,6 +290,11 @@ class AnimeRouteTests(unittest.TestCase):
         )
         self.registry_mapping = registry_mapping.start()
         self.addCleanup(registry_mapping.stop)
+        theme_link_sync = patch(
+            "backend.routes.anime.anime_theme_links.sync_anime_theme_mapping"
+        )
+        self.theme_link_sync = theme_link_sync.start()
+        self.addCleanup(theme_link_sync.stop)
 
     def _get(self, path):
         with patch("backend.security.current_user", return_value={"id": 1}):
@@ -383,6 +388,153 @@ class AnimeRouteTests(unittest.TestCase):
             response.get_json(),
             {"error": "Administrator access is required."},
         )
+
+    @patch("backend.routes.anime.anime_mapping_registry.submit_mapping_proposal")
+    @patch("backend.routes.anime.musicbrainz.get")
+    @patch("backend.routes.anime.animethemes.detail")
+    def test_user_can_submit_a_verified_override_without_updating_registry(
+        self, detail, musicbrainz_get, submit_proposal
+    ):
+        mbid = "6259b4f8-39b2-4b46-98e0-5dd433630abc"
+        theme = {
+            "id": 1477,
+            "label": "Opening 1",
+            "song": {
+                "id": 2451,
+                "title": "Shayou",
+                "artists": [{"name": "Yorushika"}],
+            },
+        }
+        detail.return_value = {
+            "slug": "anime",
+            "name": "Anime",
+            "themes": [theme],
+        }
+        musicbrainz_get.return_value = {
+            "id": mbid,
+            "title": "斜陽",
+            "primary-type": "Single",
+            "first-release-date": "2023-05-08",
+            "artist-credit": [{
+                "name": "ヨルシカ",
+                "artist": {"id": "cb9266b4-8537-4687-8763-5129c583be53"},
+            }],
+        }
+        submit_proposal.return_value = {
+            "id": 7,
+            "status": "pending",
+            "releaseGroupMbid": mbid,
+        }
+        user = {"id": 2, "role": "user"}
+
+        with patch("backend.security.current_user", return_value=user), patch(
+            "backend.routes.anime.current_user", return_value=user
+        ):
+            response = self.client.post(
+                "/api/anime/anime/themes/1477/mapping-proposals",
+                json={"releaseGroup": f"https://musicbrainz.org/release-group/{mbid}"},
+            )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.get_json()["proposal"]["status"], "pending")
+        submit_proposal.assert_called_once()
+        call = submit_proposal.call_args
+        self.assertEqual(call.args, (2,))
+        self.assertEqual(call.kwargs["anime_slug"], "anime")
+        self.assertEqual(call.kwargs["theme_id"], 1477)
+        self.assertEqual(call.kwargs["song_id"], 2451)
+        self.assertEqual(call.kwargs["target"]["primaryType"], "Single")
+
+    @patch("backend.routes.anime.anime_mapping_registry.mapping_proposals_for_anime")
+    @patch("backend.routes.anime.anime_musicbrainz.registered_mapping")
+    @patch("backend.routes.anime.anime_mapping_registry.approve_mapping_proposal")
+    @patch("backend.routes.anime.anime_mapping_registry.get_mapping_proposal")
+    def test_admin_approval_returns_public_mapping_and_cleared_review_queue(
+        self, get_proposal, approve_proposal, registered_mapping, proposals_for_anime
+    ):
+        group_id = "6259b4f8-39b2-4b46-98e0-5dd433630abc"
+        proposal = {
+            "id": 7,
+            "userId": 2,
+            "animeSlug": "anime",
+            "animeName": "Anime",
+            "themeId": 1477,
+            "themeLabel": "Opening 1",
+            "songId": 2451,
+            "songTitle": "Shayou",
+            "artists": ["Yorushika"],
+            "status": "pending",
+        }
+        get_proposal.return_value = proposal
+        approve_proposal.return_value = {**proposal, "status": "approved"}
+        registered_mapping.return_value = {
+            "state": "resolved",
+            "mappingSource": "local",
+            "releaseGroups": [{"id": group_id, "name": "斜陽"}],
+        }
+        proposals_for_anime.return_value = []
+        admin = {"id": 1, "role": "admin"}
+
+        with patch("backend.routes.anime.current_user", return_value=admin):
+            response = self._admin_request(
+                "POST",
+                "/api/anime/anime/themes/1477/mapping-proposals/7/approve",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        mapping = response.get_json()["mapping"]
+        self.assertEqual(mapping["status"], "resolved")
+        self.assertEqual(mapping["releaseGroups"][0]["id"], group_id)
+        self.assertEqual(mapping["proposals"], [])
+        self.assertEqual(response.get_json()["proposals"], [])
+        approve_proposal.assert_called_once_with(7, 1)
+        self.theme_link_sync.assert_called_once()
+        self.assertEqual(self.theme_link_sync.call_args.args[0]["slug"], "anime")
+        self.assertEqual(self.theme_link_sync.call_args.args[1]["id"], 1477)
+        self.assertEqual(
+            self.theme_link_sync.call_args.args[2]["releaseGroups"][0]["id"],
+            group_id,
+        )
+
+    @patch("backend.routes.anime.anime_mapping_registry.mapping_proposals_for_anime")
+    @patch("backend.routes.anime.anime_metadata_worker.mappings_for")
+    @patch("backend.routes.anime.anime_mapping_registry.reject_mapping_proposal")
+    @patch("backend.routes.anime.anime_mapping_registry.get_mapping_proposal")
+    def test_admin_rejection_returns_mapping_with_cleared_review_queue(
+        self, get_proposal, reject_proposal, mappings_for, proposals_for_anime
+    ):
+        proposal = {
+            "id": 7,
+            "userId": 2,
+            "animeSlug": "anime",
+            "animeName": "Anime",
+            "themeId": 1477,
+            "themeLabel": "Opening 1",
+            "songId": 2451,
+            "songTitle": "Shayou",
+            "artists": ["Yorushika"],
+            "status": "pending",
+        }
+        get_proposal.return_value = proposal
+        reject_proposal.return_value = {**proposal, "status": "rejected"}
+        mappings_for.return_value = {}
+        proposals_for_anime.return_value = []
+        admin = {"id": 1, "role": "admin"}
+
+        with patch("backend.routes.anime.current_user", return_value=admin):
+            response = self._admin_request(
+                "DELETE",
+                "/api/anime/anime/themes/1477/mapping-proposals/7",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["mapping"]["proposals"], [])
+        self.assertEqual(response.get_json()["proposals"], [])
+        self.assertEqual(response.get_json()["proposal"]["status"], "rejected")
+        reject_proposal.assert_called_once_with(7, 1)
+        self.theme_link_sync.assert_called_once()
+        self.assertEqual(self.theme_link_sync.call_args.args[0]["slug"], "anime")
+        self.assertEqual(self.theme_link_sync.call_args.args[1]["id"], 1477)
 
     @patch("backend.routes.anime.anime_musicbrainz.registered_mapping")
     @patch("backend.routes.anime.anime_mapping_registry.upsert_mapping")
@@ -660,6 +812,223 @@ class AnimeRouteTests(unittest.TestCase):
             preferred_release_group_mbid=group_id,
         )
 
+    @patch("backend.routes.anime.anime_theme_links.sync_anime_theme_mapping")
+    @patch("backend.routes.anime.anime_musicbrainz.registered_mapping")
+    @patch("backend.routes.anime.anime_mapping_registry.upsert_mapping")
+    @patch("backend.routes.anime.anime_musicbrainz.cached_mapping")
+    @patch("backend.routes.anime.musicbrainz.get")
+    @patch("backend.routes.anime.animethemes.detail")
+    def test_admin_can_confirm_an_explicit_ambiguous_automatic_candidate(
+        self,
+        detail,
+        musicbrainz_get,
+        cached_mapping,
+        upsert_mapping,
+        registered_mapping,
+        sync_mapping,
+    ):
+        first_group = "6259b4f8-39b2-4b46-98e0-5dd433630abc"
+        selected_group = "11111111-2222-4333-8444-555555555555"
+        selected_recording = "1e9b7625-9184-493b-be13-b0b6d12040c9"
+        selected_artist = "cb9266b4-8537-4687-8763-5129c583be53"
+        theme = {
+            "id": 1477,
+            "label": "Opening 4",
+            "type": "OP",
+            "sequence": 4,
+            "song": {
+                "id": 2451,
+                "title": "GO!!!",
+                "artists": [{"name": "Unknown Artist"}],
+            },
+        }
+        anime = {"slug": "naruto", "name": "Naruto", "themes": [theme]}
+        detail.return_value = anime
+        cached_mapping.return_value = {
+            "state": "ambiguous",
+            "reason": "missing-artist",
+            "matchMethod": "title-only-recording-search",
+            "recordingId": "",
+            "artistIds": [],
+            "releaseGroups": [
+                {
+                    "id": first_group,
+                    "name": "GO!!!",
+                    "artist": "Other artist",
+                    "type": "Album",
+                    "date": "2005-01-01",
+                },
+                {
+                    "id": selected_group,
+                    "name": "GO!!!",
+                    "artist": "FLOW",
+                    "type": "Single",
+                    "date": "2004-04-28",
+                    "mappingScope": "commercial_full",
+                },
+            ],
+            "recordingCandidates": [{
+                "recordingId": selected_recording,
+                "recordingTitle": "GO!!!",
+                "artist": "FLOW",
+                "artistIds": [selected_artist],
+                "releaseGroups": [{"id": selected_group, "name": "GO!!!"}],
+            }],
+        }
+        registered_mapping.return_value = {
+            "state": "resolved",
+            "mappingSource": "local",
+            "registryStatus": "confirmed",
+            "registryProvenance": "manual-confirmation",
+            "releaseGroups": [{"id": selected_group, "name": "GO!!!"}],
+        }
+
+        response = self._admin_request(
+            "PUT",
+            "/api/anime/naruto/themes/1477/mapping",
+            json={"confirmAutomatic": True, "releaseGroup": selected_group},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json()["message"],
+            "Automatic match candidate confirmed.",
+        )
+        self.assertEqual(
+            response.get_json()["mapping"]["releaseGroups"][0]["id"],
+            selected_group,
+        )
+        musicbrainz_get.assert_not_called()
+        upsert_mapping.assert_called_once_with(
+            2451,
+            title="GO!!!",
+            artists=["Unknown Artist"],
+            status="confirmed",
+            provenance="manual-confirmation",
+            scope="unknown",
+            targets=[{
+                "releaseGroupId": selected_group,
+                "recordingIds": [selected_recording],
+                "artistIds": [selected_artist],
+                "releaseGroupTitle": "GO!!!",
+                "artistName": "FLOW",
+                "primaryType": "Single",
+                "firstReleaseDate": "2004-04-28",
+                "scope": "commercial_full",
+                "preferred": True,
+            }],
+            preferred_release_group_mbid=selected_group,
+        )
+        sync_mapping.assert_called_once()
+        self.assertEqual(sync_mapping.call_args.args[0], anime)
+        self.assertEqual(sync_mapping.call_args.args[1], theme)
+        self.assertEqual(
+            sync_mapping.call_args.args[2]["releaseGroups"][0]["id"],
+            selected_group,
+        )
+
+    @patch("backend.routes.anime.anime_mapping_registry.upsert_mapping")
+    @patch("backend.routes.anime.anime_musicbrainz.cached_mapping")
+    @patch("backend.routes.anime.animethemes.detail")
+    def test_ambiguous_confirmation_rejects_an_arbitrary_release_group(
+        self,
+        detail,
+        cached_mapping,
+        upsert_mapping,
+    ):
+        candidate_group = "6259b4f8-39b2-4b46-98e0-5dd433630abc"
+        arbitrary_group = "11111111-2222-4333-8444-555555555555"
+        detail.return_value = {
+            "slug": "anime",
+            "themes": [{"id": 1, "song": {"id": 9, "title": "Song"}}],
+        }
+        cached_mapping.return_value = {
+            "state": "ambiguous",
+            "reason": "multiple-exact-release-groups",
+            "matchMethod": "artist-discography-title",
+            "releaseGroups": [{"id": candidate_group, "name": "Song"}],
+        }
+
+        response = self._admin_request(
+            "PUT",
+            "/api/anime/anime/themes/1/mapping",
+            json={"confirmAutomatic": True, "releaseGroup": arbitrary_group},
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("not part", response.get_json()["error"])
+        upsert_mapping.assert_not_called()
+
+    @patch("backend.routes.anime.anime_mapping_registry.upsert_mapping")
+    @patch("backend.routes.anime.anime_musicbrainz.cached_mapping")
+    @patch("backend.routes.anime.animethemes.detail")
+    def test_ambiguous_confirmation_requires_an_explicit_release_group(
+        self,
+        detail,
+        cached_mapping,
+        upsert_mapping,
+    ):
+        candidate_group = "6259b4f8-39b2-4b46-98e0-5dd433630abc"
+        detail.return_value = {
+            "slug": "anime",
+            "themes": [{"id": 1, "song": {"id": 9, "title": "Song"}}],
+        }
+        cached_mapping.return_value = {
+            "state": "ambiguous",
+            "reason": "missing-artist",
+            "matchMethod": "title-only-recording-search",
+            "releaseGroups": [{"id": candidate_group, "name": "Song"}],
+        }
+
+        response = self._admin_request(
+            "PUT",
+            "/api/anime/anime/themes/1/mapping",
+            json={"confirmAutomatic": True},
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("Choose", response.get_json()["error"])
+        upsert_mapping.assert_not_called()
+
+    @patch("backend.routes.anime.anime_musicbrainz.registered_mapping")
+    @patch("backend.routes.anime.anime_mapping_registry.upsert_mapping")
+    @patch("backend.routes.anime.anime_musicbrainz.cached_mapping")
+    @patch("backend.routes.anime.animethemes.detail")
+    def test_ambiguous_confirmation_allows_a_legacy_cached_candidate(
+        self,
+        detail,
+        cached_mapping,
+        upsert_mapping,
+        registered_mapping,
+    ):
+        candidate_group = "6259b4f8-39b2-4b46-98e0-5dd433630abc"
+        detail.return_value = {
+            "slug": "anime",
+            "themes": [{"id": 1, "song": {"id": 9, "title": "Song"}}],
+        }
+        cached_mapping.return_value = {
+            "state": "ambiguous",
+            "releaseGroups": [{"id": candidate_group, "name": "Song"}],
+        }
+        registered_mapping.return_value = {
+            "state": "resolved",
+            "mappingSource": "local",
+            "releaseGroups": [{"id": candidate_group, "name": "Song"}],
+        }
+
+        response = self._admin_request(
+            "PUT",
+            "/api/anime/anime/themes/1/mapping",
+            json={"confirmAutomatic": True, "releaseGroup": candidate_group},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json()["message"],
+            "Automatic match candidate confirmed.",
+        )
+        upsert_mapping.assert_called_once()
+
     @patch("backend.routes.anime.anime_mapping_registry.upsert_mapping")
     @patch("backend.routes.anime.anime_musicbrainz.cached_mapping")
     @patch("backend.routes.anime.animethemes.detail")
@@ -773,6 +1142,11 @@ class AnimeRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["mapping"]["status"], "pending")
         delete_mapping.assert_called_once_with(1477)
+        self.theme_link_sync.assert_called_once_with(
+            detail.return_value,
+            theme,
+            response.get_json()["mapping"],
+        )
 
     @patch("backend.routes.anime.anime_mapping_registry.get_mapping")
     @patch("backend.routes.anime.animethemes.detail")
@@ -861,6 +1235,9 @@ class AnimeRouteTests(unittest.TestCase):
         mapping = response.get_json()["themes"][0]["mapping"]
         self.assertEqual(mapping["status"], "resolved")
         self.assertEqual(mapping["releaseGroups"][0]["name"], "Single")
+        self.theme_link_sync.assert_called_once()
+        self.assertEqual(self.theme_link_sync.call_args.args[0], response.get_json())
+        self.assertEqual(self.theme_link_sync.call_args.args[1]["id"], 1477)
 
     @patch("backend.routes.anime.lidarr.cached_library_availability")
     @patch("backend.routes.anime.anime_musicbrainz.theme_mapping_key")
@@ -898,6 +1275,108 @@ class AnimeRouteTests(unittest.TestCase):
         group = response.get_json()["themes"][0]["mapping"]["releaseGroups"][0]
         self.assertTrue(group["availableInLidarr"])
         self.assertTrue(group["fullyAvailableInLidarr"])
+
+    @patch("backend.routes.anime._plex_index")
+    @patch("backend.routes.anime.anime_musicbrainz.theme_mapping_key")
+    @patch("backend.routes.anime.anime_metadata_worker.mappings_for")
+    @patch("backend.routes.anime.animethemes.detail")
+    def test_detail_enriches_candidates_with_cached_plex_links(
+        self, detail, mappings_for, mapping_key, plex_index
+    ):
+        group_id = "6259b4f8-39b2-4b46-98e0-5dd433630abc"
+        theme = {"id": 1477, "song": {"id": 1477, "title": "Shayou"}}
+        detail.return_value = {"slug": "anime", "themes": [theme]}
+        mapping_key.return_value = "theme-key"
+        mappings_for.return_value = {
+            "theme-key": {
+                "state": "resolved",
+                "releaseGroups": [{"id": group_id, "title": "斜陽"}],
+            }
+        }
+        plex_index.return_value = {
+            "releaseGroupsByMbid": {
+                group_id: [{
+                    "name": "斜陽",
+                    "releaseType": "Single",
+                    "musicbrainzReleaseId": "release-id",
+                    "url": "https://app.plex.tv/album",
+                    "plexampUrl": "plexamp://album",
+                }]
+            }
+        }
+
+        response = self._get("/api/anime/anime")
+
+        group = response.get_json()["themes"][0]["mapping"]["releaseGroups"][0]
+        self.assertTrue(group["availableInPlex"])
+        self.assertEqual(group["plexUrl"], "https://app.plex.tv/album")
+        self.assertEqual(group["plexampUrl"], "plexamp://album")
+        self.assertEqual(group["plexReleases"][0]["releaseId"], "release-id")
+
+    @patch("backend.routes.anime.anime_mapping_registry.mapping_proposals_for_anime")
+    @patch("backend.routes.anime.anime_musicbrainz.theme_mapping_key")
+    @patch("backend.routes.anime.anime_metadata_worker.mappings_for")
+    @patch("backend.routes.anime.animethemes.detail")
+    def test_detail_exposes_personal_proposal_and_admin_review_queue(
+        self, detail, mappings_for, mapping_key, proposals_for_anime
+    ):
+        theme = {"id": 1477, "song": {"id": 2451, "title": "Shayou"}}
+        detail.return_value = {"slug": "anime", "themes": [theme]}
+        mapping_key.return_value = "theme-key"
+        mappings_for.return_value = {"theme-key": {"state": "pending"}}
+        proposals_for_anime.return_value = [{
+            "id": 7,
+            "userId": 1,
+            "themeId": 1477,
+            "status": "pending",
+        }]
+        admin = {"id": 1, "role": "admin"}
+
+        with patch("backend.security.current_user", return_value=admin), patch(
+            "backend.routes.anime.current_user", return_value=admin
+        ):
+            response = self.client.get("/api/anime/anime")
+
+        mapping = response.get_json()["themes"][0]["mapping"]
+        self.assertEqual(mapping["myProposal"]["id"], 7)
+        self.assertEqual([item["id"] for item in mapping["proposals"]], [7])
+        proposals_for_anime.assert_called_once_with(
+            "anime",
+            submitter_user_id=1,
+            include_all_pending=True,
+        )
+
+    @patch("backend.routes.anime.anime_mapping_registry.mapping_proposals_for_anime")
+    @patch("backend.routes.anime.anime_metadata_worker.mappings_for", return_value={})
+    @patch("backend.routes.anime.animethemes.detail")
+    def test_detail_scopes_non_admin_proposals_to_the_current_user(
+        self, detail, mappings_for, proposals_for_anime
+    ):
+        detail.return_value = {
+            "slug": "anime",
+            "themes": [{"id": 1477, "song": {"id": 2451, "title": "Shayou"}}],
+        }
+        proposals_for_anime.return_value = [{
+            "id": 7,
+            "userId": 2,
+            "themeId": 1477,
+            "status": "pending",
+        }]
+        user = {"id": 2, "role": "user"}
+
+        with patch("backend.security.current_user", return_value=user), patch(
+            "backend.routes.anime.current_user", return_value=user
+        ):
+            response = self.client.get("/api/anime/anime")
+
+        mapping = response.get_json()["themes"][0]["mapping"]
+        self.assertEqual(mapping["myProposal"]["id"], 7)
+        self.assertNotIn("proposals", mapping)
+        proposals_for_anime.assert_called_once_with(
+            "anime",
+            submitter_user_id=2,
+            include_all_pending=False,
+        )
 
     @patch("backend.routes.anime.lidarr.cached_library_availability")
     @patch("backend.routes.anime.anime_musicbrainz.theme_mapping_key")
@@ -953,7 +1432,73 @@ class AnimeRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 202)
         payload = response.get_json()
         self.assertEqual(payload["mappings"]["1477"]["status"], "pending")
-        request_resolution.assert_called_once_with("naruto", [theme])
+        request_resolution.assert_called_once_with(
+            "naruto",
+            [theme],
+            requested_theme_ids=None,
+        )
+
+    @patch("backend.routes.anime.anime_musicbrainz.theme_mapping_key")
+    @patch("backend.routes.anime.anime_metadata_worker.request_resolution")
+    @patch("backend.routes.anime.animethemes.detail")
+    def test_resolution_request_can_target_visible_themes_only(
+        self, detail, request_resolution, mapping_key
+    ):
+        themes = [
+            {"id": 10, "song": {"id": 110, "title": "Opening"}},
+            {"id": 20, "song": {"id": 120, "title": "Ending"}},
+        ]
+        detail.return_value = {"slug": "anime", "themes": themes}
+        mapping_key.side_effect = ["opening", "ending"]
+        request_resolution.return_value = {
+            "status": "idle",
+            "polling": False,
+            "mappings": {
+                "opening": {"state": "pending"},
+                "ending": {"state": "pending"},
+            },
+        }
+
+        with patch("backend.security.current_user", return_value={"id": 1}):
+            response = self.client.post(
+                "/api/anime/anime/resolve",
+                json={"themeIds": [20]},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        request_resolution.assert_called_once_with(
+            "anime",
+            themes,
+            requested_theme_ids=["20"],
+        )
+
+    @patch("backend.routes.anime.anime_musicbrainz.theme_mapping_key")
+    @patch("backend.routes.anime.anime_metadata_worker.request_resolution")
+    @patch("backend.routes.anime.animethemes.detail")
+    def test_resolution_request_preserves_explicit_empty_theme_list(
+        self, detail, request_resolution, mapping_key
+    ):
+        theme = {"id": 10, "song": {"id": 110, "title": "Opening"}}
+        detail.return_value = {"slug": "anime", "themes": [theme]}
+        mapping_key.return_value = "opening"
+        request_resolution.return_value = {
+            "status": "idle",
+            "polling": False,
+            "mappings": {"opening": {"state": "pending"}},
+        }
+
+        with patch("backend.security.current_user", return_value={"id": 1}):
+            response = self.client.post(
+                "/api/anime/anime/resolve",
+                json={"themeIds": []},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        request_resolution.assert_called_once_with(
+            "anime",
+            [theme],
+            requested_theme_ids=[],
+        )
 
     @patch("backend.routes.anime.animethemes.detail")
     def test_detail_returns_404_for_missing_anime(self, detail):

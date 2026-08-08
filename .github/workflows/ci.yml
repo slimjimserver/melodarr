@@ -41,6 +41,12 @@ jobs:
       - name: Build browser assets
         run: pnpm run build
 
+      - name: Install Chromium
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Run browser regression tests
+        run: pnpm run test:browser
+
   tests:
     name: Python tests
     runs-on: ubuntu-latest

@@ -14,6 +14,7 @@ import sqlite3
 import tempfile
 import time
 import unittest
+from datetime import timedelta, timezone
 from threading import Barrier, BrokenBarrierError, Event, Thread
 from urllib.parse import parse_qs, urlparse
 from unittest.mock import Mock, patch
@@ -43,7 +44,14 @@ from backend.api_cache import (
 )
 from backend.application import create_app
 from backend.config import ARTWORK_CACHE_DIRECTORY
-from backend.services import lidarr, musicbrainz, plex, plex_auth, plex_history
+from backend.services import (
+    anime_theme_links,
+    lidarr,
+    musicbrainz,
+    plex,
+    plex_auth,
+    plex_history,
+)
 from backend.storage import (
     db,
     enqueue_lidarr_search,
@@ -63,6 +71,7 @@ from backend.workers import anime_metadata as anime_metadata_worker
 from backend.workers import artist_metadata as artist_metadata_worker
 from backend.workers import lidarr_searches as lidarr_search_worker
 from backend.workers import lidarr_library as lidarr_library_worker
+from backend.workers import lidarr_downloads as lidarr_download_worker
 from backend.workers import plex as plex_worker
 from backend.workers import plex_history as plex_history_worker
 from backend.workers import plex_metadata as plex_metadata_worker
@@ -200,8 +209,26 @@ class ApplicationFactoryTests(DatabaseTestCase):
             for method in rule.methods
             if method not in {"HEAD", "OPTIONS"}
         }
-        self.assertEqual(len(rules), 74)
-        self.assertEqual(len(route_methods), 74)
+        self.assertEqual(len(rules), 92)
+        self.assertEqual(len(route_methods), 92)
+        notification_routes = {
+            ("/api/settings/notifications", "GET"),
+            ("/api/settings/notifications", "PUT"),
+            ("/api/settings/notifications/global", "PUT"),
+            ("/api/settings/notifications/email", "PUT"),
+            ("/api/settings/notifications/web-push", "PUT"),
+            ("/api/settings/notifications/email/test", "POST"),
+            ("/api/settings/notifications/web-push/test", "POST"),
+            ("/api/account/notifications", "GET"),
+            ("/api/account/notifications", "PUT"),
+            ("/api/account/notifications/subscriptions", "POST"),
+            ("/api/account/notifications/subscriptions/<int:subscription_id>", "DELETE"),
+            ("/api/account/notifications/mutes/<kind>/<mbid>", "GET"),
+            ("/api/account/notifications/mutes/<kind>/<mbid>", "PUT"),
+            ("/service-worker.js", "GET"),
+        }
+        self.assertTrue(notification_routes <= route_methods)
+        self.assertIn(("/settings/notifications", "GET"), route_methods)
 
     def test_factory_applies_test_configuration(self):
         self.assertTrue(self.app.config["TESTING"])
@@ -426,31 +453,37 @@ class WorkerEntrypointTests(unittest.TestCase):
     @patch("backend.worker.Thread")
     @patch("backend.worker.recommendation_worker.run")
     @patch("backend.worker.init_db")
+    @patch("backend.worker.init_cache_db")
     def test_worker_initializes_storage_and_background_loops(
-        self, init_db, run, thread_class
+        self, init_cache_db, init_db, run, thread_class
     ):
         calls = []
         anime_metadata_thread = Mock()
         artist_metadata_thread = Mock()
         lidarr_thread = Mock()
+        lidarr_download_thread = Mock()
         plex_thread = Mock()
         plex_metadata_thread = Mock()
         plex_history_thread = Mock()
         lidarr_library_thread = Mock()
+        notification_thread = Mock()
         thread_class.side_effect = [
             anime_metadata_thread,
             artist_metadata_thread,
             lidarr_thread,
+            lidarr_download_thread,
             lidarr_library_thread,
             plex_thread,
             plex_metadata_thread,
             plex_history_thread,
+            notification_thread,
         ]
         init_db.side_effect = lambda: calls.append("database")
+        init_cache_db.side_effect = lambda: calls.append("cache")
         run.side_effect = lambda *_args: calls.append("recommendations")
         worker.main()
-        self.assertEqual(calls, ["database", "recommendations"])
-        self.assertEqual(thread_class.call_count, 7)
+        self.assertEqual(calls, ["cache", "database", "recommendations"])
+        self.assertEqual(thread_class.call_count, 9)
         thread_class.assert_any_call(
             target=anime_metadata_worker.run,
             name="anime-musicbrainz-resolution",
@@ -463,6 +496,16 @@ class WorkerEntrypointTests(unittest.TestCase):
         )
         thread_class.assert_any_call(
             target=lidarr_search_worker.run, name="lidarr-search-followups", daemon=True
+        )
+        thread_class.assert_any_call(
+            target=lidarr_download_worker.run,
+            name="lidarr-download-status",
+            daemon=True,
+        )
+        thread_class.assert_any_call(
+            target=worker.notification_worker.run,
+            name="notification-deliveries",
+            daemon=True,
         )
         thread_class.assert_any_call(
             target=lidarr_library_worker.run,
@@ -488,11 +531,13 @@ class WorkerEntrypointTests(unittest.TestCase):
             daemon=True,
         )
         lidarr_thread.start.assert_called_once_with()
+        lidarr_download_thread.start.assert_called_once_with()
         lidarr_library_thread.start.assert_called_once_with()
         plex_thread.start.assert_called_once_with()
         plex_metadata_thread.start.assert_called_once_with()
         plex_history_thread.start.assert_called_once_with()
         anime_metadata_thread.start.assert_called_once_with()
+        notification_thread.start.assert_called_once_with()
         artist_metadata_thread.start.assert_called_once_with()
         run.assert_called_once_with(worker.RECOMMENDATION_STARTUP_DEADLINE)
 
@@ -1094,11 +1139,12 @@ class LidarrSearchWorkerTests(unittest.TestCase):
         })
         set_refresh.assert_called_once_with([1], 56)
 
+    @patch("backend.workers.lidarr_searches.lidarr_downloads.request_poll")
     @patch("backend.workers.lidarr_searches.set_lidarr_search_command")
     @patch("backend.workers.lidarr_searches.lidarr.start_command")
     @patch("backend.workers.lidarr_searches.lidarr.command")
     def test_completed_refresh_queues_album_search(
-        self, command, start_command, set_search
+        self, command, start_command, set_search, request_poll
     ):
         command.return_value = Response(200, {"status": "completed"})
         start_command.return_value = Response(201, {"id": 66})
@@ -1119,6 +1165,7 @@ class LidarrSearchWorkerTests(unittest.TestCase):
             "albumIds": [33],
         })
         set_search.assert_called_once_with(1, 66)
+        request_poll.assert_called_once_with()
 
     @patch("backend.workers.lidarr_searches.set_lidarr_search_command")
     @patch("backend.workers.lidarr_searches.lidarr.start_command")
@@ -1527,6 +1574,12 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertIn('theme = "midnight"', theme_typescript)
         self.assertIn(':root[data-theme="midnight"]', stylesheet)
         self.assertIn(':root[data-theme="warm"]', stylesheet)
+        self.assertEqual(stylesheet.count("--requested:"), 2)
+        self.assertIn(
+            ".request-lifecycle.requested { background: var(--requested-surface); "
+            "color: var(--requested); }",
+            stylesheet,
+        )
 
     def test_detail_navigation_and_mobile_back_to_top_preserve_context(self):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -3032,6 +3085,49 @@ class AdminUsersTests(DatabaseTestCase):
             local_user_id,
         )
 
+    def test_admin_reads_canonical_target_despite_own_plex_name_collision(self):
+        self.register()
+        target_id = self.add_user("target-user")
+        with db() as connection:
+            connection.execute(
+                "UPDATE users SET plex_username = ? WHERE username = ?",
+                ("target-user", "test-user"),
+            )
+
+        response = self.client.get("/api/account/profile?username=target-user")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["user"]["id"], target_id)
+
+    def test_admin_updates_canonical_target_despite_own_plex_name_collision(self):
+        csrf_token = self.register()
+        target_id = self.add_user("target-user")
+        with db() as connection:
+            connection.execute(
+                "UPDATE users SET plex_username = ? WHERE username = ?",
+                ("target-user", "test-user"),
+            )
+
+        response = self.client.post(
+            "/api/account/general?username=target-user",
+            json={"username": "renamed-target", "password": ""},
+            headers={"X-CSRF-Token": csrf_token},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["username"], "renamed-target")
+        with db() as connection:
+            admin = connection.execute(
+                "SELECT username FROM users WHERE username = 'test-user'"
+            ).fetchone()
+            target = connection.execute(
+                "SELECT username FROM users WHERE id = ?",
+                (target_id,),
+            ).fetchone()
+        self.assertIsNotNone(admin)
+        self.assertEqual(admin["username"], "test-user")
+        self.assertEqual(target["username"], "renamed-target")
+
     @patch("backend.routes.admin._profile_plex_index")
     def test_admin_request_list_includes_metadata_availability_and_requesters(
         self, profile_plex_index
@@ -3087,6 +3183,17 @@ class AdminUsersTests(DatabaseTestCase):
                     ),
                 ],
             )
+        anime_theme_links.sync_anime_theme_mapping(
+            {"slug": "anime", "name": "Admin Anime"},
+            {
+                "id": 5,
+                "label": "Ending 1",
+                "type": "ED",
+                "sequence": 1,
+                "song": {"id": 6, "title": "Ending Song"},
+            },
+            {"state": "resolved", "releaseGroups": [{"id": "release-1"}]},
+        )
         profile_plex_index.return_value = {
             "artistsByMbid": {
                 "artist-1": {
@@ -3129,6 +3236,7 @@ class AdminUsersTests(DatabaseTestCase):
         self.assertEqual(release["release_type"], "Album")
         self.assertEqual(release["release_date"], "2024-02-03")
         self.assertEqual(release["created_at"], 300)
+        self.assertEqual(release["animeThemes"][0]["animePath"], "/anime/anime#theme-5")
         self.assertTrue(release["availableInPlex"])
         self.assertEqual(release["plexUrl"], "https://app.plex.tv/album")
         self.assertEqual(
@@ -3169,6 +3277,40 @@ class AdminUsersTests(DatabaseTestCase):
         self.assertNotIn("never-return-this-plex-key", serialized)
         self.assertNotIn("never-return-this-plex-id", serialized)
         self.assertNotIn("password_hash", serialized)
+
+    def test_admin_requests_include_safe_download_lifecycle_and_requester(self):
+        self.register()
+        requester_id = self.add_user(
+            "download-requester", plex_id="plex-private", plex_username="Plex Requester"
+        )
+        with db() as connection:
+            connection.execute(
+                "INSERT INTO request_history (user_id, kind, mbid, name, created_at) "
+                "VALUES (?, 'release-group', 'admin-group', 'Admin Album', 100)",
+                (requester_id,),
+            )
+        with (
+            patch("backend.routes.admin._profile_plex_index", return_value={
+                "artistsByMbid": {}, "releaseGroupsByMbid": {},
+            }),
+            patch("backend.routes.account.lidarr.cached_library_availability", return_value={}),
+            patch("backend.routes.account.lidarr.cached_download_availability", return_value={
+                "admin-group": {"progress": 70, "status": "downloading",
+                                "indexer": "private", "downloadClient": "private"},
+            }),
+            patch("backend.routes.account.pending_lidarr_search_mbids", return_value={"admin-group"}),
+        ):
+            response = self.client.get("/api/admin/requests")
+
+        self.assertEqual(response.status_code, 200)
+        item = next(value for value in response.get_json()["requests"] if value["mbid"] == "admin-group")
+        self.assertEqual(item["requestStatus"], "downloading")
+        self.assertEqual(item["downloadStatus"], {"progress": 70, "status": "downloading"})
+        self.assertEqual(item["requester"]["id"], requester_id)
+        self.assertEqual(item["requester"]["username"], "Plex Requester")
+        serialized = response.get_data(as_text=True)
+        self.assertNotIn("private", serialized)
+        self.assertNotIn("plex-private", serialized)
 
     @patch(
         "backend.routes.admin._profile_plex_index",
@@ -3791,7 +3933,10 @@ class SettingsMaintenanceTests(DatabaseTestCase):
             ],
         )
         jobs = {job["id"]: job for job in job_rows}
-        self.assertEqual(jobs["lidarr-library"]["schedule"], "Every 4 minutes")
+        self.assertEqual(backend_config.LIDARR_LIBRARY_SCAN_INTERVAL, 2 * 60)
+        self.assertEqual(backend_config.PLEX_RECENT_SCAN_INTERVAL, 3 * 60)
+        self.assertEqual(jobs["lidarr-library"]["schedule"], "Every 2 minutes")
+        self.assertEqual(jobs["plex-recent"]["schedule"], "Every 3 minutes")
         self.assertEqual(jobs["plex-history"]["schedule"], "Every 24 hours")
 
         recommendation = self.client.post(
@@ -4547,14 +4692,23 @@ class LidarrRequestTests(DatabaseTestCase):
 
         response = self.client.post(
             "/api/request/release-group",
-            json={"mbid": self.album_mbid},
+            json={
+                "mbid": self.album_mbid,
+                "animeSlug": "naruto",
+                "animeName": "Naruto",
+                "themeId": 1477,
+                "themeLabel": "Opening 2",
+                "songId": 1477,
+                "songTitle": "Haruka Kanata",
+            },
             headers={"X-CSRF-Token": login.get_json()["csrfToken"]},
         )
 
         self.assertEqual(response.status_code, 202)
         with db() as connection:
             listener_history = connection.execute(
-                "SELECT name FROM request_history "
+                "SELECT name, anime_slug, anime_name, theme_id, theme_label, "
+                "song_id, song_title FROM request_history "
                 "WHERE user_id = ? AND mbid = ?",
                 (listener_id, self.album_mbid),
             ).fetchall()
@@ -4562,6 +4716,9 @@ class LidarrRequestTests(DatabaseTestCase):
             [row["name"] for row in listener_history],
             ["Already Queued Album"],
         )
+        self.assertEqual(listener_history[0]["anime_slug"], "naruto")
+        self.assertEqual(listener_history[0]["theme_id"], 1477)
+        self.assertEqual(listener_history[0]["song_title"], "Haruka Kanata")
 
     @patch("backend.routes.requests.lidarr.lookup_album")
     @patch("backend.routes.requests.get_service", return_value=None)
@@ -4640,7 +4797,15 @@ class LidarrRequestTests(DatabaseTestCase):
 
         response = self.client.post(
             "/api/request/release-group",
-            json={"mbid": self.album_mbid},
+            json={
+                "mbid": self.album_mbid,
+                "animeSlug": "naruto",
+                "animeName": "Naruto",
+                "themeId": 1477,
+                "themeLabel": "Opening 2",
+                "songId": 1477,
+                "songTitle": "Haruka Kanata",
+            },
             headers={"X-CSRF-Token": self.register()},
         )
 
@@ -4656,6 +4821,12 @@ class LidarrRequestTests(DatabaseTestCase):
             "artist_name": "Test Artist",
             "release_type": "Album",
             "release_date": "2020-03-18",
+            "anime_slug": "naruto",
+            "anime_name": "Naruto",
+            "theme_id": 1477,
+            "theme_label": "Opening 2",
+            "song_id": 1477,
+            "song_title": "Haruka Kanata",
         })
         self.assertEqual(response.get_json()["refreshType"], "album")
         request_work.assert_called_once_with()
@@ -4701,6 +4872,64 @@ class LidarrRequestTests(DatabaseTestCase):
             (self.album_mbid, 77, 44, "Existing Album"),
         )
         request_work.assert_called_once_with()
+
+    @patch("backend.routes.requests.record_request")
+    @patch("backend.routes.requests.lidarr.albums_by_release_group")
+    @patch("backend.routes.requests.lidarr.add_album")
+    @patch("backend.routes.requests.lidarr.lookup_album")
+    @patch("backend.routes.requests.get_service")
+    def test_fully_available_album_history_preserves_anime_context(
+        self, get_service, lookup_album, add_album, albums_by_release_group,
+        record_history
+    ):
+        get_service.return_value = self.lidarr_config()
+        lookup_album.return_value = Response(payload=[{
+            "title": "Theme Single",
+            "foreignAlbumId": self.album_mbid,
+            "artist": {"artistName": "Theme Artist"},
+            "albumType": "Single",
+            "releaseDate": "2026-01-02T00:00:00Z",
+        }])
+        add_album.return_value = Response(400, text="Album already exists")
+        albums_by_release_group.return_value = Response(payload=[{
+            "id": 77,
+            "artistId": 44,
+            "foreignAlbumId": self.album_mbid,
+            "title": "Theme Single",
+            "artist": {"artistName": "Theme Artist"},
+            "statistics": {"totalTrackCount": 3, "trackFileCount": 3},
+        }])
+
+        response = self.client.post(
+            "/api/request/release-group",
+            json={
+                "mbid": self.album_mbid,
+                "animeSlug": "naruto",
+                "animeName": "Naruto",
+                "themeId": 1477,
+                "themeLabel": "Opening 2",
+                "songId": 1477,
+                "songTitle": "Haruka Kanata",
+            },
+            headers={"X-CSRF-Token": self.register()},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["alreadyExists"])
+        self.assertEqual(record_history.call_args.args[1:4], (
+            "release-group", self.album_mbid, "Theme Single"
+        ))
+        self.assertEqual(record_history.call_args.kwargs, {
+            "artist_name": "Theme Artist",
+            "release_type": "Single",
+            "release_date": "2026-01-02",
+            "anime_slug": "naruto",
+            "anime_name": "Naruto",
+            "theme_id": 1477,
+            "theme_label": "Opening 2",
+            "song_id": 1477,
+            "song_title": "Haruka Kanata",
+        })
 
     @patch("backend.routes.requests.lidarr_search_worker.request_work")
     @patch("backend.routes.requests.enqueue_lidarr_search")
@@ -4997,7 +5226,9 @@ class AccountProfileTests(DatabaseTestCase):
             connection.execute(
                 "INSERT INTO request_history "
                 "(user_id, kind, mbid, name, artist_name, release_type, "
-                "release_date, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "release_date, anime_slug, anime_name, theme_id, theme_label, "
+                "song_id, song_title, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     user_id,
                     "release-group",
@@ -5006,9 +5237,29 @@ class AccountProfileTests(DatabaseTestCase):
                     "Stray Kids",
                     "Album",
                     "2020-03-18",
+                    "naruto",
+                    "Naruto",
+                    1477,
+                    "Opening 2",
+                    1477,
+                    "Haruka Kanata",
                     1000,
                 ),
             )
+        anime_theme_links.sync_anime_theme_mapping(
+            {"slug": "other-anime", "name": "Other Anime"},
+            {
+                "id": 8,
+                "label": "Ending 1",
+                "type": "ED",
+                "sequence": 1,
+                "song": {"id": 9, "title": "Other Song"},
+            },
+            {
+                "state": "resolved",
+                "releaseGroups": [{"id": self.release_group_mbid}],
+            },
+        )
         get_service.return_value = {"url": "http://plex", "token": "token"}
         cached_library_index.return_value = {
             "artistsByMbid": {},
@@ -5038,6 +5289,17 @@ class AccountProfileTests(DatabaseTestCase):
         self.assertEqual(item["artist_name"], "Stray Kids")
         self.assertEqual(item["release_type"], "Album")
         self.assertEqual(item["release_date"], "2020-03-18")
+        self.assertEqual(item["anime_slug"], "naruto")
+        self.assertEqual(item["anime_name"], "Naruto")
+        self.assertEqual(item["theme_id"], 1477)
+        self.assertEqual(item["theme_label"], "Opening 2")
+        self.assertEqual(item["song_id"], 1477)
+        self.assertEqual(item["song_title"], "Haruka Kanata")
+        self.assertEqual(item["animePath"], "/anime/naruto#theme-1477")
+        self.assertEqual(
+            [link["animeSlug"] for link in item["animeThemes"]],
+            ["naruto"],
+        )
         self.assertTrue(item["availableInPlex"])
         self.assertEqual(item["plexUrl"], "https://app.plex.tv/album")
         self.assertEqual(
@@ -5045,6 +5307,41 @@ class AccountProfileTests(DatabaseTestCase):
             "https://listen.plex.tv/album/example",
         )
         musicbrainz_get.assert_not_called()
+
+    def test_profile_release_history_includes_private_safe_download_lifecycle(self):
+        self.register()
+        with db() as connection:
+            user_id = connection.execute(
+                "SELECT id FROM users WHERE username = 'test-user'"
+            ).fetchone()["id"]
+            connection.execute(
+                "INSERT INTO request_history (user_id, kind, mbid, name, created_at) "
+                "VALUES (?, 'release-group', 'profile-group', 'Profile Album', 100)",
+                (user_id,),
+            )
+        with (
+            patch("backend.routes.account.get_service", return_value=None),
+            patch("backend.routes.account.lidarr.cached_library_availability", return_value={}),
+            patch("backend.routes.account.lidarr.cached_download_availability", return_value={
+                "profile-group": {"progress": 20,
+                                  "status": {"title": "private nested status"},
+                                  "trackedDownloadStatus": {"id": "private nested tracked status"},
+                                  "trackedDownloadState": ["private nested state"],
+                                  "timeLeft": ("private nested time",),
+                                  "estimatedCompletionTime": {"path": "private nested eta"},
+                                  "downloadId": 4, "title": "private", "path": "private"},
+            }),
+            patch("backend.routes.account.pending_lidarr_search_mbids", return_value={"profile-group"}),
+        ):
+            response = self.client.get("/api/account/profile")
+
+        self.assertEqual(response.status_code, 200)
+        item = response.get_json()["requests"]["release-group"][0]
+        self.assertEqual(item["requestStatus"], "downloading")
+        self.assertEqual(item["downloadStatus"], {"progress": 20})
+        serialized = response.get_data(as_text=True)
+        for forbidden in ("downloadId", "private", "path", "nested"):
+            self.assertNotIn(forbidden, serialized)
 
     @patch("backend.routes.account.musicbrainz.get")
     @patch("backend.routes.account.get_service", return_value=None)
@@ -5067,6 +5364,20 @@ class AccountProfileTests(DatabaseTestCase):
                     1000,
                 ),
             )
+        anime_theme_links.sync_anime_theme_mapping(
+            {"slug": "legacy-anime", "name": "Legacy Anime"},
+            {
+                "id": 10,
+                "label": "Opening 1",
+                "type": "OP",
+                "sequence": 1,
+                "song": {"id": 11, "title": "Legacy Song"},
+            },
+            {
+                "state": "resolved",
+                "releaseGroups": [{"id": self.release_group_mbid}],
+            },
+        )
         musicbrainz_get.return_value = {
             "artist-credit": [{"name": "Legacy Artist"}],
             "primary-type": "EP",
@@ -5080,6 +5391,8 @@ class AccountProfileTests(DatabaseTestCase):
         self.assertEqual(item["artist_name"], "Legacy Artist")
         self.assertEqual(item["release_type"], "EP")
         self.assertEqual(item["release_date"], "2019-04-05")
+        self.assertEqual(item["animePath"], "/anime/legacy-anime#theme-10")
+        self.assertEqual(item["animeThemes"][0]["songTitle"], "Legacy Song")
         self.assertFalse(item["availableInPlex"])
         self.assertTrue(musicbrainz_get.call_args.kwargs["cache_only"])
 
@@ -5282,6 +5595,132 @@ class AccountProfileTests(DatabaseTestCase):
 
         self.assertEqual(response.status_code, 404)
         self.assertEqual(response.get_json()["error"], "User not found.")
+
+
+class LidarrDownloadStatusTests(unittest.TestCase):
+    @patch("backend.services.lidarr._request")
+    def test_queue_fetches_paginated_records(self, request):
+        request.side_effect = [
+            Response(200, {"records": [{"albumId": 1}] * 1000, "totalRecords": 1001}),
+            Response(200, {"records": [{"albumId": 2}], "totalRecords": 1001}),
+        ]
+
+        records = lidarr.queue_records({"url": "http://lidarr", "apiKey": "key"})
+
+        self.assertEqual(len(records), 1001)
+        self.assertEqual(request.call_args_list[0].kwargs["params"]["page"], 1)
+        self.assertEqual(request.call_args_list[1].kwargs["params"]["page"], 2)
+
+    @patch("backend.services.lidarr._request")
+    def test_queue_continues_after_a_short_page_when_total_records_remain(self, request):
+        request.side_effect = [
+            Response(200, {"records": [{"albumId": 1}] * 100, "totalRecords": 101}),
+            Response(200, {"records": [{"albumId": 2}], "totalRecords": 101}),
+        ]
+
+        records = lidarr.queue_records({"url": "http://lidarr", "apiKey": "key"})
+
+        self.assertEqual(len(records), 101)
+        self.assertEqual(request.call_args_list[1].kwargs["params"]["page"], 2)
+
+    def test_duplicate_queue_records_use_weighted_progress_and_stable_state(self):
+        snapshot = lidarr.normalize_download_snapshot([
+            {"album": {"foreignAlbumId": "GROUP"}, "size": 100, "sizeleft": 25,
+             "status": "Downloading", "timeleft": "2 minutes", "downloadId": 1,
+             "title": "private", "indexer": "private", "downloadClient": "private",
+             "outputPath": "private"},
+            {"album": {"foreignAlbumId": "group"}, "size": 300, "sizeleft": 300,
+             "status": "Queued", "timeleft": "3 minutes"},
+        ])
+
+        self.assertEqual(snapshot["albums"]["group"]["progress"], 19)
+        self.assertEqual(snapshot["albums"]["group"]["status"], "queued")
+        self.assertNotIn("id", snapshot["albums"]["group"])
+        serialized = json.dumps(snapshot)
+        for forbidden in ("downloadId", "private", "indexer", "downloadClient", "outputPath"):
+            self.assertNotIn(forbidden, serialized)
+
+    def test_equal_remaining_duplicates_choose_all_safe_fields_stably(self):
+        records = [
+            {"album": {"foreignAlbumId": "group"}, "size": 100, "sizeleft": 50,
+             "status": "downloading", "trackedDownloadStatus": "alpha",
+             "trackedDownloadState": "first", "timeleft": "2 minutes",
+             "estimatedCompletionTime": "tomorrow"},
+            {"album": {"foreignAlbumId": "group"}, "size": 100, "sizeleft": 50,
+             "status": "downloading", "trackedDownloadStatus": "beta",
+             "trackedDownloadState": "second", "timeleft": "2 minutes",
+             "estimatedCompletionTime": "tomorrow"},
+        ]
+
+        forward = lidarr.normalize_download_snapshot(records)
+        reversed_snapshot = lidarr.normalize_download_snapshot(list(reversed(records)))
+
+        self.assertEqual(forward, reversed_snapshot)
+        self.assertEqual(forward["albums"]["group"]["trackedDownloadStatus"], "beta")
+
+    def test_public_download_status_sanitizes_values_without_mutating_cache(self):
+        value = {
+            "progress": 150.6,
+            "status": {"title": "private status"},
+            "trackedDownloadStatus": ["private tracked status"],
+            "trackedDownloadState": ("private tracked state",),
+            "timeLeft": {"path": "private time"},
+            "estimatedCompletionTime": {"downloadId": "private eta"},
+        }
+
+        safe = lidarr.public_download_status(value)
+
+        self.assertEqual(safe, {"progress": 100})
+        self.assertEqual(value["status"], {"title": "private status"})
+        self.assertEqual(lidarr.public_download_status({"progress": -1}), {"progress": 0})
+        self.assertEqual(lidarr.public_download_status({"progress": True}), {})
+        self.assertEqual(lidarr.public_download_status({"progress": float("nan")}), {})
+        self.assertEqual(lidarr.public_download_status({"progress": "50"}), {})
+        serialized = json.dumps(safe)
+        for forbidden in ("private status", "private tracked", "private time", "private eta"):
+            self.assertNotIn(forbidden, serialized)
+
+    def test_public_download_status_formats_eta_in_the_container_timezone(self):
+        with patch(
+            "backend.services.lidarr._container_timezone",
+            return_value=timezone(timedelta(hours=-4)),
+        ):
+            safe = lidarr.public_download_status({
+                "progress": 59,
+                "timeLeft": "00:24:06.4120410",
+                "estimatedCompletionTime": "2026-08-05T20:56:32Z",
+            })
+
+        self.assertEqual(safe["timeLeft"], "00:24:06")
+        self.assertEqual(
+            safe["estimatedCompletionTime"],
+            "08/05/2026 04:56 PM",
+        )
+        self.assertEqual(
+            lidarr.public_download_status({"timeLeft": "1.02:03:04.5"}),
+            {"timeLeft": "26:03:04"},
+        )
+
+    @patch("backend.services.lidarr.set_cache_document")
+    @patch("backend.services.lidarr.cached_library_index", return_value={"albums": {}})
+    @patch("backend.services.lidarr.queue_records", return_value=[])
+    def test_successful_empty_poll_clears_snapshot(self, records, index, set_document):
+        lidarr.refresh_download_snapshot({"url": "http://lidarr", "apiKey": "key"})
+
+        self.assertEqual(set_document.call_args.args[2], {"albums": {}})
+
+    @patch("backend.services.lidarr.set_cache_document")
+    @patch("backend.services.lidarr.cached_library_index", return_value={"albums": {}})
+    @patch("backend.services.lidarr.queue_records", side_effect=requests.RequestException())
+    def test_failed_poll_keeps_the_prior_snapshot_until_expiry(self, records, index, set_document):
+        with self.assertRaises(requests.RequestException):
+            lidarr.refresh_download_snapshot({"url": "http://lidarr", "apiKey": "key"})
+
+        set_document.assert_not_called()
+
+    @patch("backend.services.lidarr.get_cache_document", return_value=["invalid"])
+    def test_malformed_cached_download_document_degrades_to_empty(self, get_document):
+        self.assertEqual(lidarr.cached_download_availability(), {})
 
 
 class LidarrClientTests(unittest.TestCase):
@@ -6050,6 +6489,8 @@ class MusicRoutesTests(DatabaseTestCase):
                 "availableInPlex": True,
                 "availableInLidarr": True,
                 "fullyAvailableInLidarr": True,
+                "requestStatus": "available",
+                "downloadStatus": None,
             },
         })
 
@@ -6094,6 +6535,52 @@ class MusicRoutesTests(DatabaseTestCase):
             payload["plexReleases"][0]["url"],
             "https://app.plex.tv/album",
         )
+
+    def test_release_group_availability_uses_safe_lifecycle_precedence(self):
+        self.register()
+        download = {
+            "progress": 45,
+            "status": "downloading",
+            "trackedDownloadStatus": "ok",
+            "trackedDownloadState": "downloading",
+            "timeLeft": "00:05:00.1234567",
+            "estimatedCompletionTime": "2026-08-05T20:56:32Z",
+            "downloadId": 17,
+            "title": "private title",
+            "indexer": "private indexer",
+            "downloadClient": "private client",
+            "path": "private path",
+        }
+        with (
+            patch("backend.routes.music._plex_release_group_inventory", return_value={}),
+            patch("backend.routes.music.lidarr.cached_library_availability") as albums,
+            patch("backend.routes.music.lidarr.cached_download_availability") as downloads,
+            patch("backend.routes.music.pending_lidarr_search_mbids") as pending,
+        ):
+            albums.return_value = {"group-id": {"fullyAvailable": True}}
+            downloads.return_value = {"group-id": download}
+            pending.return_value = {"group-id"}
+            available = self.client.get("/api/music/release-group/group-id/availability")
+            available_payload = available.get_json()
+            self.assertEqual(available_payload["requestStatus"], "available")
+            self.assertIsNone(available_payload["downloadStatus"])
+
+            albums.return_value = {"group-id": {"fullyAvailable": False}}
+            pending.return_value = {"group-id"}
+            downloading = self.client.get("/api/music/release-group/group-id/availability")
+            downloading_payload = downloading.get_json()
+            self.assertEqual(downloading_payload["requestStatus"], "downloading")
+            self.assertEqual(set(downloading_payload["downloadStatus"]), {
+                "progress", "status", "trackedDownloadStatus", "trackedDownloadState",
+                "timeLeft", "estimatedCompletionTime",
+            })
+            serialized = downloading.get_data(as_text=True)
+            for forbidden in ("downloadId", "private title", "private indexer", "private client", "private path"):
+                self.assertNotIn(forbidden, serialized)
+
+            downloads.return_value = {}
+            queued = self.client.get("/api/music/release-group/group-id/availability")
+            self.assertEqual(queued.get_json()["requestStatus"], "queued")
 
     @patch("backend.routes.music.musicbrainz.get")
     def test_completed_artist_payload_uses_shared_cache_and_etag(self, get):
@@ -6238,6 +6725,17 @@ class MusicRoutesTests(DatabaseTestCase):
             },
             {"releases": [], "release-count": 0},
         ]
+        anime_theme_links.sync_anime_theme_mapping(
+            {"slug": "anime", "name": "Example Anime"},
+            {
+                "id": 99,
+                "label": "Opening 1",
+                "type": "OP",
+                "sequence": 1,
+                "song": {"id": 100, "title": "Theme Song"},
+            },
+            {"state": "resolved", "releaseGroups": [{"id": "group-id"}]},
+        )
 
         response = self.client.get(
             "/api/music/release-group/group-id",
@@ -6245,6 +6743,17 @@ class MusicRoutesTests(DatabaseTestCase):
         )
 
         self.assertEqual(response.get_json()["romanizedTitle"], "In Full Color")
+        self.assertEqual(response.get_json()["animeThemes"], [{
+            "animeSlug": "anime",
+            "animeName": "Example Anime",
+            "animePath": "/anime/anime#theme-99",
+            "themeId": 99,
+            "themeLabel": "Opening 1",
+            "themeType": "OP",
+            "sequence": 1,
+            "songId": 100,
+            "songTitle": "Theme Song",
+        }])
         self.assertEqual(
             get.call_args_list[0].args[1], "aliases+artist-credits+url-rels"
         )
@@ -6373,6 +6882,17 @@ class MusicRoutesTests(DatabaseTestCase):
             "releases": [{"foreignReleaseId": "release-id"}],
         }])
         plex_snapshot.return_value = {"artists": [], "releaseGroups": []}
+        anime_theme_links.sync_anime_theme_mapping(
+            {"slug": "anime", "name": "Example Anime"},
+            {
+                "id": 99,
+                "label": "Opening 1",
+                "type": "OP",
+                "sequence": 1,
+                "song": {"id": 100, "title": "Theme Song"},
+            },
+            {"state": "resolved", "releaseGroups": [{"id": "group-id"}]},
+        )
 
         response = self.client.get(
             "/api/music/release-group/group-id",
@@ -6384,6 +6904,7 @@ class MusicRoutesTests(DatabaseTestCase):
         self.assertTrue(payload["provisional"])
         self.assertEqual(payload["artistId"], "artist-id")
         self.assertEqual(payload["releases"][0]["id"], "release-id")
+        self.assertEqual(payload["animeThemes"][0]["animePath"], "/anime/anime#theme-99")
         self.assertTrue(all(call.kwargs["cache_only"] for call in get.call_args_list))
 
     @patch("backend.routes.music.musicbrainz.get")

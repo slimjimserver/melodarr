@@ -199,11 +199,12 @@
     <section id="settings" class="view settings-view">
       <div class="settings-hero">
         <div><p class="eyebrow">SETTINGS</p><h1>Your music,<br><em>connected.</em></h1></div>
-        <p>Connect the services Melodarr uses, then choose the defaults for new requests. Credentials are stored in this app’s local settings file.</p>
+        <p>Configure services, request defaults, user access, and delivery preferences. Credentials are stored in this app’s local settings file.</p>
       </div>
 
       <div class="settings-tabs" role="tablist" aria-label="Settings sections">
         <button id="settings-tab-services" class="active" type="button" role="tab" aria-selected="true" aria-controls="settings-services" data-settings-page="services">Services</button>
+        <button id="settings-tab-notifications" type="button" role="tab" aria-selected="false" aria-controls="settings-notifications" tabindex="-1" data-settings-page="notifications">Notifications</button>
         <button id="settings-tab-requests" type="button" role="tab" aria-selected="false" aria-controls="settings-requests" tabindex="-1" data-settings-page="requests">Requests</button>
         <button id="settings-tab-users" type="button" role="tab" aria-selected="false" aria-controls="settings-users" tabindex="-1" data-settings-page="users">Users</button>
         <button id="settings-tab-jobs" type="button" role="tab" aria-selected="false" aria-controls="settings-jobs" tabindex="-1" data-settings-page="jobs">Jobs &amp; Cache</button>
@@ -295,6 +296,44 @@
           </form>
         </section>
 
+      </div>
+
+      <div id="settings-notifications" class="settings-stack settings-panel" role="tabpanel" aria-labelledby="settings-tab-notifications" tabindex="0" hidden>
+        <section class="settings-section notification-settings-section">
+          <div class="service-intro notification-intro"><div><h2>Notifications</h2><p>Set the application-wide delivery agents used by every notification preference.</p></div><span id="notification-state" class="service-state" aria-live="polite">Loading…</span></div>
+          <form id="notification-global-settings" class="notification-settings-form notification-card-form">
+            <fieldset class="notification-card notification-global-card">
+              <legend>Global delivery</legend>
+              <label>Application URL<small>The public URL used in email and Web Push. Web Push requires HTTPS except localhost.</small><input name="applicationUrl" type="url" placeholder="https://music.example.com"></label>
+              <label class="checkbox"><input name="enabled" type="checkbox"> Enable Notifications Globally</label>
+              <div class="form-actions"><p class="form-message" aria-live="polite"></p><button class="notification-save">Save Global Settings</button></div>
+            </fieldset>
+          </form>
+          <form id="notification-email-settings" class="notification-settings-form notification-card-form">
+            <fieldset class="notification-card">
+              <legend><img src="/icons/email.svg" width="24" height="24" alt=""> Email</legend>
+              <label class="checkbox"><input name="emailEnabled" type="checkbox"> Enable Email Delivery</label>
+              <div class="settings-fields">
+                <label>SMTP Host<input name="host"></label>
+                <label>SMTP Port<input name="port" inputmode="numeric" value="587"></label>
+                <label>Encryption<select name="encryption"><option value="starttls">STARTTLS</option><option value="tls">TLS</option><option value="none">None</option></select></label>
+                <label>Username<input name="username"></label>
+                <label>Sender Name<input name="senderName" autocomplete="organization"></label>
+                <label>Sender Address<input name="sender" type="email"></label>
+                <label>Password<input name="password" type="password" autocomplete="new-password" placeholder="Leave blank to keep saved password"></label>
+              </div>
+              <div class="form-actions"><p class="form-message" aria-live="polite">Save changes before sending a test.</p><div class="notification-actions"><button type="button" class="outline notification-test">Test Email</button><button class="notification-save">Save Email Settings</button></div></div>
+            </fieldset>
+          </form>
+          <form id="notification-web-push-settings" class="notification-settings-form notification-card-form">
+            <fieldset class="notification-card">
+              <legend><img src="/icons/web-push.svg" width="24" height="24" alt=""> Web Push</legend>
+              <label class="checkbox"><input name="webPushEnabled" type="checkbox"> Enable Web Push Delivery</label>
+              <label>VAPID Contact<input name="contact" placeholder="mailto:admin@example.com"></label>
+              <div class="form-actions"><p class="form-message" aria-live="polite">Save changes before sending a test.</p><div class="notification-actions"><button type="button" class="outline notification-test">Test Web Push</button><button class="notification-save">Save Web Push Settings</button></div></div>
+            </fieldset>
+          </form>
+        </section>
       </div>
 
       <div id="settings-requests" class="settings-stack settings-panel" role="tabpanel" aria-labelledby="settings-tab-requests" tabindex="0" hidden>
@@ -420,6 +459,7 @@
           <p data-account-owner-only>Settings</p>
           <a data-account-owner-only data-account-route="general" href="#">General</a>
           <a data-account-owner-only data-account-route="linked-accounts" href="#">Linked accounts</a>
+          <a data-account-owner-only data-account-self-only data-account-route="notifications" href="#">Notifications</a>
           <a class="admin-only" data-account-owner-only data-account-route="invitations" href="#" hidden>Invitations</a>
         </nav>
         <div id="account-content" class="account-content"></div>

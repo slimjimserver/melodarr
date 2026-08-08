@@ -31,6 +31,7 @@ os.environ.update({
     "MELODARR_CACHE_DATABASE": os.path.join(TEST_ROOT, "cache", "metadata.db"),
     "MELODARR_SETTINGS": os.path.join(TEST_ROOT, "settings.json"),
     "MELODARR_SECRET_KEY_FILE": os.path.join(TEST_ROOT, "session-secret.key"),
+    "MELODARR_VAPID_PRIVATE_KEY_FILE": os.path.join(TEST_ROOT, "vapid-private.pem"),
     "MELODARR_ARTWORK_CACHE": os.path.join(TEST_ROOT, "artwork"),
 })
 
@@ -53,6 +54,7 @@ if configured is not None:
         "SETTINGS_FILE": configured.SETTINGS_FILE,
         "ARTWORK_CACHE_DIRECTORY": configured.ARTWORK_CACHE_DIRECTORY,
         "SECRET_KEY_FILE": configured.SECRET_KEY_FILE,
+        "VAPID_PRIVATE_KEY_FILE": configured.VAPID_PRIVATE_KEY_FILE,
     }
     unsafe = {
         name: path

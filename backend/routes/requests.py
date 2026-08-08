@@ -1,7 +1,9 @@
 """Lidarr artist and release-group request routes."""
 
+import re
+
 import requests
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify
 
 if __package__ == "backend.routes":
     from ..responses import api_error, request_json_object
@@ -30,6 +32,74 @@ else:  # Support the existing `python backend/app.py` entry point.
 
 
 blueprint = Blueprint("requests", __name__)
+
+_ANIME_SLUG_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,199}")
+
+
+def _context_text(body, name, label, *, maximum=500, required=False):
+    value = body.get(name)
+    if value is None and not required:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be text.")
+    value = value.strip()
+    if required and not value:
+        raise ValueError(f"{label} is required.")
+    if len(value) > maximum:
+        raise ValueError(f"{label} must be {maximum} characters or fewer.")
+    return value
+
+
+def _context_id(body, name, label, *, required=False):
+    value = body.get(name)
+    if value in (None, "") and not required:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be a positive integer.")
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be a positive integer.") from exc
+    if normalized <= 0 or str(value).strip() != str(normalized):
+        raise ValueError(f"{label} must be a positive integer.")
+    return normalized
+
+
+def _anime_request_context(body):
+    """Validate optional snapshots used to link history back to an anime theme."""
+    names = {
+        "animeSlug",
+        "animeName",
+        "themeId",
+        "themeLabel",
+        "songId",
+        "songTitle",
+    }
+    if not any(name in body for name in names):
+        return {}
+    anime_slug = _context_text(
+        body,
+        "animeSlug",
+        "Anime slug",
+        maximum=200,
+        required=True,
+    )
+    if not _ANIME_SLUG_PATTERN.fullmatch(anime_slug):
+        raise ValueError("Anime slug is invalid.")
+    return {
+        "anime_slug": anime_slug,
+        "anime_name": _context_text(
+            body, "animeName", "Anime name", required=True
+        ),
+        "theme_id": _context_id(
+            body, "themeId", "AnimeThemes theme ID", required=True
+        ),
+        "theme_label": _context_text(
+            body, "themeLabel", "Theme label", required=True
+        ),
+        "song_id": _context_id(body, "songId", "AnimeThemes song ID"),
+        "song_title": _context_text(body, "songTitle", "Song title"),
+    }
 
 
 def _release_history_metadata(*albums):
@@ -133,6 +203,10 @@ def request_release_group():
     mbid = str(body.get("mbid", "")).strip()
     if not mbid:
         return api_error("A MusicBrainz release-group ID is required.")
+    try:
+        anime_context = _anime_request_context(body)
+    except ValueError as exc:
+        return api_error(str(exc))
     pending = pending_lidarr_search(mbid)
     if pending:
         record_request(
@@ -140,6 +214,7 @@ def request_release_group():
             "release-group",
             mbid,
             pending["name"],
+            **anime_context,
         )
         return jsonify({
             "message": (
@@ -205,6 +280,7 @@ def request_release_group():
                     mbid,
                     created_album.get("title", album.get("title", "Release group")),
                     **_release_history_metadata(created_album, album),
+                    **anime_context,
                 )
                 lidarr_library_worker.request_scan()
                 return jsonify({"message": "This release group is already fully available in Lidarr.", "alreadyExists": True})
@@ -229,6 +305,7 @@ def request_release_group():
             artist_id,
             title,
             **_release_history_metadata(created_album, album),
+            **anime_context,
         )
         lidarr_search_worker.request_work()
         lidarr_library_worker.request_scan()

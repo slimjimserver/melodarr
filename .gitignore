@@ -26,6 +26,7 @@ data/**
 *.db*
 settings.json
 session-secret.key
+vapid-private.pem
 
 # Environment
 .env

@@ -1,6 +1,12 @@
 """Lidarr configuration and HTTP client operations."""
 
+import math
+import os
+import re
+from datetime import datetime, timezone
+from numbers import Real
 from urllib.parse import quote
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 
@@ -9,6 +15,7 @@ if __package__ == "backend.services":
     from ..cache_memo import invalidate_document, memoized_document
     from ..config import (
         LIDARR_LIBRARY_CACHE_TTL,
+        LIDARR_DOWNLOAD_CACHE_TTL,
         LIDARR_METADATA_CACHE_TTL,
         LIDARR_METADATA_URL,
         LIDARR_OPTIONS_CACHE_TTL,
@@ -21,6 +28,7 @@ else:  # Support the existing `python backend/app.py` entry point.
     from cache_memo import invalidate_document, memoized_document
     from config import (
         LIDARR_LIBRARY_CACHE_TTL,
+        LIDARR_DOWNLOAD_CACHE_TTL,
         LIDARR_METADATA_CACHE_TTL,
         LIDARR_METADATA_URL,
         LIDARR_OPTIONS_CACHE_TTL,
@@ -31,6 +39,16 @@ else:  # Support the existing `python backend/app.py` entry point.
 
 
 LIBRARY_INDEX_KEY = "lidarr-library-index"
+DOWNLOAD_SNAPSHOT_NAMESPACE = "lidarr-downloads"
+DOWNLOAD_SNAPSHOT_KEY = "snapshot"
+PUBLIC_DOWNLOAD_FIELDS = (
+    "progress", "status", "trackedDownloadStatus", "trackedDownloadState",
+    "timeLeft", "estimatedCompletionTime",
+)
+TIME_LEFT_PATTERN = re.compile(
+    r"^(?:(?P<days>\d+)\.)?(?P<hours>\d+):"
+    r"(?P<minutes>[0-5]\d):(?P<seconds>[0-5]\d)(?:\.\d+)?$"
+)
 
 
 def connection(values, old=None):
@@ -143,6 +161,226 @@ def library_albums(config=None):
     return data.get("records", []) if isinstance(data, dict) else []
 
 
+def queue_records(config=None):
+    """Read all Lidarr queue pages, including the embedded album when present."""
+    records = []
+    page, page_size = 1, 1000
+    expected_total = None
+    while True:
+        response = _request(
+            "GET", "/queue", config=config, timeout=20,
+            params={"includeAlbum": "true", "page": page, "pageSize": page_size},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict) or not isinstance(payload.get("records"), list):
+            raise ValueError("Lidarr queue response did not contain records.")
+        batch = payload["records"]
+        records.extend(batch)
+        total = payload.get("totalRecords")
+        if isinstance(total, int):
+            if total < 0 or len(records) > total:
+                raise ValueError("Lidarr queue totalRecords was inconsistent.")
+            expected_total = total
+        if expected_total is not None and len(records) >= expected_total:
+            break
+        if not batch:
+            if expected_total is not None:
+                raise ValueError("Lidarr queue pagination ended before totalRecords.")
+            break
+        if expected_total is None and len(batch) < page_size:
+            break
+        page += 1
+        if page > 1000:
+            raise ValueError("Lidarr queue pagination did not terminate.")
+    return records
+
+
+def _safe_queue_text(value):
+    """Keep queue strings client-safe and bounded; queue identifiers stay private."""
+    return value.strip()[:120] if isinstance(value, str) else ""
+
+
+def _safe_progress(value):
+    """Normalize only finite numeric queue progress into a client-safe integer."""
+    if isinstance(value, bool) or not isinstance(value, Real):
+        return None
+    try:
+        numeric = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    if not math.isfinite(numeric):
+        return None
+    return max(0, min(100, int(round(numeric))))
+
+
+def _format_time_left(value):
+    """Format Lidarr's TimeSpan value as total hours, minutes, and seconds."""
+    text = _safe_queue_text(value)
+    match = TIME_LEFT_PATTERN.fullmatch(text)
+    if not match:
+        return ""
+    total_hours = (
+        int(match.group("days") or 0) * 24
+        + int(match.group("hours"))
+    )
+    return (
+        f"{total_hours:02d}:{int(match.group('minutes')):02d}:"
+        f"{int(match.group('seconds')):02d}"
+    )
+
+
+def _container_timezone():
+    """Resolve the configured container timezone, with a system-local fallback."""
+    timezone_name = os.environ.get("TZ", "").strip().lstrip(":")
+    if timezone_name:
+        try:
+            return ZoneInfo(timezone_name)
+        except ZoneInfoNotFoundError:
+            pass
+    return datetime.now().astimezone().tzinfo or timezone.utc
+
+
+def _format_completion_time(value):
+    """Render Lidarr's completion timestamp in the container's local timezone."""
+    text = _safe_queue_text(value)
+    if not text:
+        return ""
+    normalized = f"{text[:-1]}+00:00" if text[-1:].casefold() == "z" else text
+    try:
+        completion = datetime.fromisoformat(normalized)
+    except ValueError:
+        return ""
+    if completion.tzinfo is None:
+        completion = completion.replace(tzinfo=timezone.utc)
+    return completion.astimezone(_container_timezone()).strftime(
+        "%m/%d/%Y %I:%M %p"
+    )
+
+
+def _representative_texts(record):
+    """Normalize every emitted text field for stable representative selection."""
+    return (
+        _safe_queue_text(record.get("status")).casefold(),
+        _safe_queue_text(record.get("trackedDownloadStatus")).casefold(),
+        _safe_queue_text(record.get("trackedDownloadState")).casefold(),
+        _safe_queue_text(record.get("timeleft")).casefold(),
+        _safe_queue_text(record.get("estimatedCompletionTime")).casefold(),
+    )
+
+
+def _queue_release_group_id(record, album_ids):
+    album = record.get("album")
+    if isinstance(album, dict) and album.get("foreignAlbumId"):
+        return str(album["foreignAlbumId"]).casefold()
+    try:
+        album_id = int(record.get("albumId"))
+    except (TypeError, ValueError):
+        return None
+    candidates = album_ids.get(album_id, ())
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def normalize_download_snapshot(records, library_index=None):
+    """Aggregate queue records by release group without retaining queue identities.
+
+    Duplicate records use byte-weighted progress.  The representative state is the
+    item with the largest remaining fraction, then a stable safe-field tie-breaker;
+    that makes status and ETA deterministic while favoring the least-complete item.
+    """
+    album_ids = {}
+    for mbid, album in ((library_index or {}).get("albums") or {}).items():
+        try:
+            album_id = int((album or {}).get("id"))
+        except (TypeError, ValueError):
+            continue
+        album_ids.setdefault(album_id, []).append(str(mbid).casefold())
+    grouped = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        mbid = _queue_release_group_id(record, album_ids)
+        if not mbid:
+            continue
+        try:
+            size = int(record.get("size") or 0)
+            size_left = int(record.get("sizeleft") or 0)
+        except (TypeError, ValueError):
+            size, size_left = 0, 0
+        if size > 0:
+            size_left = max(0, min(size, size_left))
+        else:
+            size_left = 0
+        grouped.setdefault(mbid, []).append((record, size, size_left))
+    albums = {}
+    for mbid, items in grouped.items():
+        total = sum(size for _, size, _ in items if size > 0)
+        remaining = sum(left for _, size, left in items if size > 0)
+        progress = int(round((total - remaining) * 100 / total)) if total else 0
+        progress = max(0, min(100, progress))
+        representative = max(
+            items,
+            key=lambda item: (
+                (item[2] / item[1]) if item[1] else 1.0,
+                *_representative_texts(item[0]),
+            ),
+        )[0]
+        status, tracked_status, tracked_state, time_left, completion_time = (
+            _representative_texts(representative)
+        )
+        albums[mbid] = {
+            "progress": progress,
+            "status": status,
+            "trackedDownloadStatus": tracked_status,
+            "trackedDownloadState": tracked_state,
+            "timeLeft": time_left,
+            "estimatedCompletionTime": completion_time,
+        }
+    return {"albums": albums}
+
+
+def refresh_download_snapshot(config=None):
+    """Replace the shared live snapshot only after a complete successful poll."""
+    snapshot = normalize_download_snapshot(queue_records(config), cached_library_index())
+    # A successful empty queue deliberately clears stale entries.  Exceptions before
+    # this write leave the last-known-good document in place until its short expiry.
+    set_cache_document(
+        DOWNLOAD_SNAPSHOT_NAMESPACE, DOWNLOAD_SNAPSHOT_KEY,
+        snapshot, LIDARR_DOWNLOAD_CACHE_TTL,
+    )
+    return snapshot
+
+
+def cached_download_availability():
+    """Read the worker-written snapshot; never issue a web-request queue call."""
+    snapshot = get_cache_document(DOWNLOAD_SNAPSHOT_NAMESPACE, DOWNLOAD_SNAPSHOT_KEY)
+    if not isinstance(snapshot, dict):
+        return {}
+    albums = snapshot.get("albums")
+    return albums if isinstance(albums, dict) else {}
+
+
+def public_download_status(value):
+    """Return the fixed client-safe subset even if a cache row is malformed."""
+    if not isinstance(value, dict):
+        return None
+    sanitized = {}
+    progress = _safe_progress(value.get("progress"))
+    if progress is not None:
+        sanitized["progress"] = progress
+    for field in PUBLIC_DOWNLOAD_FIELDS[1:4]:
+        text = _safe_queue_text(value.get(field))
+        if text:
+            sanitized[field] = text.casefold() if field == "status" else text
+    time_left = _format_time_left(value.get("timeLeft"))
+    if time_left:
+        sanitized["timeLeft"] = time_left
+    completion_time = _format_completion_time(value.get("estimatedCompletionTime"))
+    if completion_time:
+        sanitized["estimatedCompletionTime"] = completion_time
+    return sanitized
+
+
 def album_availability(album):
     """Normalize Lidarr's track statistics into release-group availability."""
     statistics = album.get("statistics") or {}
@@ -155,6 +393,8 @@ def album_availability(album):
         "trackFileCount": downloaded,
         "fullyAvailable": bool(total and downloaded >= total),
         "monitored": bool(album.get("monitored")),
+        "artistMbid": str(album.get("foreignArtistId") or (album.get("artist") or {}).get("foreignArtistId") or ""),
+        "artistName": str(album.get("artistName") or (album.get("artist") or {}).get("artistName") or (album.get("artist") or {}).get("name") or ""),
     }
 
 
@@ -173,11 +413,21 @@ def scan_library_availability(config=None):
     for album in library_albums(config):
         release_group_id = album.get("foreignAlbumId")
         if release_group_id:
-            albums[release_group_id] = album_availability(album)
+            normalized = album_availability(album)
+            artist = artists.get(normalized["artistMbid"])
+            if artist and not normalized["artistName"]:
+                normalized["artistName"] = artist["name"]
+            albums[str(release_group_id).casefold()] = normalized
     payload = {"artists": artists, "albums": albums}
     set_cache_document("lidarr-library", "albums", payload, LIDARR_LIBRARY_CACHE_TTL)
     invalidate_document(LIBRARY_INDEX_KEY)
     invalidate_detail_payloads()
+    # This receives only a complete successful scan; absent records remain unknown.
+    try:
+        from ..notifications import observe_availability
+    except ImportError:
+        from notifications import observe_availability
+    observe_availability(albums)
     return payload
 
 

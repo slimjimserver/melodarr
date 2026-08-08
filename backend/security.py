@@ -53,13 +53,13 @@ def resolve_account_user(signed_in_user, requested_username=None):
     requested_username = str(requested_username).strip()
     if not requested_username:
         return None, api_error("User not found.", 404)
-    own_names = {
-        str(signed_in_user["username"] or "").casefold(),
-        str(signed_in_user["plex_username"] or "").casefold(),
-    }
-    if requested_username.casefold() in own_names:
-        return signed_in_user, None
     if signed_in_user["role"] != "admin":
+        own_names = {
+            str(signed_in_user["username"] or "").casefold(),
+            str(signed_in_user["plex_username"] or "").casefold(),
+        }
+        if requested_username.casefold() in own_names:
+            return signed_in_user, None
         return None, api_error(
             "Administrator access is required to access another user's account.",
             403,

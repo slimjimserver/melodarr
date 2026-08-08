@@ -19,7 +19,7 @@ if __package__ == "backend.routes":
         login_required,
         resolve_account_user,
     )
-    from ..services import lastfm, listenbrainz, musicbrainz, plex
+    from ..services import anime_theme_links, lastfm, listenbrainz, lidarr, musicbrainz, plex
     from ..storage import (
         db,
         count_request_history,
@@ -27,6 +27,7 @@ if __package__ == "backend.routes":
         get_lastfm_api_key,
         get_request_history,
         get_service,
+        pending_lidarr_search_mbids,
     )
     from ..workers import recommendations as recommendation_worker
 else:  # Support the existing `python backend/app.py` entry point.
@@ -37,7 +38,7 @@ else:  # Support the existing `python backend/app.py` entry point.
         login_required,
         resolve_account_user,
     )
-    from services import lastfm, listenbrainz, musicbrainz, plex
+    from services import anime_theme_links, lastfm, listenbrainz, lidarr, musicbrainz, plex
     from storage import (
         db,
         count_request_history,
@@ -45,6 +46,7 @@ else:  # Support the existing `python backend/app.py` entry point.
         get_lastfm_api_key,
         get_request_history,
         get_service,
+        pending_lidarr_search_mbids,
     )
     from workers import recommendations as recommendation_worker
 
@@ -116,8 +118,38 @@ def _cached_release_group_metadata(mbid):
     }
 
 
-def _profile_history_item(row, plex_index):
+def _explicit_anime_history_link(item):
+    if not item.get("anime_slug") or not item.get("theme_id"):
+        return None
+    return {
+        "animeSlug": item["anime_slug"],
+        "animeName": item.get("anime_name") or "Anime",
+        "animePath": f"/anime/{item['anime_slug']}#theme-{item['theme_id']}",
+        "themeId": item["theme_id"],
+        "themeLabel": item.get("theme_label") or "Theme",
+        "themeType": "",
+        "sequence": None,
+        "songId": item.get("song_id"),
+        "songTitle": item.get("song_title") or "",
+    }
+
+
+def _profile_history_item(row, plex_index, anime_link_cache=None):
     item = dict(row)
+    explicit_anime_link = _explicit_anime_history_link(item)
+    if explicit_anime_link:
+        anime_links = [explicit_anime_link]
+    elif item["kind"] == "release-group":
+        anime_link_cache = anime_link_cache if anime_link_cache is not None else {}
+        if item["mbid"] not in anime_link_cache:
+            anime_link_cache[item["mbid"]] = (
+                anime_theme_links.links_for_release_group(item["mbid"])
+            )
+        anime_links = anime_link_cache[item["mbid"]]
+    else:
+        anime_links = []
+    item["animeThemes"] = anime_links
+    item["animePath"] = anime_links[0]["animePath"] if anime_links else ""
     plex_item = None
     if item["kind"] == "artist":
         plex_item = plex_index.get("artistsByMbid", {}).get(item["mbid"])
@@ -157,6 +189,37 @@ def _profile_history_item(row, plex_index):
         "plexampUrl": (plex_item or {}).get("plexampUrl") or "",
     })
     return item
+
+
+def apply_release_group_lifecycle(items):
+    """Decorate request rows from shared snapshots without per-row database reads."""
+    release_ids = [item["mbid"] for item in items if item["kind"] == "release-group"]
+    if not release_ids:
+        return items
+    try:
+        albums = lidarr.cached_library_availability()
+        downloads = lidarr.cached_download_availability()
+    except Exception:
+        # Request history remains available when the short-lived worker cache is not.
+        albums, downloads = {}, {}
+    pending = pending_lidarr_search_mbids(release_ids)
+    for item in items:
+        if item["kind"] != "release-group":
+            continue
+        mbid = str(item["mbid"])
+        album = albums.get(mbid.casefold())
+        download = lidarr.public_download_status(downloads.get(mbid.casefold()))
+        if album and album.get("fullyAvailable"):
+            status, download = "available", None
+        elif download:
+            status = "downloading"
+        elif mbid.casefold() in pending:
+            status = "queued"
+        else:
+            status = "requested"
+        item["requestStatus"] = status
+        item["downloadStatus"] = download
+    return items
 
 
 def _profile_user_payload(user):
@@ -241,12 +304,17 @@ def account_profile():
     total = count_request_history(user["id"])
     history = {"artist": [], "release-group": []}
     plex_index = _profile_plex_index()
-    for row in get_request_history(
+    anime_link_cache = {}
+    rows = [dict(row) for row in get_request_history(
         user["id"],
         limit=REQUESTS_PAGE_SIZE,
         offset=(page - 1) * REQUESTS_PAGE_SIZE,
-    ):
-        history[row["kind"]].append(_profile_history_item(row, plex_index))
+    )]
+    apply_release_group_lifecycle(rows)
+    for row in rows:
+        history[row["kind"]].append(
+            _profile_history_item(row, plex_index, anime_link_cache)
+        )
     return jsonify({
         "username": user["username"],
         "user": _profile_user_payload(user),

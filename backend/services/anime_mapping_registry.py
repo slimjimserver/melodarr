@@ -316,6 +316,44 @@ def _insert_targets(connection, mapping, now, created_at_by_group=None):
         )
 
 
+def _upsert_mapping(connection, mapping, now):
+    """Write a normalized mapping using the caller's active transaction."""
+    song_id = mapping["song_id"]
+    existing = connection.execute(
+        "SELECT created_at FROM anime_song_mappings WHERE song_id = ?",
+        (song_id,),
+    ).fetchone()
+    created_at = existing["created_at"] if existing else now
+    target_created = {
+        row["release_group_mbid"]: row["created_at"]
+        for row in connection.execute(
+            "SELECT release_group_mbid, created_at "
+            "FROM anime_song_mapping_targets WHERE song_id = ?",
+            (song_id,),
+        )
+    }
+    connection.execute(
+        "INSERT INTO anime_song_mappings "
+        "(song_id, title_snapshot, artists_json, status, provenance, "
+        "mapping_scope, schema_version, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(song_id) DO UPDATE SET "
+        "title_snapshot = excluded.title_snapshot, "
+        "artists_json = excluded.artists_json, status = excluded.status, "
+        "provenance = excluded.provenance, "
+        "mapping_scope = excluded.mapping_scope, "
+        "schema_version = excluded.schema_version, "
+        "updated_at = excluded.updated_at",
+        _mapping_values(mapping, created_at, now),
+    )
+    connection.execute(
+        "DELETE FROM anime_song_mapping_targets WHERE song_id = ?",
+        (song_id,),
+    )
+    _insert_targets(connection, mapping, now, target_created)
+    return _read_mapping(connection, song_id)
+
+
 def upsert_mapping(
     song_id,
     *,
@@ -346,39 +384,7 @@ def upsert_mapping(
 
     now = time.time()
     with db() as connection:
-        existing = connection.execute(
-            "SELECT created_at FROM anime_song_mappings WHERE song_id = ?",
-            (song_id,),
-        ).fetchone()
-        created_at = existing["created_at"] if existing else now
-        target_created = {
-            row["release_group_mbid"]: row["created_at"]
-            for row in connection.execute(
-                "SELECT release_group_mbid, created_at "
-                "FROM anime_song_mapping_targets WHERE song_id = ?",
-                (song_id,),
-            )
-        }
-        connection.execute(
-            "INSERT INTO anime_song_mappings "
-            "(song_id, title_snapshot, artists_json, status, provenance, "
-            "mapping_scope, schema_version, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(song_id) DO UPDATE SET "
-            "title_snapshot = excluded.title_snapshot, "
-            "artists_json = excluded.artists_json, status = excluded.status, "
-            "provenance = excluded.provenance, "
-            "mapping_scope = excluded.mapping_scope, "
-            "schema_version = excluded.schema_version, "
-            "updated_at = excluded.updated_at",
-            _mapping_values(mapping, created_at, now),
-        )
-        connection.execute(
-            "DELETE FROM anime_song_mapping_targets WHERE song_id = ?",
-            (song_id,),
-        )
-        _insert_targets(connection, mapping, now, target_created)
-        return _read_mapping(connection, song_id)
+        return _upsert_mapping(connection, mapping, now)
 
 
 def create_mapping_if_absent(
@@ -446,3 +452,238 @@ def reject_mapping(song_id, *, title, artists, provenance="manual"):
         scope="unknown",
         targets=[],
     )
+
+
+def _positive_id(value, label):
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be a positive integer.")
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be a positive integer.") from exc
+    if normalized <= 0 or str(value).strip() != str(normalized):
+        raise ValueError(f"{label} must be a positive integer.")
+    return normalized
+
+
+def _proposal_document(row):
+    if row is None:
+        return None
+    target = json.loads(row["target_json"])
+    release_group_mbid = target["releaseGroupId"]
+    return {
+        "id": row["id"],
+        "userId": row["submitter_user_id"],
+        "animeSlug": row["anime_slug"],
+        "animeName": row["anime_name"],
+        "themeId": row["theme_id"],
+        "themeLabel": row["theme_label"],
+        "songId": row["song_id"],
+        "songTitle": row["song_title"],
+        "artists": json.loads(row["artists_json"]),
+        "releaseGroupMbid": release_group_mbid,
+        "releaseGroup": target,
+        "musicBrainzUrl": (
+            f"https://musicbrainz.org/release-group/{release_group_mbid}"
+        ),
+        "status": row["status"],
+        "submittedBy": {
+            "id": row["submitter_user_id"],
+            "username": row["submitter_username"],
+        },
+        "reviewedByUserId": row["reviewed_by_user_id"],
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+        "reviewedAt": row["reviewed_at"],
+    }
+
+
+_PROPOSAL_SELECT = """
+    SELECT proposal.*, users.username AS submitter_username
+    FROM anime_mapping_proposals AS proposal
+    JOIN users ON users.id = proposal.submitter_user_id
+"""
+
+
+def _read_proposal(connection, proposal_id):
+    row = connection.execute(
+        _PROPOSAL_SELECT + " WHERE proposal.id = ?",
+        (proposal_id,),
+    ).fetchone()
+    return _proposal_document(row)
+
+
+def submit_mapping_proposal(
+    submitter_user_id,
+    *,
+    anime_slug,
+    anime_name,
+    theme_id,
+    theme_label,
+    song_id,
+    song_title,
+    artists,
+    target,
+):
+    """Create or revise one user's pending override without touching registry state."""
+    submitter_user_id = _positive_id(submitter_user_id, "Submitter user ID")
+    anime_slug = _text(anime_slug, "Anime slug")
+    anime_name = _text(anime_name, "Anime name")
+    theme_id = _positive_id(theme_id, "AnimeThemes theme ID")
+    theme_label = _text(theme_label, "Theme label")
+    song_id = _song_id(song_id)
+    song_title = _text(song_title, "Source song title")
+    artists = _normalize_artists(artists)
+    target = _normalize_target(target, "unknown")
+    target["preferred"] = True
+    artists_json = json.dumps(artists, ensure_ascii=False, separators=(",", ":"))
+    target_json = json.dumps(target, ensure_ascii=False, separators=(",", ":"))
+    now = time.time()
+    with db() as connection:
+        existing = connection.execute(
+            "SELECT id FROM anime_mapping_proposals "
+            "WHERE submitter_user_id = ? AND anime_slug = ? AND theme_id = ? "
+            "AND status = 'pending'",
+            (submitter_user_id, anime_slug, theme_id),
+        ).fetchone()
+        if existing:
+            proposal_id = existing["id"]
+            connection.execute(
+                "UPDATE anime_mapping_proposals SET anime_name = ?, "
+                "theme_label = ?, song_id = ?, song_title = ?, artists_json = ?, "
+                "target_json = ?, updated_at = ? WHERE id = ?",
+                (
+                    anime_name,
+                    theme_label,
+                    song_id,
+                    song_title,
+                    artists_json,
+                    target_json,
+                    now,
+                    proposal_id,
+                ),
+            )
+        else:
+            cursor = connection.execute(
+                "INSERT INTO anime_mapping_proposals "
+                "(submitter_user_id, anime_slug, anime_name, theme_id, "
+                "theme_label, song_id, song_title, artists_json, target_json, "
+                "status, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                (
+                    submitter_user_id,
+                    anime_slug,
+                    anime_name,
+                    theme_id,
+                    theme_label,
+                    song_id,
+                    song_title,
+                    artists_json,
+                    target_json,
+                    now,
+                    now,
+                ),
+            )
+            proposal_id = cursor.lastrowid
+        return _read_proposal(connection, proposal_id)
+
+
+def get_mapping_proposal(proposal_id):
+    proposal_id = _positive_id(proposal_id, "Mapping proposal ID")
+    with db() as connection:
+        return _read_proposal(connection, proposal_id)
+
+
+def mapping_proposals_for_anime(
+    anime_slug,
+    *,
+    submitter_user_id=None,
+    include_all_pending=False,
+):
+    """Return proposals visible to a user or the administrator review queue."""
+    anime_slug = _text(anime_slug, "Anime slug")
+    parameters = [anime_slug]
+    clauses = ["proposal.anime_slug = ?"]
+    if include_all_pending and submitter_user_id is not None:
+        submitter_user_id = _positive_id(submitter_user_id, "Submitter user ID")
+        clauses.append(
+            "(proposal.status = 'pending' OR proposal.submitter_user_id = ?)"
+        )
+        parameters.append(submitter_user_id)
+    elif include_all_pending:
+        clauses.append("proposal.status = 'pending'")
+    elif submitter_user_id is not None:
+        submitter_user_id = _positive_id(submitter_user_id, "Submitter user ID")
+        clauses.append("proposal.submitter_user_id = ?")
+        parameters.append(submitter_user_id)
+    else:
+        return []
+    with db() as connection:
+        rows = connection.execute(
+            _PROPOSAL_SELECT
+            + " WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY proposal.updated_at DESC, proposal.id DESC",
+            parameters,
+        ).fetchall()
+    return [_proposal_document(row) for row in rows]
+
+
+def approve_mapping_proposal(proposal_id, reviewer_user_id):
+    """Atomically publish a verified proposal and close competing proposals."""
+    proposal_id = _positive_id(proposal_id, "Mapping proposal ID")
+    reviewer_user_id = _positive_id(reviewer_user_id, "Reviewer user ID")
+    now = time.time()
+    with db() as connection:
+        proposal = _read_proposal(connection, proposal_id)
+        if proposal is None:
+            return None
+        if proposal["status"] == "rejected":
+            raise ValueError("Rejected mapping proposals cannot be approved.")
+        if proposal["status"] == "approved":
+            return proposal
+        mapping = _normalize_mapping(
+            proposal["songId"],
+            title=proposal["songTitle"],
+            artists=proposal["artists"],
+            status="confirmed",
+            provenance=f"user-proposal:{proposal_id}",
+            scope=proposal["releaseGroup"].get("scope") or "unknown",
+            targets=[proposal["releaseGroup"]],
+            preferred_release_group_mbid=proposal["releaseGroupMbid"],
+        )
+        _upsert_mapping(connection, mapping, now)
+        connection.execute(
+            "UPDATE anime_mapping_proposals SET status = 'approved', "
+            "reviewed_by_user_id = ?, reviewed_at = ?, updated_at = ? "
+            "WHERE id = ? AND status = 'pending'",
+            (reviewer_user_id, now, now, proposal_id),
+        )
+        connection.execute(
+            "UPDATE anime_mapping_proposals SET status = 'rejected', "
+            "reviewed_by_user_id = ?, reviewed_at = ?, updated_at = ? "
+            "WHERE song_id = ? AND status = 'pending' AND id != ?",
+            (reviewer_user_id, now, now, proposal["songId"], proposal_id),
+        )
+        return _read_proposal(connection, proposal_id)
+
+
+def reject_mapping_proposal(proposal_id, reviewer_user_id):
+    """Reject a pending proposal without modifying the universal mapping."""
+    proposal_id = _positive_id(proposal_id, "Mapping proposal ID")
+    reviewer_user_id = _positive_id(reviewer_user_id, "Reviewer user ID")
+    now = time.time()
+    with db() as connection:
+        proposal = _read_proposal(connection, proposal_id)
+        if proposal is None:
+            return None
+        if proposal["status"] == "approved":
+            raise ValueError("Approved mapping proposals cannot be rejected.")
+        if proposal["status"] == "pending":
+            connection.execute(
+                "UPDATE anime_mapping_proposals SET status = 'rejected', "
+                "reviewed_by_user_id = ?, reviewed_at = ?, updated_at = ? "
+                "WHERE id = ?",
+                (reviewer_user_id, now, now, proposal_id),
+            )
+        return _read_proposal(connection, proposal_id)

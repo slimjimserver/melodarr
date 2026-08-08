@@ -4,9 +4,11 @@
   "packageManager": "pnpm@11.9.0",
   "scripts": {
     "build": "tsc --project tsconfig.json --noEmit && node scripts/build.mjs",
-    "check": "tsc --project tsconfig.json --noEmit"
+    "check": "tsc --project tsconfig.json --noEmit",
+    "test:browser": "node ./node_modules/@playwright/test/cli.js test"
   },
   "devDependencies": {
+    "@playwright/test": "1.62.0",
     "esbuild": "0.28.1",
     "typescript": "5.9.3"
   }
