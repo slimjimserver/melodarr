@@ -21,6 +21,7 @@ class TestFilesystemIsolationTests(unittest.TestCase):
             "settings": backend_config.SETTINGS_FILE,
             "artwork": backend_config.ARTWORK_CACHE_DIRECTORY,
             "session secret": backend_config.SECRET_KEY_FILE,
+            "vapid private key": backend_config.VAPID_PRIVATE_KEY_FILE,
         }
         for label, path in paths.items():
             with self.subTest(path=label):
@@ -40,6 +41,7 @@ class TestFilesystemIsolationTests(unittest.TestCase):
                 SETTINGS_FILE=f"{production}/settings.json",
                 ARTWORK_CACHE_DIRECTORY=f"{production}/cache/artwork",
                 SECRET_KEY_FILE=f"{production}/session-secret.key",
+                VAPID_PRIVATE_KEY_FILE=f"{production}/vapid-private.pem",
             ),
             patch.object(application, "load_session_secret") as load_secret,
             patch.object(application, "init_cache_db") as init_cache,

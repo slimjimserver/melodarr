@@ -26,6 +26,7 @@ if __package__:
     from .routes.pages import blueprint as pages_blueprint
     from .routes.requests import blueprint as requests_blueprint
     from .routes.settings import blueprint as settings_blueprint
+    from .routes.notifications import blueprint as notifications_blueprint
     from .security import verify_csrf_token
     from .storage import init_db
 else:  # Support the existing `python backend/app.py` entry point.
@@ -42,6 +43,7 @@ else:  # Support the existing `python backend/app.py` entry point.
     from routes.pages import blueprint as pages_blueprint
     from routes.requests import blueprint as requests_blueprint
     from routes.settings import blueprint as settings_blueprint
+    from routes.notifications import blueprint as notifications_blueprint
     from security import verify_csrf_token
     from storage import init_db
 
@@ -141,6 +143,7 @@ BLUEPRINTS = (
     music_blueprint,
     requests_blueprint,
     settings_blueprint,
+    notifications_blueprint,
     pages_blueprint,
 )
 
@@ -176,4 +179,9 @@ def create_app(config=None):
     app.after_request(compress_response)
     for blueprint in BLUEPRINTS:
         app.register_blueprint(blueprint)
+    @app.get("/service-worker.js")
+    def service_worker():
+        response = send_file(os.path.join(FRONTEND_ROOT, "static", "service-worker.js"), mimetype="application/javascript", conditional=True)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
     return app

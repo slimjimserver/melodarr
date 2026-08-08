@@ -209,8 +209,26 @@ class ApplicationFactoryTests(DatabaseTestCase):
             for method in rule.methods
             if method not in {"HEAD", "OPTIONS"}
         }
-        self.assertEqual(len(rules), 77)
-        self.assertEqual(len(route_methods), 77)
+        self.assertEqual(len(rules), 92)
+        self.assertEqual(len(route_methods), 92)
+        notification_routes = {
+            ("/api/settings/notifications", "GET"),
+            ("/api/settings/notifications", "PUT"),
+            ("/api/settings/notifications/global", "PUT"),
+            ("/api/settings/notifications/email", "PUT"),
+            ("/api/settings/notifications/web-push", "PUT"),
+            ("/api/settings/notifications/email/test", "POST"),
+            ("/api/settings/notifications/web-push/test", "POST"),
+            ("/api/account/notifications", "GET"),
+            ("/api/account/notifications", "PUT"),
+            ("/api/account/notifications/subscriptions", "POST"),
+            ("/api/account/notifications/subscriptions/<int:subscription_id>", "DELETE"),
+            ("/api/account/notifications/mutes/<kind>/<mbid>", "GET"),
+            ("/api/account/notifications/mutes/<kind>/<mbid>", "PUT"),
+            ("/service-worker.js", "GET"),
+        }
+        self.assertTrue(notification_routes <= route_methods)
+        self.assertIn(("/settings/notifications", "GET"), route_methods)
 
     def test_factory_applies_test_configuration(self):
         self.assertTrue(self.app.config["TESTING"])
@@ -448,6 +466,7 @@ class WorkerEntrypointTests(unittest.TestCase):
         plex_metadata_thread = Mock()
         plex_history_thread = Mock()
         lidarr_library_thread = Mock()
+        notification_thread = Mock()
         thread_class.side_effect = [
             anime_metadata_thread,
             artist_metadata_thread,
@@ -457,13 +476,14 @@ class WorkerEntrypointTests(unittest.TestCase):
             plex_thread,
             plex_metadata_thread,
             plex_history_thread,
+            notification_thread,
         ]
         init_db.side_effect = lambda: calls.append("database")
         init_cache_db.side_effect = lambda: calls.append("cache")
         run.side_effect = lambda *_args: calls.append("recommendations")
         worker.main()
         self.assertEqual(calls, ["cache", "database", "recommendations"])
-        self.assertEqual(thread_class.call_count, 8)
+        self.assertEqual(thread_class.call_count, 9)
         thread_class.assert_any_call(
             target=anime_metadata_worker.run,
             name="anime-musicbrainz-resolution",
@@ -480,6 +500,11 @@ class WorkerEntrypointTests(unittest.TestCase):
         thread_class.assert_any_call(
             target=lidarr_download_worker.run,
             name="lidarr-download-status",
+            daemon=True,
+        )
+        thread_class.assert_any_call(
+            target=worker.notification_worker.run,
+            name="notification-deliveries",
             daemon=True,
         )
         thread_class.assert_any_call(
@@ -512,6 +537,7 @@ class WorkerEntrypointTests(unittest.TestCase):
         plex_metadata_thread.start.assert_called_once_with()
         plex_history_thread.start.assert_called_once_with()
         anime_metadata_thread.start.assert_called_once_with()
+        notification_thread.start.assert_called_once_with()
         artist_metadata_thread.start.assert_called_once_with()
         run.assert_called_once_with(worker.RECOMMENDATION_STARTUP_DEADLINE)
 

@@ -29,9 +29,9 @@ interface AppElement extends HTMLElement {
   alt: string;
   fetchPriority: string;
 }
-type AccountPage = "profile" | "requests" | "general" | "linked-accounts" | "invitations";
+type AccountPage = "profile" | "requests" | "general" | "linked-accounts" | "notifications" | "invitations";
 type AppView = "discover" | "detail" | "library" | "settings" | "account";
-type SettingsPage = "services" | "requests" | "users" | "jobs";
+type SettingsPage = "services" | "notifications" | "requests" | "users" | "jobs";
 type ThemeName = "midnight" | "warm";
 
 interface CurrentUser {
@@ -95,6 +95,24 @@ interface AdminRequest {
   song_title?: string;
   animeThemes?: AnimeThemeLink[];
   requester: AdminUserIdentity;
+}
+
+function pushDeviceMetadata(): JsonObject {
+  // This intentionally derives a small presentation label in the browser and
+  // sends no raw user-agent string to the server.
+  const navigatorWithHints = navigator as Navigator & { userAgentData?: { mobile?: boolean; platform?: string; brands?: Array<{ brand: string }> } };
+  const userAgent = navigator.userAgent || "";
+  const mobileHint = Boolean(navigatorWithHints.userAgentData?.mobile);
+  const iPhone = /iPhone/i.test(userAgent);
+  const iPad = /iPad/i.test(userAgent) || (/Macintosh/i.test(userAgent) && /Mobile/i.test(userAgent));
+  const android = /Android/i.test(userAgent) || /Android/i.test(navigatorWithHints.userAgentData?.platform || "");
+  const platform = navigatorWithHints.userAgentData?.platform || navigator.platform || "";
+  const deviceName = iPhone ? "iPhone" : iPad ? "iPad" : android ? "Android Device" : mobileHint ? "Mobile Device" : "Desktop Device";
+  const operatingSystem = iPhone || iPad ? "iOS" : android ? "Android" : /Win/i.test(platform) ? "Windows" : /Mac/i.test(platform) ? "macOS" : /Linux/i.test(platform) ? "Linux" : "Unknown";
+  const brands = (navigatorWithHints.userAgentData?.brands || []).map((brand) => brand.brand).join(" ");
+  const browser = /Edg|Edge/i.test(userAgent + brands) ? "Edge" : /Firefox/i.test(userAgent + brands) ? "Firefox" : /CriOS|Chrome|Chromium/i.test(userAgent + brands) ? "Chrome" : /Safari/i.test(userAgent) && (iPhone || iPad || mobileHint) ? "Mobile Safari" : /Safari/i.test(userAgent) ? "Safari" : "Unknown";
+  const engine = iPhone || iPad ? "WebKit" : /AppleWebKit|Chrome|Chromium/i.test(userAgent + brands) ? "Blink" : /Gecko/i.test(userAgent) ? "Gecko" : "Unknown";
+  return { deviceName, operatingSystem, browser, engine };
 }
 
 interface AnimeThemeLink {
@@ -632,6 +650,56 @@ async function refreshSettings(loadLidarrOptions = true) {
     ? `Lidarr connected${plex.configured ? " · Plex connected" : ""}`
     : "Connect Lidarr in Settings";
   status.className = `status ${lidarr.configured ? "ready" : "warn"}`;
+  await refreshNotificationSettings();
+}
+
+async function refreshNotificationSettings() {
+  if (currentUser?.role !== "admin") return;
+  const globalForm = document.querySelector<HTMLFormElement>("#notification-global-settings");
+  const emailForm = document.querySelector<HTMLFormElement>("#notification-email-settings");
+  const pushForm = document.querySelector<HTMLFormElement>("#notification-web-push-settings");
+  if (!globalForm || !emailForm || !pushForm) return;
+  try {
+    const config = await api("/api/settings/notifications");
+    const state = $<HTMLElement>("#notification-state");
+    state.textContent = config.enabled ? "Enabled" : "Disabled";
+    const input = (form: HTMLFormElement, name: string) => requiredDescendant<HTMLInputElement | HTMLSelectElement>(form, `[name="${name}"]`);
+    (input(globalForm, "enabled") as HTMLInputElement).checked = Boolean(config.enabled);
+    (input(globalForm, "applicationUrl") as HTMLInputElement).value = config.applicationUrl || "";
+    (input(emailForm, "host") as HTMLInputElement).value = config.email?.host || "";
+    (input(emailForm, "port") as HTMLInputElement).value = String(config.email?.port || 587);
+    (input(emailForm, "encryption") as HTMLSelectElement).value = config.email?.encryption || "starttls";
+    (input(emailForm, "username") as HTMLInputElement).value = config.email?.username || "";
+    (input(emailForm, "senderName") as HTMLInputElement).value = config.email?.senderName || "";
+    (input(emailForm, "sender") as HTMLInputElement).value = config.email?.sender || "";
+    (input(emailForm, "password") as HTMLInputElement).value = "";
+    (input(emailForm, "emailEnabled") as HTMLInputElement).checked = Boolean(config.email?.enabled);
+    (input(pushForm, "contact") as HTMLInputElement).value = config.webPush?.contact || "";
+    (input(pushForm, "webPushEnabled") as HTMLInputElement).checked = Boolean(config.webPush?.enabled);
+    const bindSave = (form: HTMLFormElement, path: string, payload: () => JsonObject, success: string) => {
+      if (form.dataset.bound) return;
+      form.dataset.bound = "true";
+      const message = requiredDescendant<HTMLElement>(form, ".form-message");
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        try { await api(path, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload()) }); setMessage(message, success); await refreshNotificationSettings(); }
+        catch (error) { setMessage(message, error.message, true); }
+      });
+    };
+    bindSave(globalForm, "/api/settings/notifications/global", () => ({ enabled: (input(globalForm, "enabled") as HTMLInputElement).checked, applicationUrl: (input(globalForm, "applicationUrl") as HTMLInputElement).value }), "Global notification settings saved.");
+    bindSave(emailForm, "/api/settings/notifications/email", () => ({ enabled: (input(emailForm, "emailEnabled") as HTMLInputElement).checked, host: (input(emailForm, "host") as HTMLInputElement).value, port: (input(emailForm, "port") as HTMLInputElement).value, encryption: (input(emailForm, "encryption") as HTMLSelectElement).value, username: (input(emailForm, "username") as HTMLInputElement).value, senderName: (input(emailForm, "senderName") as HTMLInputElement).value, sender: (input(emailForm, "sender") as HTMLInputElement).value, password: (input(emailForm, "password") as HTMLInputElement).value }), "Email notification settings saved.");
+    bindSave(pushForm, "/api/settings/notifications/web-push", () => ({ enabled: (input(pushForm, "webPushEnabled") as HTMLInputElement).checked, contact: (input(pushForm, "contact") as HTMLInputElement).value }), "Web Push notification settings saved.");
+    const tests: Array<[HTMLFormElement, string]> = [[emailForm, "/api/settings/notifications/email/test"], [pushForm, "/api/settings/notifications/web-push/test"]];
+    tests.forEach(([form, path]) => {
+      if (form.dataset.testBound) return;
+      form.dataset.testBound = "true";
+      requiredDescendant<HTMLButtonElement>(form, ".notification-test").addEventListener("click", async () => {
+        const message = requiredDescendant<HTMLElement>(form, ".form-message");
+        try { const result = await api(path as string, { method: "POST" }); setMessage(message, result.message || "Test sent."); }
+        catch (error) { setMessage(message, error.message, true); }
+      });
+    });
+  } catch (error) { setMessage($<HTMLElement>("#notification-state"), error.message, true); }
 }
 
 function formatBytes(bytes: number) {
@@ -758,6 +826,8 @@ function showSettingsPage(page: SettingsPage, updateHistory = true) {
   if (page === "jobs") {
     refreshMaintenance();
     maintenanceRefreshTimer = window.setInterval(refreshMaintenance, 10_000);
+  } else if (page === "notifications") {
+    refreshNotificationSettings();
   } else if (page === "requests") {
     refreshAdminRequests();
   } else if (page === "users") {
@@ -976,6 +1046,9 @@ function setupNavigation() {
       element.hidden = element.classList.contains("admin-only")
         ? user.role !== "admin"
         : !isOwnAccount && user.role !== "admin";
+    });
+    document.querySelectorAll<HTMLElement>("[data-account-self-only]").forEach((element) => {
+      element.hidden = !isOwnAccount;
     });
     content.replaceChildren();
     const message = document.createElement("p");
@@ -1284,6 +1357,98 @@ function setupNavigation() {
           }
         });
         content.append(form);
+      } else if (page === "notifications" && isOwnAccount) {
+        const prefs = await api("/api/account/notifications", { signal: controller.signal });
+        if (!isCurrentRender()) return;
+        content.replaceChildren();
+        const form = document.createElement("form"); form.className = "account-form notification-preferences";
+        form.innerHTML = `<h2>Notifications</h2>
+          <fieldset class="notification-preference-card notification-master-card">
+            <legend>Availability alerts</legend>
+            <label class="notification-toggle"><input name="enabled" type="checkbox"><span><strong>Enable availability notifications</strong><small>Receive alerts when music becomes available.</small></span></label>
+          </fieldset>
+          <fieldset class="notification-preference-card">
+            <legend>Music Notifications</legend>
+            <label>Music Notifications<select name="musicNotifications"><option value="requested">Requested Music</option><option value="all">All Music</option></select></label>
+          </fieldset>
+          <fieldset class="notification-preference-card">
+            <legend>Delivery methods</legend>
+            <label>Notification email<input name="notificationEmail" type="email" autocomplete="email"></label>
+            <label class="notification-toggle"><input name="emailEnabled" type="checkbox"><span><strong>Email</strong><small>Send availability alerts to this email address.</small></span></label>
+            <label class="notification-toggle"><input name="webPushEnabled" type="checkbox"><span><strong>Web Push</strong><small>Show availability alerts on registered browsers.</small></span></label>
+            <div class="push-device-row"><p class="push-state" aria-live="polite"></p><button type="button" class="outline enable-push">Enable this device</button></div>
+          </fieldset>
+          <div class="form-actions"><p class="form-message" aria-live="polite"></p><button>Save notification preferences</button></div>`;
+        const input = (name: string) => requiredDescendant<HTMLInputElement>(form, `[name="${name}"]`);
+        ["enabled", "emailEnabled", "webPushEnabled"].forEach((name) => { input(name).checked = Boolean(prefs[name]); });
+        const musicNotifications = requiredDescendant<HTMLSelectElement>(form, '[name="musicNotifications"]');
+        musicNotifications.value = prefs.allNewMusic ? "all" : "requested";
+        input("notificationEmail").value = prefs.notificationEmail || "";
+        const plexDerivedEmail = prefs.notificationEmailSource === "plex" ? String(prefs.notificationEmail || "") : "";
+        const formMessage = requiredDescendant<HTMLElement>(form, ".form-message");
+        const pushState = requiredDescendant<HTMLElement>(form, ".push-state");
+        const pushButton = requiredDescendant<HTMLButtonElement>(form, ".enable-push");
+        const permission = "Notification" in window ? Notification.permission : "unsupported";
+        pushState.textContent = `Email ${prefs.global?.emailAvailable ? "is available" : "is not configured"}. Web Push: ${prefs.global?.webPushAvailable ? permission : "not configured"}.`;
+        pushButton.disabled = !prefs.global?.webPushAvailable || !("serviceWorker" in navigator) || !window.isSecureContext;
+        const musicPreferencePayload = () => musicNotifications.value === "all"
+          ? { requestedAvailable: false, allNewMusic: true }
+          : { requestedAvailable: true, allNewMusic: false };
+        const notificationEmailPayload = () => {
+          const displayed = input("notificationEmail").value.trim();
+          return plexDerivedEmail && displayed === plexDerivedEmail ? "" : displayed;
+        };
+        form.addEventListener("submit", async (event) => { event.preventDefault(); try {
+          await api("/api/account/notifications", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
+            enabled: input("enabled").checked, emailEnabled: input("emailEnabled").checked, webPushEnabled: input("webPushEnabled").checked,
+            ...musicPreferencePayload(), notificationEmail: notificationEmailPayload(),
+          }) }); setMessage(formMessage, "Notification preferences saved.");
+        } catch (error) { setMessage(formMessage, error.message, true); } });
+        pushButton.addEventListener("click", async () => { try {
+          const registration = await navigator.serviceWorker.register("/service-worker.js", { scope: "/" });
+          const granted = await Notification.requestPermission(); if (granted !== "granted") throw new Error("Browser notification permission was not granted.");
+          const key = prefs.global?.publicKey; if (!key) throw new Error("Web Push is not configured.");
+          const bytes = Uint8Array.from(atob(key.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - key.length % 4) % 4)), c => c.charCodeAt(0));
+          let subscription = await registration.pushManager.getSubscription();
+          const sameKey = subscription && subscription.options.applicationServerKey
+            && Array.from(new Uint8Array(subscription.options.applicationServerKey)).join(",") === Array.from(bytes).join(",");
+          if (subscription && !sameKey) {
+            const oldDevice = (prefs.devices || []).find((device: JsonObject) => String(device.endpoint || "") === subscription!.endpoint);
+            await subscription.unsubscribe();
+            if (oldDevice) await api(`/api/account/notifications/subscriptions/${encodeURIComponent(String(oldDevice.id))}`, { method: "DELETE" });
+            subscription = null;
+          }
+          if (!subscription) subscription = await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: bytes });
+          await api("/api/account/notifications/subscriptions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...subscription.toJSON(), ...pushDeviceMetadata() }) });
+          await api("/api/account/notifications", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled: input("enabled").checked, emailEnabled: input("emailEnabled").checked, webPushEnabled: true, ...musicPreferencePayload(), notificationEmail: notificationEmailPayload() }) });
+          input("webPushEnabled").checked = true; setMessage(formMessage, "This device is registered and Web Push notifications are enabled.");
+          showAccountPage?.("notifications", false, targetUsername);
+        } catch (error) { setMessage(formMessage, error.message, true); } });
+        const devices = document.createElement("section"); devices.className = "account-section notification-devices";
+        const deviceTitle = document.createElement("h2"); deviceTitle.className = "manage-devices-title"; deviceTitle.textContent = "Manage Devices"; devices.append(deviceTitle);
+        const deviceRows = prefs.devices || [];
+        if (!deviceRows.length) { const empty = document.createElement("p"); empty.className = "message"; empty.textContent = "No browsers are registered for Web Push."; devices.append(empty); }
+        deviceRows.forEach((device: JsonObject) => {
+          const row = document.createElement("article"); row.className = "notification-device-card";
+          const icon = document.createElement("img"); icon.src = "/icons/mobile-device.svg"; icon.width = 42; icon.height = 42; icon.alt = "";
+          const identity = document.createElement("div"); identity.className = "notification-device-identity";
+          const title = document.createElement("strong"); title.textContent = String(device.device_name || "Browser");
+          const registered = document.createElement("small"); registered.textContent = `Registered ${new Date(Number(device.created_at) * 1000).toLocaleString()}`;
+          const metadata = document.createElement("dl"); metadata.className = "notification-device-metadata";
+          [["Operating System", device.operating_system], ["Browser", device.browser], ["Engine", device.engine]].forEach(([label, value]) => {
+            const term = document.createElement("dt"); term.textContent = label;
+            const definition = document.createElement("dd"); definition.textContent = String(value || "Unknown"); metadata.append(term, definition);
+          });
+          identity.append(title, registered);
+          const remove = document.createElement("button"); remove.type = "button"; remove.className = "notification-delete-subscription"; remove.setAttribute("aria-label", `Delete subscription for ${title.textContent}`);
+          const trash = document.createElementNS("http://www.w3.org/2000/svg", "svg"); trash.setAttribute("viewBox", "0 0 24 24"); trash.setAttribute("width", "18"); trash.setAttribute("height", "18"); trash.setAttribute("aria-hidden", "true"); trash.setAttribute("focusable", "false");
+          const trashPath = document.createElementNS("http://www.w3.org/2000/svg", "path"); trashPath.setAttribute("d", "M4 7h16M10 11v6m4-6v6M9 7l1-2h4l1 2m-9 0 1 13h10l1-13"); trashPath.setAttribute("fill", "none"); trashPath.setAttribute("stroke", "currentColor"); trashPath.setAttribute("stroke-width", "2"); trashPath.setAttribute("stroke-linecap", "round"); trashPath.setAttribute("stroke-linejoin", "round"); trash.append(trashPath);
+          remove.append(trash, document.createTextNode("Delete Subscription"));
+          remove.addEventListener("click", async () => { remove.disabled = true; try { await api(`/api/account/notifications/subscriptions/${encodeURIComponent(String(device.id))}`, { method: "DELETE" }); showAccountPage?.("notifications", false, targetUsername); } catch (error) { setMessage(formMessage, error.message, true); remove.disabled = false; } });
+          row.append(icon, identity, metadata, remove); devices.append(row);
+        });
+        content.append(form);
+        content.append(devices);
       } else if (page === "invitations") {
         content.replaceChildren();
         const form = document.createElement("form") as AppForm; form.className = "service-card account-form";
@@ -1332,6 +1497,13 @@ function setupNavigation() {
       showView("discover");
       return;
     }
+    const allowedPages: AccountPage[] = ["profile", "requests"];
+    if (isOwnAccount || currentUser.role === "admin") {
+      allowedPages.push("general", "linked-accounts");
+    }
+    if (isOwnAccount) allowedPages.push("notifications");
+    if (currentUser.role === "admin") allowedPages.push("invitations");
+    page = allowedPages.includes(page) ? page : "profile";
     activeAccountUsername = username;
     activeAccountRequestPage = page === "requests" ? Math.max(1, requestPage) : 1;
     showView("account", false);
@@ -1342,12 +1514,7 @@ function setupNavigation() {
         accountPath(page, username, activeAccountRequestPage),
       );
     }
-    const allowedPages: AccountPage[] = ["profile", "requests"];
-    if (isOwnAccount || currentUser.role === "admin") {
-      allowedPages.push("general", "linked-accounts");
-    }
-    if (currentUser.role === "admin") allowedPages.push("invitations");
-    renderAccount(allowedPages.includes(page) ? page : "profile");
+    renderAccount(page);
   };
 
   document.querySelectorAll<HTMLElement>(".nav-link").forEach((button) => {
@@ -1372,7 +1539,7 @@ function setupNavigation() {
   });
 
   window.addEventListener("popstate", () => {
-    if (["/settings", "/settings/requests", "/settings/users", "/settings/jobs"].includes(window.location.pathname)) {
+    if (["/settings", "/settings/notifications", "/settings/requests", "/settings/users", "/settings/jobs"].includes(window.location.pathname)) {
       if (currentUser?.role !== "admin") {
         showView("discover", false);
         window.history.replaceState({ view: "discover" }, "", "/");
@@ -1382,6 +1549,8 @@ function setupNavigation() {
       showView("settings", false);
       const page: SettingsPage = window.location.pathname.endsWith("/requests")
         ? "requests"
+        : window.location.pathname.endsWith("/notifications")
+          ? "notifications"
         : window.location.pathname.endsWith("/users")
           ? "users"
           : window.location.pathname.endsWith("/jobs") ? "jobs" : "services";
@@ -1389,7 +1558,7 @@ function setupNavigation() {
       return;
     }
     const accountMatch = window.location.pathname.match(
-      /^\/([^/]+)(?:\/(requests)|\/settings\/(general|linked-accounts|invitations))?\/?$/,
+      /^\/([^/]+)(?:\/(requests)|\/settings\/(general|linked-accounts|notifications|invitations))?\/?$/,
     );
     const accountUsername = accountMatch ? decodeURIComponent(accountMatch[1]) : "";
     const canViewAccount = accountMatch && currentUser && (
@@ -1409,7 +1578,7 @@ function setupNavigation() {
   });
 
   const initialView = window.location.pathname.slice(1) || "discover";
-  if (["settings/requests", "settings/users", "settings/jobs"].includes(initialView)) showView("settings", false);
+  if (["settings/notifications", "settings/requests", "settings/users", "settings/jobs"].includes(initialView)) showView("settings", false);
   else if (["library", "settings"].includes(initialView)) showView(initialView as AppView, false);
 
   document.querySelectorAll<HTMLElement>(".tab-bar .nav-link").forEach((button) => button.addEventListener("click", () => {

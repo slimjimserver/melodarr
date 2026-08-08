@@ -699,13 +699,15 @@
     getLidarrExternalUrl().then((externalUrl) => {
       if (!externalUrl) return;
       const resource = kind === "artist" ? "artist" : "album";
-      links.append(createServiceIconLink(
+      const bell = links.querySelector(".notification-mute");
+      links.insertBefore(createServiceIconLink(
         `${externalUrl}/${resource}/${encodeURIComponent(id)}`,
         "/icons/lidarr.svg",
         "Open in Lidarr",
         "external-link-lidarr",
-      ));
+      ), bell);
     });
+    return links;
   }
 
   function detailPlexLinks(kind: "artist" | "release-group", data: JsonObject) {
@@ -750,8 +752,8 @@
       existing.replaceWith(updated);
       return;
     }
-    const lidarrLink = links.querySelector(".external-link-lidarr");
-    links.insertBefore(updated, lidarrLink);
+    const nextLink = links.querySelector(".external-link-lidarr, .notification-mute");
+    links.insertBefore(updated, nextLink);
   }
 
   function createMeta(kind: DetailKind, data: JsonObject) {
@@ -1597,6 +1599,26 @@
       songId: String(theme.song?.id || ""),
       songTitle: String(theme.song?.title || ""),
     };
+  }
+
+  function addMuteButton(container: HTMLElement, kind: "artist" | "release-group", mbid: string) {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(mbid)) return;
+    const bell = document.createElement("button");
+    bell.type = "button"; bell.className = "notification-mute"; bell.dataset.notificationMute = "true";
+    bell.title = "Mute availability notifications"; bell.setAttribute("aria-label", bell.title); bell.setAttribute("aria-pressed", "false");
+    const icon = document.createElement("img"); icon.alt = ""; icon.width = 24; icon.height = 24; icon.decoding = "async"; bell.append(icon);
+    bell.disabled = true; container.append(bell);
+    const label = (muted: boolean) => { icon.src = muted ? "/icons/bell-snooze.svg" : "/icons/bell-alert.svg"; bell.setAttribute("aria-pressed", String(muted)); bell.dataset.muted = String(muted); };
+    api<{ muted: boolean }>(`/api/account/notifications/mutes/${kind}/${encodeURIComponent(mbid)}`)
+      .then((state) => { label(state.muted); bell.disabled = false; })
+      .catch(() => bell.remove());
+    bell.addEventListener("click", async (event) => {
+      event.preventDefault(); event.stopPropagation();
+      const muted = bell.dataset.muted !== "true"; bell.disabled = true;
+      try { const state = await api<{ muted: boolean }>(`/api/account/notifications/mutes/${kind}/${encodeURIComponent(mbid)}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ muted }) }); label(state.muted); }
+      catch { /* Keep the last known state; the account page exposes details. */ }
+      finally { bell.disabled = false; }
+    });
   }
 
   function animeCandidatePlexLink(candidate: JsonObject) {
@@ -2775,6 +2797,7 @@
       }
       $("#detail-subtitle").textContent = [data.country, data.disambiguation].filter(Boolean).join(" · ");
       const meta = createMeta("artist", data);
+      addMuteButton(requiredDescendant<HTMLElement>(meta, ".external-icons"), "artist", String(data.id));
       const facts = [data.type, data.gender, data.area, data.lifeSpan?.begin].filter(Boolean).join(" · ");
       if (facts) meta.append(document.createElement("br"), `Artist information: ${facts}`);
       results.append(meta);
@@ -2847,7 +2870,9 @@
         subtitle.append(data.artist || "");
       }
       [data.type, data.date].filter(Boolean).forEach((value) => subtitle.append(` · ${value}`));
-      results.append(createMeta("release-group", data));
+      const meta = createMeta("release-group", data);
+      addMuteButton(requiredDescendant<HTMLElement>(meta, ".external-icons"), "release-group", String(data.id));
+      results.append(meta);
       const animeThemes = (data.animeThemes || []) as JsonObject[];
       if (animeThemes.length) results.append(createReleaseAnimeThemes(animeThemes));
       const requestButton = document.createElement("button");
@@ -2870,7 +2895,10 @@
           animeContext: releaseAnimeRequestContext(data),
         }));
       }
-      results.append(requestButton);
+      const actions = document.createElement("div");
+      actions.className = "detail-actions";
+      actions.append(requestButton);
+      results.append(actions);
       renderDownloadStatus(data);
       data.releases.forEach((release: JsonObject) => {
         const card = createCard(

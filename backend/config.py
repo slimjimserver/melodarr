@@ -82,6 +82,10 @@ SECRET_KEY_FILE = _path_from_environment(
     "MELODARR_SECRET_KEY_FILE",
     os.path.join(os.path.dirname(os.path.abspath(DATABASE)), "session-secret.key"),
 )
+VAPID_PRIVATE_KEY_FILE = _path_from_environment(
+    "MELODARR_VAPID_PRIVATE_KEY_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(DATABASE)), "vapid-private.pem"),
+)
 
 
 def assert_test_storage_isolation():
@@ -114,6 +118,7 @@ def assert_test_storage_isolation():
         "SETTINGS_FILE": SETTINGS_FILE,
         "ARTWORK_CACHE_DIRECTORY": ARTWORK_CACHE_DIRECTORY,
         "SECRET_KEY_FILE": SECRET_KEY_FILE,
+        "VAPID_PRIVATE_KEY_FILE": VAPID_PRIVATE_KEY_FILE,
     }
     unsafe = {}
     for name, path in paths.items():

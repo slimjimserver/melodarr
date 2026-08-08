@@ -813,6 +813,134 @@ def init_db():
                 created_at REAL NOT NULL
             )
         """)
+        # Notification rows deliberately retain event and target snapshots.  This
+        # makes scans idempotent and keeps provider I/O out of the scan transaction.
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS user_notification_preferences (
+                user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                notification_email TEXT,
+                enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0, 1)),
+                email_enabled INTEGER NOT NULL DEFAULT 0 CHECK(email_enabled IN (0, 1)),
+                web_push_enabled INTEGER NOT NULL DEFAULT 0 CHECK(web_push_enabled IN (0, 1)),
+                requested_available INTEGER NOT NULL DEFAULT 1 CHECK(requested_available IN (0, 1)),
+                all_new_music INTEGER NOT NULL DEFAULT 0 CHECK(all_new_music IN (0, 1)),
+                updated_at REAL NOT NULL
+            )
+        """)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS web_push_subscriptions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                endpoint TEXT NOT NULL UNIQUE,
+                p256dh TEXT NOT NULL,
+                auth TEXT NOT NULL,
+                device_name TEXT,
+                operating_system TEXT,
+                browser TEXT,
+                engine TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+        """)
+        # Keep installations from before device details were introduced usable.
+        # These are deliberately nullable: old subscriptions never contained a
+        # user agent-derived label and must remain valid until the user replaces
+        # them.
+        subscription_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(web_push_subscriptions)")
+        }
+        for column in ("device_name", "operating_system", "browser", "engine"):
+            if column not in subscription_columns:
+                connection.execute(f"ALTER TABLE web_push_subscriptions ADD COLUMN {column} TEXT")
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS notification_mutes (
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL CHECK(kind IN ('artist', 'release-group')),
+                mbid TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                PRIMARY KEY(user_id, kind, mbid)
+            )
+        """)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS release_availability_state (
+                release_mbid TEXT PRIMARY KEY,
+                fully_available INTEGER NOT NULL CHECK(fully_available IN (0, 1)),
+                generation INTEGER NOT NULL DEFAULT 0 CHECK(generation >= 0),
+                artist_mbid TEXT NOT NULL DEFAULT '',
+                artist_name TEXT NOT NULL DEFAULT '',
+                release_title TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+        """)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS notification_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                release_mbid TEXT NOT NULL,
+                generation INTEGER NOT NULL,
+                artist_mbid TEXT NOT NULL,
+                artist_name TEXT NOT NULL,
+                release_title TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                UNIQUE(release_mbid, generation)
+            )
+        """)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS notification_deliveries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id INTEGER NOT NULL REFERENCES notification_events(id) ON DELETE CASCADE,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                channel TEXT NOT NULL CHECK(channel IN ('email', 'web-push')),
+                email_target TEXT,
+                subscription_id INTEGER REFERENCES web_push_subscriptions(id) ON DELETE SET NULL,
+                push_endpoint TEXT,
+                push_p256dh TEXT,
+                push_auth TEXT,
+                status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'leased', 'sent', 'dead')),
+                attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+                next_attempt_at REAL NOT NULL,
+                lease_token TEXT,
+                lease_until REAL,
+                last_error TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                CHECK((channel = 'email' AND email_target IS NOT NULL AND subscription_id IS NULL
+                       AND push_endpoint IS NULL AND push_p256dh IS NULL AND push_auth IS NULL)
+                   OR (channel = 'web-push' AND email_target IS NULL AND push_endpoint IS NOT NULL
+                       AND push_p256dh IS NOT NULL AND push_auth IS NOT NULL))
+            )
+        """)
+        delivery_columns = {row["name"] for row in connection.execute("PRAGMA table_info(notification_deliveries)")}
+        if "push_endpoint" not in delivery_columns:
+            # The first notification release joined live subscriptions at send time.
+            # Rebuild before enabling snapshots: a browser endpoint may subsequently
+            # transfer to another user, and historical work must never follow it.
+            connection.execute("""CREATE TABLE notification_deliveries_v2 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id INTEGER NOT NULL REFERENCES notification_events(id) ON DELETE CASCADE,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                channel TEXT NOT NULL CHECK(channel IN ('email', 'web-push')),
+                email_target TEXT, subscription_id INTEGER REFERENCES web_push_subscriptions(id) ON DELETE SET NULL,
+                push_endpoint TEXT, push_p256dh TEXT, push_auth TEXT,
+                status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'leased', 'sent', 'dead')),
+                attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0), next_attempt_at REAL NOT NULL,
+                lease_token TEXT, lease_until REAL, last_error TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL,
+                CHECK((channel='email' AND email_target IS NOT NULL AND subscription_id IS NULL AND push_endpoint IS NULL AND push_p256dh IS NULL AND push_auth IS NULL)
+                   OR (channel='web-push' AND email_target IS NULL AND push_endpoint IS NOT NULL AND push_p256dh IS NOT NULL AND push_auth IS NOT NULL))
+            )""")
+            connection.execute("""INSERT INTO notification_deliveries_v2
+                (id,event_id,user_id,channel,email_target,subscription_id,push_endpoint,push_p256dh,push_auth,status,attempts,next_attempt_at,lease_token,lease_until,last_error,created_at,updated_at)
+                SELECT d.id,d.event_id,d.user_id,d.channel,d.email_target,d.subscription_id,s.endpoint,s.p256dh,s.auth,d.status,d.attempts,d.next_attempt_at,d.lease_token,d.lease_until,d.last_error,d.created_at,d.updated_at
+                FROM notification_deliveries d LEFT JOIN web_push_subscriptions s ON s.id=d.subscription_id
+                WHERE d.channel='email' OR s.id IS NOT NULL""")
+            connection.execute("DROP TABLE notification_deliveries")
+            connection.execute("ALTER TABLE notification_deliveries_v2 RENAME TO notification_deliveries")
+        connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS notification_delivery_email_unique "
+                           "ON notification_deliveries(event_id, user_id, email_target) WHERE channel = 'email'")
+        connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS notification_delivery_push_unique "
+            "ON notification_deliveries(event_id, user_id, push_endpoint) WHERE channel = 'web-push'")
+        connection.execute("CREATE INDEX IF NOT EXISTS notification_deliveries_due "
+                           "ON notification_deliveries(status, next_attempt_at)")
         request_columns = {
             row["name"]
             for row in connection.execute("PRAGMA table_info(request_history)")

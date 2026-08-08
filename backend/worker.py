@@ -13,6 +13,7 @@ if __package__:
     from .workers import plex_history as plex_history_worker
     from .workers import plex_metadata as plex_metadata_worker
     from .workers import recommendations as recommendation_worker
+    from .workers import notifications as notification_worker
 else:  # Support `python backend/worker.py` for local development.
     from api_cache import init_cache_db
     from storage import init_db
@@ -25,6 +26,7 @@ else:  # Support `python backend/worker.py` for local development.
     from workers import plex_history as plex_history_worker
     from workers import plex_metadata as plex_metadata_worker
     from workers import recommendations as recommendation_worker
+    from workers import notifications as notification_worker
 
 
 LIDARR_LIBRARY_STARTUP_DELAY = 10
@@ -88,6 +90,12 @@ def main():
         daemon=True,
     )
     plex_history_thread.start()
+    notification_thread = Thread(
+        target=notification_worker.run,
+        name="notification-deliveries",
+        daemon=True,
+    )
+    notification_thread.start()
     recommendation_worker.run(RECOMMENDATION_STARTUP_DEADLINE)
 
 

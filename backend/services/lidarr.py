@@ -393,6 +393,8 @@ def album_availability(album):
         "trackFileCount": downloaded,
         "fullyAvailable": bool(total and downloaded >= total),
         "monitored": bool(album.get("monitored")),
+        "artistMbid": str(album.get("foreignArtistId") or (album.get("artist") or {}).get("foreignArtistId") or ""),
+        "artistName": str(album.get("artistName") or (album.get("artist") or {}).get("artistName") or (album.get("artist") or {}).get("name") or ""),
     }
 
 
@@ -411,11 +413,21 @@ def scan_library_availability(config=None):
     for album in library_albums(config):
         release_group_id = album.get("foreignAlbumId")
         if release_group_id:
-            albums[str(release_group_id).casefold()] = album_availability(album)
+            normalized = album_availability(album)
+            artist = artists.get(normalized["artistMbid"])
+            if artist and not normalized["artistName"]:
+                normalized["artistName"] = artist["name"]
+            albums[str(release_group_id).casefold()] = normalized
     payload = {"artists": artists, "albums": albums}
     set_cache_document("lidarr-library", "albums", payload, LIDARR_LIBRARY_CACHE_TTL)
     invalidate_document(LIBRARY_INDEX_KEY)
     invalidate_detail_payloads()
+    # This receives only a complete successful scan; absent records remain unknown.
+    try:
+        from ..notifications import observe_availability
+    except ImportError:
+        from notifications import observe_availability
+    observe_availability(albums)
     return payload
 
 
