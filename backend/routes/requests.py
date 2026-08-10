@@ -6,6 +6,7 @@ import requests
 from flask import Blueprint, jsonify
 
 if __package__ == "backend.routes":
+    from .. import notifications
     from ..responses import api_error, request_json_object
     from ..security import current_user, login_required
     from ..services import lidarr
@@ -18,6 +19,7 @@ if __package__ == "backend.routes":
     from ..workers import lidarr_searches as lidarr_search_worker
     from ..workers import lidarr_library as lidarr_library_worker
 else:  # Support the existing `python backend/app.py` entry point.
+    import notifications
     from responses import api_error, request_json_object
     from security import current_user, login_required
     from services import lidarr
@@ -203,6 +205,7 @@ def request_release_group():
     mbid = str(body.get("mbid", "")).strip()
     if not mbid:
         return api_error("A MusicBrainz release-group ID is required.")
+    user = current_user()
     try:
         anime_context = _anime_request_context(body)
     except ValueError as exc:
@@ -210,11 +213,14 @@ def request_release_group():
     pending = pending_lidarr_search(mbid)
     if pending:
         record_request(
-            current_user()["id"],
+            user["id"],
             "release-group",
             mbid,
             pending["name"],
             **anime_context,
+        )
+        notifications.queue_admin_request(
+            user["id"], user["username"], mbid, pending["name"]
         )
         return jsonify({
             "message": (
@@ -274,13 +280,25 @@ def request_release_group():
             total_tracks = statistics.get("totalTrackCount", created_album.get("trackCount", 0))
             downloaded_tracks = statistics.get("trackFileCount", 0)
             if total_tracks and downloaded_tracks >= total_tracks:
+                history_metadata = _release_history_metadata(
+                    created_album, album
+                )
                 record_request(
-                    current_user()["id"],
+                    user["id"],
                     "release-group",
                     mbid,
                     created_album.get("title", album.get("title", "Release group")),
-                    **_release_history_metadata(created_album, album),
+                    **history_metadata,
                     **anime_context,
+                )
+                notifications.queue_admin_request(
+                    user["id"],
+                    user["username"],
+                    mbid,
+                    created_album.get(
+                        "title", album.get("title", "Release group")
+                    ),
+                    history_metadata["artist_name"],
                 )
                 lidarr_library_worker.request_scan()
                 return jsonify({"message": "This release group is already fully available in Lidarr.", "alreadyExists": True})
@@ -298,14 +316,22 @@ def request_release_group():
             )
 
         title = created_album.get("title", album.get("title", "Release group"))
+        history_metadata = _release_history_metadata(created_album, album)
         enqueue_lidarr_search(
-            current_user()["id"],
+            user["id"],
             mbid,
             created_album["id"],
             artist_id,
             title,
-            **_release_history_metadata(created_album, album),
+            **history_metadata,
             **anime_context,
+        )
+        notifications.queue_admin_request(
+            user["id"],
+            user["username"],
+            mbid,
+            title,
+            history_metadata["artist_name"],
         )
         lidarr_search_worker.request_work()
         lidarr_library_worker.request_scan()

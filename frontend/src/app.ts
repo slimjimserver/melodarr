@@ -1408,23 +1408,28 @@ function setupNavigation() {
         const form = document.createElement("form"); form.className = "account-form notification-preferences";
         form.innerHTML = `<h2>Notifications</h2>
           <fieldset class="notification-preference-card notification-master-card">
-            <legend>Availability alerts</legend>
-            <label class="notification-toggle"><input name="enabled" type="checkbox"><span><strong>Enable availability notifications</strong><small>Receive alerts when music becomes available.</small></span></label>
+            <legend>Music alerts</legend>
+            <label class="notification-toggle"><input name="enabled" type="checkbox"><span><strong>Enable music notifications</strong><small>Receive music alerts using the preferences below.</small></span></label>
           </fieldset>
           <fieldset class="notification-preference-card">
             <legend>Music Notifications</legend>
             <label>Music Notifications<select name="musicNotifications"><option value="requested">Requested Music</option><option value="all">All Music</option></select></label>
           </fieldset>
+          ${user.role === "admin" ? `<fieldset class="notification-preference-card admin-request-notifications">
+            <legend>Administrator alerts</legend>
+            <label class="notification-toggle"><input name="adminRequestNotifications" type="checkbox"><span><strong>New music requests</strong><small>Notify me when another user requests a release group. Your own requests are excluded.</small></span></label>
+          </fieldset>` : ""}
           <fieldset class="notification-preference-card">
             <legend>Delivery methods</legend>
             <label>Notification email<input name="notificationEmail" type="email" autocomplete="email"></label>
-            <label class="notification-toggle"><input name="emailEnabled" type="checkbox"><span><strong>Email</strong><small>Send availability alerts to this email address.</small></span></label>
-            <label class="notification-toggle"><input name="webPushEnabled" type="checkbox"><span><strong>Web Push</strong><small>Show availability alerts on registered browsers.</small></span></label>
+            <label class="notification-toggle"><input name="emailEnabled" type="checkbox"><span><strong>Email</strong><small>Send music alerts to this email address.</small></span></label>
+            <label class="notification-toggle"><input name="webPushEnabled" type="checkbox"><span><strong>Web Push</strong><small>Show music alerts on registered browsers.</small></span></label>
             <div class="push-device-row"><p class="push-state" aria-live="polite"></p><button type="button" class="outline enable-push">Enable this device</button></div>
           </fieldset>
           <div class="form-actions"><p class="form-message" aria-live="polite"></p><button>Save notification preferences</button></div>`;
         const input = (name: string) => requiredDescendant<HTMLInputElement>(form, `[name="${name}"]`);
         ["enabled", "emailEnabled", "webPushEnabled"].forEach((name) => { input(name).checked = Boolean(prefs[name]); });
+        if (user.role === "admin") input("adminRequestNotifications").checked = Boolean(prefs.adminRequestNotifications);
         const musicNotifications = requiredDescendant<HTMLSelectElement>(form, '[name="musicNotifications"]');
         musicNotifications.value = prefs.allNewMusic ? "all" : "requested";
         input("notificationEmail").value = prefs.notificationEmail || "";
@@ -1438,6 +1443,9 @@ function setupNavigation() {
         const musicPreferencePayload = () => musicNotifications.value === "all"
           ? { requestedAvailable: false, allNewMusic: true }
           : { requestedAvailable: true, allNewMusic: false };
+        const adminRequestPreferencePayload = () => user.role === "admin"
+          ? { adminRequestNotifications: input("adminRequestNotifications").checked }
+          : {};
         const notificationEmailPayload = () => {
           const displayed = input("notificationEmail").value.trim();
           return plexDerivedEmail && displayed === plexDerivedEmail ? "" : displayed;
@@ -1445,7 +1453,7 @@ function setupNavigation() {
         form.addEventListener("submit", async (event) => { event.preventDefault(); try {
           await api("/api/account/notifications", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
             enabled: input("enabled").checked, emailEnabled: input("emailEnabled").checked, webPushEnabled: input("webPushEnabled").checked,
-            ...musicPreferencePayload(), notificationEmail: notificationEmailPayload(),
+            ...musicPreferencePayload(), ...adminRequestPreferencePayload(), notificationEmail: notificationEmailPayload(),
           }) }); setMessage(formMessage, "Notification preferences saved.");
         } catch (error) { setMessage(formMessage, error.message, true); } });
         pushButton.addEventListener("click", async () => { try {
@@ -1464,7 +1472,7 @@ function setupNavigation() {
           }
           if (!subscription) subscription = await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: bytes });
           await api("/api/account/notifications/subscriptions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...subscription.toJSON(), ...pushDeviceMetadata() }) });
-          await api("/api/account/notifications", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled: input("enabled").checked, emailEnabled: input("emailEnabled").checked, webPushEnabled: true, ...musicPreferencePayload(), notificationEmail: notificationEmailPayload() }) });
+          await api("/api/account/notifications", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ enabled: input("enabled").checked, emailEnabled: input("emailEnabled").checked, webPushEnabled: true, ...musicPreferencePayload(), ...adminRequestPreferencePayload(), notificationEmail: notificationEmailPayload() }) });
           input("webPushEnabled").checked = true; setMessage(formMessage, "This device is registered and Web Push notifications are enabled.");
           showAccountPage?.("notifications", false, targetUsername);
         } catch (error) { setMessage(formMessage, error.message, true); } });

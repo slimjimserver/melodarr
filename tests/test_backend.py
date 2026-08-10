@@ -4770,6 +4770,7 @@ class LidarrRequestTests(DatabaseTestCase):
         history = self.request_history()
         self.assertEqual((history[0]["kind"], history[0]["mbid"]), ("artist", self.artist_mbid))
 
+    @patch("backend.routes.requests.notifications.queue_admin_request")
     @patch("backend.routes.requests.lidarr_search_worker.request_work")
     @patch("backend.routes.requests.enqueue_lidarr_search")
     @patch("backend.routes.requests.lidarr.start_command")
@@ -4778,7 +4779,7 @@ class LidarrRequestTests(DatabaseTestCase):
     @patch("backend.routes.requests.get_service")
     def test_new_album_persists_refresh_then_search_job(
         self, get_service, lookup_album, add_album, start_command,
-        enqueue_search, request_work
+        enqueue_search, request_work, queue_admin_request
     ):
         get_service.return_value = self.lidarr_config()
         lookup_album.return_value = Response(payload=[{
@@ -4828,6 +4829,13 @@ class LidarrRequestTests(DatabaseTestCase):
             "song_id": 1477,
             "song_title": "Haruka Kanata",
         })
+        queue_admin_request.assert_called_once_with(
+            user_id,
+            "test-user",
+            self.album_mbid,
+            "Test Album",
+            "Test Artist",
+        )
         self.assertEqual(response.get_json()["refreshType"], "album")
         request_work.assert_called_once_with()
         start_command.assert_not_called()
