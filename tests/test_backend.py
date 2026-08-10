@@ -76,6 +76,7 @@ from backend.workers import plex as plex_worker
 from backend.workers import plex_history as plex_history_worker
 from backend.workers import plex_metadata as plex_metadata_worker
 from backend.workers import recommendations as recommendation_worker
+from backend.workers import similar_artists as similar_artist_worker
 
 
 class Response:
@@ -152,6 +153,13 @@ class DatabaseTestCase(unittest.TestCase):
                 lastCompletedAt=None,
             )
         artist_metadata_worker.wake_requested.clear()
+        with similar_artist_worker.queue_lock:
+            similar_artist_worker.queued_candidates.clear()
+            similar_artist_worker.active_candidate_keys.clear()
+            similar_artist_worker.job_state.update(
+                running=False, queued=0, completed=0, lastCompletedAt=None,
+            )
+        similar_artist_worker.wake_requested.clear()
         with plex_history_worker.request_lock:
             plex_history_worker.sync_requested = False
             plex_history_worker.full_sync_requested = False
@@ -209,8 +217,9 @@ class ApplicationFactoryTests(DatabaseTestCase):
             for method in rule.methods
             if method not in {"HEAD", "OPTIONS"}
         }
-        self.assertEqual(len(rules), 92)
-        self.assertEqual(len(route_methods), 92)
+        self.assertEqual(len(rules), 93)
+        self.assertEqual(len(route_methods), 93)
+        self.assertIn(("/api/music/artist/<mbid>/similar", "GET"), route_methods)
         notification_routes = {
             ("/api/settings/notifications", "GET"),
             ("/api/settings/notifications", "PUT"),
@@ -460,6 +469,7 @@ class WorkerEntrypointTests(unittest.TestCase):
         calls = []
         anime_metadata_thread = Mock()
         artist_metadata_thread = Mock()
+        similar_artist_thread = Mock()
         lidarr_thread = Mock()
         lidarr_download_thread = Mock()
         plex_thread = Mock()
@@ -470,6 +480,7 @@ class WorkerEntrypointTests(unittest.TestCase):
         thread_class.side_effect = [
             anime_metadata_thread,
             artist_metadata_thread,
+            similar_artist_thread,
             lidarr_thread,
             lidarr_download_thread,
             lidarr_library_thread,
@@ -483,7 +494,7 @@ class WorkerEntrypointTests(unittest.TestCase):
         run.side_effect = lambda *_args: calls.append("recommendations")
         worker.main()
         self.assertEqual(calls, ["cache", "database", "recommendations"])
-        self.assertEqual(thread_class.call_count, 9)
+        self.assertEqual(thread_class.call_count, 10)
         thread_class.assert_any_call(
             target=anime_metadata_worker.run,
             name="anime-musicbrainz-resolution",
@@ -492,6 +503,11 @@ class WorkerEntrypointTests(unittest.TestCase):
         thread_class.assert_any_call(
             target=artist_metadata_worker.run,
             name="musicbrainz-artist-revalidation",
+            daemon=True,
+        )
+        thread_class.assert_any_call(
+            target=similar_artist_worker.run,
+            name="lastfm-similar-artist-resolution",
             daemon=True,
         )
         thread_class.assert_any_call(
@@ -539,6 +555,7 @@ class WorkerEntrypointTests(unittest.TestCase):
         anime_metadata_thread.start.assert_called_once_with()
         notification_thread.start.assert_called_once_with()
         artist_metadata_thread.start.assert_called_once_with()
+        similar_artist_thread.start.assert_called_once_with()
         run.assert_called_once_with(worker.RECOMMENDATION_STARTUP_DEADLINE)
 
     @patch("backend.workers.lidarr_library.time.time", return_value=100)
@@ -6432,6 +6449,91 @@ class DiscoveryRoutesTests(DatabaseTestCase):
 
 
 class MusicRoutesTests(DatabaseTestCase):
+    @patch("backend.routes.music.lastfm.get_public")
+    @patch("backend.routes.music.get_lastfm_api_key", return_value="")
+    def test_similar_artists_is_empty_without_a_shared_lastfm_key(
+        self, get_api_key, get_public
+    ):
+        artist_id = "11111111-1111-1111-1111-111111111111"
+        self.register()
+
+        response = self.client.get(f"/api/music/artist/{artist_id}/similar")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), {
+            "artists": [],
+            "configured": False,
+            "offset": 0,
+            "limit": 12,
+            "total": 0,
+            "nextOffset": None,
+            "hasMore": False,
+            "pending": 0,
+        })
+        get_api_key.assert_called_once_with()
+        get_public.assert_not_called()
+
+    @patch("backend.routes.music.lidarr.cached_artist_availability")
+    @patch("backend.routes.music.lastfm.get_public")
+    @patch(
+        "backend.routes.music.get_lastfm_api_key",
+        return_value="shared-lastfm-key",
+    )
+    def test_similar_artists_returns_navigable_deduplicated_matches(
+        self, get_api_key, get_public, artist_availability
+    ):
+        artist_id = "11111111-1111-1111-1111-111111111111"
+        similar_id = "22222222-2222-2222-2222-222222222222"
+        tracked_id = "33333333-3333-3333-3333-333333333333"
+        get_public.return_value = {
+            "similarartists": {
+                "artist": [
+                    {"mbid": artist_id, "name": "Current artist", "match": "1"},
+                    {"mbid": similar_id, "name": "Neighbor", "match": "0.913"},
+                    {"mbid": similar_id, "name": "Duplicate", "match": "0.8"},
+                    {"mbid": "", "name": "Missing identifier", "match": "0.7"},
+                    {"mbid": tracked_id, "name": "Tracked", "match": "0.5"},
+                    {"mbid": "invalid", "name": "Invalid identifier", "match": "0.4"},
+                ],
+            },
+        }
+        artist_availability.return_value = {tracked_id: {"id": 42}}
+        self.register()
+
+        response = self.client.get(f"/api/music/artist/{artist_id}/similar")
+        payload = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        self.assertTrue(payload["configured"])
+        self.assertEqual(payload["total"], 4)
+        self.assertEqual(payload["pending"], 2)
+        self.assertFalse(payload["hasMore"])
+        self.assertIsNone(payload["nextOffset"])
+        self.assertEqual([artist["id"] for artist in payload["artists"]], [
+            similar_id,
+            tracked_id,
+        ])
+        self.assertEqual(payload["artists"][0], {
+            "id": similar_id,
+            "name": "Neighbor",
+            "type": "91% match",
+            "rank": 0,
+            "match": 0.913,
+            "coverArt": f"/api/artwork/artist/{similar_id}?size=thumb",
+            "availableInLidarr": False,
+            "recommendationSource": "Similar on Last.fm",
+        })
+        self.assertTrue(payload["artists"][1]["availableInLidarr"])
+        get_api_key.assert_called_once_with()
+        get_public.assert_called_once_with(
+            "artist.getsimilar",
+            "shared-lastfm-key",
+            mbid=artist_id,
+            limit=50,
+            autocorrect=1,
+        )
+
     @patch("backend.routes.music.get_service")
     @patch("backend.routes.music.lidarr.cached_artist_availability")
     @patch("backend.routes.music._plex_artist")

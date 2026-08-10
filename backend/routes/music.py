@@ -1,5 +1,6 @@
 """MusicBrainz artist, release-group, and release detail routes."""
 
+import sqlite3
 from contextlib import nullcontext
 from urllib.parse import quote
 from uuid import UUID
@@ -9,20 +10,38 @@ from flask import Blueprint, jsonify, request
 
 if __package__ == "backend.routes":
     from .. import detail_cache
-    from ..media_urls import artist_large_cover_art, release_group_cover_art
+    from ..media_urls import (
+        artist_cover_art,
+        artist_large_cover_art,
+        release_group_cover_art,
+    )
     from ..responses import api_error
     from ..security import login_required
-    from ..services import anime_theme_links, lidarr, musicbrainz, plex
-    from ..storage import get_service, pending_lidarr_search_mbids
+    from ..services import anime_theme_links, lastfm, lidarr, musicbrainz, plex
+    from ..storage import (
+        get_lastfm_api_key,
+        get_service,
+        pending_lidarr_search_mbids,
+    )
     from ..workers import artist_metadata as artist_metadata_worker
+    from ..workers import similar_artists as similar_artist_worker
 else:
     import detail_cache
-    from media_urls import artist_large_cover_art, release_group_cover_art
+    from media_urls import (
+        artist_cover_art,
+        artist_large_cover_art,
+        release_group_cover_art,
+    )
     from responses import api_error
     from security import login_required
-    from services import anime_theme_links, lidarr, musicbrainz, plex
-    from storage import get_service, pending_lidarr_search_mbids
+    from services import anime_theme_links, lastfm, lidarr, musicbrainz, plex
+    from storage import (
+        get_lastfm_api_key,
+        get_service,
+        pending_lidarr_search_mbids,
+    )
     from workers import artist_metadata as artist_metadata_worker
+    from workers import similar_artists as similar_artist_worker
 
 
 blueprint = Blueprint("music", __name__)
@@ -101,6 +120,175 @@ def _download_snapshot():
         return {}
 
 
+SIMILAR_ARTIST_CANDIDATE_LIMIT = 50
+SIMILAR_ARTIST_PAGE_LIMIT = 12
+
+
+def _similar_artist_candidates(items, current_artist_id):
+    """Normalize and deduplicate the shared Last.fm candidate set."""
+    candidates = []
+    seen_ids = {current_artist_id.casefold()}
+    seen_names = set()
+    for item in items:
+        name = " ".join(str(item.get("name") or "").strip().split())
+        normalized_name = name.casefold()
+        if not name or normalized_name in seen_names:
+            continue
+        try:
+            artist_id = str(UUID(str(item.get("mbid") or "")))
+        except (TypeError, ValueError, AttributeError):
+            artist_id = ""
+        normalized_id = artist_id.casefold()
+        if normalized_id and normalized_id in seen_ids:
+            continue
+        seen_names.add(normalized_name)
+        if normalized_id:
+            seen_ids.add(normalized_id)
+        try:
+            match = max(0.0, min(1.0, float(item.get("match") or 0)))
+        except (TypeError, ValueError):
+            match = 0.0
+        candidates.append(
+            {
+                "id": artist_id,
+                "name": name,
+                "url": str(item.get("url") or "").strip()[:500],
+                "match": round(match, 4),
+            }
+        )
+    return candidates
+
+
+def _similar_artist_payload(
+    candidates,
+    current_artist_id,
+    offset,
+    end,
+    available_artist_ids,
+):
+    """Resolve one stable raw slice and deduplicate identities across pages."""
+    artists = []
+    pending = 0
+    seen_ids = {current_artist_id.casefold()}
+    for index, candidate in enumerate(candidates[:end]):
+        try:
+            resolution = (
+                {"id": candidate["id"], "name": candidate["name"]}
+                if candidate["id"]
+                else similar_artist_worker.cached_resolution(candidate)
+            )
+        except sqlite3.Error:
+            resolution = None
+        if resolution is None:
+            if index >= offset:
+                pending += 1
+            continue
+        artist_id = str(resolution.get("id") or "")
+        normalized_id = artist_id.casefold()
+        if not artist_id or normalized_id in seen_ids:
+            continue
+        seen_ids.add(normalized_id)
+        if index < offset:
+            continue
+        match = candidate["match"]
+        artists.append(
+            {
+                "id": artist_id,
+                "name": str(resolution.get("name") or candidate["name"]),
+                "type": f"{round(match * 100)}% match" if match else "Similar artist",
+                "rank": index,
+                "match": match,
+                "coverArt": artist_cover_art(artist_id),
+                "availableInLidarr": normalized_id in available_artist_ids,
+                "recommendationSource": "Similar on Last.fm",
+            }
+        )
+    return artists, pending
+
+
+@blueprint.get("/api/music/artist/<mbid>/similar")
+@login_required
+def artist_similar(mbid):
+    """Return cached Last.fm neighbors without delaying artist detail."""
+    try:
+        artist_id = str(UUID(mbid))
+    except ValueError:
+        return api_error("Invalid MusicBrainz artist ID.")
+    api_key = get_lastfm_api_key()
+    if not api_key:
+        return jsonify(
+            {
+                "artists": [],
+                "configured": False,
+                "offset": 0,
+                "limit": SIMILAR_ARTIST_PAGE_LIMIT,
+                "total": 0,
+                "nextOffset": None,
+                "hasMore": False,
+                "pending": 0,
+            }
+        )
+    offset = max(0, request.args.get("offset", 0, type=int) or 0)
+    page_limit = max(
+        1,
+        min(
+            SIMILAR_ARTIST_PAGE_LIMIT,
+            request.args.get("limit", SIMILAR_ARTIST_PAGE_LIMIT, type=int)
+            or SIMILAR_ARTIST_PAGE_LIMIT,
+        ),
+    )
+    try:
+        items = (
+            lastfm.get_public(
+                "artist.getsimilar",
+                api_key,
+                mbid=artist_id,
+                limit=SIMILAR_ARTIST_CANDIDATE_LIMIT,
+                autocorrect=1,
+            )
+            .get("similarartists", {})
+            .get("artist", [])
+        )
+        candidates = _similar_artist_candidates(items, artist_id)
+    except (ValueError, requests.RequestException, TypeError, AttributeError):
+        return api_error("Last.fm could not load similar artists.", 502)
+    unresolved = [item for item in candidates if not item["id"]]
+    try:
+        similar_artist_worker.request_resolutions(unresolved)
+    except sqlite3.Error:
+        pass
+    try:
+        available_artist_ids = {
+            str(value).casefold() for value in lidarr.cached_artist_availability()
+        }
+    except (sqlite3.Error, ValueError):
+        available_artist_ids = set()
+    end = min(len(candidates), offset + page_limit)
+    artists, pending = _similar_artist_payload(
+        candidates,
+        artist_id,
+        offset,
+        end,
+        available_artist_ids,
+    )
+    has_more = end < len(candidates)
+    next_offset = end if has_more and not pending else None
+    response = jsonify(
+        {
+            "artists": artists,
+            "configured": True,
+            "offset": offset,
+            "limit": page_limit,
+            "total": len(candidates),
+            "nextOffset": next_offset,
+            "hasMore": has_more,
+            "pending": pending,
+        }
+    )
+    response.headers["Cache-Control"] = "no-store" if pending else "private, max-age=60"
+    return response
+
+
 @blueprint.get("/api/music/artist/<mbid>/availability")
 @login_required
 def artist_availability(mbid):
@@ -109,11 +297,13 @@ def artist_availability(mbid):
     lidarr_artist = lidarr.cached_artist_availability().get(mbid)
     available_in_plex = bool(plex_artist)
     available_in_lidarr = bool(lidarr_artist)
-    release_group_ids = list(dict.fromkeys(
-        value.strip()
-        for value in request.args.getlist("releaseGroup")
-        if value.strip()
-    ))[:50]
+    release_group_ids = list(
+        dict.fromkeys(
+            value.strip()
+            for value in request.args.getlist("releaseGroup")
+            if value.strip()
+        )
+    )[:50]
     plex_groups = (
         _plex_release_group_inventory() if release_group_ids else {}
     )

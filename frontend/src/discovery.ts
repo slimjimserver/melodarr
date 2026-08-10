@@ -1241,7 +1241,11 @@
     return card;
   }
 
-  function createRecommendationCarouselCard(item: JsonObject, kind: "artist" | "release-group") {
+  function createRecommendationCarouselCard(
+    item: JsonObject,
+    kind: "artist" | "release-group",
+    messageElement: Element = $("#recommendations-message"),
+  ) {
     const card = document.createElement("article");
     card.className = "recommendation-card";
     const fallback = document.createElement("div");
@@ -1305,17 +1309,28 @@
     const requestButton = document.createElement("button");
     requestButton.className = "recommendation-request";
     requestButton.type = "button";
-    requestButton.textContent = "Request";
-    requestButton.addEventListener("click", (event) => {
-      event.stopPropagation();
-      if (kind === "artist") openRequestDialog(item, $("#recommendations-message"));
-      else requestReleaseGroup({ id: item.id, button: requestButton });
-    });
+    if (kind === "artist" && item.availableInLidarr) {
+      requestButton.textContent = "In Lidarr";
+      requestButton.disabled = true;
+      requestButton.title = "This artist is already in Lidarr";
+    } else {
+      requestButton.textContent = "Request";
+      requestButton.addEventListener("click", (event) => {
+        event.stopPropagation();
+        if (kind === "artist") openRequestDialog(item, messageElement);
+        else requestReleaseGroup({ id: item.id, button: requestButton });
+      });
+    }
     card.append(requestButton);
     return card;
   }
 
-  function recommendationRow(title: string, items: JsonObject[], kind: "artist" | "release-group") {
+  function recommendationRow(
+    title: string,
+    items: JsonObject[],
+    kind: "artist" | "release-group",
+    messageElement: Element = $("#recommendations-message"),
+  ) {
     const group = document.createElement("section");
     group.className = "recommendation-row";
     const heading = document.createElement("h3"); heading.textContent = title;
@@ -1331,7 +1346,7 @@
       const end = Math.min(rendered + batchSize, items.length);
       const fragment = document.createDocumentFragment();
       for (let index = rendered; index < end; index += 1) {
-        fragment.append(createRecommendationCarouselCard(items[index], kind));
+        fragment.append(createRecommendationCarouselCard(items[index], kind, messageElement));
       }
       carousel.append(fragment);
       rendered = end;
@@ -1348,6 +1363,158 @@
     if (rendered < items.length) group.append(more);
     return group;
   }
+
+  function similarArtistsView(artistId: string) {
+    const pageSize = 12;
+    const section = document.createElement("section");
+    section.className = "recommendation-row similar-artists-view";
+    section.hidden = true;
+    const heading = document.createElement("h3");
+    heading.textContent = "Similar artists";
+    heading.tabIndex = -1;
+    const placeholder = document.createElement("div");
+    placeholder.className = "similar-artists-list similar-artists-placeholder";
+    placeholder.append(skeletonBlock(
+      "skeleton-card",
+      window.matchMedia("(max-width: 700px)").matches ? 4 : 6,
+    ));
+    placeholder.hidden = true;
+    const list = document.createElement("div");
+    list.className = "similar-artists-list";
+    list.setAttribute("aria-label", "Similar artists");
+    list.hidden = true;
+    const status = document.createElement("p");
+    status.className = "message similar-artists-status";
+    status.setAttribute("aria-live", "polite");
+    const more = document.createElement("button");
+    more.className = "outline recommendation-more";
+    more.type = "button";
+    more.textContent = "Show more similar artists";
+    more.hidden = true;
+    section.append(heading, placeholder, list, status, more);
+
+    const action = captureDetailActionContext();
+    const renderedArtistIds = new Set<string>();
+    let loaded = false;
+    let loading = false;
+    let nextOffset = 0;
+
+    const requestPage = async (offset: number, pollAttempt = 0, revealNew = false) => {
+      if (loading || !isCurrentDetailAction(action) || !section.isConnected) return;
+      loading = true;
+      section.setAttribute("aria-busy", "true");
+      if (!renderedArtistIds.size) placeholder.hidden = false;
+      more.hidden = false;
+      more.disabled = true;
+      more.textContent = pollAttempt ? "Matching similar artists." : "Loading similar artists.";
+
+      try {
+        const data = await getJson(
+          `/api/music/artist/${encodeURIComponent(artistId)}/similar?offset=${offset}&limit=${pageSize}`,
+          30_000,
+          detailSessionAbort.signal,
+        );
+        if (!isCurrentDetailAction(action) || !section.isConnected) return;
+        placeholder.hidden = true;
+        const fragment = document.createDocumentFragment();
+        let firstNewCard: HTMLElement | undefined;
+        ((data.artists || []) as JsonObject[]).forEach((artist) => {
+          const id = String(artist.id || "");
+          if (!id || renderedArtistIds.has(id)) return;
+          renderedArtistIds.add(id);
+          const card = createRecommendationCarouselCard(artist, "artist", $("#detail-message"));
+          const rank = Number(artist.rank);
+          card.dataset.recommendationRank = String(Number.isFinite(rank) ? rank : Number.MAX_SAFE_INTEGER);
+          firstNewCard ||= card;
+          fragment.append(card);
+        });
+        list.append(fragment);
+        [...list.querySelectorAll<HTMLElement>(".recommendation-card")]
+          .sort((first, second) => (
+            Number(first.dataset.recommendationRank) - Number(second.dataset.recommendationRank)
+          ))
+          .forEach((card) => list.append(card));
+        list.hidden = renderedArtistIds.size === 0;
+        if (revealNew && firstNewCard) {
+          const focusTarget = firstNewCard.querySelector<HTMLElement>(".recommendation-open");
+          focusTarget?.focus({ preventScroll: true });
+          firstNewCard.scrollIntoView({
+            behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
+            block: "start",
+            inline: "nearest",
+          });
+        }
+
+        if (data.configured === false) {
+          status.textContent = "Similar artists are unavailable because Last.fm is not configured.";
+          more.hidden = true;
+          return;
+        }
+
+        const pending = Number(data.pending || 0);
+        if (pending > 0) {
+          // The offset identifies a raw Last.fm candidate slice. Keep polling
+          // that same slice until its low-priority MusicBrainz matches settle,
+          // otherwise advancing could skip recommendations that resolve later.
+          nextOffset = offset;
+          status.textContent = `Matching ${pending} more ${pending === 1 ? "artist" : "artists"}.`;
+          more.textContent = "Matching similar artists.";
+          if (pollAttempt < 40) {
+            setTimeout(() => {
+              if (isCurrentDetailAction(action) && section.isConnected) {
+                void requestPage(offset, pollAttempt + 1, revealNew && !firstNewCard);
+              }
+            }, 1500);
+          } else {
+            status.textContent = "Some similar artists are still being matched.";
+            more.disabled = false;
+            more.textContent = "Continue matching";
+          }
+          return;
+        }
+
+        status.textContent = renderedArtistIds.size
+          ? `${renderedArtistIds.size} similar ${renderedArtistIds.size === 1 ? "artist" : "artists"}`
+          : "No similar artists were found.";
+        const responseOffset = Number(data.nextOffset);
+        if (data.hasMore === true && Number.isFinite(responseOffset)) {
+          nextOffset = responseOffset;
+          more.disabled = false;
+          more.hidden = false;
+          const remaining = Math.max(0, Number(data.total || 0) - nextOffset);
+          more.textContent = remaining
+            ? `Show ${Math.min(pageSize, remaining)} more`
+            : "Show more similar artists";
+          more.setAttribute("aria-label", "Show more similar artists");
+        } else {
+          more.hidden = true;
+          if (revealNew && !firstNewCard) heading.focus();
+        }
+      } catch (error) {
+        if (!isCurrentDetailAction(action) || error.name === "AbortError") return;
+        placeholder.hidden = true;
+        status.textContent = error.message;
+        nextOffset = offset;
+        more.disabled = false;
+        more.hidden = false;
+        more.textContent = "Retry similar artists";
+      } finally {
+        loading = false;
+        section.removeAttribute("aria-busy");
+      }
+    };
+
+    more.addEventListener("click", () => void requestPage(nextOffset, 0, nextOffset > 0));
+    return {
+      element: section,
+      load: () => {
+        if (loaded) return;
+        loaded = true;
+        void requestPage(0);
+      },
+    };
+  }
+
 
   function deferredTasteRows(rows: JsonObject[]) {
     const group = document.createElement("section");
@@ -1456,7 +1623,10 @@
         .every((secondary: string) => enabledSecondary.has(secondary)))
     );
 
-    const container = document.createDocumentFragment();
+    const container = document.createElement("div");
+    container.className = "artist-discography";
+    const tools = document.createElement("div");
+    tools.className = "discography-tools";
     const filter = document.createElement("div");
     filter.className = "discography-filter";
     const filterLabel = document.createElement("label");
@@ -1473,14 +1643,22 @@
     const filterMessage = document.createElement("p");
     filterMessage.className = "message";
     filterMessage.setAttribute("aria-live", "polite");
-    container.append(filter, filterMessage);
+    tools.append(filter, filterMessage);
 
     const layout = document.createElement("div");
     layout.className = "discography-layout";
+    const sidebar = document.createElement("div");
+    sidebar.className = "discography-sidebar";
     const index = document.createElement("nav");
     index.className = "discography-nav";
+    index.setAttribute("aria-label", "Artist discography sections");
     const content = document.createElement("div");
     content.className = "discography-content";
+    const releaseContent = document.createElement("div");
+    releaseContent.id = "discography-release-view";
+    releaseContent.className = "discography-release-view";
+    const similar = similarArtistsView(String(data.id));
+    similar.element.id = "similar-artists-view";
     const sections: Array<{
       element: HTMLDetailsElement;
       summary: HTMLElement;
@@ -1533,13 +1711,16 @@
       });
       sections.push(entry);
       renderSection(entry);
-      content.append(section);
+      releaseContent.append(section);
 
       link.addEventListener("click", (event) => {
         // Keep the discography navigation inside the current rendered view.
         // Native fragment navigation changes the URL and can cause the SPA
         // route handler to re-render before the section is expanded.
         event.preventDefault();
+        tools.hidden = false;
+        releaseContent.hidden = false;
+        similar.element.hidden = true;
         section.open = true;
         section.scrollIntoView({ behavior: "smooth", block: "start" });
       });
@@ -1611,11 +1792,32 @@
           });
           filters.append(chip);
         });
-      container.append(filters);
+      tools.append(filters);
     }
 
-    layout.append(index, content);
-    container.append(layout);
+    const similarButton = document.createElement("button");
+    similarButton.className = "discography-similar-nav";
+    similarButton.type = "button";
+    similarButton.textContent = "Similar artists";
+    similarButton.setAttribute("aria-controls", similar.element.id);
+    similarButton.setAttribute("aria-expanded", "false");
+    similarButton.addEventListener("click", () => {
+      tools.hidden = true;
+      releaseContent.hidden = true;
+      similar.element.hidden = false;
+      similarButton.setAttribute("aria-expanded", "true");
+      similar.load();
+      similar.element.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+    index.querySelectorAll("a").forEach((link) => {
+      link.addEventListener("click", () => {
+        similarButton.setAttribute("aria-expanded", "false");
+      });
+    });
+    sidebar.append(index, similarButton);
+    content.append(releaseContent, similar.element);
+    layout.append(sidebar, content);
+    container.append(tools, layout);
     refreshSections();
     return container;
   }
