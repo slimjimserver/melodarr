@@ -764,10 +764,11 @@ details summary { margin-bottom: 17px; color: var(--accent-bright); cursor: poin
   #detail .outline { margin-bottom: 20px; }
 
   .discography-layout, .account-layout { grid-template-columns: 1fr; }
-  .discography-sidebar { position: static; display: flex; max-width: 100%; overflow-x: auto; padding-bottom: 4px; scroll-snap-type: x proximity; overscroll-behavior-x: contain; }
-  .discography-nav { position: static; display: flex; min-width: max-content; }
-  .discography-nav a, .discography-similar-nav { min-height: 44px; flex: 0 0 auto; white-space: nowrap; scroll-snap-align: start; }
-  .discography-similar-nav { width: auto; }
+  .discography-sidebar { position: static; display: grid; grid-template-columns: minmax(0, 1fr) auto; width: calc(100% + 16px); max-width: none; margin-inline: -8px; gap: 8px; overflow: visible; padding: 2px 8px 8px; }
+  .discography-nav { position: static; display: flex; min-width: 0; justify-content: space-between; gap: 2px; padding-inline: 6px; }
+  .discography-nav a, .discography-similar-nav { min-width: 0; min-height: 44px; white-space: nowrap; }
+  .discography-nav a { flex: 0 1 auto; padding-inline: 2px; font-size: 12px; }
+  .discography-similar-nav { width: auto; padding-inline: 10px; font-size: 12px; }
   .account-nav { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .account-nav p { grid-column: 1 / -1; }
   .history-detail { align-items: flex-start; }

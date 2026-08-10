@@ -158,6 +158,21 @@ for (const viewport of [
     await expect(search).toBeVisible();
     await expect(similarView).toBeHidden();
 
+    if (viewport.name === "mobile") {
+      const edges = await page.evaluate(() => {
+        const sidebar = document.querySelector(".discography-sidebar");
+        const releaseTypes = document.querySelector(".discography-nav");
+        const releaseSearch = document.querySelector("#discography-search");
+        return {
+          sidebarLeft: sidebar?.getBoundingClientRect().left ?? 0,
+          releaseTypesLeft: releaseTypes?.getBoundingClientRect().left ?? 0,
+          releaseSearchLeft: releaseSearch?.getBoundingClientRect().left ?? 0,
+        };
+      });
+      expect(edges.releaseTypesLeft).toBeCloseTo(edges.releaseSearchLeft, 0);
+      expect(edges.releaseTypesLeft - edges.sidebarLeft).toBeGreaterThanOrEqual(7);
+    }
+
     const firstPage = page.waitForRequest((request) => (
       request.url().includes("/api/music/artist/fixture-artist/similar?offset=0&limit=12")
     ));
