@@ -143,6 +143,35 @@ test("SPA navigation moves focus to the main landmark", async ({ page }) => {
   await expect(page.locator("#main-content")).toHaveCSS("outline-style", "none");
 });
 
+test("mobile tab bar stays 82px tall including its safe-area padding", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/");
+  await signIn(page, "ada");
+  await page.evaluate(() => document.documentElement.style.setProperty("--safe-bottom", "24px"));
+
+  const metrics = await page.locator(".tab-bar").evaluate((tabBar) => {
+    const bounds = tabBar.getBoundingClientRect();
+    const styles = getComputedStyle(tabBar);
+    const main = document.querySelector("main");
+    const toasts = document.querySelector("#toasts");
+    return {
+      bottom: bounds.bottom,
+      height: bounds.height,
+      mainPaddingBottom: main ? getComputedStyle(main).paddingBottom : "",
+      paddingBottom: styles.paddingBottom,
+      toastBottom: toasts ? getComputedStyle(toasts).bottom : "",
+    };
+  });
+
+  expect(metrics).toEqual({
+    bottom: 844,
+    height: 82,
+    mainPaddingBottom: "118px",
+    paddingBottom: "24px",
+    toastBottom: "100px",
+  });
+});
+
 for (const viewport of [
   { name: "desktop", width: 1280, height: 800 },
   { name: "mobile", width: 390, height: 844 },
