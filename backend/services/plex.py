@@ -33,7 +33,7 @@ else:  # Support the existing `python backend/app.py` entry point.
 
 
 scan_lock = RLock()
-SNAPSHOT_VERSION = 5
+SNAPSHOT_VERSION = 6
 METADATA_TAG_FIELDS = {
     "genres": "Genre",
     "styles": "Style",
@@ -326,9 +326,9 @@ def _scan_sections(config, sections, *, recently_added=False):
     for section in sections:
         endpoint = "recentlyAdded" if recently_added else "all"
         section_releases = []
-        for media_type, collection, normalizer in (
-            (8, "artists", _normalize_artist),
-            (9, "releaseGroups", _normalize_release_group),
+        for media_type, plex_type, collection, normalizer in (
+            (8, "artist", "artists", _normalize_artist),
+            (9, "album", "releaseGroups", _normalize_release_group),
         ):
             response = requests.get(
                 f"{base}/library/sections/{section['id']}/{endpoint}",
@@ -339,7 +339,13 @@ def _scan_sections(config, sections, *, recently_added=False):
             response.raise_for_status()
             metadata = response.json().get("MediaContainer", {}).get("Metadata", [])
             normalized = [
-                normalizer(config, section, item) for item in metadata
+                normalizer(config, section, item)
+                for item in metadata
+                # Plex's recentlyAdded endpoint can ignore the requested type
+                # and return albums for an artist query. Never merge an
+                # explicitly different entity type into the artist snapshot.
+                if not item.get("type")
+                or str(item["type"]).casefold() == plex_type
             ]
             result[collection].extend(normalized)
             if collection == "releaseGroups":

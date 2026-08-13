@@ -143,6 +143,16 @@ test("SPA navigation moves focus to the main landmark", async ({ page }) => {
   await expect(page.locator("#main-content")).toHaveCSS("outline-style", "none");
 });
 
+test("library page describes artist holdings only", async ({ page }) => {
+  await page.goto("/");
+  await signIn(page, "ada");
+  await page.getByRole("button", { name: "Your library" }).click();
+
+  const summary = page.locator("#library-copy");
+  await expect(summary).toHaveText("0 artists available in your Plex music libraries.");
+  await expect(summary).not.toContainText("releases");
+});
+
 test("mobile tab bar stays 82px tall including its safe-area padding", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/");

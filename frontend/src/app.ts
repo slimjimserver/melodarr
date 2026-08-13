@@ -2914,7 +2914,8 @@ function setupLibrary() {
           [artist.name, artist.sortName].filter(Boolean).join(" "),
         ),
       }));
-      $("#library-copy").textContent = `${library.artistCount} artists and ${library.releaseGroupCount} releases available in your Plex music libraries.`;
+      const artistLabel = library.artistCount === 1 ? "artist" : "artists";
+      $("#library-copy").textContent = `${library.artistCount} ${artistLabel} available in your Plex music libraries.`;
       setMessage($("#library-message"), "");
       filter.hidden = false;
       filterArtists();

@@ -8560,6 +8560,34 @@ class LibraryRouteTests(DatabaseTestCase):
     @patch("backend.routes.library.plex.library_snapshot")
     @patch("backend.routes.library.plex.cached_library_snapshot")
     @patch("backend.routes.library.get_service")
+    def test_stale_cache_falls_back_to_a_current_snapshot(
+        self, get_service_mock, cached_snapshot, live_snapshot
+    ):
+        get_service_mock.return_value = {"url": "http://plex:32400", "token": "token"}
+        cached_snapshot.return_value = {
+            "snapshotVersion": plex.SNAPSHOT_VERSION - 1,
+            "artists": [{"name": "Album incorrectly cached as an artist"}],
+            "releaseGroups": [{"name": "Album"}],
+        }
+        live_snapshot.return_value = {
+            "snapshotVersion": plex.SNAPSHOT_VERSION,
+            "artists": [{"name": "Correct Artist"}],
+            "releaseGroups": [{"name": "Album"}],
+        }
+        self.register()
+
+        response = self.client.get("/api/library")
+
+        self.assertEqual(response.status_code, 200)
+        live_snapshot.assert_called_once()
+        self.assertEqual(
+            [artist["name"] for artist in response.get_json()["artists"]],
+            ["Correct Artist"],
+        )
+
+    @patch("backend.routes.library.plex.library_snapshot")
+    @patch("backend.routes.library.plex.cached_library_snapshot")
+    @patch("backend.routes.library.get_service")
     def test_empty_cache_falls_back_to_a_live_scan(
         self, get_service_mock, cached_snapshot, live_snapshot
     ):
@@ -9265,6 +9293,49 @@ class PlexClientTests(unittest.TestCase):
                 "WHERE cache_key LIKE 'plex-guid:%'"
             ).fetchone()["count"]
         self.assertEqual(guid_rows, 2)
+
+    @patch("backend.services.plex.requests.get")
+    def test_recent_scan_rejects_albums_returned_for_the_artist_query(self, get):
+        get.side_effect = [
+            Response(payload={"MediaContainer": {"Metadata": [{
+                "type": "album",
+                "title": "Album incorrectly returned as an artist",
+                "ratingKey": "20",
+            }]}}),
+            Response(payload={"MediaContainer": {"Metadata": [{
+                "type": "album",
+                "title": "A New Album",
+                "parentTitle": "A New Artist",
+                "parentRatingKey": "10",
+                "parentKey": "/library/metadata/10/children",
+                "ratingKey": "20",
+            }]}}),
+            Response(payload={"MediaContainer": {"Metadata": [{
+                "type": "artist",
+                "title": "A New Artist",
+                "ratingKey": "10",
+                "key": "/library/metadata/10/children",
+            }]}}),
+        ]
+
+        result = plex._scan_sections(
+            {
+                "url": "http://plex:32400",
+                "token": "token",
+                "machineIdentifier": "server-1",
+            },
+            [{"id": "music", "title": "Music"}],
+            recently_added=True,
+        )
+
+        self.assertEqual(
+            [artist["name"] for artist in result["artists"]],
+            ["A New Artist"],
+        )
+        self.assertEqual(
+            [release["name"] for release in result["releaseGroups"]],
+            ["A New Album"],
+        )
 
     @patch("backend.services.plex.requests.get")
     def test_recent_album_hydrates_parent_artist_missing_from_recent_feed(self, get):

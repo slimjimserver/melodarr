@@ -37,9 +37,16 @@ def plex_library():
         return api_error("Plex is not configured.", 503)
     try:
         # Serve the background worker's snapshot. Only a genuinely empty cache
-        # falls through to a scan, so a page load never blocks on Plex.
+        # or an older snapshot format falls through to a scan, so normal page
+        # loads never block on Plex.
         inventory = plex.cached_library_snapshot(config)
-        if not inventory.get("artists") and not inventory.get("releaseGroups"):
+        snapshot_is_stale = (
+            inventory.get("snapshotVersion", plex.SNAPSHOT_VERSION)
+            != plex.SNAPSHOT_VERSION
+        )
+        if snapshot_is_stale or (
+            not inventory.get("artists") and not inventory.get("releaseGroups")
+        ):
             inventory = plex.library_snapshot(config)
         artists = inventory.get("artists", [])
         release_groups = inventory.get("releaseGroups", [])
