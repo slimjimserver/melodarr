@@ -1159,12 +1159,19 @@ class LidarrSearchWorkerTests(unittest.TestCase):
     @patch("backend.workers.lidarr_searches.lidarr_downloads.request_poll")
     @patch("backend.workers.lidarr_searches.set_lidarr_search_command")
     @patch("backend.workers.lidarr_searches.lidarr.start_command")
+    @patch("backend.workers.lidarr_searches.lidarr.monitor_albums")
     @patch("backend.workers.lidarr_searches.lidarr.command")
     def test_completed_refresh_queues_album_search(
-        self, command, start_command, set_search, request_poll
+        self, command, monitor_albums, start_command, set_search, request_poll
     ):
+        operations = []
         command.return_value = Response(200, {"status": "completed"})
-        start_command.return_value = Response(201, {"id": 66})
+        monitor_albums.side_effect = lambda album_ids: (
+            operations.append(("monitor", album_ids)) or Response(200)
+        )
+        start_command.side_effect = lambda values: (
+            operations.append(("search", values)) or Response(201, {"id": 66})
+        )
         job = {
             "id": 1,
             "name": "Queued Album",
@@ -1177,20 +1184,48 @@ class LidarrSearchWorkerTests(unittest.TestCase):
         lidarr_search_worker.process_job(job)
 
         command.assert_called_once_with(55)
+        monitor_albums.assert_called_once_with([33])
         start_command.assert_called_once_with({
             "name": "AlbumSearch",
             "albumIds": [33],
         })
+        self.assertEqual([name for name, _ in operations], ["monitor", "search"])
         set_search.assert_called_once_with(1, 66)
         request_poll.assert_called_once_with()
 
-    @patch("backend.workers.lidarr_searches.set_lidarr_search_command")
+    @patch("backend.workers.lidarr_searches.defer_lidarr_search")
     @patch("backend.workers.lidarr_searches.lidarr.start_command")
+    @patch("backend.workers.lidarr_searches.lidarr.monitor_albums")
     @patch("backend.workers.lidarr_searches.lidarr.command")
-    def test_shared_refresh_is_polled_once_then_searches_every_album(
-        self, command, start_command, set_search
+    def test_failed_monitor_update_defers_without_searching(
+        self, command, monitor_albums, start_command, defer_search
     ):
         command.return_value = Response(200, {"status": "completed"})
+        monitor_albums.return_value = Response(500, text="monitor failed")
+        job = {
+            "id": 1,
+            "name": "Unmonitored Album",
+            "album_id": 33,
+            "artist_id": 44,
+            "refresh_command_id": 55,
+            "search_command_id": None,
+        }
+
+        lidarr_search_worker.process_job(job)
+
+        monitor_albums.assert_called_once_with([33])
+        start_command.assert_not_called()
+        defer_search.assert_called_once()
+
+    @patch("backend.workers.lidarr_searches.set_lidarr_search_command")
+    @patch("backend.workers.lidarr_searches.lidarr.start_command")
+    @patch("backend.workers.lidarr_searches.lidarr.monitor_albums")
+    @patch("backend.workers.lidarr_searches.lidarr.command")
+    def test_shared_refresh_is_polled_once_then_searches_every_album(
+        self, command, monitor_albums, start_command, set_search
+    ):
+        command.return_value = Response(200, {"status": "completed"})
+        monitor_albums.return_value = Response(200)
         start_command.side_effect = [
             Response(201, {"id": 66}),
             Response(201, {"id": 67}),
@@ -1210,6 +1245,9 @@ class LidarrSearchWorkerTests(unittest.TestCase):
         lidarr_search_worker.process_jobs(jobs)
 
         command.assert_called_once_with(55)
+        self.assertEqual(monitor_albums.call_count, 2)
+        monitor_albums.assert_any_call([33])
+        monitor_albums.assert_any_call([34])
         self.assertEqual(start_command.call_count, 2)
         start_command.assert_any_call({"name": "AlbumSearch", "albumIds": [33]})
         start_command.assert_any_call({"name": "AlbumSearch", "albumIds": [34]})
@@ -5774,6 +5812,25 @@ class LidarrClientTests(unittest.TestCase):
             headers={"X-Api-Key": "key"},
             timeout=15,
             params={"term": "mbid:artist-id"},
+        )
+
+    @patch("backend.services.lidarr.requests.request")
+    def test_monitor_albums_uses_album_monitor_endpoint(self, request):
+        response = Mock()
+        request.return_value = response
+
+        result = lidarr.monitor_albums(
+            [33],
+            config={"url": "http://lidarr:8686", "apiKey": "key"},
+        )
+
+        self.assertIs(result, response)
+        request.assert_called_once_with(
+            "PUT",
+            "http://lidarr:8686/api/v1/album/monitor",
+            headers={"X-Api-Key": "key"},
+            timeout=15,
+            json={"albumIds": [33], "monitored": True},
         )
 
     @patch("backend.services.lidarr.library_artists")
