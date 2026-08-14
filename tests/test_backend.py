@@ -76,6 +76,7 @@ from backend.workers import plex as plex_worker
 from backend.workers import plex_history as plex_history_worker
 from backend.workers import plex_metadata as plex_metadata_worker
 from backend.workers import recommendations as recommendation_worker
+from backend.workers import similar_artists as similar_artist_worker
 
 
 class Response:
@@ -152,6 +153,13 @@ class DatabaseTestCase(unittest.TestCase):
                 lastCompletedAt=None,
             )
         artist_metadata_worker.wake_requested.clear()
+        with similar_artist_worker.queue_lock:
+            similar_artist_worker.queued_candidates.clear()
+            similar_artist_worker.active_candidate_keys.clear()
+            similar_artist_worker.job_state.update(
+                running=False, queued=0, completed=0, lastCompletedAt=None,
+            )
+        similar_artist_worker.wake_requested.clear()
         with plex_history_worker.request_lock:
             plex_history_worker.sync_requested = False
             plex_history_worker.full_sync_requested = False
@@ -209,8 +217,9 @@ class ApplicationFactoryTests(DatabaseTestCase):
             for method in rule.methods
             if method not in {"HEAD", "OPTIONS"}
         }
-        self.assertEqual(len(rules), 92)
-        self.assertEqual(len(route_methods), 92)
+        self.assertEqual(len(rules), 93)
+        self.assertEqual(len(route_methods), 93)
+        self.assertIn(("/api/music/artist/<mbid>/similar", "GET"), route_methods)
         notification_routes = {
             ("/api/settings/notifications", "GET"),
             ("/api/settings/notifications", "PUT"),
@@ -460,6 +469,7 @@ class WorkerEntrypointTests(unittest.TestCase):
         calls = []
         anime_metadata_thread = Mock()
         artist_metadata_thread = Mock()
+        similar_artist_thread = Mock()
         lidarr_thread = Mock()
         lidarr_download_thread = Mock()
         plex_thread = Mock()
@@ -470,6 +480,7 @@ class WorkerEntrypointTests(unittest.TestCase):
         thread_class.side_effect = [
             anime_metadata_thread,
             artist_metadata_thread,
+            similar_artist_thread,
             lidarr_thread,
             lidarr_download_thread,
             lidarr_library_thread,
@@ -483,7 +494,7 @@ class WorkerEntrypointTests(unittest.TestCase):
         run.side_effect = lambda *_args: calls.append("recommendations")
         worker.main()
         self.assertEqual(calls, ["cache", "database", "recommendations"])
-        self.assertEqual(thread_class.call_count, 9)
+        self.assertEqual(thread_class.call_count, 10)
         thread_class.assert_any_call(
             target=anime_metadata_worker.run,
             name="anime-musicbrainz-resolution",
@@ -492,6 +503,11 @@ class WorkerEntrypointTests(unittest.TestCase):
         thread_class.assert_any_call(
             target=artist_metadata_worker.run,
             name="musicbrainz-artist-revalidation",
+            daemon=True,
+        )
+        thread_class.assert_any_call(
+            target=similar_artist_worker.run,
+            name="lastfm-similar-artist-resolution",
             daemon=True,
         )
         thread_class.assert_any_call(
@@ -539,6 +555,7 @@ class WorkerEntrypointTests(unittest.TestCase):
         anime_metadata_thread.start.assert_called_once_with()
         notification_thread.start.assert_called_once_with()
         artist_metadata_thread.start.assert_called_once_with()
+        similar_artist_thread.start.assert_called_once_with()
         run.assert_called_once_with(worker.RECOMMENDATION_STARTUP_DEADLINE)
 
     @patch("backend.workers.lidarr_library.time.time", return_value=100)
@@ -1142,12 +1159,19 @@ class LidarrSearchWorkerTests(unittest.TestCase):
     @patch("backend.workers.lidarr_searches.lidarr_downloads.request_poll")
     @patch("backend.workers.lidarr_searches.set_lidarr_search_command")
     @patch("backend.workers.lidarr_searches.lidarr.start_command")
+    @patch("backend.workers.lidarr_searches.lidarr.monitor_albums")
     @patch("backend.workers.lidarr_searches.lidarr.command")
     def test_completed_refresh_queues_album_search(
-        self, command, start_command, set_search, request_poll
+        self, command, monitor_albums, start_command, set_search, request_poll
     ):
+        operations = []
         command.return_value = Response(200, {"status": "completed"})
-        start_command.return_value = Response(201, {"id": 66})
+        monitor_albums.side_effect = lambda album_ids: (
+            operations.append(("monitor", album_ids)) or Response(200)
+        )
+        start_command.side_effect = lambda values: (
+            operations.append(("search", values)) or Response(201, {"id": 66})
+        )
         job = {
             "id": 1,
             "name": "Queued Album",
@@ -1160,20 +1184,48 @@ class LidarrSearchWorkerTests(unittest.TestCase):
         lidarr_search_worker.process_job(job)
 
         command.assert_called_once_with(55)
+        monitor_albums.assert_called_once_with([33])
         start_command.assert_called_once_with({
             "name": "AlbumSearch",
             "albumIds": [33],
         })
+        self.assertEqual([name for name, _ in operations], ["monitor", "search"])
         set_search.assert_called_once_with(1, 66)
         request_poll.assert_called_once_with()
 
-    @patch("backend.workers.lidarr_searches.set_lidarr_search_command")
+    @patch("backend.workers.lidarr_searches.defer_lidarr_search")
     @patch("backend.workers.lidarr_searches.lidarr.start_command")
+    @patch("backend.workers.lidarr_searches.lidarr.monitor_albums")
     @patch("backend.workers.lidarr_searches.lidarr.command")
-    def test_shared_refresh_is_polled_once_then_searches_every_album(
-        self, command, start_command, set_search
+    def test_failed_monitor_update_defers_without_searching(
+        self, command, monitor_albums, start_command, defer_search
     ):
         command.return_value = Response(200, {"status": "completed"})
+        monitor_albums.return_value = Response(500, text="monitor failed")
+        job = {
+            "id": 1,
+            "name": "Unmonitored Album",
+            "album_id": 33,
+            "artist_id": 44,
+            "refresh_command_id": 55,
+            "search_command_id": None,
+        }
+
+        lidarr_search_worker.process_job(job)
+
+        monitor_albums.assert_called_once_with([33])
+        start_command.assert_not_called()
+        defer_search.assert_called_once()
+
+    @patch("backend.workers.lidarr_searches.set_lidarr_search_command")
+    @patch("backend.workers.lidarr_searches.lidarr.start_command")
+    @patch("backend.workers.lidarr_searches.lidarr.monitor_albums")
+    @patch("backend.workers.lidarr_searches.lidarr.command")
+    def test_shared_refresh_is_polled_once_then_searches_every_album(
+        self, command, monitor_albums, start_command, set_search
+    ):
+        command.return_value = Response(200, {"status": "completed"})
+        monitor_albums.return_value = Response(200)
         start_command.side_effect = [
             Response(201, {"id": 66}),
             Response(201, {"id": 67}),
@@ -1193,6 +1245,9 @@ class LidarrSearchWorkerTests(unittest.TestCase):
         lidarr_search_worker.process_jobs(jobs)
 
         command.assert_called_once_with(55)
+        self.assertEqual(monitor_albums.call_count, 2)
+        monitor_albums.assert_any_call([33])
+        monitor_albums.assert_any_call([34])
         self.assertEqual(start_command.call_count, 2)
         start_command.assert_any_call({"name": "AlbumSearch", "albumIds": [33]})
         start_command.assert_any_call({"name": "AlbumSearch", "albumIds": [34]})
@@ -4770,6 +4825,7 @@ class LidarrRequestTests(DatabaseTestCase):
         history = self.request_history()
         self.assertEqual((history[0]["kind"], history[0]["mbid"]), ("artist", self.artist_mbid))
 
+    @patch("backend.routes.requests.notifications.queue_admin_request")
     @patch("backend.routes.requests.lidarr_search_worker.request_work")
     @patch("backend.routes.requests.enqueue_lidarr_search")
     @patch("backend.routes.requests.lidarr.start_command")
@@ -4778,7 +4834,7 @@ class LidarrRequestTests(DatabaseTestCase):
     @patch("backend.routes.requests.get_service")
     def test_new_album_persists_refresh_then_search_job(
         self, get_service, lookup_album, add_album, start_command,
-        enqueue_search, request_work
+        enqueue_search, request_work, queue_admin_request
     ):
         get_service.return_value = self.lidarr_config()
         lookup_album.return_value = Response(payload=[{
@@ -4828,6 +4884,13 @@ class LidarrRequestTests(DatabaseTestCase):
             "song_id": 1477,
             "song_title": "Haruka Kanata",
         })
+        queue_admin_request.assert_called_once_with(
+            user_id,
+            "test-user",
+            self.album_mbid,
+            "Test Album",
+            "Test Artist",
+        )
         self.assertEqual(response.get_json()["refreshType"], "album")
         request_work.assert_called_once_with()
         start_command.assert_not_called()
@@ -5751,6 +5814,25 @@ class LidarrClientTests(unittest.TestCase):
             params={"term": "mbid:artist-id"},
         )
 
+    @patch("backend.services.lidarr.requests.request")
+    def test_monitor_albums_uses_album_monitor_endpoint(self, request):
+        response = Mock()
+        request.return_value = response
+
+        result = lidarr.monitor_albums(
+            [33],
+            config={"url": "http://lidarr:8686", "apiKey": "key"},
+        )
+
+        self.assertIs(result, response)
+        request.assert_called_once_with(
+            "PUT",
+            "http://lidarr:8686/api/v1/album/monitor",
+            headers={"X-Api-Key": "key"},
+            timeout=15,
+            json={"albumIds": [33], "monitored": True},
+        )
+
     @patch("backend.services.lidarr.library_artists")
     def test_tracked_artist_matches_musicbrainz_id_locally(self, artists):
         artists.return_value = [
@@ -6424,6 +6506,91 @@ class DiscoveryRoutesTests(DatabaseTestCase):
 
 
 class MusicRoutesTests(DatabaseTestCase):
+    @patch("backend.routes.music.lastfm.get_public")
+    @patch("backend.routes.music.get_lastfm_api_key", return_value="")
+    def test_similar_artists_is_empty_without_a_shared_lastfm_key(
+        self, get_api_key, get_public
+    ):
+        artist_id = "11111111-1111-1111-1111-111111111111"
+        self.register()
+
+        response = self.client.get(f"/api/music/artist/{artist_id}/similar")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), {
+            "artists": [],
+            "configured": False,
+            "offset": 0,
+            "limit": 12,
+            "total": 0,
+            "nextOffset": None,
+            "hasMore": False,
+            "pending": 0,
+        })
+        get_api_key.assert_called_once_with()
+        get_public.assert_not_called()
+
+    @patch("backend.routes.music.lidarr.cached_artist_availability")
+    @patch("backend.routes.music.lastfm.get_public")
+    @patch(
+        "backend.routes.music.get_lastfm_api_key",
+        return_value="shared-lastfm-key",
+    )
+    def test_similar_artists_returns_navigable_deduplicated_matches(
+        self, get_api_key, get_public, artist_availability
+    ):
+        artist_id = "11111111-1111-1111-1111-111111111111"
+        similar_id = "22222222-2222-2222-2222-222222222222"
+        tracked_id = "33333333-3333-3333-3333-333333333333"
+        get_public.return_value = {
+            "similarartists": {
+                "artist": [
+                    {"mbid": artist_id, "name": "Current artist", "match": "1"},
+                    {"mbid": similar_id, "name": "Neighbor", "match": "0.913"},
+                    {"mbid": similar_id, "name": "Duplicate", "match": "0.8"},
+                    {"mbid": "", "name": "Missing identifier", "match": "0.7"},
+                    {"mbid": tracked_id, "name": "Tracked", "match": "0.5"},
+                    {"mbid": "invalid", "name": "Invalid identifier", "match": "0.4"},
+                ],
+            },
+        }
+        artist_availability.return_value = {tracked_id: {"id": 42}}
+        self.register()
+
+        response = self.client.get(f"/api/music/artist/{artist_id}/similar")
+        payload = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        self.assertTrue(payload["configured"])
+        self.assertEqual(payload["total"], 4)
+        self.assertEqual(payload["pending"], 2)
+        self.assertFalse(payload["hasMore"])
+        self.assertIsNone(payload["nextOffset"])
+        self.assertEqual([artist["id"] for artist in payload["artists"]], [
+            similar_id,
+            tracked_id,
+        ])
+        self.assertEqual(payload["artists"][0], {
+            "id": similar_id,
+            "name": "Neighbor",
+            "type": "91% match",
+            "rank": 0,
+            "match": 0.913,
+            "coverArt": f"/api/artwork/artist/{similar_id}?size=thumb",
+            "availableInLidarr": False,
+            "recommendationSource": "Similar on Last.fm",
+        })
+        self.assertTrue(payload["artists"][1]["availableInLidarr"])
+        get_api_key.assert_called_once_with()
+        get_public.assert_called_once_with(
+            "artist.getsimilar",
+            "shared-lastfm-key",
+            mbid=artist_id,
+            limit=50,
+            autocorrect=1,
+        )
+
     @patch("backend.routes.music.get_service")
     @patch("backend.routes.music.lidarr.cached_artist_availability")
     @patch("backend.routes.music._plex_artist")
@@ -8450,6 +8617,34 @@ class LibraryRouteTests(DatabaseTestCase):
     @patch("backend.routes.library.plex.library_snapshot")
     @patch("backend.routes.library.plex.cached_library_snapshot")
     @patch("backend.routes.library.get_service")
+    def test_stale_cache_falls_back_to_a_current_snapshot(
+        self, get_service_mock, cached_snapshot, live_snapshot
+    ):
+        get_service_mock.return_value = {"url": "http://plex:32400", "token": "token"}
+        cached_snapshot.return_value = {
+            "snapshotVersion": plex.SNAPSHOT_VERSION - 1,
+            "artists": [{"name": "Album incorrectly cached as an artist"}],
+            "releaseGroups": [{"name": "Album"}],
+        }
+        live_snapshot.return_value = {
+            "snapshotVersion": plex.SNAPSHOT_VERSION,
+            "artists": [{"name": "Correct Artist"}],
+            "releaseGroups": [{"name": "Album"}],
+        }
+        self.register()
+
+        response = self.client.get("/api/library")
+
+        self.assertEqual(response.status_code, 200)
+        live_snapshot.assert_called_once()
+        self.assertEqual(
+            [artist["name"] for artist in response.get_json()["artists"]],
+            ["Correct Artist"],
+        )
+
+    @patch("backend.routes.library.plex.library_snapshot")
+    @patch("backend.routes.library.plex.cached_library_snapshot")
+    @patch("backend.routes.library.get_service")
     def test_empty_cache_falls_back_to_a_live_scan(
         self, get_service_mock, cached_snapshot, live_snapshot
     ):
@@ -9155,6 +9350,49 @@ class PlexClientTests(unittest.TestCase):
                 "WHERE cache_key LIKE 'plex-guid:%'"
             ).fetchone()["count"]
         self.assertEqual(guid_rows, 2)
+
+    @patch("backend.services.plex.requests.get")
+    def test_recent_scan_rejects_albums_returned_for_the_artist_query(self, get):
+        get.side_effect = [
+            Response(payload={"MediaContainer": {"Metadata": [{
+                "type": "album",
+                "title": "Album incorrectly returned as an artist",
+                "ratingKey": "20",
+            }]}}),
+            Response(payload={"MediaContainer": {"Metadata": [{
+                "type": "album",
+                "title": "A New Album",
+                "parentTitle": "A New Artist",
+                "parentRatingKey": "10",
+                "parentKey": "/library/metadata/10/children",
+                "ratingKey": "20",
+            }]}}),
+            Response(payload={"MediaContainer": {"Metadata": [{
+                "type": "artist",
+                "title": "A New Artist",
+                "ratingKey": "10",
+                "key": "/library/metadata/10/children",
+            }]}}),
+        ]
+
+        result = plex._scan_sections(
+            {
+                "url": "http://plex:32400",
+                "token": "token",
+                "machineIdentifier": "server-1",
+            },
+            [{"id": "music", "title": "Music"}],
+            recently_added=True,
+        )
+
+        self.assertEqual(
+            [artist["name"] for artist in result["artists"]],
+            ["A New Artist"],
+        )
+        self.assertEqual(
+            [release["name"] for release in result["releaseGroups"]],
+            ["A New Album"],
+        )
 
     @patch("backend.services.plex.requests.get")
     def test_recent_album_hydrates_parent_artist_missing_from_recent_feed(self, get):

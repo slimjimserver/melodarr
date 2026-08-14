@@ -192,6 +192,28 @@ class AnimeFrontendTests(unittest.TestCase):
         self.assertIn('detailRequests.delete(`release-group:${String(id)}`)', self.discovery)
         self.assertIn(".release-anime-theme-link", self.stylesheet)
 
+    def test_artist_detail_loads_paginated_similar_artists_from_the_sidebar(self):
+        self.assertIn("function similarArtistsView(artistId: string)", self.discovery)
+        self.assertIn(
+            "`/api/music/artist/${encodeURIComponent(artistId)}/similar?offset=${offset}&limit=${pageSize}`",
+            self.discovery,
+        )
+        self.assertIn("nextOffset = offset;", self.discovery)
+        self.assertIn("requestPage(offset, pollAttempt + 1", self.discovery)
+        self.assertIn("card.dataset.recommendationRank", self.discovery)
+        self.assertIn('similarButton.className = "discography-similar-nav"', self.discovery)
+        self.assertIn("tools.hidden = true;", self.discovery)
+        self.assertIn("releaseContent.hidden = true;", self.discovery)
+        self.assertIn("similar.element.hidden = false;", self.discovery)
+        self.assertNotIn("results.append(similarArtistsSection", self.discovery)
+        self.assertIn('results.append(renderDiscography(data))', self.discovery)
+        self.assertIn('requestButton.textContent = "In Lidarr"', self.discovery)
+        self.assertIn(".discography-sidebar", self.stylesheet)
+        self.assertIn(".discography-similar-nav", self.stylesheet)
+        self.assertIn('list.className = "similar-artists-list"', self.discovery)
+        self.assertIn(".similar-artists-list .recommendation-card", self.stylesheet)
+        self.assertIn("grid-template-columns: minmax(0, 1fr) auto", self.stylesheet)
+
     def test_detail_work_is_cancelled_and_generation_guarded_across_sessions(self):
         self.assertIn("let detailSessionGeneration = 0", self.discovery)
         self.assertIn("let detailSessionAbort = new AbortController()", self.discovery)

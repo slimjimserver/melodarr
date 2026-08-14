@@ -72,7 +72,8 @@ def claim_due_delivery():
             (token, now + LEASE_SECONDS, now, row["id"], MAX_ATTEMPTS, now, now))
         if not cursor.rowcount:
             return None
-        return connection.execute("""SELECT d.*, e.release_mbid, e.artist_name, e.release_title, u.username,
+        return connection.execute("""SELECT d.*, e.release_mbid, e.artist_name, e.release_title,
+            e.event_type, e.requester_username, u.username,
             d.push_endpoint, d.push_p256dh, d.push_auth FROM notification_deliveries d
             JOIN notification_events e ON e.id=d.event_id
             JOIN users u ON u.id=d.user_id
@@ -90,23 +91,50 @@ def build_email_message(delivery, *, test=False):
     release = _header_text(delivery["release_title"], "Music")
     artist = _header_text(delivery["artist_name"], "your requested artist")
     username = _header_text(delivery.get("username") if hasattr(delivery, "get") else delivery["username"], "there")
+    event_type = (
+        delivery.get("event_type", "availability")
+        if hasattr(delivery, "get")
+        else delivery["event_type"]
+    )
+    requester = _header_text(
+        delivery.get("requester_username", "")
+        if hasattr(delivery, "get")
+        else delivery["requester_username"],
+        "Someone",
+    )
+    is_request = event_type == "request" and not test
     base_url = str(notification_config().get("applicationUrl") or "").rstrip("/")
     path = f"/albums/{delivery['release_mbid']}"
     destination = f"{base_url}{path}" if base_url else path
     message = EmailMessage()
-    message["Subject"] = f"Music Now Available - {release} by {artist}"
+    message["Subject"] = (
+        f"New Music Request - {release} by {artist}"
+        if is_request
+        else f"Music Now Available - {release} by {artist}"
+    )
     message["From"] = formataddr((_header_text(config.get("senderName"), "Melodarr"), config["sender"]))
     message["To"] = delivery["email_target"]
     test_line = "This is a representative Melodarr test notification.\n" if test else ""
-    text = f"{test_line}{release} by {artist} is now available in Melodarr.\n{destination}\n"
+    text = (
+        f"{requester} requested {release} by {artist}.\n{destination}\n"
+        if is_request
+        else f"{test_line}{release} by {artist} is now available in Melodarr.\n{destination}\n"
+    )
     message.set_content(text)
     artwork = f"https://coverartarchive.org/release-group/{html.escape(str(delivery['release_mbid']), quote=True)}/front-500"
     escaped_release = html.escape(release)
     escaped_artist = html.escape(artist)
     escaped_user = html.escape(username)
+    escaped_requester = html.escape(requester)
     escaped_destination = html.escape(destination, quote=True)
     test_copy = "<p style=\"margin:0 0 18px;color:#d9d2cf;font:14px/1.55 Arial,sans-serif\">This is a representative Melodarr test notification; it does not indicate that a request became available.</p>" if test else ""
-    markup = f'''<!doctype html><html><body style="margin:0;padding:0;background:#16131b"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="width:100%;background:#16131b"><tr><td align="center" style="padding:32px 16px"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:640px;background:#241f2b;border-radius:20px;overflow:hidden"><tr><td align="center" style="padding:34px 28px 22px;background:#30293a"><img src="cid:melodarr-logo" width="96" height="96" alt="Melodarr" style="display:block;border:0;max-width:96px;height:auto"><div style="margin-top:12px;color:#fff7f2;font:700 30px/1 Arial,sans-serif;letter-spacing:-1px">Melodarr</div></td></tr><tr><td style="padding:32px 28px"><h1 style="margin:0 0 12px;color:#fff7f2;font:700 28px/1.2 Arial,sans-serif">Hi, {escaped_user}!</h1><p style="margin:0 0 22px;color:#d9d2cf;font:16px/1.55 Arial,sans-serif">Great news — music you care about is now available in your library.</p>{test_copy}<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="width:100%;border:1px solid #51465d;border-radius:14px;background:#1d1923"><tr><td style="padding:20px;vertical-align:middle"><div style="color:#c4b6d8;font:700 12px/1.2 Arial,sans-serif;letter-spacing:1px;text-transform:uppercase">Now available</div><div style="margin-top:8px;color:#fff7f2;font:700 21px/1.25 Arial,sans-serif">{escaped_release}</div><div style="margin-top:5px;color:#d9d2cf;font:15px/1.4 Arial,sans-serif">{escaped_artist}</div></td><td width="132" style="padding:12px 12px 12px 0;vertical-align:middle"><img src="{artwork}" width="120" height="120" alt="Cover art for {escaped_release}" style="display:block;width:120px;height:120px;max-width:100%;border:0;border-radius:10px;background:#51465d;color:#fff7f2;font:12px Arial,sans-serif;object-fit:cover"></td></tr></table><table role="presentation" cellpadding="0" cellspacing="0" style="margin:26px auto 0"><tr><td align="center" bgcolor="#c7593a" style="border-radius:999px"><a href="{escaped_destination}" style="display:inline-block;padding:15px 28px;color:#fffaf7;font:700 16px Arial,sans-serif;text-decoration:none">Open in Melodarr</a></td></tr></table></td></tr></table></td></tr></table></body></html>'''
+    intro = (
+        f"{escaped_requester} requested {escaped_release} by {escaped_artist}."
+        if is_request
+        else "Great news — music you care about is now available in your library."
+    )
+    eyebrow = "New request" if is_request else "Now available"
+    markup = f'''<!doctype html><html><body style="margin:0;padding:0;background:#16131b"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="width:100%;background:#16131b"><tr><td align="center" style="padding:32px 16px"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:640px;background:#241f2b;border-radius:20px;overflow:hidden"><tr><td align="center" style="padding:34px 28px 22px;background:#30293a"><img src="cid:melodarr-logo" width="96" height="96" alt="Melodarr" style="display:block;border:0;max-width:96px;height:auto"><div style="margin-top:12px;color:#fff7f2;font:700 30px/1 Arial,sans-serif;letter-spacing:-1px">Melodarr</div></td></tr><tr><td style="padding:32px 28px"><h1 style="margin:0 0 12px;color:#fff7f2;font:700 28px/1.2 Arial,sans-serif">Hi, {escaped_user}!</h1><p style="margin:0 0 22px;color:#d9d2cf;font:16px/1.55 Arial,sans-serif">{intro}</p>{test_copy}<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="width:100%;border:1px solid #51465d;border-radius:14px;background:#1d1923"><tr><td style="padding:20px;vertical-align:middle"><div style="color:#c4b6d8;font:700 12px/1.2 Arial,sans-serif;letter-spacing:1px;text-transform:uppercase">{eyebrow}</div><div style="margin-top:8px;color:#fff7f2;font:700 21px/1.25 Arial,sans-serif">{escaped_release}</div><div style="margin-top:5px;color:#d9d2cf;font:15px/1.4 Arial,sans-serif">{escaped_artist}</div></td><td width="132" style="padding:12px 12px 12px 0;vertical-align:middle"><img src="{artwork}" width="120" height="120" alt="Cover art for {escaped_release}" style="display:block;width:120px;height:120px;max-width:100%;border:0;border-radius:10px;background:#51465d;color:#fff7f2;font:12px Arial,sans-serif;object-fit:cover"></td></tr></table><table role="presentation" cellpadding="0" cellspacing="0" style="margin:26px auto 0"><tr><td align="center" bgcolor="#c7593a" style="border-radius:999px"><a href="{escaped_destination}" style="display:inline-block;padding:15px 28px;color:#fffaf7;font:700 16px Arial,sans-serif;text-decoration:none">Open in Melodarr</a></td></tr></table></td></tr></table></td></tr></table></body></html>'''
     message.add_alternative(markup, subtype="html")
     logo_path = Path(__file__).resolve().parents[2] / "frontend" / "icons" / "melodarr-180.png"
     try:
@@ -140,10 +168,17 @@ def _push(delivery, *, test=False):
     except ImportError as exc:
         raise RuntimeError("pywebpush is not installed") from exc
     config = notification_config().get("webPush") or {}
-    payload = json.dumps(
-        {"title": "Melodarr test notification", "body": "This is a representative test notification. No music availability changed.", "url": "/"}
-        if test else {"title": f"{delivery['release_title']} is now available", "body": f"{delivery['artist_name']} is now available in Melodarr.", "url": f"/albums/{delivery['release_mbid']}"}
-    )
+    event_type = delivery.get("event_type", "availability") if hasattr(delivery, "get") else delivery["event_type"]
+    requester = _header_text(delivery.get("requester_username", "") if hasattr(delivery, "get") else delivery["requester_username"], "Someone")
+    release = _header_text(delivery["release_title"], "Music")
+    artist = _header_text(delivery["artist_name"], "Unknown Artist")
+    if test:
+        contents = {"title": "Test Notification", "body": "This is a test notification. No new music added.", "url": "/"}
+    elif event_type == "request":
+        contents = {"title": f"{release} by {artist}", "body": f"{requester} requested a new release group", "url": f"/albums/{delivery['release_mbid']}"}
+    else:
+        contents = {"title": f"{release} by {artist}", "body": "This Release Group is now available", "url": f"/albums/{delivery['release_mbid']}"}
+    payload = json.dumps(contents)
     session = NoRedirectSession()
     try:
         webpush({"endpoint": delivery["push_endpoint"], "keys": {"p256dh": delivery["push_p256dh"], "auth": delivery["push_auth"]}}, payload, vapid_private_key=VAPID_PRIVATE_KEY_FILE, vapid_claims={"sub": config["contact"]}, ttl=WEB_PUSH_TTL_SECONDS, requests_session=session, timeout=20)

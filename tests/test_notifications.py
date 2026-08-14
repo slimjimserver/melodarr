@@ -3,6 +3,7 @@ if __package__:
 else:
     from _test_environment import TEST_ROOT
 
+import json
 import os
 import sqlite3
 import tempfile
@@ -43,6 +44,88 @@ class NotificationStorageTests(unittest.TestCase):
         with storage.db() as connection:
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_events").fetchone()[0], 1)
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_deliveries").fetchone()[0], 0)
+
+    def test_request_alerts_only_other_enabled_admins(self):
+        with storage.db() as connection:
+            connection.execute(
+                "UPDATE users SET role='admin', plex_email='requester@example.test' "
+                "WHERE id=?",
+                (self.user_id,),
+            )
+            other_admin_id = connection.execute(
+                "INSERT INTO users "
+                "(username,password_hash,role,plex_email,created_at) "
+                "VALUES ('other-admin','x','admin','other@example.test',0)"
+            ).lastrowid
+            regular_user_id = connection.execute(
+                "INSERT INTO users "
+                "(username,password_hash,role,plex_email,created_at) "
+                "VALUES ('listener','x','user','listener@example.test',0)"
+            ).lastrowid
+            for user_id in (other_admin_id, regular_user_id):
+                connection.execute(
+                    "INSERT INTO user_notification_preferences "
+                    "(user_id,enabled,email_enabled,web_push_enabled,"
+                    "requested_available,all_new_music,updated_at) "
+                    "VALUES (?,1,1,0,1,0,0)",
+                    (user_id,),
+                )
+
+        with patch(
+            "backend.notifications.global_channels",
+            return_value=(True, True, False),
+        ), patch("backend.workers.notifications.wake_requested.set") as wake:
+            queued = notifications.queue_admin_request(
+                self.user_id,
+                "user",
+                "11111111-1111-1111-1111-111111111111",
+                "Album",
+                "Artist",
+            )
+
+        self.assertEqual(queued, 1)
+        wake.assert_called_once_with()
+        with storage.db() as connection:
+            event = connection.execute(
+                "SELECT * FROM notification_events"
+            ).fetchone()
+            deliveries = connection.execute(
+                "SELECT user_id,email_target FROM notification_deliveries"
+            ).fetchall()
+        self.assertEqual(event["event_type"], "request")
+        self.assertEqual(event["requester_username"], "user")
+        self.assertLess(event["generation"], 0)
+        self.assertEqual(
+            [(row["user_id"], row["email_target"]) for row in deliveries],
+            [(other_admin_id, "other@example.test")],
+        )
+
+        with storage.db() as connection:
+            connection.execute(
+                "UPDATE user_notification_preferences "
+                "SET admin_request_notifications=0 WHERE user_id=?",
+                (other_admin_id,),
+            )
+            connection.execute("DELETE FROM notification_events")
+        with patch(
+            "backend.notifications.global_channels",
+            return_value=(True, True, False),
+        ):
+            queued = notifications.queue_admin_request(
+                self.user_id,
+                "user",
+                "11111111-1111-1111-1111-111111111111",
+                "Album",
+                "Artist",
+            )
+        self.assertEqual(queued, 0)
+        with storage.db() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM notification_events"
+                ).fetchone()[0],
+                0,
+            )
 
     def test_missing_scan_entry_is_unknown(self):
         album = {"fullyAvailable": False, "title": "Album"}
@@ -197,6 +280,9 @@ class NotificationStorageTests(unittest.TestCase):
         self.assertEqual(app.count('requestedAvailable: false, allNewMusic: true'), 1)
         self.assertEqual(app.count('requestedAvailable: true, allNewMusic: false'), 1)
         self.assertEqual(app.count('...musicPreferencePayload()'), 2)
+        self.assertIn('name="adminRequestNotifications"', app)
+        self.assertIn('user.role === "admin" ? `<fieldset', app)
+        self.assertEqual(app.count('...adminRequestPreferencePayload()'), 2)
         self.assertNotIn('Requested music when available', app)
         self.assertNotIn('All newly available music', app)
         self.assertNotIn('Choose how Melodarr contacts you.', app)
@@ -245,6 +331,46 @@ class NotificationStorageTests(unittest.TestCase):
         self.assertIn("Open in Melodarr", rendered)
         self.assertIn("Content-ID: <melodarr-logo>", message.as_string())
 
+    def test_request_email_reuses_branded_template_and_names_requester(self):
+        delivery = {
+            "event_type": "request",
+            "requester_username": "listener <one>",
+            "release_title": "Requested Album",
+            "artist_name": "Requested Artist",
+            "release_mbid": "11111111-1111-1111-1111-111111111111",
+            "email_target": "admin@example.test",
+            "username": "admin",
+        }
+        with patch(
+            "backend.workers.notifications.notification_config",
+            return_value={
+                "applicationUrl": "https://melodarr.example",
+                "email": {
+                    "host": "smtp.example",
+                    "sender": "sender@example.test",
+                    "senderName": "Melodarr",
+                },
+            },
+        ):
+            message = notification_worker.build_email_message(delivery)
+
+        self.assertEqual(
+            message["Subject"],
+            "New Music Request - Requested Album by Requested Artist",
+        )
+        self.assertIn(
+            "listener <one> requested Requested Album by Requested Artist.",
+            message.get_body(preferencelist=("plain",)).get_content(),
+        )
+        rendered = message.get_body(preferencelist=("html",)).get_content()
+        self.assertIn(
+            "listener &lt;one&gt; requested Requested Album by Requested Artist.",
+            rendered,
+        )
+        self.assertIn("New request", rendered)
+        self.assertIn("cid:melodarr-logo", rendered)
+        self.assertIn("Open in Melodarr", rendered)
+
     def test_partial_config_save_retains_sibling_sections_and_password(self):
         previous = notifications.notification_config()
         self.addCleanup(storage.save_service, "notifications", previous)
@@ -270,14 +396,58 @@ class NotificationStorageTests(unittest.TestCase):
         self.assertFalse(post.call_args.kwargs["allow_redirects"])
         close.assert_called_once_with()
 
-    def test_web_push_test_payload_is_explicit(self):
-        delivery = {"push_endpoint": "https://fcm.googleapis.com/push", "push_p256dh": "key", "push_auth": "auth", "release_title": "Album", "artist_name": "Artist", "release_mbid": "11111111-1111-1111-1111-111111111111"}
-        with patch("backend.workers.notifications.notification_config", return_value={"webPush": {"contact": "mailto:admin@example.test"}}), patch("pywebpush.webpush") as webpush, patch.object(notification_worker.NoRedirectSession, "close"):
-            notification_worker._push(delivery, test=True)
-        payload = webpush.call_args.args[1]
-        self.assertIn("Melodarr test notification", payload)
-        self.assertIn("representative test notification", payload)
-        self.assertIn("No music availability changed", payload)
+    def test_web_push_payload_copy_is_exact_for_each_notification_type(self):
+        delivery = {
+            "push_endpoint": "https://fcm.googleapis.com/push",
+            "push_p256dh": "key",
+            "push_auth": "auth",
+            "release_title": "Album",
+            "artist_name": "Artist",
+            "release_mbid": "11111111-1111-1111-1111-111111111111",
+        }
+        cases = (
+            (
+                "availability",
+                {},
+                False,
+                {
+                    "title": "Album by Artist",
+                    "body": "This Release Group is now available",
+                    "url": "/albums/11111111-1111-1111-1111-111111111111",
+                },
+            ),
+            (
+                "request",
+                {"event_type": "request", "requester_username": "listener"},
+                False,
+                {
+                    "title": "Album by Artist",
+                    "body": "listener requested a new release group",
+                    "url": "/albums/11111111-1111-1111-1111-111111111111",
+                },
+            ),
+            (
+                "test",
+                {},
+                True,
+                {
+                    "title": "Test Notification",
+                    "body": "This is a test notification. No new music added.",
+                    "url": "/",
+                },
+            ),
+        )
+        for name, overrides, test, expected in cases:
+            with self.subTest(name=name), patch(
+                "backend.workers.notifications.notification_config",
+                return_value={
+                    "webPush": {"contact": "mailto:admin@example.test"}
+                },
+            ), patch("pywebpush.webpush") as webpush, patch.object(
+                notification_worker.NoRedirectSession, "close"
+            ):
+                notification_worker._push({**delivery, **overrides}, test=test)
+            self.assertEqual(json.loads(webpush.call_args.args[1]), expected)
 
     def test_artist_mute_overrides_matching_artist_request(self):
         release = "11111111-1111-1111-1111-111111111111"
@@ -437,6 +607,47 @@ class NotificationRouteTests(unittest.TestCase):
         self.assertEqual(response.mimetype, "text/html")
         self.assertEqual(response.headers["Cache-Control"], "no-cache")
         self.assertIn(b'id="settings-notifications"', response.data)
+
+    def test_admin_request_alert_preference_is_admin_only_and_persisted(self):
+        payload = {
+            "enabled": True,
+            "emailEnabled": True,
+            "webPushEnabled": False,
+            "requestedAvailable": True,
+            "allNewMusic": False,
+            "adminRequestNotifications": False,
+            "notificationEmail": "",
+        }
+        headers = {"X-CSRF-Token": "csrf"}
+
+        self._login_as(self.admin_id)
+        admin_response = self.client.put(
+            "/api/account/notifications", json=payload, headers=headers
+        )
+        self.assertEqual(admin_response.status_code, 200)
+        self.assertFalse(admin_response.get_json()["adminRequestNotifications"])
+
+        self._login_as(self.user_id)
+        user_response = self.client.put(
+            "/api/account/notifications",
+            json={**payload, "adminRequestNotifications": True},
+            headers=headers,
+        )
+        self.assertEqual(user_response.status_code, 200)
+        self.assertFalse(user_response.get_json()["adminRequestNotifications"])
+        with storage.db() as connection:
+            rows = connection.execute(
+                "SELECT user_id,admin_request_notifications "
+                "FROM user_notification_preferences "
+                "WHERE user_id IN (?,?) ORDER BY user_id",
+                (self.admin_id, self.user_id),
+            ).fetchall()
+        self.assertEqual(
+            [(row["user_id"], row["admin_request_notifications"]) for row in rows],
+            # A normal user cannot alter the dormant preference. If promoted
+            # later, the administrator default remains enabled.
+            [(self.admin_id, 0), (self.user_id, 1)],
+        )
 
     def test_subscription_endpoint_allowlist_blocks_ssrf(self):
         self._login_as(self.user_id)

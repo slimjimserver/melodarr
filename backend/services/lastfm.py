@@ -1,6 +1,9 @@
 """Last.fm API client operations."""
 
+import json
+from contextlib import contextmanager
 from hashlib import sha256
+from threading import Lock
 
 if __package__ == "backend.services":
     from ..api_cache import (
@@ -19,6 +22,8 @@ else:  # Support the existing `python backend/app.py` entry point.
 
 
 LASTFM_PUBLIC_CACHE_NAMESPACE = "lastfm:public"
+_request_locks_lock = Lock()
+_request_locks = {}
 
 
 def user_cache_namespace(username):
@@ -45,6 +50,34 @@ def clear_user_cache(username):
     return removed
 
 
+@contextmanager
+def _request_lock(namespace, method, api_key, extra):
+    """Coalesce same-key cache misses without retaining credentials in memory."""
+    payload = json.dumps(
+        [namespace, method, str(api_key or ""), extra],
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    key = sha256(payload.encode("utf-8")).hexdigest()
+    with _request_locks_lock:
+        entry = _request_locks.get(key)
+        if entry is None:
+            entry = {"lock": Lock(), "users": 0}
+            _request_locks[key] = entry
+        entry["users"] += 1
+        lock = entry["lock"]
+    lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
+        with _request_locks_lock:
+            entry["users"] -= 1
+            if entry["users"] == 0 and _request_locks.get(key) is entry:
+                del _request_locks[key]
+
+
 def _get(method, api_key, *, username=None, **extra):
     """Call one cached Last.fm API method and normalize API-level errors."""
     params = {
@@ -56,17 +89,16 @@ def _get(method, api_key, *, username=None, **extra):
     if username:
         params["user"] = username
     namespace = (
-        user_cache_namespace(username)
-        if username
-        else LASTFM_PUBLIC_CACHE_NAMESPACE
+        user_cache_namespace(username) if username else LASTFM_PUBLIC_CACHE_NAMESPACE
     )
-    data = cached_json_get(
-        LASTFM_URL,
-        params=params,
-        headers={"User-Agent": USER_AGENT},
-        namespace=namespace,
-        ttl=LASTFM_CACHE_TTL,
-    )
+    with _request_lock(namespace, method, api_key, extra):
+        data = cached_json_get(
+            LASTFM_URL,
+            params=params,
+            headers={"User-Agent": USER_AGENT},
+            namespace=namespace,
+            ttl=LASTFM_CACHE_TTL,
+        )
     if data.get("error"):
         raise ValueError(data.get("message", "Last.fm rejected the request."))
     return data

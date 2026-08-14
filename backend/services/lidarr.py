@@ -137,6 +137,16 @@ def add_album(album, config=None):
     return _request("POST", "/album", config=config, json=album, timeout=20)
 
 
+def monitor_albums(album_ids, monitored=True, config=None):
+    """Set Lidarr's monitored state for one or more local album records."""
+    return _request(
+        "PUT",
+        "/album/monitor",
+        config=config,
+        json={"albumIds": album_ids, "monitored": monitored},
+    )
+
+
 def albums_by_release_group(mbid, config=None):
     return _request("GET", "/album", config=config, params={"foreignAlbumId": mbid})
 

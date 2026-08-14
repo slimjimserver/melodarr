@@ -76,6 +76,8 @@ def _start_album_refresh(job):
 
 def _start_album_search(job):
     try:
+        monitor = lidarr.monitor_albums([job["album_id"]])
+        monitor.raise_for_status()
         search = lidarr.start_command({
             "name": "AlbumSearch",
             "albumIds": [job["album_id"]],
@@ -84,7 +86,8 @@ def _start_album_search(job):
         set_lidarr_search_command(job["id"], search.json()["id"])
         lidarr_downloads.request_poll()
         logger.info(
-            "Queued Lidarr album search for %s after metadata refresh completed",
+            "Monitored and queued Lidarr album search for %s after metadata "
+            "refresh completed",
             job["name"],
         )
     except (KeyError, ValueError, requests.RequestException) as exc:

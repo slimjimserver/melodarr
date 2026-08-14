@@ -20,6 +20,7 @@
   --ease-out: cubic-bezier(.16, 1, .3, 1);
   --tab-bar-height: 0px;
   --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --bottom-ui-offset: var(--safe-bottom);
 }
 
 * { box-sizing: border-box; }
@@ -87,7 +88,7 @@ nav { display: flex; height: 100%; gap: 8px; }
 .tab-bar { display: none; }
 
 .auth-view { display: grid; min-height: 100vh; place-items: center; padding: 32px 24px; }
-.auth-card, .setup-card, .artist-card, .service-card, .artist-meta, .library-card, .discography-nav {
+.auth-card, .setup-card, .artist-card, .service-card, .artist-meta, .library-card, .discography-nav, .discography-similar-nav {
   position: relative; overflow: hidden; border: 1px solid var(--border); background: rgba(255, 252, 247, .88);
   box-shadow: 0 10px 30px rgba(68, 50, 38, .07), inset 0 1px rgba(255, 255, 255, .8);
 }
@@ -156,7 +157,7 @@ button:active, .request:active { transform: scale(.98); }
 .invitation-result input { width: 100%; }
 .invitation-result button { height: 43px; }
 
-main { max-width: 1050px; margin: auto; padding: clamp(70px, 10vw, 120px) 28px; padding-bottom: calc(clamp(70px, 10vw, 120px) + var(--tab-bar-height) + var(--safe-bottom)); }
+main { max-width: 1050px; margin: auto; padding: clamp(70px, 10vw, 120px) 28px; padding-bottom: calc(clamp(70px, 10vw, 120px) + var(--safe-bottom)); }
 .view { display: none; animation: reveal .45s var(--ease-out); }
 .view.active { display: block; }
 @keyframes reveal { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
@@ -181,9 +182,9 @@ h1 em { font-style: normal; }
 .recommendations-heading { display: flex; align-items: end; justify-content: space-between; gap: 20px; }
 .recommendations-heading .eyebrow { margin-bottom: 8px; }
 .recommendations-heading h2 { margin: 0; font-size: 27px; letter-spacing: -.04em; }
-.recommendation-row { margin-top: 30px; content-visibility: auto; contain-intrinsic-size: auto 270px; }
+.recommendation-row { min-width: 0; margin-top: 30px; content-visibility: auto; contain-intrinsic-size: auto 270px; }
 .recommendation-row h3 { margin: 0 0 12px; font-size: 17px; letter-spacing: -.02em; }
-.recommendation-carousel { display: flex; gap: 13px; overflow-x: auto; overflow-y: hidden; padding: 2px 2px 14px; scroll-snap-type: x proximity; scrollbar-color: var(--border-hover) transparent; -webkit-overflow-scrolling: touch; overscroll-behavior-x: contain; }
+.recommendation-carousel { display: flex; width: 100%; max-width: 100%; gap: 13px; overflow-x: auto; overflow-y: hidden; padding: 2px 2px 14px; scroll-snap-type: x proximity; scrollbar-color: var(--border-hover) transparent; -webkit-overflow-scrolling: touch; overscroll-behavior-x: contain; touch-action: pan-x; }
 .recommendation-carousel::-webkit-scrollbar { height: 7px; }
 .recommendation-carousel::-webkit-scrollbar-thumb { border-radius: 999px; background: var(--border-hover); }
 .recommendation-card { position: relative; display: grid; flex: 0 0 154px; gap: 8px; scroll-snap-align: start; cursor: pointer; outline: none; }
@@ -241,8 +242,24 @@ h1 em { font-style: normal; }
 .download-meter span { display: block; height: 100%; border-radius: inherit; background: var(--success); transition: width .25s ease; }
 .refresh-discography { padding: 10px 14px; font-size: 13px; }
 .discography-layout { display: grid; grid-template-columns: 180px minmax(0, 1fr); gap: 26px; }
+.discography-sidebar { position: sticky; top: 92px; display: grid; align-self: start; min-width: 0; gap: 10px; }
+.discography-sidebar .discography-nav { position: static; top: auto; }
 .discography-nav { position: sticky; top: 92px; display: grid; align-self: start; gap: 5px; height: fit-content; border-radius: 12px; padding: 12px; }
 .discography-nav a { color: var(--foreground-subtle); padding: 7px 6px; border-radius: 6px; font-size: 13px; line-height: 1.3; text-decoration: none; }
+.discography-similar-nav { width: 100%; min-height: 58px; border-radius: 12px; color: var(--foreground-subtle); cursor: pointer; padding: 12px 17px; font: 600 13px/1.3 inherit; text-align: left; }
+.discography-similar-nav[aria-expanded="true"] { border-color: var(--accent); color: var(--foreground); }
+.discography-content { min-width: 0; }
+.similar-artists-view { max-width: 100%; margin-top: 0; content-visibility: visible; }
+.similar-artists-status { margin: 6px 0 12px; }
+.similar-artists-list { display: grid; width: 100%; max-width: 100%; gap: 10px; }
+.similar-artists-list .recommendation-card { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; width: 100%; min-width: 0; flex: none; gap: 12px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); padding: 12px 14px; scroll-snap-align: none; cursor: default; }
+.similar-artists-list .recommendation-open { grid-template-columns: 64px minmax(0, 1fr); grid-template-rows: auto auto; align-items: center; column-gap: 12px; row-gap: 5px; }
+.similar-artists-list .recommendation-art { grid-column: 1; grid-row: 1 / 3; width: 64px; height: 64px; border-radius: 10px; }
+.similar-artists-list .recommendation-source { position: static; grid-column: 2; grid-row: 1; max-width: 100%; justify-self: start; }
+.similar-artists-list .recommendation-info { grid-column: 2; grid-row: 2; }
+.similar-artists-list .recommendation-request { min-width: 96px; }
+.similar-artists-placeholder .skeleton-card { width: 100%; }
+
 
 /* Secondary-type filters. A large discography is mostly live bootlegs,
    compilations, and remixes, so those are opt-in rather than default. */
@@ -378,7 +395,7 @@ h1 em { font-style: normal; }
 
 /* Toasts. Request results appear next to the thumb rather than at the top of a
    page the reader may have scrolled hundreds of rows past. */
-.toasts { display: grid; position: fixed; right: 0; bottom: calc(18px + var(--tab-bar-height) + var(--safe-bottom)); left: 0; z-index: 40; justify-items: center; gap: 8px; padding: 0 16px; pointer-events: none; }
+.toasts { display: grid; position: fixed; right: 0; bottom: calc(18px + var(--bottom-ui-offset)); left: 0; z-index: 40; justify-items: center; gap: 8px; padding: 0 16px; pointer-events: none; }
 .toast { max-width: min(520px, 100%); border: 1px solid var(--border-hover); border-radius: 12px; background: #fffaf3; color: var(--foreground); padding: 12px 16px; box-shadow: 0 14px 36px rgba(68, 50, 38, .18); animation: toast-in .28s var(--ease-out); font-size: 13px; line-height: 1.45; }
 .toast.error { border-color: rgba(164, 52, 52, .4); color: var(--danger); }
 .toast.leaving { animation: toast-out .22s var(--ease-out) forwards; }
@@ -618,7 +635,7 @@ details summary { margin-bottom: 17px; color: var(--accent-bright); cursor: poin
 .dialog-actions { display: flex; justify-content: flex-end; gap: 10px; margin: 22px -27px -27px; border-top: 1px solid var(--border); padding: 17px 27px; }
 .dialog-actions button { min-height: 44px; padding: 0 16px; }
 
-#back-to-top { position: fixed; right: 24px; bottom: calc(24px + var(--tab-bar-height) + var(--safe-bottom)); z-index: 10; min-width: 44px; min-height: 44px; border: 1px solid var(--border-hover); border-radius: 999px; background: rgba(255, 250, 243, .96); color: var(--foreground); cursor: pointer; opacity: 0; padding: 12px 15px; pointer-events: none; transform: translateY(10px); box-shadow: 0 6px 18px rgba(68, 50, 38, .12); transition: .2s var(--ease-out); font-size: 13px; font-weight: 600; }
+#back-to-top { position: fixed; right: 24px; bottom: calc(24px + var(--bottom-ui-offset)); z-index: 10; min-width: 44px; min-height: 44px; border: 1px solid var(--border-hover); border-radius: 999px; background: rgba(255, 250, 243, .96); color: var(--foreground); cursor: pointer; opacity: 0; padding: 12px 15px; pointer-events: none; transform: translateY(10px); box-shadow: 0 6px 18px rgba(68, 50, 38, .12); transition: .2s var(--ease-out); font-size: 13px; font-weight: 600; }
 #back-to-top.visible { opacity: 1; pointer-events: auto; transform: none; }
 
 /* Pointer affordances. Touch browsers keep :hover applied after a tap, which
@@ -636,7 +653,7 @@ details summary { margin-bottom: 17px; color: var(--accent-bright); cursor: poin
   .artist-card:hover, .service-card:hover { border-color: var(--border-hover); background: #fffdf9; box-shadow: 0 14px 34px rgba(68, 50, 38, .1); transform: translateY(-2px); }
   .service-icon-link:hover { background: rgba(168, 68, 45, .1); }
   .external-icons :is(a, .notification-mute):hover:not(:disabled) { border-color: var(--accent); background: rgba(168, 68, 45, .1); transform: translateY(-1px); }
-  .discography-nav a:hover { background: var(--surface); color: var(--accent-bright); }
+  .discography-nav a:hover, .discography-similar-nav:hover { background: var(--surface); color: var(--accent-bright); }
   .type-filter:hover { border-color: var(--border-hover); color: var(--foreground); }
   .library-card:hover { border-color: var(--border-hover); transform: translateY(-3px); }
   .settings-tabs button:hover { border-bottom-color: var(--accent-bright); color: var(--foreground); background: rgba(168, 68, 45, .07); }
@@ -652,7 +669,7 @@ details summary { margin-bottom: 17px; color: var(--accent-bright); cursor: poin
 }
 
 @media (max-width: 700px) {
-  :root { --tab-bar-height: 58px; }
+  :root { --tab-bar-height: 82px; --bottom-ui-offset: var(--tab-bar-height); }
   input, select, textarea { font-size: 16px; }
   header { display: flex; gap: 12px; height: 62px; padding: 0 16px; padding-top: env(safe-area-inset-top, 0px); }
   .header-nav { display: none; }
@@ -662,15 +679,15 @@ details summary { margin-bottom: 17px; color: var(--accent-bright); cursor: poin
 
   .tab-bar {
     display: grid; position: fixed; right: 0; bottom: 0; left: 0; z-index: 30;
-    grid-auto-flow: column; grid-auto-columns: 1fr; height: auto; gap: 0;
+    grid-auto-flow: column; grid-auto-columns: 1fr; height: var(--tab-bar-height); gap: 0;
     border-top: 1px solid var(--border); background: #fffaf3;
     padding-bottom: var(--safe-bottom); box-shadow: 0 -5px 18px rgba(68, 50, 38, .08);
   }
-  .tab-bar .nav-link { display: grid; align-content: center; justify-items: center; min-width: 0; min-height: var(--tab-bar-height); gap: 3px; border: 0; border-top: 2px solid transparent; padding: 8px 4px; white-space: nowrap; font-size: 11px; font-weight: 600; }
+  .tab-bar .nav-link { display: grid; align-content: center; justify-items: center; min-width: 0; min-height: 0; gap: 3px; border: 0; border-top: 2px solid transparent; padding: 8px 4px; white-space: nowrap; font-size: 11px; font-weight: 600; }
   .tab-bar .nav-link.active { border-top-color: var(--accent); border-bottom-color: transparent; color: var(--accent-bright); }
   .tab-icon { font-size: 16px; line-height: 1; }
 
-  main { padding: 28px 16px calc(32px + var(--tab-bar-height) + var(--safe-bottom)); }
+  main { padding: 28px 16px calc(32px + var(--tab-bar-height)); }
   h1 { font-size: clamp(34px, 10vw, 52px); letter-spacing: -.045em; }
   .eyebrow { margin-bottom: 12px; }
   .intro { margin: 16px 0 22px; font-size: 15px; }
@@ -748,7 +765,11 @@ details summary { margin-bottom: 17px; color: var(--accent-bright); cursor: poin
   #detail .outline { margin-bottom: 20px; }
 
   .discography-layout, .account-layout { grid-template-columns: 1fr; }
-  .discography-nav { position: static; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .discography-sidebar { position: static; display: grid; grid-template-columns: minmax(0, 1fr) auto; width: calc(100% + 16px); max-width: none; margin-inline: -8px; gap: 8px; overflow: visible; padding: 2px 8px 8px; }
+  .discography-nav { position: static; display: flex; min-width: 0; justify-content: space-between; gap: 2px; padding-inline: 6px; }
+  .discography-nav a, .discography-similar-nav { min-width: 0; min-height: 44px; white-space: nowrap; }
+  .discography-nav a { flex: 0 1 auto; padding-inline: 2px; font-size: 12px; }
+  .discography-similar-nav { width: auto; padding-inline: 10px; font-size: 12px; }
   .account-nav { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .account-nav p { grid-column: 1 / -1; }
   .history-detail { align-items: flex-start; }
@@ -860,7 +881,7 @@ button,
     backdrop-filter: none;
   }
   .tab-bar .nav-link.active { border-top-color: var(--accent); color: var(--accent); }
-  main { padding: 30px 18px calc(36px + var(--tab-bar-height) + var(--safe-bottom)); }
+  main { padding: 30px 18px calc(36px + var(--tab-bar-height)); }
   h1 { font-size: clamp(36px, 10.5vw, 50px); line-height: 1; }
   .intro { line-height: 1.55; }
 
@@ -980,7 +1001,8 @@ button,
 :root[data-theme="midnight"] .notification-device-row,
 :root[data-theme="midnight"] .notification-device-card,
 :root[data-theme="midnight"] .library-card,
-:root[data-theme="midnight"] .discography-nav {
+:root[data-theme="midnight"] .discography-nav,
+:root[data-theme="midnight"] .discography-similar-nav {
   background: linear-gradient(145deg, rgba(255, 255, 255, .075), rgba(255, 255, 255, .025));
   box-shadow: 0 0 0 1px rgba(255, 255, 255, .018), 0 12px 36px rgba(0, 0, 0, .26), 0 0 64px rgba(0, 0, 0, .12), inset 0 1px rgba(255, 255, 255, .06);
 }

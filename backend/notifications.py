@@ -60,6 +60,11 @@ def safe_text(value, *, field, maximum=MAX_DEVICE_TEXT):
     return value
 
 
+def _snapshot_text(value, maximum=500):
+    """Bound provider display text while replacing unsafe control characters."""
+    return re.sub(r"[\x00-\x1f\x7f]+", " ", str(value or "")).strip()[:maximum]
+
+
 def notification_config():
     config = get_service("notifications") or {}
     return config if isinstance(config, dict) else {}
@@ -277,6 +282,10 @@ def user_preferences(user):
     return {"enabled": bool(row.get("enabled", 0)), "emailEnabled": bool(row.get("email_enabled", 0)),
             "webPushEnabled": bool(row.get("web_push_enabled", 0)), "requestedAvailable": bool(row.get("requested_available", 1)),
             "allNewMusic": bool(row.get("all_new_music", 0)),
+            "adminRequestNotifications": bool(
+                user["role"] == "admin"
+                and row.get("admin_request_notifications", 1)
+            ),
             # notificationEmail is the display/effective value.  The explicit
             # override field lets clients avoid persisting an unchanged Plex
             # address and therefore preserve the live fallback relationship.
@@ -296,14 +305,167 @@ def save_user_preferences(user, values):
         raise ValueError("Notification email must be valid.")
     flags = {key: _bool(values, key) for key in ("enabled", "emailEnabled", "webPushEnabled", "requestedAvailable", "allNewMusic")}
     with db() as connection:
+        existing = connection.execute(
+            "SELECT admin_request_notifications "
+            "FROM user_notification_preferences WHERE user_id=?",
+            (user["id"],),
+        ).fetchone()
+        existing_request_preference = bool(
+            existing["admin_request_notifications"]
+            if existing
+            else True
+        )
+        admin_request_notifications = (
+            _bool(
+                values,
+                "adminRequestNotifications",
+                existing_request_preference,
+            )
+            if user["role"] == "admin"
+            else existing_request_preference
+        )
         connection.execute("""INSERT INTO user_notification_preferences
-            (user_id, notification_email, enabled, email_enabled, web_push_enabled, requested_available, all_new_music, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (user_id, notification_email, enabled, email_enabled, web_push_enabled,
+             requested_available, all_new_music, admin_request_notifications,
+             updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET notification_email=excluded.notification_email, enabled=excluded.enabled,
             email_enabled=excluded.email_enabled, web_push_enabled=excluded.web_push_enabled,
-            requested_available=excluded.requested_available, all_new_music=excluded.all_new_music, updated_at=excluded.updated_at""",
-            (user["id"], email or None, *(int(flags[key]) for key in flags), time.time()))
+            requested_available=excluded.requested_available,
+            all_new_music=excluded.all_new_music,
+            admin_request_notifications=excluded.admin_request_notifications,
+            updated_at=excluded.updated_at""",
+            (
+                user["id"],
+                email or None,
+                *(int(flags[key]) for key in flags),
+                int(admin_request_notifications),
+                time.time(),
+            ))
     return user_preferences(user)
+
+
+def queue_admin_request(
+    requester_id,
+    requester_username,
+    release_mbid,
+    release_title,
+    artist_name="",
+):
+    """Queue a release request alert for enabled admins other than its requester."""
+    master, email_on, push_on = global_channels()
+    if (
+        not master
+        or not (email_on or push_on)
+        or not valid_mbid(str(release_mbid))
+    ):
+        return 0
+
+    now = time.time()
+    requester_username = _snapshot_text(requester_username)
+    release_title = _snapshot_text(release_title)
+    artist_name = _snapshot_text(artist_name)
+    with db() as connection:
+        # Serialize generation assignment. Availability generations are positive;
+        # negative generations reserve the existing uniqueness key for requests.
+        connection.execute("BEGIN IMMEDIATE")
+        if not artist_name:
+            previous = connection.execute(
+                "SELECT artist_name FROM request_history WHERE mbid=? "
+                "AND NULLIF(TRIM(artist_name), '') IS NOT NULL "
+                "ORDER BY created_at DESC, id DESC LIMIT 1",
+                (release_mbid,),
+            ).fetchone()
+            if previous:
+                artist_name = _snapshot_text(previous["artist_name"])
+
+        preferences = connection.execute(
+            """SELECT p.*, u.plex_email, u.username FROM user_notification_preferences p
+            JOIN users u ON u.id=p.user_id
+            WHERE p.enabled=1 AND p.admin_request_notifications=1
+            AND u.role='admin' AND u.id<>?""",
+            (requester_id,),
+        ).fetchall()
+        if not preferences:
+            return 0
+
+        minimum = connection.execute(
+            "SELECT MIN(generation) AS generation FROM notification_events "
+            "WHERE release_mbid=?",
+            (release_mbid,),
+        ).fetchone()["generation"]
+        generation = min(int(minimum or 0), 0) - 1
+        event = connection.execute(
+            """INSERT INTO notification_events
+            (release_mbid, generation, artist_mbid, artist_name, release_title,
+             event_type, requester_username, created_at)
+            VALUES (?, ?, '', ?, ?, 'request', ?, ?)""",
+            (
+                release_mbid,
+                generation,
+                artist_name,
+                release_title,
+                requester_username,
+                now,
+            ),
+        )
+        event_id = event.lastrowid
+        deliveries = 0
+        for pref in preferences:
+            if email_on and pref["email_enabled"]:
+                target = str(
+                    pref["notification_email"] or pref["plex_email"] or ""
+                ).strip()
+                if valid_email(target):
+                    connection.execute(
+                        """INSERT OR IGNORE INTO notification_deliveries
+                        (event_id,user_id,channel,email_target,status,attempts,
+                         next_attempt_at,created_at,updated_at)
+                        VALUES (?,?,'email',?,'pending',0,?,?,?)""",
+                        (event_id, pref["user_id"], target, now, now, now),
+                    )
+                    deliveries += 1
+            if push_on and pref["web_push_enabled"]:
+                subscriptions = connection.execute(
+                    "SELECT id, endpoint, p256dh, auth "
+                    "FROM web_push_subscriptions WHERE user_id=?",
+                    (pref["user_id"],),
+                ).fetchall()
+                for subscription in subscriptions:
+                    connection.execute(
+                        """INSERT OR IGNORE INTO notification_deliveries
+                        (event_id,user_id,channel,subscription_id,push_endpoint,
+                         push_p256dh,push_auth,status,attempts,next_attempt_at,
+                         created_at,updated_at)
+                        VALUES (?,?,'web-push',?,?,?,?, 'pending',0,?,?,?)""",
+                        (
+                            event_id,
+                            pref["user_id"],
+                            subscription["id"],
+                            subscription["endpoint"],
+                            subscription["p256dh"],
+                            subscription["auth"],
+                            now,
+                            now,
+                            now,
+                        ),
+                    )
+                    deliveries += 1
+        if not deliveries:
+            connection.execute(
+                "DELETE FROM notification_events WHERE id=?", (event_id,)
+            )
+            return 0
+
+    try:
+        if __package__:
+            from .workers.notifications import wake_requested
+        else:
+            from workers.notifications import wake_requested
+        wake_requested.set()
+    except ImportError:
+        pass
+    return deliveries
 
 
 def observe_availability(albums):

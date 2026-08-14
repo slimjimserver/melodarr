@@ -142,3 +142,110 @@ test("SPA navigation moves focus to the main landmark", async ({ page }) => {
   await expect(page.locator("#main-content")).toBeFocused();
   await expect(page.locator("#main-content")).toHaveCSS("outline-style", "none");
 });
+
+test("library page describes artist holdings only", async ({ page }) => {
+  await page.goto("/");
+  await signIn(page, "ada");
+  await page.getByRole("button", { name: "Your library" }).click();
+
+  const summary = page.locator("#library-copy");
+  await expect(summary).toHaveText("0 artists available in your Plex music libraries.");
+  await expect(summary).not.toContainText("releases");
+});
+
+test("mobile tab bar stays 82px tall including its safe-area padding", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/");
+  await signIn(page, "ada");
+  await page.evaluate(() => document.documentElement.style.setProperty("--safe-bottom", "24px"));
+
+  const metrics = await page.locator(".tab-bar").evaluate((tabBar) => {
+    const bounds = tabBar.getBoundingClientRect();
+    const styles = getComputedStyle(tabBar);
+    const main = document.querySelector("main");
+    const toasts = document.querySelector("#toasts");
+    return {
+      bottom: bounds.bottom,
+      height: bounds.height,
+      mainPaddingBottom: main ? getComputedStyle(main).paddingBottom : "",
+      paddingBottom: styles.paddingBottom,
+      toastBottom: toasts ? getComputedStyle(toasts).bottom : "",
+    };
+  });
+
+  expect(metrics).toEqual({
+    bottom: 844,
+    height: 82,
+    mainPaddingBottom: "118px",
+    paddingBottom: "24px",
+    toastBottom: "100px",
+  });
+});
+
+for (const viewport of [
+  { name: "desktop", width: 1280, height: 800 },
+  { name: "mobile", width: 390, height: 844 },
+]) {
+  test(`similar artists replace the discography and flow vertically on ${viewport.name}`, async ({ page }) => {
+    await page.setViewportSize({ width: viewport.width, height: viewport.height });
+    await page.goto("/artists/fixture-artist");
+    await signIn(page, "ada");
+    await expect(page.locator("#detail-title")).toHaveText("Fixture Artist");
+
+    const search = page.getByLabel("Search releases");
+    const similarView = page.locator("#similar-artists-view");
+    await expect(search).toBeVisible();
+    await expect(similarView).toBeHidden();
+
+    if (viewport.name === "mobile") {
+      const edges = await page.evaluate(() => {
+        const sidebar = document.querySelector(".discography-sidebar");
+        const releaseTypes = document.querySelector(".discography-nav");
+        const releaseSearch = document.querySelector("#discography-search");
+        return {
+          sidebarLeft: sidebar?.getBoundingClientRect().left ?? 0,
+          releaseTypesLeft: releaseTypes?.getBoundingClientRect().left ?? 0,
+          releaseSearchLeft: releaseSearch?.getBoundingClientRect().left ?? 0,
+        };
+      });
+      expect(edges.releaseTypesLeft).toBeCloseTo(edges.releaseSearchLeft, 0);
+      expect(edges.releaseTypesLeft - edges.sidebarLeft).toBeGreaterThanOrEqual(7);
+    }
+
+    const firstPage = page.waitForRequest((request) => (
+      request.url().includes("/api/music/artist/fixture-artist/similar?offset=0&limit=12")
+    ));
+    await page.getByRole("button", { name: "Similar artists", exact: true }).click();
+    await firstPage;
+    await expect(search).toBeHidden();
+    await expect(similarView).toBeVisible();
+    await expect(similarView.locator(".recommendation-card")).toHaveCount(12);
+    const list = similarView.getByLabel("Similar artists", { exact: true });
+    expect(await list.evaluate((element) => element.scrollWidth <= element.clientWidth + 1)).toBe(true);
+    const initialTops = await list.locator(".recommendation-card").evaluateAll((cards) => (
+      cards.map((card) => card.getBoundingClientRect().top)
+    ));
+    expect(initialTops.every((top, index) => (
+      index === 0 || top > initialTops[index - 1]
+    ))).toBe(true);
+
+    const secondPage = page.waitForRequest((request) => (
+      request.url().includes("/api/music/artist/fixture-artist/similar?offset=12&limit=12")
+    ));
+    await page.getByRole("button", { name: "Show more similar artists" }).click();
+    await secondPage;
+    await expect(similarView.locator(".recommendation-card")).toHaveCount(18);
+    await expect(page.getByRole("button", { name: "Open details for Similar Artist 13" })).toBeFocused();
+    const expandedTops = await list.locator(".recommendation-card").evaluateAll((cards) => (
+      cards.map((card) => card.getBoundingClientRect().top)
+    ));
+    expect(expandedTops.every((top, index) => (
+      index === 0 || top > expandedTops[index - 1]
+    ))).toBe(true);
+    expect(await list.evaluate((element) => element.scrollLeft)).toBe(0);
+
+    await page.getByRole("link", { name: "Albums", exact: true }).click();
+    await expect(search).toBeVisible();
+    await expect(similarView).toBeHidden();
+  });
+}

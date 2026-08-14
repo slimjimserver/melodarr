@@ -44,6 +44,40 @@ function animeDetail() {
   };
 }
 
+function artistDetail() {
+  return {
+    id: "fixture-artist",
+    name: "Fixture Artist",
+    type: "Group",
+    sections: {
+      Album: [{
+        id: "fixture-album",
+        title: "Fixture Album",
+        type: "Album",
+        date: "2026-01-01",
+        secondaryTypes: [],
+      }],
+    },
+  };
+}
+
+const similarArtists = Array.from({ length: 18 }, (_, index) => ({
+  id: `similar-${index + 1}`,
+  name: `Similar Artist ${index + 1}`,
+  type: "Artist",
+  rank: index,
+  recommendationSource: "Last.fm",
+  availableInLidarr: index === 0,
+}));
+
+function similarArtistPage(url) {
+  const offset = Number(url.searchParams.get("offset") || 0);
+  const limit = Number(url.searchParams.get("limit") || 12);
+  const artists = similarArtists.slice(offset, offset + limit);
+  const nextOffset = offset + limit < similarArtists.length ? offset + limit : null;
+  return { artists, configured: true, offset, limit, total: similarArtists.length, nextOffset, hasMore: nextOffset !== null, pending: 0 };
+}
+
 function accountSettings(username = signedInAs) {
   settingsReads += 1;
   return {
@@ -114,6 +148,12 @@ const server = createServer(async (request, response) => {
   if (url.pathname === "/api/auth/logout" && request.method === "POST") {
     signedInAs = "";
     return send(response, 200, { message: "Signed out" });
+  }
+  if (url.pathname === "/api/music/artist/fixture-artist/similar") {
+    return send(response, 200, similarArtistPage(url));
+  }
+  if (url.pathname === "/api/music/artist/fixture-artist") {
+    return send(response, 200, artistDetail());
   }
   if (url.pathname === "/api/anime/switching-anime") {
     return send(response, 200, animeDetail());

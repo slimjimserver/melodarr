@@ -824,9 +824,23 @@ def init_db():
                 web_push_enabled INTEGER NOT NULL DEFAULT 0 CHECK(web_push_enabled IN (0, 1)),
                 requested_available INTEGER NOT NULL DEFAULT 1 CHECK(requested_available IN (0, 1)),
                 all_new_music INTEGER NOT NULL DEFAULT 0 CHECK(all_new_music IN (0, 1)),
+                admin_request_notifications INTEGER NOT NULL DEFAULT 1
+                    CHECK(admin_request_notifications IN (0, 1)),
                 updated_at REAL NOT NULL
             )
         """)
+        preference_columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(user_notification_preferences)"
+            )
+        }
+        if "admin_request_notifications" not in preference_columns:
+            connection.execute(
+                "ALTER TABLE user_notification_preferences ADD COLUMN "
+                "admin_request_notifications INTEGER NOT NULL DEFAULT 1 "
+                "CHECK(admin_request_notifications IN (0, 1))"
+            )
         connection.execute("""
             CREATE TABLE IF NOT EXISTS web_push_subscriptions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -881,10 +895,26 @@ def init_db():
                 artist_mbid TEXT NOT NULL,
                 artist_name TEXT NOT NULL,
                 release_title TEXT NOT NULL,
+                event_type TEXT NOT NULL DEFAULT 'availability',
+                requester_username TEXT NOT NULL DEFAULT '',
                 created_at REAL NOT NULL,
                 UNIQUE(release_mbid, generation)
             )
         """)
+        event_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(notification_events)")
+        }
+        if "event_type" not in event_columns:
+            connection.execute(
+                "ALTER TABLE notification_events ADD COLUMN "
+                "event_type TEXT NOT NULL DEFAULT 'availability'"
+            )
+        if "requester_username" not in event_columns:
+            connection.execute(
+                "ALTER TABLE notification_events ADD COLUMN "
+                "requester_username TEXT NOT NULL DEFAULT ''"
+            )
         connection.execute("""
             CREATE TABLE IF NOT EXISTS notification_deliveries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

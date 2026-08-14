@@ -1,4 +1,5 @@
 """Dedicated background-worker process entry point."""
+
 from threading import Thread
 
 if __package__:
@@ -6,27 +7,29 @@ if __package__:
     from .storage import init_db
     from .workers import anime_metadata as anime_metadata_worker
     from .workers import artist_metadata as artist_metadata_worker
-    from .workers import lidarr_searches as lidarr_search_worker
-    from .workers import lidarr_library as lidarr_library_worker
     from .workers import lidarr_downloads as lidarr_download_worker
+    from .workers import lidarr_library as lidarr_library_worker
+    from .workers import lidarr_searches as lidarr_search_worker
+    from .workers import notifications as notification_worker
     from .workers import plex as plex_worker
     from .workers import plex_history as plex_history_worker
     from .workers import plex_metadata as plex_metadata_worker
     from .workers import recommendations as recommendation_worker
-    from .workers import notifications as notification_worker
+    from .workers import similar_artists as similar_artist_worker
 else:  # Support `python backend/worker.py` for local development.
     from api_cache import init_cache_db
     from storage import init_db
     from workers import anime_metadata as anime_metadata_worker
     from workers import artist_metadata as artist_metadata_worker
-    from workers import lidarr_searches as lidarr_search_worker
-    from workers import lidarr_library as lidarr_library_worker
     from workers import lidarr_downloads as lidarr_download_worker
+    from workers import lidarr_library as lidarr_library_worker
+    from workers import lidarr_searches as lidarr_search_worker
+    from workers import notifications as notification_worker
     from workers import plex as plex_worker
     from workers import plex_history as plex_history_worker
     from workers import plex_metadata as plex_metadata_worker
     from workers import recommendations as recommendation_worker
-    from workers import notifications as notification_worker
+    from workers import similar_artists as similar_artist_worker
 
 
 LIDARR_LIBRARY_STARTUP_DELAY = 10
@@ -51,6 +54,12 @@ def main():
         daemon=True,
     )
     artist_metadata_thread.start()
+    similar_artist_thread = Thread(
+        target=similar_artist_worker.run,
+        name="lastfm-similar-artist-resolution",
+        daemon=True,
+    )
+    similar_artist_thread.start()
     lidarr_thread = Thread(
         target=lidarr_search_worker.run,
         name="lidarr-search-followups",
