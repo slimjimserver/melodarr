@@ -217,9 +217,11 @@ class ApplicationFactoryTests(DatabaseTestCase):
             for method in rule.methods
             if method not in {"HEAD", "OPTIONS"}
         }
-        self.assertEqual(len(rules), 93)
-        self.assertEqual(len(route_methods), 93)
+        self.assertEqual(len(rules), 95)
+        self.assertEqual(len(route_methods), 95)
         self.assertIn(("/api/music/artist/<mbid>/similar", "GET"), route_methods)
+        self.assertIn(("/api/settings/musicbrainz", "POST"), route_methods)
+        self.assertIn(("/api/settings/musicbrainz/test", "POST"), route_methods)
         notification_routes = {
             ("/api/settings/notifications", "GET"),
             ("/api/settings/notifications", "PUT"),
@@ -1760,6 +1762,28 @@ class DeploymentConfigTests(unittest.TestCase):
             discovery_typescript,
         )
 
+    def test_musicbrainz_service_settings_support_self_hosting_and_testing(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(
+            os.path.join(project_root, "frontend", "static", "index.html"),
+            encoding="utf-8",
+        ) as file:
+            frontend = file.read()
+        with open(
+            os.path.join(project_root, "frontend", "src", "app.ts"),
+            encoding="utf-8",
+        ) as file:
+            app_typescript = file.read()
+
+        self.assertIn('id="musicbrainz-settings"', frontend)
+        self.assertIn('name="baseUrl"', frontend)
+        self.assertIn('name="userAgent"', frontend)
+        self.assertIn('name="requestIntervalMs"', frontend)
+        self.assertNotIn("Cache lifetime (days)", frontend)
+        self.assertIn('"/api/settings/musicbrainz"', app_typescript)
+        self.assertIn('"/api/settings/musicbrainz/test"', app_typescript)
+        self.assertIn("setupMusicBrainzSettings();", app_typescript)
+
     def test_lastfm_key_is_admin_managed_and_user_forms_only_collect_usernames(self):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with open(
@@ -2235,6 +2259,8 @@ class AuthenticationTests(DatabaseTestCase):
             "/api/request/release-group",
             "/api/settings/lidarr",
             "/api/settings/lidarr/test",
+            "/api/settings/musicbrainz",
+            "/api/settings/musicbrainz/test",
             "/api/auth/plex/start",
             "/api/auth/plex/poll",
             "/api/auth/plex/inspect",
@@ -3947,6 +3973,78 @@ class SettingsMaintenanceTests(DatabaseTestCase):
 
         self.assertEqual(response.status_code, 403)
         self.assertFalse(get_service("lastfm"))
+
+    @patch("backend.routes.settings.musicbrainz.test_connection")
+    def test_admin_can_save_and_test_self_hosted_musicbrainz(self, test_connection):
+        token = self.register()
+        initial = self.client.get("/api/settings")
+        self.assertEqual(initial.status_code, 200)
+        self.assertEqual(initial.get_json()["musicbrainz"], {
+            "baseUrl": "https://musicbrainz.org/ws/2",
+            "userAgent": backend_config.USER_AGENT,
+            "requestIntervalMs": 1100,
+        })
+
+        proposed = {
+            "baseUrl": "http://192.168.1.10:5000/ws/2/",
+            "userAgent": "Melodarr Self Hosted/1.0",
+            "requestIntervalMs": 0,
+        }
+        saved = self.client.post(
+            "/api/settings/musicbrainz",
+            json=proposed,
+            headers={"X-CSRF-Token": token},
+        )
+        self.assertEqual(saved.status_code, 200)
+        expected = {**proposed, "baseUrl": proposed["baseUrl"].rstrip("/")}
+        self.assertEqual(saved.get_json()["musicbrainz"], expected)
+        self.assertEqual(get_service("musicbrainz"), expected)
+        self.assertEqual(
+            self.client.get("/api/settings").get_json()["musicbrainz"],
+            expected,
+        )
+
+        test_connection.return_value = {
+            "message": "Connected to MusicBrainz WS2.",
+            "baseUrl": expected["baseUrl"],
+            "latencyMs": 12,
+            "recording": {
+                "id": musicbrainz.TEST_RECORDING_ID,
+                "title": "Intro",
+            },
+        }
+        tested = self.client.post(
+            "/api/settings/musicbrainz/test",
+            json=proposed,
+            headers={"X-CSRF-Token": token},
+        )
+        self.assertEqual(tested.status_code, 200)
+        self.assertEqual(tested.get_json()["latencyMs"], 12)
+        test_connection.assert_called_once_with(proposed)
+
+    def test_invalid_musicbrainz_settings_are_not_saved(self):
+        token = self.register()
+        valid = {
+            "baseUrl": "http://musicbrainz.local:5000/ws/2",
+            "userAgent": "Melodarr Test/1.0",
+            "requestIntervalMs": 0,
+        }
+        invalid_values = (
+            {**valid, "baseUrl": "ftp://musicbrainz.local/ws/2"},
+            {**valid, "userAgent": "   "},
+            {**valid, "requestIntervalMs": -1},
+            {**valid, "requestIntervalMs": 1.5},
+        )
+
+        for values in invalid_values:
+            with self.subTest(values=values):
+                response = self.client.post(
+                    "/api/settings/musicbrainz",
+                    json=values,
+                    headers={"X-CSRF-Token": token},
+                )
+                self.assertEqual(response.status_code, 400)
+        self.assertIsNone(get_service("musicbrainz"))
 
     @patch("backend.routes.settings.plex_history_worker.request_full_sync")
     @patch("backend.routes.settings.lidarr_library_worker.request_scan")
@@ -5944,6 +6042,122 @@ class MusicBrainzClientTests(unittest.TestCase):
         if hasattr(musicbrainz._session_state, "session"):
             del musicbrainz._session_state.session
 
+    @patch("backend.services.musicbrainz.get_service")
+    def test_configuration_normalizes_self_hosted_settings(self, get_service):
+        get_service.return_value = {
+            "baseUrl": "http://musicbrainz.local:5000/ws/2/",
+            "userAgent": "  Melodarr Local/1.0  ",
+            "requestIntervalMs": "0",
+        }
+
+        self.assertEqual(musicbrainz.configuration(), {
+            "baseUrl": "http://musicbrainz.local:5000/ws/2",
+            "userAgent": "Melodarr Local/1.0",
+            "requestIntervalMs": 0,
+        })
+
+    @patch("backend.services.musicbrainz.cached_json_get")
+    @patch("backend.services.musicbrainz.configuration")
+    def test_metadata_uses_configured_endpoint_user_agent_and_interval(
+        self, configuration, cached_get
+    ):
+        configuration.return_value = {
+            "baseUrl": "http://musicbrainz.local:5000/ws/2",
+            "userAgent": "Melodarr Local/1.0",
+            "requestIntervalMs": 0,
+        }
+        cached_get.return_value = {"id": "artist-id"}
+
+        result = musicbrainz.get("/artist/artist-id", "genres")
+
+        self.assertEqual(result, {"id": "artist-id"})
+        self.assertEqual(
+            cached_get.call_args.args[0],
+            "http://musicbrainz.local:5000/ws/2/artist/artist-id",
+        )
+        self.assertEqual(
+            cached_get.call_args.kwargs["headers"],
+            {"User-Agent": "Melodarr Local/1.0"},
+        )
+        with patch.object(musicbrainz, "_wait_for_request_slot") as wait_for_slot:
+            cached_get.call_args.kwargs["before_request"]()
+        wait_for_slot.assert_called_once_with("interactive", 0.0)
+
+    @patch("backend.services.musicbrainz.time.sleep")
+    @patch("backend.services.musicbrainz.time.monotonic")
+    @patch("backend.services.musicbrainz._http_get")
+    def test_connection_probe_resolves_a_known_ws2_recording(
+        self, http_get, monotonic, sleep
+    ):
+        monotonic.side_effect = [10.0, 10.042]
+        http_get.side_effect = [
+            Response(200, {
+                "id": musicbrainz.TEST_RECORDING_ID,
+                "title": "Intro",
+            }),
+            Response(200, {
+                "artists": [{"id": "artist-id", "name": "3 Doors Down"}],
+            }),
+        ]
+        proposed = {
+            "baseUrl": "http://musicbrainz.local:5000/ws/2/",
+            "userAgent": "Melodarr Local/1.0",
+            "requestIntervalMs": 1100,
+        }
+
+        result = musicbrainz.test_connection(proposed)
+
+        self.assertEqual(result["latencyMs"], 42)
+        self.assertEqual(result["recording"]["title"], "Intro")
+        sleep.assert_called_once_with(1.1)
+        self.assertEqual(http_get.call_count, 2)
+        lookup_call, search_call = http_get.call_args_list
+        self.assertEqual(
+            lookup_call.args[0],
+            f"http://musicbrainz.local:5000/ws/2/recording/"
+            f"{musicbrainz.TEST_RECORDING_ID}",
+        )
+        self.assertEqual(lookup_call.kwargs, {
+            "params": {"fmt": "json"},
+            "headers": {
+                "Accept": "application/json",
+                "User-Agent": "Melodarr Local/1.0",
+            },
+            "timeout": 15,
+            "allow_redirects": False,
+        })
+        self.assertEqual(
+            search_call.args[0],
+            "http://musicbrainz.local:5000/ws/2/artist/",
+        )
+        self.assertEqual(search_call.kwargs["params"], {
+            "query": "3 Doors Down",
+            "fmt": "json",
+            "limit": 1,
+            "dismax": "true",
+        })
+
+    @patch("backend.services.musicbrainz._http_get")
+    def test_connection_rejects_a_server_with_broken_search(self, http_get):
+        http_get.side_effect = [
+            Response(200, {
+                "id": musicbrainz.TEST_RECORDING_ID,
+                "title": "Intro",
+            }),
+            Response(503, {
+                "error": "Can't connect to search:8983 (No address associated)",
+            }),
+        ]
+
+        with self.assertRaises(musicbrainz.SearchUnavailableError) as raised:
+            musicbrainz.test_connection({
+                "baseUrl": "http://musicbrainz.local:5000/ws/2",
+                "userAgent": "Melodarr Local/1.0",
+                "requestIntervalMs": 0,
+            })
+
+        self.assertIn("search/Solr service", str(raised.exception))
+
     @patch("backend.services.musicbrainz.requests.Session")
     def test_musicbrainz_reuses_a_thread_local_http_session(self, session_factory):
         session = session_factory.return_value
@@ -6010,10 +6224,18 @@ class MusicBrainzClientTests(unittest.TestCase):
     @patch("backend.services.musicbrainz.time.monotonic")
     def test_live_request_slots_are_shared_and_spaced(self, monotonic, sleep):
         monotonic.side_effect = [10.0, 10.2, 11.1]
-        musicbrainz._wait_for_request_slot()
-        musicbrainz._wait_for_request_slot()
+        musicbrainz._wait_for_request_slot(request_interval_seconds=1.1)
+        musicbrainz._wait_for_request_slot(request_interval_seconds=1.1)
         sleep.assert_called_once_with(0.9000000000000004)
         self.assertAlmostEqual(musicbrainz._next_request_at, 12.2)
+
+    @patch("backend.services.musicbrainz.time.sleep")
+    @patch("backend.services.musicbrainz.time.monotonic", return_value=10.0)
+    def test_zero_request_interval_does_not_sleep(self, _monotonic, sleep):
+        musicbrainz._wait_for_request_slot(request_interval_seconds=0)
+
+        sleep.assert_not_called()
+        self.assertEqual(musicbrainz._next_request_at, 10.0)
 
     @patch("backend.services.musicbrainz._wait_for_request_slot")
     @patch("backend.services.musicbrainz.cached_json_get")
@@ -6026,12 +6248,12 @@ class MusicBrainzClientTests(unittest.TestCase):
 
         wait_for_slot.assert_not_called()
         before_request()
-        wait_for_slot.assert_called_once_with("background")
+        wait_for_slot.assert_called_once_with("background", 1.1)
 
         wait_for_slot.reset_mock()
         musicbrainz.get("/release-group/group", "", priority="prefetch")
         cached_get.call_args.kwargs["before_request"]()
-        wait_for_slot.assert_called_once_with("prefetch")
+        wait_for_slot.assert_called_once_with("prefetch", 1.1)
 
     @patch("backend.services.musicbrainz.cached_json_get")
     def test_critical_discography_calls_get_extended_retries(self, cached_get):
@@ -6238,6 +6460,27 @@ class LastFmDiscoveryTests(DatabaseTestCase):
 
 
 class DiscoveryRoutesTests(DatabaseTestCase):
+    @patch("backend.routes.discovery.musicbrainz.search")
+    def test_musicbrainz_503_reports_an_unavailable_search_service(self, search):
+        failure_response = Response(503, {
+            "error": "Could not retrieve results from search:8983",
+        })
+        error = requests.HTTPError("HTTP 503")
+        error.response = failure_response
+        search.side_effect = error
+
+        response = self.client.get(
+            "/api/search?q=3%20doors%20down&type=artist",
+            headers={"X-CSRF-Token": self.register()},
+        )
+
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(
+            response.get_json()["error"],
+            musicbrainz.SEARCH_UNAVAILABLE_MESSAGE,
+        )
+        self.assertNotIn("search:8983", response.get_data(as_text=True))
+
     @patch("backend.routes.discovery.animethemes.search")
     def test_anime_search_uses_the_anime_provider(self, search):
         search.return_value = [{

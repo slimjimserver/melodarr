@@ -406,8 +406,12 @@ def search():
             )
     try:
         response = musicbrainz.search(query, search_type, plain_search=True)
-    except requests.RequestException:
-        return api_error("MusicBrainz could not be reached. Try again shortly.", 502)
+    except requests.RequestException as exc:
+        message = musicbrainz.search_error_message(exc)
+        return api_error(
+            message or "MusicBrainz could not be reached. Try again shortly.",
+            502,
+        )
 
     if search_type == "artist":
         plex_artists = _plex_search_artists()

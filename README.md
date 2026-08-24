@@ -120,6 +120,7 @@ MELODARR_COOKIE_SECURE: "true"
 
 Service credentials are normally configured after signing in.
 
+- **MusicBrainz:** use the hosted WS2 endpoint or set a compatible self-hosted WS2 base URL, user agent, and request interval. Keep the default 1100 ms interval for musicbrainz.org; a local server can usually use 0 ms. The connection can be tested before saving.
 - **Lidarr (required for requests):** hostname or IP address, port, SSL choice, API key, and optionally an external browser-facing URL. After testing the connection, choose the root folder, quality and metadata profiles, monitoring behavior, tags, and automatic-search behavior.
 - **Plex (optional):** sign in with the Plex account that owns the server, choose one of its advertised connections, and select one or more music libraries to scan. Plex tokens are retrieved through the secure Plex PIN flow and are never pasted into Melodarr.
 - **ListenBrainz (optional, per user):** public ListenBrainz username.

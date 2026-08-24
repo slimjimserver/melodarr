@@ -138,6 +138,12 @@ type LastfmSettingsForm = HTMLFormElement & {
   apiKey: HTMLInputElement;
 };
 
+type MusicBrainzSettingsForm = HTMLFormElement & {
+  baseUrl: HTMLInputElement;
+  userAgent: HTMLInputElement;
+  requestIntervalMs: HTMLInputElement;
+};
+
 interface PlexConnection extends JsonObject {
   uri: string;
   local: boolean;
@@ -593,6 +599,24 @@ async function refreshSettings(loadLidarrOptions = true) {
   const settings = await api("/api/settings");
   const { lidarr, plex } = settings;
   lidarrDefaults = lidarr.defaults || {};
+
+  const musicbrainz = settings.musicbrainz || {};
+  const musicbrainzForm = $<MusicBrainzSettingsForm>("#musicbrainz-settings");
+  musicbrainzForm.baseUrl.value = musicbrainz.baseUrl || "";
+  musicbrainzForm.userAgent.value = musicbrainz.userAgent || "";
+  musicbrainzForm.requestIntervalMs.value = String(
+    musicbrainz.requestIntervalMs ?? 1100,
+  );
+  let musicbrainzState = "Self-hosted service";
+  try {
+    const host = new URL(musicbrainz.baseUrl).hostname;
+    musicbrainzState = host === "musicbrainz.org"
+      ? "Hosted service"
+      : `Self-hosted · ${host}`;
+  } catch {
+    // Keep a useful fallback if the settings response is unexpectedly incomplete.
+  }
+  $("#musicbrainz-state").textContent = musicbrainzState;
 
   const lastfmConfigured = Boolean(settings.lastfm?.configured);
   $("#lastfm-state").textContent = lastfmConfigured ? "API key configured" : "Not configured";
@@ -2515,6 +2539,64 @@ function setupLidarrSettings() {
   });
 }
 
+function setupMusicBrainzSettings() {
+  const form = $<MusicBrainzSettingsForm>("#musicbrainz-settings");
+  const testButton = $<HTMLButtonElement>("#test-musicbrainz");
+  const saveButton = $<HTMLButtonElement>("#save-musicbrainz");
+  const message = requiredDescendant<HTMLElement>(form, ".form-message");
+
+  const payload = () => ({
+    baseUrl: form.baseUrl.value,
+    userAgent: form.userAgent.value,
+    requestIntervalMs: Number(form.requestIntervalMs.value),
+  });
+  const setBusy = (busy: boolean) => {
+    testButton.disabled = busy;
+    saveButton.disabled = busy;
+    form.toggleAttribute("aria-busy", busy);
+  };
+
+  testButton.addEventListener("click", async () => {
+    if (!form.reportValidity()) return;
+    setBusy(true);
+    setMessage(message, "Testing MusicBrainz connection…");
+    try {
+      const result = await api("/api/settings/musicbrainz/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload()),
+      });
+      setMessage(message, `${result.message} (${result.latencyMs} ms)`);
+    } catch (error) {
+      setMessage(message, error.message, true);
+    } finally {
+      setBusy(false);
+    }
+  });
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!form.reportValidity()) return;
+    setBusy(true);
+    setMessage(message, "Saving MusicBrainz settings…");
+    try {
+      const result = await api("/api/settings/musicbrainz", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload()),
+      });
+      setMessage(message, result.message || "MusicBrainz settings saved.");
+      await refreshSettings(false);
+    } catch (error) {
+      setMessage(message, error.message, true);
+    } finally {
+      setBusy(false);
+    }
+  });
+
+  form.addEventListener("input", () => setMessage(message, ""));
+}
+
 function setupLastfmSettings() {
   const form = $<LastfmSettingsForm>("#lastfm-settings");
   const saveButton = $<HTMLButtonElement>("#save-lastfm-key");
@@ -2941,6 +3023,7 @@ setupNavigation();
 setupAdminRequests();
 setupAdminUsers();
 setupStandalonePullToRefresh();
+setupMusicBrainzSettings();
 setupLidarrSettings();
 setupLastfmSettings();
 setupPlexSettings();

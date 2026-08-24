@@ -248,6 +248,33 @@
         </section>
 
         <section class="settings-section">
+          <div class="service-intro"><img class="service-icon" src="/icons/musicbrainz.svg" width="42" height="42" loading="lazy" decoding="async" alt="MusicBrainz"><div><h2>MusicBrainz</h2><p>Use the hosted WS2 service or a compatible self-hosted server.</p></div><span id="musicbrainz-state" class="service-state">Hosted service</span></div>
+          <form id="musicbrainz-settings" class="service-card">
+            <div class="settings-fields">
+              <label class="wide-field">WS2 base URL
+                <small>Include the WS2 path, for example http://musicbrainz.local:5000/ws/2.</small>
+                <input name="baseUrl" type="url" placeholder="https://musicbrainz.org/ws/2" required>
+              </label>
+              <label class="wide-field">User agent
+                <small>Identifies this Melodarr instance to the MusicBrainz server.</small>
+                <input name="userAgent" autocomplete="off" required>
+              </label>
+              <label>Request interval (ms)
+                <small>Keep 1100 ms for musicbrainz.org; a local server can usually use 0 ms.</small>
+                <input name="requestIntervalMs" type="number" inputmode="numeric" min="0" max="60000" step="1" required>
+              </label>
+            </div>
+            <div class="form-actions">
+              <p class="form-message" aria-live="polite"></p>
+              <div class="service-actions">
+                <button type="button" id="test-musicbrainz" class="secondary-action">Test connection</button>
+                <button type="submit" id="save-musicbrainz">Save MusicBrainz settings</button>
+              </div>
+            </div>
+          </form>
+        </section>
+
+        <section class="settings-section">
           <div class="service-intro"><img class="service-icon" src="/icons/lidarr.svg" width="42" height="42" loading="lazy" decoding="async" alt="Lidarr"><div><h2>Lidarr</h2><p>Where approved artist requests are added and monitored.</p></div><span id="lidarr-state" class="service-state">Not connected</span></div>
           <form id="lidarr-settings" class="service-card lidarr-card">
           <div class="settings-fields">
