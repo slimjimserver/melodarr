@@ -51,6 +51,25 @@
     if (!element) throw new Error(`Required element not found: ${selector}`);
     return element;
   };
+  function isPlainPrimaryClick(event: MouseEvent) {
+    return (
+      event.button === 0
+      && !event.metaKey
+      && !event.ctrlKey
+      && !event.shiftKey
+      && !event.altKey
+      && !event.defaultPrevented
+    );
+  }
+
+  function interceptInternalLink(link: HTMLAnchorElement, navigate: () => void) {
+    link.addEventListener("click", (event) => {
+      if (!isPlainPrimaryClick(event)) return;
+      event.preventDefault();
+      navigate();
+    });
+  }
+
   let currentDetail: DetailReference | null = null;
   let currentDetailData: JsonObject | undefined;
   const detailHistory: DetailReference[] = [];
@@ -60,9 +79,76 @@
   let lidarrExternalUrl: string | undefined;
   let lidarrExternalUrlRequest: Promise<string> | undefined;
   let lidarrExternalUrlVersion = 0;
+  let chartPoll: ReturnType<typeof setTimeout> | undefined;
+  let tasteAbort: AbortController | undefined;
   let recommendationPoll: ReturnType<typeof setTimeout> | undefined;
   let recommendationRequestVersion = 0;
   let recommendationAbort: AbortController | undefined;
+  let recommendationRefreshedAt = 0;
+  let recommendationWaitingAfter: number | undefined;
+  let recommendationChartCountry = "us";
+  let recommendationChartFilter = "recent";
+  let recommendationObserver: IntersectionObserver | undefined;
+  const recommendationFeedback = new Map<string, string>();
+  const recommendationVisibilityTimers = new Map<Element, ReturnType<typeof setTimeout>>();
+
+  function clearRecommendationObservers() {
+    recommendationObserver?.disconnect();
+    recommendationObserver = undefined;
+    recommendationVisibilityTimers.forEach(clearTimeout);
+    recommendationVisibilityTimers.clear();
+  }
+
+  function recommendationActivity(item: JsonObject, action: string) {
+    return postJson("/api/discover/activity", {
+      events: [{ id: item.id, kind: item.kind, action }],
+    }, recommendationAbort?.signal);
+  }
+
+  function observeRecommendations() {
+    const version = recommendationRequestVersion;
+    recommendationObserver = new IntersectionObserver((entries) => {
+      entries.forEach((entry) => {
+        clearTimeout(recommendationVisibilityTimers.get(entry.target));
+        if (!entry.isIntersecting || entry.intersectionRatio < 0.5) return;
+        recommendationVisibilityTimers.set(entry.target, setTimeout(() => {
+          if (document.hidden || version !== recommendationRequestVersion) return;
+          const card = entry.target as HTMLElement;
+          recommendationObserver?.unobserve(card);
+          recommendationVisibilityTimers.delete(card);
+          recommendationActivity({ id: card.dataset.itemId, kind: card.dataset.itemKind }, "impression")
+            .catch(() => { /* Measurement must not interrupt browsing. */ });
+        }, 1000));
+      });
+    }, { threshold: 0.5 });
+    document.querySelectorAll("[data-personal-recommendation]").forEach((card) => recommendationObserver?.observe(card));
+  }
+
+  function recommendationOutcomes() {
+    const details = document.createElement("details");
+    details.className = "recommendation-outcomes";
+    const summary = document.createElement("summary");
+    summary.textContent = "Your recommendation activity";
+    const text = document.createElement("p");
+    text.className = "field-help";
+    details.append(summary, text);
+    details.addEventListener("toggle", async () => {
+      if (!details.open) return;
+      const version = recommendationRequestVersion;
+      text.textContent = "Loading your activity…";
+      try {
+        const data = await getJson("/api/discover/metrics", 30_000, recommendationAbort?.signal);
+        if (version !== recommendationRequestVersion) return;
+        text.textContent = `In the last 30 days: ${data.shown} suggestions seen, ${data.opened} opened, `
+          + `${data.requested} requested within 7 days of seeing them. `
+          + (data.played === null ? "Plex listening outcomes are not available yet. " : `${data.played} played in Plex after requesting. `)
+          + "These counts show what followed a suggestion, not whether it caused the request. Only your activity is included.";
+      } catch (error) {
+        if (version === recommendationRequestVersion && error.name !== "AbortError") text.textContent = "Your activity couldn’t be loaded. Open this section to try again.";
+      }
+    });
+    return details;
+  }
   let searchRequestVersion = 0;
   let searchDebounce: ReturnType<typeof setTimeout>;
   let searchAbort: AbortController | undefined;
@@ -284,7 +370,7 @@
     $("#main-content").focus();
   }
 
-  function createCard(title: string, description: string, onClick?: EventListener, coverArt = "", detailKind?: DetailKind, detailId = "") {
+  function createCard(title: string, description: string, onClick?: () => void, coverArt = "", detailKind?: DetailKind, detailId = "") {
     const card = document.createElement("article");
     card.className = `artist-card${onClick ? " clickable" : ""}`;
     const fallbackAvatar = document.createElement("div");
@@ -309,15 +395,15 @@
     const text = document.createElement("p");
     text.textContent = description;
     info.append(heading, text);
-    if (onClick) {
-      const openButton = document.createElement("button");
-      openButton.className = "card-open";
-      openButton.type = "button";
-      openButton.setAttribute("aria-label", `Open details for ${title}`);
-      openButton.append(artwork, info);
-      openButton.addEventListener("click", onClick);
-      if (detailKind && detailId) addDetailPrefetch(openButton, detailKind, detailId);
-      card.append(openButton);
+    if (onClick && detailKind && detailId) {
+      const openLink = document.createElement("a");
+      openLink.className = "card-open";
+      openLink.href = detailPath(detailKind, detailId);
+      openLink.setAttribute("aria-label", `Open details for ${title}`);
+      openLink.append(artwork, info);
+      interceptInternalLink(openLink, onClick);
+      addDetailPrefetch(openLink, detailKind, detailId);
+      card.append(openLink);
     } else {
       card.append(artwork, info);
     }
@@ -875,7 +961,9 @@
   }
 
   function artistReleaseGroups(data: JsonObject) {
-    return (Object.values(data.sections || {}) as JsonObject[][]).flat();
+    const groups = (Object.values(data.sections || {}) as JsonObject[][]).flat();
+    return [...new Map([...groups, ...(data.animeReleaseGroups || [])]
+      .map((group: JsonObject) => [String(group.id), group])).values()];
   }
 
   function incompleteArtistReleaseGroups(data: JsonObject) {
@@ -971,6 +1059,9 @@
           button.textContent = requestStatusLabel(group);
           button.disabled = true;
           button.title = "This release group is being requested from Lidarr";
+        } else if (group.availabilityPending) {
+          button.textContent = "Requested";
+          button.disabled = true;
         } else if (group.availableInLidarr && !group.availabilityPending) {
           button.textContent = "Search missing";
           button.disabled = false;
@@ -1162,6 +1253,7 @@
   }) {
     const action = captureDetailActionContext();
     const button = releaseGroup.button;
+    const previousLabel = button.textContent;
     button.disabled = true;
     button.textContent = "Sending to Lidarr…";
     try {
@@ -1190,14 +1282,17 @@
           // Keep the just-requested state stable until the Lidarr library
           // snapshot observes it, then transition to Search missing/Available.
           group.availableInLidarr = true;
-          group.availabilityPending = true;
+          group.availabilityPending = !result.alreadyExists;
+          group.fullyAvailableInLidarr = Boolean(result.alreadyExists);
+          group.requestStatus = result.pending ? "queued" : "requested";
+          applyArtistReleaseGroupAvailability(currentDetailData, {});
           startDetailAvailability("artist", currentDetailData, 0);
         }
       }
     } catch (error) {
       if (!isCurrentDetailAction(action) || error.name === "AbortError") return;
       showToast(error.message, true);
-      button.textContent = "Request release group";
+      button.textContent = previousLabel;
       button.disabled = false;
     }
   }
@@ -1260,8 +1355,18 @@
       image.fetchPriority = "low";
       image.width = 154;
       image.height = 154;
-      loadArtworkWhenNear(image, item.coverArt, fallback);
+      const artworkUrl = new URL(item.coverArt, window.location.origin);
+      if (artworkUrl.origin === window.location.origin && /^\/api\/artwork\/(artist|release-group)\//.test(artworkUrl.pathname)) {
+        artworkUrl.searchParams.set("size", window.devicePixelRatio >= 2 ? "large" : "card");
+      }
+      loadArtworkWhenNear(image, artworkUrl.href, fallback);
       artwork = image;
+    }
+    const personalized = Boolean(item.personalized);
+    if (personalized) {
+      card.dataset.personalRecommendation = "true";
+      card.dataset.itemId = item.id;
+      card.dataset.itemKind = kind;
     }
     const sourceName = item.recommendationSource || "Recommendation";
     const source = document.createElement("span");
@@ -1297,15 +1402,24 @@
     const subtitle = document.createElement("span");
     subtitle.textContent = kind === "artist" ? (item.type || "Artist") : [item.artist, item.type].filter(Boolean).join(" · ");
     info.append(title, subtitle);
-    const open = () => showDetail(kind === "artist" ? "artist" : "release-group", item.id);
-    const openButton = document.createElement("button");
-    openButton.className = "recommendation-open";
-    openButton.type = "button";
-    openButton.setAttribute("aria-label", `Open details for ${item.name}`);
-    openButton.append(artwork, source, info);
-    openButton.addEventListener("click", open);
-    addDetailPrefetch(openButton, kind === "artist" ? "artist" : "release-group", item.id);
-    card.append(openButton);
+    const detailKind = kind === "artist" ? "artist" : "release-group";
+    const openLink = document.createElement("a");
+    openLink.className = "recommendation-open";
+    openLink.href = detailPath(detailKind, item.id);
+    openLink.setAttribute("aria-label", `Open details for ${item.name}`);
+    openLink.append(artwork, ...(personalized ? [] : [source]), info);
+    if (personalized) {
+      const reason = document.createElement("p");
+      reason.className = "recommendation-reason";
+      reason.textContent = item.reason;
+      openLink.append(reason);
+      openLink.addEventListener("click", () => {
+        recommendationActivity(item, "open").catch(() => {});
+      });
+    }
+    interceptInternalLink(openLink, () => showDetail(detailKind, item.id));
+    addDetailPrefetch(openLink, detailKind, item.id);
+    card.append(openLink);
     const requestButton = document.createElement("button");
     requestButton.className = "recommendation-request";
     requestButton.type = "button";
@@ -1314,7 +1428,8 @@
       requestButton.disabled = true;
       requestButton.title = "This artist is already in Lidarr";
     } else {
-      requestButton.textContent = "Request";
+      requestButton.textContent = personalized && kind === "release-group"
+        ? (item.availability === "partial" ? "Request missing tracks" : "Request album") : "Request";
       requestButton.addEventListener("click", (event) => {
         event.stopPropagation();
         if (kind === "artist") openRequestDialog(item, messageElement);
@@ -1322,6 +1437,79 @@
       });
     }
     card.append(requestButton);
+    if (personalized) {
+      const actions = document.createElement("div");
+      actions.className = "recommendation-actions";
+      const more = document.createElement("button");
+      more.type = "button";
+      const feedbackKey = `${kind}:${item.id}`;
+      let liked = (recommendationFeedback.get(feedbackKey) ?? item.feedback) === "more";
+      const updateMore = () => {
+        more.textContent = liked ? "Undo preference" : "More like this";
+        more.setAttribute("aria-pressed", String(liked));
+      };
+      updateMore();
+      more.addEventListener("click", async () => {
+        const version = recommendationRequestVersion;
+        more.disabled = true;
+        try {
+          await recommendationActivity(item, liked ? "undo" : "more");
+          if (version !== recommendationRequestVersion) return;
+          liked = !liked;
+          recommendationFeedback.set(feedbackKey, liked ? "more" : "neutral");
+          updateMore();
+          showToast(liked ? "Saved. Future picks will include more music like this." : "Preference removed.");
+        } catch (error) {
+          if (version === recommendationRequestVersion && error.name !== "AbortError") showToast(error.message, true);
+        } finally {
+          more.disabled = false;
+        }
+      });
+      const dismiss = document.createElement("button");
+      dismiss.type = "button";
+      dismiss.textContent = "Not interested";
+      dismiss.addEventListener("click", async () => {
+        const version = recommendationRequestVersion;
+        dismiss.disabled = true;
+        try {
+          await recommendationActivity(item, "dismiss");
+          if (version !== recommendationRequestVersion) return;
+          recommendationFeedback.set(feedbackKey, "dismiss");
+          recommendationObserver?.unobserve(card);
+          clearTimeout(recommendationVisibilityTimers.get(card));
+          const content = [...card.childNodes];
+          const note = document.createElement("p");
+          note.textContent = `${item.name} hidden`;
+          const undo = document.createElement("button");
+          undo.type = "button";
+          undo.className = "recommendation-request";
+          undo.textContent = "Undo";
+          undo.addEventListener("click", async () => {
+            undo.disabled = true;
+            try {
+              await recommendationActivity(item, "undo");
+              if (version !== recommendationRequestVersion) return;
+              liked = false;
+              recommendationFeedback.set(feedbackKey, "neutral");
+              updateMore();
+              card.replaceChildren(...content);
+              dismiss.disabled = false;
+              dismiss.focus();
+            } catch (error) {
+              if (version === recommendationRequestVersion && error.name !== "AbortError") showToast(error.message, true);
+              undo.disabled = false;
+            }
+          });
+          card.replaceChildren(note, undo);
+          undo.focus();
+        } catch (error) {
+          if (version === recommendationRequestVersion && error.name !== "AbortError") showToast(error.message, true);
+          dismiss.disabled = false;
+        }
+      });
+      actions.append(more, dismiss);
+      card.append(actions);
+    }
     return card;
   }
 
@@ -1336,7 +1524,7 @@
     const heading = document.createElement("h3"); heading.textContent = title;
     const carousel = document.createElement("div"); carousel.className = "recommendation-carousel";
     group.append(heading, carousel);
-    const batchSize = window.matchMedia("(max-width: 700px)").matches ? 6 : 8;
+    const batchSize = items.some((item) => item.personalized) || window.matchMedia("(max-width: 700px)").matches ? 6 : 8;
     let rendered = 0;
     const more = document.createElement("button");
     more.className = "outline recommendation-more";
@@ -1346,7 +1534,9 @@
       const end = Math.min(rendered + batchSize, items.length);
       const fragment = document.createDocumentFragment();
       for (let index = rendered; index < end; index += 1) {
-        fragment.append(createRecommendationCarouselCard(items[index], kind, messageElement));
+        const card = createRecommendationCarouselCard(items[index], items[index].kind || kind, messageElement);
+        fragment.append(card);
+        if (items[index].personalized) recommendationObserver?.observe(card);
       }
       carousel.append(fragment);
       rendered = end;
@@ -1362,6 +1552,303 @@
     renderMore();
     if (rendered < items.length) group.append(more);
     return group;
+  }
+
+  function tastePreferencesPanel(preferences: JsonObject) {
+    const host = $("#recommendation-preferences");
+    if (host.childElementCount) return;
+    tasteAbort?.abort();
+    tasteAbort = new AbortController();
+    const signal = tasteAbort.signal;
+    const details = document.createElement("details");
+    details.className = "taste-preferences";
+    const current = () => !signal.aborted && details.isConnected;
+    const summary = document.createElement("summary");
+    summary.innerHTML = `<span class="taste-summary-copy"><strong>Shape Your Recommendations</strong><span class="taste-summary-meta"></span></span><span class="taste-chevron" aria-hidden="true"></span>`;
+    const summaryMeta = summary.querySelector<HTMLElement>(".taste-summary-meta")!;
+    const form = document.createElement("form");
+    form.innerHTML = `
+      <fieldset class="taste-fields">
+        <div class="taste-layout">
+          <section class="taste-mix-section">
+            <fieldset class="taste-mix-group">
+              <legend>Find your balance</legend>
+              <p class="field-help">Stay close to your favorites, or make room for something new.</p>
+              <div class="taste-mix-options">
+                <label><input type="radio" name="mix" value="familiar" aria-label="More familiar artists"><span>Familiar</span></label>
+                <label><input type="radio" name="mix" value="balanced" aria-label="Balanced"><span>Balanced</span></label>
+                <label><input type="radio" name="mix" value="discovery" aria-label="More discovery"><span>Discover</span></label>
+              </div>
+            </fieldset>
+            <div class="taste-preview-heading">Your row order <span>Up to</span></div>
+            <ol class="taste-row-preview" aria-label="Recommendation row preview" aria-live="polite"></ol>
+            <p class="taste-fine-print">Counts depend on available matches. Your chart selection stays independent.</p>
+          </section>
+          <section class="taste-favorites-section">
+            <div class="taste-section-heading"><label for="taste-artist-search">A few of your favorites</label><span class="taste-artist-count">0 / 5</span></div>
+            <p class="field-help">Optional. These artists guide missing-album picks and related discoveries.</p>
+            <div class="taste-artists" aria-label="Favorite artists"></div>
+            <div class="taste-search-box">
+              <input id="taste-artist-search" name="artist" autocomplete="off" placeholder="Search artists…" aria-label="Find a favorite artist">
+              <button type="button" class="outline taste-search" aria-label="Find artists">Find</button>
+            </div>
+            <div class="taste-search-results" aria-live="polite"></div>
+          </section>
+        </div>
+        <div class="taste-footer"><span class="taste-save-state">All changes saved</span><button class="taste-save" aria-label="Save taste preferences">Save changes</button></div>
+      </fieldset>
+      <p class="message taste-status" role="status"></p>
+      <p class="taste-request-note">Requested something for someone else? Turn off <strong>Use for recommendations</strong> on your Requests page.</p>`;
+    const mixValue = () => form.querySelector<HTMLInputElement>('input[name="mix"]:checked')!.value;
+    const initialMode = ["familiar", "balanced", "discovery"].includes(preferences.mode) ? preferences.mode : "balanced";
+    form.querySelector<HTMLInputElement>(`input[name="mix"][value="${initialMode}"]`)!.checked = true;
+    let selected: JsonObject[] = [...(preferences.starterArtists || [])];
+    const input = form.querySelector<HTMLInputElement>('input[name="artist"]')!;
+    const search = form.querySelector<HTMLButtonElement>(".taste-search")!;
+    const matches = form.querySelector<HTMLElement>(".taste-search-results")!;
+    const chosen = form.querySelector<HTMLElement>(".taste-artists")!;
+    const status = form.querySelector<HTMLElement>(".taste-status")!;
+    const fieldset = form.querySelector<HTMLFieldSetElement>(".taste-fields")!;
+    const save = form.querySelector<HTMLButtonElement>(".taste-save")!;
+    const saveState = form.querySelector<HTMLElement>(".taste-save-state")!;
+    const preview = form.querySelector<HTMLOListElement>(".taste-row-preview")!;
+    const modeNames: Record<string, string> = { familiar: "Familiar first", balanced: "Balanced mix", discovery: "Discovery first" };
+    const selectionKey = () => JSON.stringify({ mode: mixValue(), artists: selected });
+    let savedKey = selectionKey();
+    const updateSummary = () => {
+      summaryMeta.textContent = `${modeNames[mixValue()]} · ${selected.length ? `${selected.length} favorite${selected.length === 1 ? "" : "s"}` : "Add your favorite artists"}`;
+    };
+    const updateMix = () => {
+      const mode = mixValue();
+      const rows: [string, number][] = [
+        ["More from artists you love", mode === "familiar" ? 8 : mode === "discovery" ? 4 : 6],
+        ["Because you requested…", 6],
+        ["Try something new", mode === "discovery" ? 8 : mode === "familiar" ? 4 : 6],
+      ];
+      if (mode === "discovery") rows.reverse();
+      preview.replaceChildren();
+      rows.forEach(([title, count]) => {
+        const row = document.createElement("li");
+        const titleSpan = document.createElement("span");
+        titleSpan.textContent = title;
+        const amount = document.createElement("span");
+        amount.className = "taste-row-count";
+        amount.textContent = String(count);
+        row.append(titleSpan, amount);
+        preview.append(row);
+      });
+    };
+    const updateDirty = () => {
+      const dirty = selectionKey() !== savedKey;
+      save.disabled = !dirty;
+      saveState.textContent = dirty ? "Unsaved changes" : "All changes saved";
+    };
+    form.querySelectorAll<HTMLInputElement>('input[name="mix"]').forEach(radio => radio.addEventListener("change", () => {
+      updateMix();
+      updateDirty();
+      status.textContent = "";
+    }));
+    const renderChosen = () => {
+      status.textContent = "";
+      chosen.replaceChildren();
+      form.querySelector<HTMLElement>(".taste-artist-count")!.textContent = `${selected.length} / 5`;
+      updateDirty();
+      selected.forEach((artist) => {
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "taste-artist-chip";
+        remove.textContent = `${artist.name} ×`;
+        remove.setAttribute("aria-label", `Remove ${artist.name} from favorites`);
+        remove.addEventListener("click", () => {
+          selected = selected.filter((item) => item.id !== artist.id);
+          renderChosen();
+        });
+        chosen.append(remove);
+      });
+    };
+    let searchVersion = 0;
+    input.addEventListener("input", () => { searchVersion++; matches.replaceChildren(); });
+    const findArtists = async () => {
+      const query = input.value.trim();
+      if (query.length < 2) { status.textContent = "Enter at least two characters to find an artist."; return; }
+      const version = ++searchVersion;
+      search.disabled = true;
+      matches.textContent = "Finding artists…";
+      try {
+        const result = await getJson(`/api/search?type=artist&q=${encodeURIComponent(query)}`, 30_000, signal);
+        if (!current() || version !== searchVersion) return;
+        matches.replaceChildren();
+        (result.results || []).slice(0, 10).forEach((artist: JsonObject) => {
+          const add = document.createElement("button");
+          add.type = "button";
+          add.className = "taste-artist-result";
+          add.textContent = `${artist.name}${artist.disambiguation ? ` · ${artist.disambiguation}` : ""}`;
+          add.addEventListener("click", () => {
+            if (selected.some((item) => item.id === artist.id)) { status.textContent = "That artist is already selected."; return; }
+            if (selected.length >= 5) { status.textContent = "You can choose up to five artists. Remove one to add another."; return; }
+            selected.push({ id: artist.id, name: artist.name });
+            renderChosen();
+            matches.replaceChildren();
+            input.value = "";
+            status.textContent = "Artist added. Save your taste preferences when ready.";
+            input.focus();
+          });
+          matches.append(add);
+        });
+        if (!matches.childElementCount) matches.textContent = "No artists found. Try another spelling.";
+      } catch (error) {
+        if (current() && version === searchVersion) matches.textContent = `Couldn’t find artists. ${error.message}`;
+      } finally { if (current()) search.disabled = false; }
+    };
+    search.addEventListener("click", findArtists);
+    input.addEventListener("keydown", event => { if (event.key === "Enter") { event.preventDefault(); findArtists(); } });
+    form.addEventListener("submit", async event => {
+      event.preventDefault();
+      if (selectionKey() === savedKey) return;
+      fieldset.disabled = true;
+      save.textContent = "Saving…";
+      status.textContent = "Saving your taste preferences…";
+      try {
+        const saved = await postJson("/api/discover/preferences", { mode: mixValue(), starterArtists: selected }, signal);
+        if (!current()) return;
+        savedKey = selectionKey();
+        updateSummary();
+        matches.replaceChildren();
+        input.value = "";
+        status.textContent = saved.message;
+        loadRecommendations($("#load-recommendations"));
+      } catch (error) {
+        if (current()) status.textContent = `Couldn’t save your taste preferences. ${error.message}`;
+      } finally {
+        if (current()) { fieldset.disabled = false; save.textContent = "Save changes"; updateDirty(); }
+      }
+    });
+    renderChosen();
+    updateMix();
+    updateSummary();
+    details.append(summary, form);
+    host.append(details);
+  }
+
+  function pollCountryCharts(data: JsonObject) {
+    clearTimeout(chartPoll);
+    if (!Object.values(data.popularCharts || {}).some((chart) => (chart as JsonObject).pending)) return;
+    const version = recommendationRequestVersion;
+    chartPoll = setTimeout(async () => {
+      try {
+        const updated = await getJson("/api/discover/charts", 30_000, recommendationAbort?.signal);
+        if (version !== recommendationRequestVersion) return;
+        const previous = document.querySelector(".popular-albums");
+        if (previous) {
+          // Avoid replacing a focused selector or an active request/feedback control.
+          if (!previous.contains(document.activeElement)) {
+            previous.querySelectorAll("[data-personal-recommendation]").forEach(card => {
+              recommendationObserver?.unobserve(card);
+              clearTimeout(recommendationVisibilityTimers.get(card));
+              recommendationVisibilityTimers.delete(card);
+            });
+            previous.replaceWith(popularAlbumSection(updated));
+          } else {
+            pollCountryCharts(data);
+            return;
+          }
+        }
+        pollCountryCharts(updated);
+      } catch (error) {
+        if (version === recommendationRequestVersion && error.name !== "AbortError") pollCountryCharts(data);
+      }
+    }, 15_000);
+  }
+
+  function popularAlbumSection(data: JsonObject) {
+    const section = document.createElement("section");
+    section.className = "popular-albums";
+    const heading = document.createElement("h3");
+    heading.textContent = "Popular albums right now";
+    const description = document.createElement("p");
+    description.className = "recommendation-description";
+    const countryLabel = document.createElement("label");
+    countryLabel.className = "popular-albums-filter";
+    countryLabel.append("Country ");
+    const country = document.createElement("select");
+    country.setAttribute("aria-label", "Chart country");
+    [["us", "United States"], ["jp", "Japan"]].forEach(([value, text]) => {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = text;
+      country.append(option);
+    });
+    country.value = recommendationChartCountry;
+    countryLabel.append(country);
+    const filterLabel = document.createElement("label");
+    filterLabel.className = "popular-albums-filter";
+    filterLabel.append("Show ");
+    const filter = document.createElement("select");
+    filter.setAttribute("aria-label", "Popular album selection");
+    [["recent", "New & popular · last 6 months"], ["all", "All chart albums"]].forEach(([value, text]) => {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = text;
+      filter.append(option);
+    });
+    filter.value = recommendationChartFilter;
+    filterLabel.append(filter);
+    const results = document.createElement("div");
+    results.className = "popular-albums-results";
+    results.setAttribute("aria-live", "polite");
+    const render = () => {
+      const chart = data.popularCharts?.[country.value] || (country.value === "us" ? data.popularChart : null) || {};
+      const countryName = country.value === "jp" ? "Japan" : "US";
+      const updated = chart.updated ? new Date(chart.updated) : null;
+      description.textContent = `From Apple Music’s ${countryName} Top 100, matched to albums you can request.`
+        + (updated && !Number.isNaN(updated.getTime()) ? ` Chart updated ${updated.toLocaleDateString()}.` : "")
+        + (chart.stale ? " Showing the last chart we could load; a retry is scheduled."
+          : chart.status === "partial" ? " Some albums are still being matched." : "");
+      results.querySelectorAll("[data-personal-recommendation]").forEach((card) => {
+        recommendationObserver?.unobserve(card);
+        clearTimeout(recommendationVisibilityTimers.get(card));
+        recommendationVisibilityTimers.delete(card);
+      });
+      const albums = data.popularAlbumsByCountry?.[country.value]
+        || (country.value === "us" ? data.popularAlbums : []) || [];
+      const items = albums.filter((item: JsonObject) =>
+        (filter.value === "all" || item.recentRelease)
+        && recommendationFeedback.get(`${item.kind}:${item.id}`) !== "dismiss",
+      );
+      results.replaceChildren();
+      if (items.length) {
+        const row = recommendationRow("Chart albums", items.map((item: JsonObject) => ({ ...item, personalized: true })), "release-group");
+        row.querySelector("h3")?.remove();
+        results.append(row);
+      } else {
+        const message = document.createElement("p");
+        message.className = "message";
+        message.textContent = country.value === "jp" && !data.popularCharts?.jp
+          ? "Japan’s chart is being prepared. It will appear when recommendations refresh."
+          : chart.status === "refreshing"
+            ? `${countryName}’s chart is being prepared. It will appear here when ready.`
+          : chart.status === "unavailable"
+          ? "The album chart couldn’t be loaded. Your personal recommendations are still available."
+          : filter.value === "recent"
+            ? "No new chart albums to request right now. Try All chart albums."
+            : "No additional chart albums to request right now.";
+        results.append(message);
+      }
+    };
+    filter.addEventListener("change", () => {
+      recommendationChartFilter = filter.value;
+      render();
+    });
+    country.addEventListener("change", () => {
+      recommendationChartCountry = country.value;
+      render();
+    });
+    const controls = document.createElement("div");
+    controls.className = "popular-albums-controls";
+    controls.append(countryLabel, filterLabel);
+    section.append(heading, description, controls, results);
+    render();
+    return section;
   }
 
   function similarArtistsView(artistId: string) {
@@ -1545,7 +2032,7 @@
   function createReleaseGroupCard(group: JsonObject) {
     const card = createCard(
       releaseGroupDisplayTitle(group),
-      [group.date, ...(group.secondaryTypes || []), group.disambiguation]
+      [group.date, ...(group.animeNames || []), ...(group.secondaryTypes || []), group.disambiguation]
         .filter(Boolean)
         .join(" · "),
       () => showDetail("release-group", group.id),
@@ -1553,6 +2040,9 @@
       "release-group",
       group.id,
     );
+    const metadata = card.querySelector<HTMLParagraphElement>(".artist-info p")!;
+    metadata.classList.add("release-group-metadata");
+    metadata.title = metadata.textContent || "";
     const groupRequest = document.createElement("button");
     groupRequest.className = "request release-group-request";
     groupRequest.type = "button";
@@ -1714,6 +2204,7 @@
       releaseContent.append(section);
 
       link.addEventListener("click", (event) => {
+        if (!isPlainPrimaryClick(event)) return;
         // Keep the discography navigation inside the current rendered view.
         // Native fragment navigation changes the URL and can cause the SPA
         // route handler to re-render before the section is expanded.
@@ -1725,6 +2216,138 @@
         section.scrollIntoView({ behavior: "smooth", block: "start" });
       });
       index.append(link);
+    });
+
+    const animeSection = document.createElement("details");
+    animeSection.id = "artist-anime";
+    animeSection.className = "discography-section";
+    const animeSummary = document.createElement("summary");
+    animeSummary.textContent = "Anime";
+    const animeBody = document.createElement("div");
+    animeSection.append(animeSummary, animeBody);
+    const animeLink = document.createElement("a");
+    animeLink.href = "#artist-anime";
+    animeLink.textContent = "Anime";
+    // Keep anime below Singles, even when that release section is empty.
+    releaseContent.insertBefore(animeSection, sections[3].element);
+    index.insertBefore(animeLink, sections[3].link);
+    let animeLoaded = false;
+    let animeLoading = false;
+    const animeSignal = detailSessionAbort.signal;
+    async function loadArtistAnime() {
+      if (animeLoaded || animeLoading) return;
+      animeLoading = true;
+      animeBody.textContent = "Loading anime appearances…";
+      try {
+        const payload = await getJson(
+          `/api/music/artist/${encodeURIComponent(data.id)}/anime`, 60_000, animeSignal,
+        );
+        if (!animeSection.isConnected || animeSignal.aborted) return;
+        const items = (payload.anime || []) as JsonObject[];
+        const performances = items.flatMap((anime) => (anime.performances || []).map(
+          (performance: JsonObject) => ({ ...performance, year: anime.year, season: anime.season }),
+        )) as JsonObject[];
+        const knownGroups = new Map(artistReleaseGroups(data).map(group => [String(group.id), group]));
+        performances.forEach(performance => {
+          performance.releaseGroups = (performance.releaseGroups || []).map((group: JsonObject) => {
+            const existing = knownGroups.get(String(group.id));
+            const shared = existing ? Object.assign(existing, group) : group;
+            knownGroups.set(String(group.id), shared);
+            return shared;
+          });
+        });
+        data.animeReleaseGroups = [...new Map(performances.flatMap(performance => performance.releaseGroups)
+          .map((group: JsonObject) => [String(group.id), group])).values()];
+        applyArtistReleaseGroupAvailability(data, {});
+        if (incompleteArtistReleaseGroups(data).length) startDetailAvailability("artist", data);
+        animeSummary.textContent = `Anime (${performances.length})`;
+        animeBody.replaceChildren();
+        const icons = document.querySelector("#detail-results .artist-meta .external-icons");
+        if (icons && items.length) {
+          icons.querySelectorAll(".external-link-animethemes").forEach((link) => link.remove());
+          const slugs = new Set<string>();
+          (payload.artistLinks || []).forEach((artist: JsonObject) => {
+            const slug = String(artist.slug || "");
+            if (!slug || slugs.has(slug)) return;
+            slugs.add(slug);
+            icons.insertBefore(createServiceIconLink(
+              `https://animethemes.moe/artist/${encodeURIComponent(slug)}`,
+              "/icons/animethemes.svg", "Open on AnimeThemes",
+              "external-link-animethemes",
+            ), icons.querySelector(".notification-mute"));
+          });
+        }
+        if (!performances.length) {
+          animeBody.textContent = "No linked anime appearances yet. Match an anime theme to this artist's release to connect their appearances.";
+        } else {
+          const filter = document.createElement("label");
+          filter.className = "artist-anime-sort";
+          filter.textContent = "Sort themes";
+          const sort = document.createElement("select");
+          [
+            ["newest", "Newest anime first"], ["oldest", "Oldest anime first"],
+            ["anime", "Anime title (A–Z)"], ["song", "Song title (A–Z)"],
+            ["type", "Openings, then endings"],
+          ].forEach(([value, text]) => sort.append(new Option(text, value)));
+          filter.append(sort);
+          const rows = document.createElement("div");
+          const compareText = (a: unknown, b: unknown) => String(a || "").localeCompare(
+            String(b || ""), undefined, { numeric: true, sensitivity: "base" },
+          );
+          const seasons = ["winter", "spring", "summer", "fall"];
+          const date = (item: JsonObject) => Number(item.year) * 4
+            + seasons.indexOf(String(item.season || "").toLowerCase());
+          const typeRank = (item: JsonObject) => item.themeType === "OP" ? 0 : item.themeType === "ED" ? 1 : 2;
+          function renderPerformances() {
+            const ordered = [...performances].sort((a, b) => {
+              let comparison = 0;
+              if (sort.value === "newest" || sort.value === "oldest") {
+                // Unknown years stay last in either chronological direction.
+                comparison = Number(!a.year) - Number(!b.year);
+                if (!comparison && a.year && b.year) {
+                  comparison = (date(a) - date(b)) * (sort.value === "newest" ? -1 : 1);
+                }
+              } else if (sort.value === "song") {
+                comparison = compareText(a.songTitle, b.songTitle);
+              } else if (sort.value === "type") {
+                comparison = typeRank(a) - typeRank(b);
+              }
+              return comparison || compareText(a.animeName, b.animeName)
+                || typeRank(a) - typeRank(b)
+                || compareText(a.themeLabel, b.themeLabel)
+                || compareText(a.songTitle, b.songTitle)
+                || compareText(a.themeId, b.themeId);
+            });
+            const rendered = createReleaseAnimeThemes(ordered, true, data);
+            rows.replaceChildren(rendered.querySelector(".release-anime-theme-list")!);
+          }
+          sort.addEventListener("change", renderPerformances);
+          animeBody.append(filter, rows);
+          renderPerformances();
+        }
+        animeLoaded = true;
+      } catch (error) {
+        if (!animeSection.isConnected || animeSignal.aborted) return;
+        animeBody.textContent = "Anime appearances could not be loaded. ";
+        const retry = document.createElement("button");
+        retry.type = "button";
+        retry.textContent = "Retry";
+        retry.addEventListener("click", () => void loadArtistAnime());
+        animeBody.append(retry);
+      } finally {
+        animeLoading = false;
+      }
+    }
+    // Resolve external artist links even while the Anime section is collapsed.
+    queueMicrotask(() => void loadArtistAnime());
+    animeLink.addEventListener("click", (event) => {
+      if (!isPlainPrimaryClick(event)) return;
+      event.preventDefault();
+      tools.hidden = false;
+      releaseContent.hidden = false;
+      similar.element.hidden = true;
+      animeSection.open = true;
+      animeSection.scrollIntoView({ behavior: "smooth", block: "start" });
     });
 
     function refreshSections() {
@@ -2021,7 +2644,7 @@
       const confirm = document.createElement("button");
       confirm.className = "anime-candidate-confirm";
       confirm.type = "button";
-      confirm.textContent = "Confirm match";
+      confirm.textContent = "Confirm this release";
       confirm.addEventListener("click", (event) => {
         event.stopPropagation();
         confirmMatch(confirm);
@@ -2041,6 +2664,7 @@
     const review = String(
       mapping?.registryStatus || mapping?.mappingStatus || "",
     ).toLowerCase();
+    if (provenance === "automatic-unique-single") return "Automatic · single confirmed";
     if (provenance === "manual-confirmation") return "Automatic match · confirmed";
     if (provenance === "manual") {
       return review === "confirmed" ? "Manual · confirmed" : "Manual mapping";
@@ -2065,6 +2689,10 @@
     affectedReleaseGroupIds.forEach((id) => {
       detailRequests.delete(`release-group:${String(id)}`);
     });
+    // Artist summaries embed these release-to-anime associations too.
+    for (const key of detailRequests.keys()) {
+      if (key.startsWith("artist:")) detailRequests.delete(key);
+    }
     if (payload.theme) Object.assign(theme, payload.theme);
     if (payload.mapping !== undefined) theme.mapping = payload.mapping || {};
     if (payload.myProposal !== undefined) theme.myProposal = payload.myProposal;
@@ -2337,7 +2965,9 @@
     const status = document.createElement("span");
     status.className = "anime-mapping-status";
     status.setAttribute("role", "status");
-    status.textContent = state === "resolved"
+    status.textContent = mapping?.reason === "artist-recording-catalog-incomplete"
+      ? "Catalog scan pending"
+      : state === "resolved"
       ? "Matched"
       : state === "ambiguous"
         ? "Choose a release"
@@ -2373,9 +3003,11 @@
       (group, index, all) => group?.id && all.findIndex((candidate) => candidate?.id === group.id) === index,
     );
     const automaticMatchMethod = String(mapping?.matchMethod || "");
-    const canConfirmAmbiguousCandidate = currentUser?.role === "admin"
+    const canConfirmCandidate = currentUser?.role === "admin"
       && manageMappings
-      && state === "ambiguous"
+      && (state === "ambiguous" || (state === "resolved"
+        && ["recording-search", "artist-discography-title"].includes(automaticMatchMethod)
+        && (automaticMatchMethod !== "recording-search" || Boolean(mapping?.recordingId))))
       && groups.length > 0
       && !mapping?.mappingSource;
     const confirmAutomaticMatch = async (
@@ -2416,19 +3048,25 @@
       candidateSummary.textContent = `${groups.length} release ${groups.length === 1 ? "option" : "options"}`;
       const candidates = document.createElement("div");
       candidates.className = "anime-release-candidates";
-      recommendedId = String(
-        mapping?.recommendedReleaseGroupId
-        || mapping?.recommended?.id
-        || (state === "resolved" ? groups[0]?.id : ""),
-      );
+      const preferredIds = [
+        mapping?.recommendedReleaseGroupId,
+        mapping?.recommended?.id,
+        mapping?.preferredReleaseGroupId,
+        groups.find(group => group.preferred)?.id,
+      ].filter(Boolean).map(String);
+      recommendedId = preferredIds.find(id => groups.some(group => String(group.id) === id))
+        || String(groups[0].id);
+      // Keep the recommendation visible even when alternatives are collapsed.
+      const recommendedIndex = groups.findIndex(group => String(group.id) === recommendedId);
+      if (recommendedIndex > 0) groups.unshift(...groups.splice(recommendedIndex, 1));
       const renderCandidateLimit = (showAll: boolean) => {
         const visible = showAll ? groups : groups.slice(0, 3);
         candidates.replaceChildren(...visible.map((group) => createAnimeReleaseCandidate(
           group,
           theme,
           Boolean(recommendedId) && String(group.id) === recommendedId,
-          canConfirmAmbiguousCandidate
-            ? (button) => confirmAutomaticMatch(String(group.id), button, "Confirm match")
+          canConfirmCandidate
+            ? (button) => confirmAutomaticMatch(String(group.id), button, "Confirm this release")
             : undefined,
         )));
         if (groups.length > 3) {
@@ -2456,56 +3094,6 @@
       renderCandidateLimit(false);
       candidateDetails.append(candidateSummary, candidates);
       container.append(candidateDetails);
-    }
-    const canConfirmAutomatic = currentUser?.role === "admin"
-      && manageMappings
-      && state === "resolved"
-      && (
-        automaticMatchMethod === "recording-search"
-        || automaticMatchMethod === "artist-discography-title"
-      )
-      && (
-        automaticMatchMethod !== "recording-search"
-        || Boolean(mapping?.recordingId)
-      )
-      && Boolean(recommendedId)
-      && !mapping?.mappingSource;
-    if (canConfirmAutomatic) {
-      const confirmation = document.createElement("div");
-      confirmation.className = "anime-mapping-confirmation";
-      const confirm = document.createElement("button");
-      confirm.type = "button";
-      confirm.textContent = "Confirm recommended match";
-      const confirmationMessage = document.createElement("span");
-      confirmationMessage.setAttribute("role", "status");
-      confirm.addEventListener("click", async () => {
-        confirm.disabled = true;
-        confirmationMessage.classList.remove("error");
-        confirmationMessage.textContent = "Saving recommended MusicBrainz mapping…";
-        const action = captureDetailActionContext();
-        const endpoint = `/api/anime/${encodeURIComponent(String(currentDetail?.id || ""))}`
-          + `/themes/${encodeURIComponent(String(theme.id))}/mapping`;
-        try {
-          const payload = await api(endpoint, {
-            method: "PUT",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              confirmAutomatic: true,
-              releaseGroup: recommendedId,
-            }),
-            signal: detailSessionAbort.signal,
-          });
-          if (!isCurrentDetailAction(action)) return;
-          updateAnimeThemeMapping(theme, payload);
-        } catch (error) {
-          if (!isCurrentDetailAction(action) || error.name === "AbortError") return;
-          confirmationMessage.classList.add("error");
-          confirmationMessage.textContent = error.message;
-          confirm.disabled = false;
-        }
-      });
-      confirmation.append(confirm, confirmationMessage);
-      container.append(confirmation);
     }
     const proposalReview = currentUser?.role === "admin" && manageMappings
       ? createAnimeProposalReview(theme, mapping)
@@ -2536,7 +3124,24 @@
     title.textContent = String(theme.song?.title || "Untitled theme");
     const artists = document.createElement("p");
     artists.className = "anime-theme-artists";
-    artists.textContent = animeArtistNames(theme.song || {}) || "Unknown artist";
+    (theme.song?.artists || []).forEach((artist: JsonObject | string) => {
+      const name = typeof artist === "string" ? artist : String(artist.name || "");
+      if (!name) return;
+      if (artists.childNodes.length) artists.append(", ");
+      const mbid = typeof artist === "string" ? "" : theme.mapping?.artistLinks?.[String(artist.id)];
+      if (mbid) {
+        const link = document.createElement("a");
+        link.className = "artist-detail-link";
+        link.href = detailPath("artist", String(mbid));
+        link.textContent = name;
+        interceptInternalLink(link, () => showDetail("artist", String(mbid)));
+        addDetailPrefetch(link, "artist", String(mbid));
+        artists.append(link);
+      } else {
+        artists.append(name);
+      }
+    });
+    if (!artists.childNodes.length) artists.textContent = "Unknown artist";
     heading.append(sequence, title, artists);
     const notes = Array.isArray(theme.notes)
       ? theme.notes.filter(Boolean).join("; ")
@@ -2610,10 +3215,7 @@
       const link = document.createElement("a");
       link.href = detailPath("series", slug);
       link.textContent = name;
-      link.addEventListener("click", (event) => {
-        event.preventDefault();
-        showDetail("series", slug);
-      });
+      interceptInternalLink(link, () => showDetail("series", slug));
       addDetailPrefetch(link, "series", slug);
       seriesCopy.append(link);
     });
@@ -2775,6 +3377,7 @@
       link.href = `#${section.id}`;
       link.textContent = sectionLabels[kind];
       link.addEventListener("click", (event) => {
+        if (!isPlainPrimaryClick(event)) return;
         event.preventDefault();
         section.open = true;
         section.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -2840,10 +3443,7 @@
       const link = document.createElement("a");
       link.className = "anime-series-card";
       link.href = detailPath("anime", animeSlug);
-      link.addEventListener("click", (event) => {
-        event.preventDefault();
-        showDetail("anime", animeSlug);
-      });
+      interceptInternalLink(link, () => showDetail("anime", animeSlug));
       addDetailPrefetch(link, "anime", animeSlug);
 
       const artwork = document.createElement("div");
@@ -2932,7 +3532,60 @@
     };
   }
 
-  function createReleaseAnimeThemes(associations: JsonObject[]) {
+  function createArtistAnimeActionCard(association: JsonObject, link: HTMLAnchorElement) {
+    const card = document.createElement("article");
+    card.className = "artist-anime-action-card artist-card";
+    // Keep the navigation anchor and request action as separate controls.
+    link.querySelector(".release-anime-theme-arrow")?.remove();
+    const actions = document.createElement("div");
+    actions.className = "artist-anime-actions";
+    const groups = association.releaseGroups as JsonObject[];
+    let selected = groups.find(group => group.fullyAvailableInLidarr)
+      || groups.find(group => group.preferred)
+      || (groups.length === 1 ? groups[0] : undefined);
+    const button = document.createElement("button");
+    button.className = "request release-group-request";
+    button.type = "button";
+    function updateAction() {
+      card.dataset.releaseGroupId = selected ? String(selected.id) : "";
+      button.disabled = !selected || Boolean(selected.fullyAvailableInLidarr)
+        || Boolean(selected.availabilityPending)
+        || ["queued", "downloading"].includes(String(selected.requestStatus || ""));
+      button.textContent = !selected ? "Choose release"
+        : selected.fullyAvailableInLidarr ? "Available"
+        : ["queued", "downloading"].includes(String(selected.requestStatus || "")) ? requestStatusLabel(selected)
+        : selected.availabilityPending ? "Requested"
+        : selected.availableInLidarr ? "Search missing" : "Request";
+    }
+    if (groups.length > 1) {
+      const select = document.createElement("select");
+      select.setAttribute("aria-label", `Release for ${association.songTitle}`);
+      select.append(new Option("Choose release…", ""));
+      groups.forEach(group => select.append(new Option(
+        `${group.title || group.id}${group.preferred ? " (preferred)" : ""}`, String(group.id),
+      )));
+      select.value = selected ? String(selected.id) : "";
+      select.addEventListener("change", () => {
+        selected = groups.find(group => String(group.id) === select.value);
+        updateAction();
+      });
+      actions.append(select);
+    }
+    button.addEventListener("click", () => {
+      if (!selected) return;
+      void requestReleaseGroup({ id: String(selected.id), button, animeContext: {
+        animeSlug: association.animeSlug, animeName: association.animeName,
+        themeId: String(association.themeId), themeLabel: association.themeLabel,
+        songId: String(association.songId || ""), songTitle: association.songTitle,
+      } });
+    });
+    updateAction();
+    actions.append(button);
+    card.append(link, actions);
+    return card;
+  }
+
+  function createReleaseAnimeThemes(associations: JsonObject[], songFirst = false, artistData?: JsonObject) {
     const section = document.createElement("section");
     section.className = "release-anime-themes";
     const heading = document.createElement("h2");
@@ -2947,12 +3600,25 @@
       link.href = path;
       const copy = document.createElement("span");
       const anime = document.createElement("strong");
-      anime.textContent = String(association.animeName || "Anime");
+      anime.textContent = String(songFirst ? association.songTitle || "Untitled song" : association.animeName || "Anime");
       const theme = document.createElement("span");
-      theme.textContent = [animeAssociationLabel(association), association.songTitle]
+      theme.textContent = [animeAssociationLabel(association), songFirst ? association.animeName : association.songTitle]
         .filter(Boolean)
         .join(" · ");
       copy.append(anime, theme);
+      if (songFirst) {
+        const season = String(association.season || "").trim();
+        const premiere = [
+          season ? season.charAt(0).toUpperCase() + season.slice(1).toLowerCase() : "",
+          association.year,
+        ].filter(Boolean).join(" ");
+        if (premiere) {
+          const date = document.createElement("span");
+          date.className = "anime-premiere";
+          date.textContent = premiere;
+          copy.insertBefore(date, theme);
+        }
+      }
       const arrow = document.createElement("span");
       arrow.className = "release-anime-theme-arrow";
       arrow.setAttribute("aria-hidden", "true");
@@ -2971,7 +3637,11 @@
           );
         });
       }
-      list.append(link);
+      if (artistData && (association.releaseGroups || []).length) {
+        list.append(createArtistAnimeActionCard(association, link));
+      } else {
+        list.append(link);
+      }
     });
     section.append(heading, list);
     return section;
@@ -3241,10 +3911,7 @@
         artistLink.className = "artist-detail-link";
         artistLink.href = detailPath("artist", data.artistId);
         artistLink.textContent = data.artist;
-        artistLink.addEventListener("click", (event) => {
-          event.preventDefault();
-          showDetail("artist", data.artistId);
-        });
+        interceptInternalLink(artistLink, () => showDetail("artist", data.artistId));
         subtitle.append(artistLink);
       } else {
         subtitle.append(data.artist || "");
@@ -3285,6 +3952,9 @@
           releaseGroupDisplayTitle(release),
           [release.date, release.country, release.format, release.trackCount ? `${release.trackCount} tracks` : "", release.status, release.disambiguation].filter(Boolean).join(" · "),
           () => showDetail("release", release.id),
+          release.coverArt,
+          "release",
+          release.id,
         );
         card.dataset.releaseId = String(release.id);
         if (release.availableInPlex) addPlexAvailability(card, "This edition is in Plex");
@@ -3448,7 +4118,14 @@
         } else {
           results.append(type === "artist"
             ? (result.plex ? createPlexArtistCard(result, description, result.plex) : createSearchArtistCard(result, description))
-            : createCard(releaseGroupDisplayTitle(result), description, () => showDetail("release-group", result.id)));
+            : createCard(
+                releaseGroupDisplayTitle(result),
+                description,
+                () => showDetail("release-group", result.id),
+                result.coverArt,
+                "release-group",
+                result.id,
+              ));
         }
       });
     } catch (error) {
@@ -3484,9 +4161,12 @@
   async function loadRecommendations(button: HTMLButtonElement) {
     const requestVersion = ++recommendationRequestVersion;
     recommendationAbort?.abort();
+    clearRecommendationObservers();
+    recommendationFeedback.clear();
     const controller = new AbortController();
     recommendationAbort = controller;
     clearTimeout(recommendationPoll);
+    clearTimeout(chartPoll);
     const message = $("#recommendations-message");
     const results = $("#recommendation-results");
     button.disabled = true;
@@ -3500,10 +4180,21 @@
       const data = await getJson("/api/discover", 30_000, controller.signal);
       if (requestVersion !== recommendationRequestVersion) return;
       results.replaceChildren();
+      if (data.tastePreferences) tastePreferencesPanel(data.tastePreferences);
       if (data.pending) {
-        message.textContent = "Your recommendation cache is being prepared. This page will populate automatically after the background scan finishes.";
+        if (data.popularChart) results.append(popularAlbumSection(data));
+        observeRecommendations();
+        message.textContent = "We’re preparing your first picks. They’ll appear here when ready.";
         recommendationPoll = setTimeout(() => loadRecommendations(button), 15_000);
         return;
+      }
+      recommendationRefreshedAt = Number(data.refreshedAt) || 0;
+      if (recommendationWaitingAfter !== undefined || data.feedVersion !== 5) {
+        if (data.feedVersion === 5 && recommendationRefreshedAt > (recommendationWaitingAfter ?? 0)) {
+          recommendationWaitingAfter = undefined;
+        } else {
+          recommendationPoll = setTimeout(() => loadRecommendations(button), 15_000);
+        }
       }
       const artists = data.artists || [];
       const albums = data.albums || [];
@@ -3518,6 +4209,46 @@
         ? ` ${unavailableProviders.join(" and ")} was temporarily unavailable; available results are shown and a retry is scheduled.`
         : "";
       message.textContent = `Last refreshed ${new Date(data.refreshedAt * 1000).toLocaleString()}.${retryNotice}`;
+      if ([2, 3, 4, 5].includes(data.feedVersion)) {
+        const sections = data.sections || [];
+        sections.forEach((section: JsonObject) => {
+          const row = recommendationRow(section.title,
+            section.items.map((item: JsonObject) => ({ ...item, personalized: true })), "release-group");
+          const description = document.createElement("p");
+          description.className = "recommendation-description";
+          description.textContent = section.description;
+          row.querySelector("h3")?.after(description);
+          results.append(row);
+        });
+        if (data.popularChart) results.append(popularAlbumSection(data));
+        if (!sections.length && !data.popularAlbums?.length
+            && !Object.values(data.popularAlbumsByCountry || {}).some((albums) => Array.isArray(albums) && albums.length)) {
+          message.textContent = "No new picks yet. Request an artist or album to start shaping your recommendations, or link your listening history." + retryNotice;
+        }
+        if (["partial", "unavailable"].includes(data.catalogStatus)) message.textContent += " Some familiar-artist albums couldn’t be checked; we’ll retry shortly.";
+        if (data.requestStatus === "unavailable") message.textContent += " Request-based suggestions are temporarily unavailable; we’ll retry shortly.";
+        if (data.requestStatus === "similarity-unconfigured") message.textContent += " An administrator can connect Last.fm to add similar-artist discoveries from your requests.";
+        if (data.chartArtists?.length) {
+          const browse = document.createElement("details");
+          browse.className = "recommendation-browse";
+          const summary = document.createElement("summary");
+          summary.textContent = "Browse popular music";
+          const note = document.createElement("p");
+          note.className = "field-help";
+          note.textContent = "Global Last.fm charts, independent of your personal picks.";
+          browse.append(summary, note);
+          browse.addEventListener("toggle", () => {
+            if (browse.open && !browse.querySelector(".recommendation-row")) {
+              browse.append(recommendationRow("Popular on Last.fm", data.chartArtists, "artist"));
+            }
+          });
+          results.append(browse);
+        }
+        results.append(recommendationOutcomes());
+        observeRecommendations();
+        pollCountryCharts(data);
+        return;
+      }
       if (artists.length) results.append(recommendationRow("Artists", artists, "artist"));
       if (otherReleases.length) results.append(recommendationRow("Albums", otherReleases, "release-group"));
       if (singles.length) results.append(recommendationRow("Singles", singles, "release-group"));
@@ -3535,15 +4266,28 @@
         : `We couldn’t load recommendations just now. ${error.message}`;
     } finally {
       if (requestVersion === recommendationRequestVersion) {
-        recommendationAbort = undefined;
         button.disabled = false;
         results.removeAttribute("aria-busy");
       }
     }
   }
 
-  $("#load-recommendations").addEventListener("click", () => {
-    loadRecommendations($("#load-recommendations"));
+  $("#load-recommendations").addEventListener("click", async () => {
+    const button = $("#load-recommendations") as unknown as HTMLButtonElement;
+    const version = recommendationRequestVersion;
+    button.disabled = true;
+    try {
+      const data = await postJson("/api/discover/refresh", {}, recommendationAbort?.signal);
+      if (version !== recommendationRequestVersion) return;
+      recommendationWaitingAfter = recommendationRefreshedAt;
+      $("#recommendations-message").textContent = data.message;
+      clearTimeout(recommendationPoll);
+      recommendationPoll = setTimeout(() => loadRecommendations(button), 15_000);
+    } catch (error) {
+      if (version === recommendationRequestVersion && error.name !== "AbortError") showToast(error.message, true);
+    } finally {
+      if (version === recommendationRequestVersion) button.disabled = false;
+    }
   });
   function invalidateAuthenticatedDetailState() {
     detailSessionGeneration += 1;
@@ -3586,6 +4330,15 @@
   });
   window.addEventListener("melodarr-signed-out", () => {
     recommendationRequestVersion += 1;
+    recommendationWaitingAfter = undefined;
+    recommendationRefreshedAt = 0;
+    recommendationChartCountry = "us";
+    recommendationChartFilter = "recent";
+    clearTimeout(chartPoll);
+    tasteAbort?.abort();
+    $("#recommendation-preferences").replaceChildren();
+    recommendationFeedback.clear();
+    clearRecommendationObservers();
     searchRequestVersion += 1;
     recommendationAbort?.abort();
     searchAbort?.abort();

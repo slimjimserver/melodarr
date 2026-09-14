@@ -20,9 +20,9 @@
       <span>melodarr</span>
     </a>
     <nav class="header-nav">
-      <button class="nav-link active" type="button" data-view="discover" aria-current="page">Discover</button>
-      <button class="nav-link" type="button" data-view="library">Your library</button>
-      <button class="nav-link admin-only" type="button" data-view="settings">Settings</button>
+      <a class="nav-link active" href="/" data-view="discover" aria-current="page">Discover</a>
+      <a class="nav-link" href="/library" data-view="library">Your library</a>
+      <a class="nav-link admin-only" href="/settings" data-view="settings">Settings</a>
     </nav>
     <div id="status" class="status" role="status" aria-live="polite">Checking services…</div>
     <button id="theme-toggle" class="theme-toggle" type="button">
@@ -143,7 +143,7 @@
     <section id="discover" class="view active">
       <p class="eyebrow">FIND YOUR NEXT FAVORITE</p>
       <h1>What do you want<br>to hear <em>next?</em></h1>
-      <p class="intro">Explore MusicBrainz directly or discover recommendations shaped around your listening history.</p>
+      <p class="intro">Explore MusicBrainz directly or discover recommendations shaped around your requests and listening.</p>
       <form id="search-form" class="search">
         <select id="search-type" aria-label="Search type">
           <option value="artist">Artists</option>
@@ -158,10 +158,11 @@
       <div id="results" class="results" aria-label="Search results"></div>
       <section class="recommendations" aria-labelledby="recommendations-title">
         <div class="recommendations-heading">
-          <div><p class="eyebrow">LINKED ACCOUNTS</p><h2 id="recommendations-title">Recommended for you</h2></div>
-          <button id="load-recommendations" class="outline" type="button">Get recommendations</button>
+          <div><p class="eyebrow">YOUR NEXT FAVORITE</p><h2 id="recommendations-title">Recommended for you</h2></div>
+          <button id="load-recommendations" class="outline" type="button">Refresh picks</button>
         </div>
-        <p id="recommendations-message" class="message" aria-live="polite">Connect ListenBrainz or Last.fm in Linked accounts and we’ll shape recommendations around what you love.</p>
+        <p id="recommendations-message" class="message" aria-live="polite">Your requests and listening help us find your next favorite. Tell us what catches your ear.</p>
+        <div id="recommendation-preferences"></div>
         <div id="recommendation-results" aria-label="Music recommendations"></div>
       </section>
     </section>
@@ -203,11 +204,11 @@
       </div>
 
       <div class="settings-tabs" role="tablist" aria-label="Settings sections">
-        <button id="settings-tab-services" class="active" type="button" role="tab" aria-selected="true" aria-controls="settings-services" data-settings-page="services">Services</button>
-        <button id="settings-tab-notifications" type="button" role="tab" aria-selected="false" aria-controls="settings-notifications" tabindex="-1" data-settings-page="notifications">Notifications</button>
-        <button id="settings-tab-requests" type="button" role="tab" aria-selected="false" aria-controls="settings-requests" tabindex="-1" data-settings-page="requests">Requests</button>
-        <button id="settings-tab-users" type="button" role="tab" aria-selected="false" aria-controls="settings-users" tabindex="-1" data-settings-page="users">Users</button>
-        <button id="settings-tab-jobs" type="button" role="tab" aria-selected="false" aria-controls="settings-jobs" tabindex="-1" data-settings-page="jobs">Jobs &amp; Cache</button>
+        <a id="settings-tab-services" class="active" href="/settings" role="tab" aria-selected="true" aria-controls="settings-services" data-settings-page="services">Services</a>
+        <a id="settings-tab-notifications" href="/settings/notifications" role="tab" aria-selected="false" aria-controls="settings-notifications" tabindex="-1" data-settings-page="notifications">Notifications</a>
+        <a id="settings-tab-requests" href="/settings/requests" role="tab" aria-selected="false" aria-controls="settings-requests" tabindex="-1" data-settings-page="requests">Requests</a>
+        <a id="settings-tab-users" href="/settings/users" role="tab" aria-selected="false" aria-controls="settings-users" tabindex="-1" data-settings-page="users">Users</a>
+        <a id="settings-tab-jobs" href="/settings/jobs" role="tab" aria-selected="false" aria-controls="settings-jobs" tabindex="-1" data-settings-page="jobs">Jobs &amp; Cache</a>
       </div>
 
       <div id="settings-services" class="settings-stack settings-panel" role="tabpanel" aria-labelledby="settings-tab-services" tabindex="0">
@@ -519,9 +520,9 @@
     </form>
   </dialog>
   <nav class="tab-bar" aria-label="Primary">
-    <button class="nav-link active" type="button" data-view="discover" aria-current="page"><span class="tab-icon" aria-hidden="true">◎</span>Discover</button>
-    <button class="nav-link" type="button" data-view="library"><span class="tab-icon" aria-hidden="true">▤</span>Library</button>
-    <button class="nav-link admin-only" type="button" data-view="settings"><span class="tab-icon" aria-hidden="true">⚙</span>Settings</button>
+    <a class="nav-link active" href="/" data-view="discover" aria-current="page"><span class="tab-icon" aria-hidden="true">◎</span>Discover</a>
+    <a class="nav-link" href="/library" data-view="library"><span class="tab-icon" aria-hidden="true">▤</span>Library</a>
+    <a class="nav-link admin-only" href="/settings" data-view="settings"><span class="tab-icon" aria-hidden="true">⚙</span>Settings</a>
   </nav>
   <div id="toasts" class="toasts" aria-live="polite" aria-atomic="false"></div>
   <button id="back-to-top" type="button" aria-label="Back to top">↑ <span>Top</span></button>

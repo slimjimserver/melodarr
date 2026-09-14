@@ -17,7 +17,7 @@ if __package__ == "backend.routes":
     )
     from ..responses import api_error
     from ..security import login_required
-    from ..services import anime_theme_links, lastfm, lidarr, musicbrainz, plex
+    from ..services import anime_artist_links, anime_theme_links, lastfm, lidarr, musicbrainz, plex
     from ..storage import (
         get_lastfm_api_key,
         get_service,
@@ -34,7 +34,7 @@ else:
     )
     from responses import api_error
     from security import login_required
-    from services import anime_theme_links, lastfm, lidarr, musicbrainz, plex
+    from services import anime_artist_links, anime_theme_links, lastfm, lidarr, musicbrainz, plex
     from storage import (
         get_lastfm_api_key,
         get_service,
@@ -420,8 +420,12 @@ def _artist_detail_payload(
     pending_groups = pending_lidarr_search_mbids(
         group.get("id") for group in raw_groups
     )
+    anime_names = anime_theme_links.anime_names_for_release_groups(
+        group.get("id") for group in raw_groups
+    )
     groups = [
         {
+            "animeNames": anime_names.get(str(group["id"]).casefold(), []),
             "id": group["id"], "title": group.get("title", "Untitled"),
             "romanizedTitle": musicbrainz.romanized_release_group_title(group),
             "date": group.get("first-release-date", ""),
@@ -489,6 +493,9 @@ def _lidarr_artist_detail_payload(mbid):
         return None
     artist_id = artist.get("id")
     albums = lidarr.albums_by_artist(artist_id, config) if artist_id is not None else []
+    anime_names = anime_theme_links.anime_names_for_release_groups(
+        album.get("foreignAlbumId") for album in albums
+    )
     plex_groups = _plex_release_group_inventory()
     groups = []
     for album in albums:
@@ -500,6 +507,7 @@ def _lidarr_artist_detail_payload(mbid):
         ]
         groups.append({
             "id": group_id,
+            "animeNames": anime_names.get(str(group_id).casefold(), []),
             "title": album.get("title") or "Untitled",
             "romanizedTitle": musicbrainz.romanized_release_group_title({
                 "title": album.get("title"),
@@ -887,3 +895,38 @@ def release_detail(mbid):
             return detail_cache.payload_response(cache_key, payload, generation)
     except requests.RequestException:
         return api_error("MusicBrainz could not load this release.", 502)
+
+
+@blueprint.get("/api/music/artist/<mbid>/anime")
+@login_required
+def artist_anime(mbid):
+    try:
+        payload = anime_artist_links.appearances(mbid)
+        performances = [
+            performance for anime in payload["anime"]
+            for performance in anime.get("performances") or []
+        ]
+        targets = anime_theme_links.release_groups_for_performances(performances)
+        group_ids = {group["id"] for groups in targets.values() for group in groups}
+        library = lidarr.cached_library_availability() if group_ids else {}
+        downloads = _download_snapshot() if group_ids else {}
+        pending = pending_lidarr_search_mbids(group_ids) if group_ids else set()
+        for performance in performances:
+            groups = targets.get((performance["animeSlug"], performance["themeId"]), [])
+            performance["releaseGroups"] = []
+            for group in groups:
+                group_id = group["id"].casefold()
+                album = library.get(group_id)
+                status, download = _release_group_lifecycle(
+                    group_id, album, downloads.get(group_id), group_id in pending,
+                )
+                performance["releaseGroups"].append({
+                    **group, "availableInLidarr": bool(album),
+                    "fullyAvailableInLidarr": bool(album and album.get("fullyAvailable")),
+                    "requestStatus": status, "downloadStatus": download,
+                })
+        return jsonify(payload)
+    except ValueError:
+        return api_error("Invalid artist ID.", 400)
+    except requests.RequestException:
+        return api_error("Anime appearances could not be loaded. Try again shortly.", 502)

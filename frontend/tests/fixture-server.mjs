@@ -61,6 +61,35 @@ function artistDetail() {
   };
 }
 
+function releaseGroupDetail() {
+  return {
+    id: "fixture-album",
+    title: "Fixture Album",
+    artist: "Fixture Artist",
+    artistId: "fixture-artist",
+    releases: [{
+      id: "fixture-release",
+      title: "Fixture Album",
+      date: "2026-01-01",
+      country: "US",
+      format: "CD",
+      trackCount: 1,
+      status: "Official",
+    }],
+  };
+}
+
+function releaseDetail() {
+  return {
+    id: "fixture-release",
+    title: "Fixture Album",
+    artist: "Fixture Artist",
+    date: "2026-01-01",
+    country: "US",
+    tracks: [{ number: 1, title: "Fixture Track", artist: "Fixture Artist" }],
+  };
+}
+
 const similarArtists = Array.from({ length: 18 }, (_, index) => ({
   id: `similar-${index + 1}`,
   name: `Similar Artist ${index + 1}`,
@@ -154,6 +183,12 @@ const server = createServer(async (request, response) => {
   }
   if (url.pathname === "/api/music/artist/fixture-artist") {
     return send(response, 200, artistDetail());
+  }
+  if (url.pathname === "/api/music/release-group/fixture-album") {
+    return send(response, 200, releaseGroupDetail());
+  }
+  if (url.pathname === "/api/music/release/fixture-release") {
+    return send(response, 200, releaseDetail());
   }
   if (url.pathname === "/api/anime/switching-anime") {
     return send(response, 200, animeDetail());

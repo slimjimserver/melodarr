@@ -167,6 +167,10 @@ def registry_document(
 class AnimeMusicBrainzResolverTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="melodarr-anime-tests-")
+        database_patch = patch.object(storage, "DATABASE", os.path.join(self.temporary.name, "app.db"))
+        database_patch.start()
+        self.addCleanup(database_patch.stop)
+        storage.init_db()
         self.original_cache_database = api_cache.CACHE_DATABASE
         api_cache.CACHE_DATABASE = os.path.join(self.temporary.name, "metadata.db")
         api_cache.init_cache_db()
@@ -432,6 +436,30 @@ class AnimeMusicBrainzResolverTests(unittest.TestCase):
         self.assertIn("alias:", search.call_args_list[0].args[0])
         self.musicbrainz_get.assert_not_called()
 
+    @patch("backend.services.anime_musicbrainz.musicbrainz.search")
+    def test_verified_identity_skips_name_search_and_expands_recording_releases(self, search):
+        search.return_value = {"recordings": [recording(releases=[])]}
+        self.musicbrainz_get.return_value = {"releases": [
+            release("album", "Album", primary_type="Album"), release("single", "Single")]}
+        result = anime_musicbrainz.resolve_theme(
+            theme(), verified_artists={"ASIAN KUNG-FU GENERATION": "artist-1"})
+        self.assertEqual(result["state"], "resolved")
+        self.assertEqual(result["preferredReleaseGroupId"], "single")
+        self.assertEqual(search.call_count, 1)
+        self.musicbrainz_get.assert_called_once_with(
+            "/release", "release-groups+artist-credits", recording="recording-1",
+            limit=100, offset=0, priority="background")
+
+    def test_tv_edits_are_not_automatically_selected_as_studio_recordings(self):
+        for version in ("TV size", "TV edit", "TV version", "short version"):
+            with self.subTest(version=version):
+                self.assertTrue(anime_musicbrainz._has_version_marker(recording(disambiguation=version)))
+
+    def test_verified_identity_rejects_same_name_with_different_mbid(self):
+        self.assertFalse(anime_musicbrainz._credits_match(
+            ["ALI"], [[{"id": "correct", "verified": True}]],
+            recording(artist_name="ALI", artist_id="wrong")))
+
     def test_release_groups_prioritize_singles_and_lower_special_editions(self):
         groups = anime_musicbrainz._release_groups(
             recording(
@@ -462,11 +490,11 @@ class AnimeMusicBrainzResolverTests(unittest.TestCase):
             [group["id"] for group in groups],
             [
                 "group-single",
+                "group-ep",
+                "group-album",
                 "group-compilation",
                 "group-dj-mix",
                 "group-live",
-                "group-ep",
-                "group-album",
             ],
         )
 

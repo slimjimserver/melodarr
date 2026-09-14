@@ -71,7 +71,7 @@ header {
 .eyebrow, h1 em { color: var(--accent-bright); }
 nav { display: flex; height: 100%; gap: 8px; }
 .nav-link, .logout, button { font-family: inherit; }
-.nav-link { border: 0; border-bottom: 1px solid transparent; background: transparent; color: var(--foreground-muted); cursor: pointer; padding: 0 10px; transition: color .2s var(--ease-out), border-color .2s var(--ease-out); font-size: 13px; font-weight: 500; }
+.nav-link { display: inline-flex; align-items: center; border: 0; border-bottom: 1px solid transparent; background: transparent; color: var(--foreground-muted); cursor: pointer; padding: 0 10px; transition: color .2s var(--ease-out), border-color .2s var(--ease-out); font-size: 13px; font-weight: 500; text-decoration: none; }
 .nav-link.active { border-color: var(--accent); color: var(--foreground); }
 .status { margin-left: auto; color: var(--foreground-muted); font-size: 12px; }
 .status.ready { color: var(--success); }
@@ -88,7 +88,8 @@ nav { display: flex; height: 100%; gap: 8px; }
 .tab-bar { display: none; }
 
 .auth-view { display: grid; min-height: 100vh; place-items: center; padding: 32px 24px; }
-.auth-card, .setup-card, .artist-card, .service-card, .artist-meta, .library-card, .discography-nav, .discography-similar-nav {
+.auth-card, .setup-card, .artist-card, .service-card, .artist-meta, .library-card, .discography-nav, .discography-similar-nav,
+:where(#artist-anime) .release-anime-theme-link {
   position: relative; overflow: hidden; border: 1px solid var(--border); background: rgba(255, 252, 247, .88);
   box-shadow: 0 10px 30px rgba(68, 50, 38, .07), inset 0 1px rgba(255, 255, 255, .8);
 }
@@ -184,11 +185,11 @@ h1 em { font-style: normal; }
 .recommendations-heading h2 { margin: 0; font-size: 27px; letter-spacing: -.04em; }
 .recommendation-row { min-width: 0; margin-top: 30px; content-visibility: auto; contain-intrinsic-size: auto 270px; }
 .recommendation-row h3 { margin: 0 0 12px; font-size: 17px; letter-spacing: -.02em; }
-.recommendation-carousel { display: flex; width: 100%; max-width: 100%; gap: 13px; overflow-x: auto; overflow-y: hidden; padding: 2px 2px 14px; scroll-snap-type: x proximity; scrollbar-color: var(--border-hover) transparent; -webkit-overflow-scrolling: touch; overscroll-behavior-x: contain; touch-action: pan-x; }
+.recommendation-carousel { display: flex; width: 100%; max-width: 100%; gap: 13px; overflow-x: auto; overflow-y: hidden; padding: 2px 2px 14px; scroll-snap-type: x proximity; scrollbar-color: var(--border-hover) transparent; -webkit-overflow-scrolling: touch; overscroll-behavior-x: contain; touch-action: pan-x pan-y pinch-zoom; }
 .recommendation-carousel::-webkit-scrollbar { height: 7px; }
 .recommendation-carousel::-webkit-scrollbar-thumb { border-radius: 999px; background: var(--border-hover); }
 .recommendation-card { position: relative; display: grid; flex: 0 0 154px; gap: 8px; scroll-snap-align: start; cursor: pointer; outline: none; }
-.recommendation-open { display: grid; position: relative; min-width: 0; gap: 8px; border: 0; background: transparent; color: inherit; padding: 0; cursor: pointer; text-align: left; }
+.recommendation-open { display: grid; position: relative; min-width: 0; gap: 8px; border: 0; background: transparent; color: inherit; padding: 0; cursor: pointer; text-align: left; text-decoration: none; }
 .recommendation-open:focus-visible .recommendation-art { border-color: var(--accent-bright); box-shadow: 0 10px 25px rgba(68, 50, 38, .16), 0 0 0 2px rgba(168, 68, 45, .18); transform: translateY(-2px); }
 .recommendation-art { display: block; width: 154px; aspect-ratio: 1; border: 1px solid var(--border); border-radius: 12px; background: var(--background-elevated); object-fit: cover; transition: transform .2s var(--ease-out), border-color .2s var(--ease-out), box-shadow .2s var(--ease-out); }
 .recommendation-fallback { background: linear-gradient(135deg, #7f89ed, #252951 62%, #be6a9b); }
@@ -203,12 +204,12 @@ h1 em { font-style: normal; }
 
 .artist-card { display: flex; align-items: center; gap: 15px; border-radius: 14px; padding: 14px 16px; transition: border-color .25s var(--ease-out), background .25s var(--ease-out), box-shadow .25s var(--ease-out), transform .25s var(--ease-out); }
 .artist-card.clickable { cursor: default; }
-.card-open { display: flex; min-width: 0; flex: 1; align-items: center; gap: 15px; border: 0; background: transparent; color: inherit; padding: 0; cursor: pointer; text-align: left; }
+.card-open { display: flex; min-width: 0; flex: 1; align-items: center; gap: 15px; border: 0; background: transparent; color: inherit; padding: 0; cursor: pointer; text-align: left; text-decoration: none; }
 .avatar { width: 44px; height: 44px; flex: none; border: 1px solid var(--border); border-radius: 50%; background: linear-gradient(135deg, #e3ad8f, #c97459 54%, #8375a8); }
 .cover-art { width: 44px; height: 44px; flex: none; border: 1px solid rgba(255, 255, 255, .1); border-radius: 10px; background: var(--background-elevated); object-fit: cover; }
 .artist-info { min-width: 0; flex: 1; }
 .artist-info h2 { margin: 0 0 3px; font-size: 15px; letter-spacing: -.02em; }
-.artist-info p, .library-card span { margin: 0; color: var(--foreground-muted); font-size: 13px; }
+.artist-info p, .library-card span, .release-anime-theme-link .anime-premiere { margin: 0; color: var(--foreground-muted); font-size: 13px; }
 .artist-card .request { display: inline-flex; align-items: center; justify-content: center; min-height: 40px; border-radius: 7px; padding: 0 14px; font-size: 12px; text-decoration: none; }
 .service-icon-link { display: inline-flex; align-items: center; justify-content: center; width: 44px; height: 44px; border: 1px solid rgba(168, 68, 45, .35); border-radius: 11px; padding: 10px; transition: background .18s var(--ease-out); }
 .service-icon-link img { display: block; width: 100%; height: 100%; object-fit: contain; }
@@ -278,7 +279,7 @@ h1 em { font-style: normal; }
 .library-filter span, .discography-filter span { min-width: 92px; color: var(--foreground-muted); padding-bottom: 12px; font-size: 12px; text-align: right; white-space: nowrap; }
 .library-results { display: grid; grid-template-columns: repeat(auto-fill, minmax(175px, 1fr)); gap: 12px; }
 .library-render-sentinel { grid-column: 1 / -1; height: 1px; }
-.library-card { display: flex; min-width: 0; flex-direction: column; overflow: hidden; border-radius: 14px; padding: 0; content-visibility: auto; contain-intrinsic-size: 260px; transition: transform .25s var(--ease-out), border-color .25s var(--ease-out); }
+.library-card { display: flex; min-width: 0; flex-direction: column; overflow: hidden; border-radius: 14px; color: inherit; padding: 0; content-visibility: auto; contain-intrinsic-size: 260px; text-decoration: none; transition: transform .25s var(--ease-out), border-color .25s var(--ease-out); }
 .library-artwork { width: 100%; aspect-ratio: 1; overflow: hidden; border-bottom: 1px solid var(--border); background: linear-gradient(135deg, #e3ad8f, #c97459 54%, #8375a8); }
 .library-artwork img { display: block; width: 100%; height: 100%; object-fit: cover; }
 .library-card-info { display: flex; min-width: 0; flex-direction: column; padding: 14px 16px 16px; }
@@ -407,8 +408,8 @@ h1 em { font-style: normal; }
 .settings-hero > p { margin: 0 0 8px; color: var(--foreground-muted); font-size: 15px; line-height: 1.6; }
 .settings-stack { max-width: 860px; }
 .settings-tabs { display: flex; max-width: 860px; gap: 5px; margin: -26px 0 30px; border-bottom: 1px solid var(--border); }
-.settings-tabs button { border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: transparent; color: var(--foreground-muted); padding: 12px 14px 10px; box-shadow: none; }
-.settings-tabs button.active { border-bottom-color: var(--accent-bright); color: var(--foreground); background: rgba(168, 68, 45, .07); }
+.settings-tabs a { display: inline-flex; align-items: center; justify-content: center; border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: transparent; color: var(--foreground-muted); padding: 12px 14px 10px; box-shadow: none; text-align: center; text-decoration: none; }
+.settings-tabs a.active { border-bottom-color: var(--accent-bright); color: var(--foreground); background: rgba(168, 68, 45, .07); }
 .settings-panel[hidden] { display: none; }
 .settings-section { max-width: none; border-top: 1px solid var(--border); padding: 28px 0 34px; }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; margin: -1px; clip: rect(0 0 0 0); white-space: nowrap; }
@@ -573,10 +574,11 @@ dialog::backdrop { background: rgba(48, 39, 32, .52); }
 .profile-summary { display: flex; align-items: center; gap: 15px; border: 1px solid var(--border); border-radius: 14px; background: rgba(255, 250, 243, .7); padding: 18px; }
 .profile-summary h2 { margin-bottom: 4px; }
 .profile-summary p { margin: 0; color: var(--foreground-muted); font-size: 12px; }
-.history-item { display: flex; align-items: center; border: 1px solid var(--border); border-radius: 11px; background: rgba(255, 250, 243, .7); color: var(--foreground); overflow: hidden; transition: border-color .2s var(--ease-out), background .2s var(--ease-out); }
+.history-item { display: block; min-width: 0; border: 1px solid var(--border); border-radius: 11px; background: rgba(255, 250, 243, .7); color: var(--foreground); overflow: hidden; transition: border-color .2s var(--ease-out), background .2s var(--ease-out); }
 .request-lifecycle { display: inline-flex; width: fit-content; margin-top: 5px; border-radius: 999px; background: rgba(90, 112, 79, .1); color: var(--success); padding: 3px 7px; font-size: 11px; font-weight: 700; }
 .request-lifecycle.requested { background: var(--requested-surface); color: var(--requested); }
-.history-item > .request-lifecycle { margin-right: 10px; }
+.history-main { display: flex; align-items: center; min-width: 0; }
+.history-copy > .request-lifecycle { margin-top: 2px; }
 .history-detail { display: flex; flex: 1; align-items: center; justify-content: space-between; min-width: 0; gap: 16px; color: var(--foreground); padding: 11px 15px; text-decoration: none; }
 .history-copy { display: grid; min-width: 0; gap: 4px; }
 .history-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; font-weight: 700; }
@@ -651,13 +653,13 @@ details summary { margin-bottom: 17px; color: var(--accent-bright); cursor: poin
   .anime-candidate-confirm:hover:not(:disabled) { background: rgba(50, 108, 74, .14); }
   .recommendation-card:hover .recommendation-art { border-color: var(--accent-bright); box-shadow: 0 10px 25px rgba(0, 0, 0, .35), 0 0 0 2px rgba(94, 106, 210, .22); transform: translateY(-2px); }
   .recommendation-request:hover { border-color: var(--accent); background: rgba(94, 106, 210, .22); }
-  .artist-card:hover, .service-card:hover { border-color: var(--border-hover); background: #fffdf9; box-shadow: 0 14px 34px rgba(68, 50, 38, .1); transform: translateY(-2px); }
+  .artist-card:hover, .service-card:hover, :where(#artist-anime) .release-anime-theme-link:hover { border-color: var(--border-hover); background: #fffdf9; box-shadow: 0 14px 34px rgba(68, 50, 38, .1); transform: translateY(-2px); }
   .service-icon-link:hover { background: rgba(168, 68, 45, .1); }
   .external-icons :is(a, .notification-mute):hover:not(:disabled) { border-color: var(--accent); background: rgba(168, 68, 45, .1); transform: translateY(-1px); }
   .discography-nav a:hover, .discography-similar-nav:hover { background: var(--surface); color: var(--accent-bright); }
   .type-filter:hover { border-color: var(--border-hover); color: var(--foreground); }
   .library-card:hover { border-color: var(--border-hover); transform: translateY(-3px); }
-  .settings-tabs button:hover { border-bottom-color: var(--accent-bright); color: var(--foreground); background: rgba(168, 68, 45, .07); }
+  .settings-tabs a:hover { border-bottom-color: var(--accent-bright); color: var(--foreground); background: rgba(168, 68, 45, .07); }
   .maintenance-table button:hover { border-color: rgba(255, 157, 157, .72); background: rgba(255, 116, 126, .16); color: #ffc0c0; box-shadow: 0 5px 15px rgba(120, 28, 38, .18), inset 0 1px rgba(255, 255, 255, .08); transform: translateY(-1px); }
   .maintenance-table .run-job:hover { border-color: rgba(146, 156, 255, .82); background: var(--accent-bright); color: #fff; box-shadow: 0 0 0 1px rgba(125, 137, 246, .38), 0 7px 18px rgba(94, 106, 210, .34), inset 0 1px rgba(255, 255, 255, .24); }
   .option-choice:hover span { border-color: var(--border-hover); background: var(--surface-hover); color: var(--foreground); transform: translateY(-1px); }
@@ -931,8 +933,8 @@ button,
   .search button { width: 100%; }
 
   .settings-tabs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; border-bottom: 0; overflow: visible; }
-  .settings-tabs button { min-width: 0; min-height: 44px; border: 1px solid var(--border); border-radius: 10px; padding: 8px 6px; line-height: 1.2; }
-  .settings-tabs button.active { border-color: var(--accent-bright); }
+  .settings-tabs a { min-width: 0; min-height: 44px; align-content: center; border: 1px solid var(--border); border-radius: 10px; padding: 8px 6px; line-height: 1.2; }
+  .settings-tabs a.active { border-color: var(--accent-bright); }
 }
 
 /* Theme control and palettes. Midnight intentionally restores Melodarr's
@@ -998,6 +1000,7 @@ button,
 :root[data-theme="midnight"] .auth-card,
 :root[data-theme="midnight"] .setup-card,
 :root[data-theme="midnight"] .artist-card,
+:root[data-theme="midnight"] :where(#artist-anime) .release-anime-theme-link,
 :root[data-theme="midnight"] .service-card,
 :root[data-theme="midnight"] .artist-meta,
 :root[data-theme="midnight"] .notification-card,
@@ -1086,7 +1089,7 @@ button,
   box-shadow: 0 14px 40px rgba(0, 0, 0, .5);
 }
 :root[data-theme="midnight"] .toast.error { border-color: rgba(255, 157, 157, .5); color: #ffc0c0; }
-:root[data-theme="midnight"] .settings-tabs button.active,
+:root[data-theme="midnight"] .settings-tabs a.active,
 :root[data-theme="midnight"] .account-nav a.active { background: rgba(94, 106, 210, .16); }
 :root[data-theme="midnight"] .maintenance-table-wrap,
 :root[data-theme="midnight"] .option-picker,
@@ -1144,13 +1147,14 @@ button,
     box-shadow: 0 0 0 1px rgba(125, 137, 246, .75), 0 8px 22px rgba(94, 106, 210, .38), inset 0 1px rgba(255, 255, 255, .22);
   }
   :root[data-theme="midnight"] .artist-card:hover,
+  :root[data-theme="midnight"] :where(#artist-anime) .release-anime-theme-link:hover,
   :root[data-theme="midnight"] .service-card:hover {
     background: linear-gradient(145deg, rgba(255, 255, 255, .095), rgba(255, 255, 255, .035));
     box-shadow: 0 0 0 1px rgba(255, 255, 255, .04), 0 16px 42px rgba(0, 0, 0, .36), 0 0 70px rgba(94, 106, 210, .1), inset 0 1px rgba(255, 255, 255, .08);
   }
   :root[data-theme="midnight"] .service-icon-link:hover,
   :root[data-theme="midnight"] .external-icons :is(a, .notification-mute):hover:not(:disabled) { background: var(--accent); }
-  :root[data-theme="midnight"] .settings-tabs button:hover,
+  :root[data-theme="midnight"] .settings-tabs a:hover,
   :root[data-theme="midnight"] .account-nav a:hover { background: rgba(94, 106, 210, .16); }
 }
 
@@ -1195,4 +1199,159 @@ button,
 
 @media (max-width: 360px) {
   header { gap: 8px; padding-right: 8px; padding-left: 8px; }
+}
+
+/* Personal recommendations give the reason and decision controls room to breathe. */
+.recommendation-card[data-personal-recommendation] { flex-basis: 210px; align-content: start; cursor: default; }
+.recommendation-card[data-personal-recommendation] .recommendation-art { width: 100%; }
+.recommendation-card[data-personal-recommendation] .recommendation-info strong,
+.recommendation-card[data-personal-recommendation] .recommendation-info span { white-space: normal; }
+.recommendation-reason { margin: 0; color: var(--foreground-muted); font-size: 12px; line-height: 1.5; min-height: 54px; }
+.recommendation-description { color: var(--foreground-muted); font-size: 13px; margin: -4px 0 16px; line-height: 1.5; }
+.recommendation-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; }
+.recommendation-actions a, .recommendation-actions button { color: var(--foreground-muted); font: inherit; font-size: 12px; min-height: 44px; display: inline-flex; align-items: center; padding: 4px 0; border: 0; background: transparent; cursor: pointer; text-align: left; }
+.recommendation-actions button[aria-pressed="true"] { color: var(--accent-bright); }
+.recommendation-actions a:hover, .recommendation-actions button:hover { color: var(--foreground); text-decoration: underline; }
+.recommendation-browse, .recommendation-outcomes { margin-top: 28px; border-top: 1px solid var(--border); padding-top: 20px; }
+.recommendation-browse summary, .recommendation-outcomes summary { cursor: pointer; min-height: 44px; align-content: center; }
+@media (max-width: 700px) {
+  .recommendation-card[data-personal-recommendation] { flex-basis: 176px; }
+  .recommendation-card[data-personal-recommendation] .recommendation-art { height: 176px; }
+}
+
+.popular-albums { margin-top: 32px; }
+.popular-albums h3 { margin: 0 0 12px; font-size: 17px; letter-spacing: -.02em; }
+.popular-albums-controls { display: flex; flex-wrap: wrap; gap: 12px 24px; }
+.popular-albums-filter { min-width: 0; max-width: 100%; display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--foreground-muted); }
+.popular-albums-filter select { width: auto; min-width: 0; max-width: 100%; min-height: 44px; }
+.popular-albums-results .recommendation-row { margin-top: 16px; }
+
+/* A compact disclosure opens into a focused taste editor. */
+.taste-preferences { padding: 0; margin: 18px 0 24px; max-width: 880px; border: 1px solid var(--border); border-radius: 16px; background: var(--surface); overflow: hidden; }
+.taste-preferences > summary { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin: 0; padding: 18px 20px; min-height: 72px; list-style: none; cursor: pointer; color: var(--foreground); }
+.taste-preferences > summary::-webkit-details-marker { display: none; }
+.taste-summary-copy { display: grid; gap: 5px; min-width: 0; }
+.taste-summary-copy strong { font-size: 14px; font-weight: 600; letter-spacing: -.02em; }
+.taste-summary-meta { font-size: 12px; color: var(--foreground-muted); }
+.taste-chevron { width: 8px; height: 8px; flex: none; border-right: 1.5px solid var(--foreground-muted); border-bottom: 1.5px solid var(--foreground-muted); transform: rotate(45deg); transition: transform .2s var(--ease-out); margin: 0 3px 4px; }
+.taste-preferences[open] .taste-chevron { transform: rotate(225deg); margin-bottom: -4px; }
+.taste-preferences[open] > summary { border-bottom: 1px solid var(--border); }
+.taste-preferences form { padding: 22px 20px 16px; }
+.taste-preferences fieldset { min-width: 0; margin: 0; border: 0; padding: 0; }
+.taste-layout { display: grid; grid-template-columns: 1fr 1fr; gap: 32px; }
+.taste-layout section { min-width: 0; }
+.taste-preferences legend, .taste-section-heading label { font-size: 13px; font-weight: 600; color: var(--foreground); padding: 0; }
+.taste-preferences .field-help { margin: 8px 0 16px; line-height: 1.6; font-size: 12px; }
+.taste-mix-options { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 3px; padding: 4px; background: var(--background-base); border: 1px solid var(--border); border-radius: 11px; }
+.taste-mix-options label { position: relative; display: block; min-width: 0; margin: 0; cursor: pointer; }
+.taste-mix-options input { position: absolute; inset: 0; opacity: 0; width: 100%; height: 100%; margin: 0; z-index: 1; cursor: pointer; }
+.taste-mix-options span { display: grid; place-items: center; min-height: 44px; border: 1px solid transparent; border-radius: 7px; padding: 8px 3px; font-size: 12px; font-weight: 500; color: var(--foreground-muted); }
+.taste-mix-options input:checked + span { background: var(--background-elevated); color: var(--accent-bright); border-color: var(--border-hover); box-shadow: 0 2px 5px rgba(0, 0, 0, .05); }
+.taste-mix-options input:focus-visible + span { outline: 2px solid var(--accent-bright); outline-offset: 2px; }
+.taste-mix-options input:disabled + span { opacity: .6; cursor: wait; }
+.taste-preview-heading { display: flex; justify-content: space-between; margin: 20px 0 6px; font-size: 11px; color: var(--foreground-muted); }
+.taste-row-preview { list-style: none; margin: 0; padding: 0; display: grid; }
+.taste-row-preview li { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 0; border-bottom: 1px solid var(--border); font-size: 12px; color: var(--foreground-subtle); }
+.taste-row-preview li:first-child { color: var(--foreground); }
+.taste-row-preview li:last-child { border-bottom: 0; }
+.taste-row-count { display: grid; place-items: center; flex: none; width: 25px; height: 25px; border-radius: 7px; background: var(--accent-glow); color: var(--accent-bright); font-variant-numeric: tabular-nums; }
+.taste-fine-print { margin: 10px 0 0; font-size: 11px; color: var(--foreground-muted); line-height: 1.6; }
+.taste-section-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.taste-artist-count { font-size: 11px; color: var(--foreground-muted); font-variant-numeric: tabular-nums; }
+.taste-artists { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 12px; }
+.taste-artists:empty { display: none; }
+.taste-artists .taste-artist-chip { white-space: normal; overflow-wrap: anywhere; min-height: 44px; border-radius: 24px; padding: 8px 12px; border: 1px solid var(--border); background: var(--background-elevated); color: var(--foreground-subtle); font-size: 12px; font-weight: 400; box-shadow: none; }
+.taste-search-box { display: flex; gap: 8px; }
+.taste-search-box input { min-width: 0; width: 100%; flex: 1; min-height: 44px; margin: 0; font-size: 13px; }
+.taste-search-box .taste-search { flex: none; min-height: 44px; padding: 8px 12px; font-size: 12px; }
+.taste-search-results { display: grid; max-height: 260px; overflow-y: auto; margin-top: 8px; border: 1px solid var(--border); border-radius: 10px; font-size: 12px; }
+.taste-search-results:empty { display: none; }
+.taste-search-results .taste-artist-result { min-height: 44px; padding: 12px; border: 0; border-bottom: 1px solid var(--border); border-radius: 0; background: transparent; color: var(--foreground); text-align: left; white-space: normal; overflow-wrap: anywhere; font-size: 12px; font-weight: 400; box-shadow: none; }
+.taste-search-results .taste-artist-result:last-child { border-bottom: 0; }
+.taste-artist-result:hover, .taste-artist-chip:hover { background: var(--accent-glow); }
+.taste-footer { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--border); }
+.taste-save-state { font-size: 11px; color: var(--foreground-muted); }
+.taste-footer .taste-save { min-height: 44px; padding: 10px 16px; font-size: 12px; }
+.taste-preferences .taste-status { font-size: 12px; margin: 12px 0 0; }
+.taste-status:empty { display: none; }
+.taste-request-note { border-top: 1px solid var(--border); margin: 16px 0 0; padding-top: 14px; color: var(--foreground-muted); font-size: 11px; line-height: 1.6; }
+.taste-request-note strong { font-weight: 500; color: var(--foreground-subtle); }
+@media (max-width: 640px) {
+  .taste-layout { grid-template-columns: 1fr; gap: 24px; }
+  .taste-preferences > summary { padding: 16px; }
+  .taste-preferences form { padding: 20px 16px 16px; }
+  .taste-favorites-section { padding-top: 20px; border-top: 1px solid var(--border); }
+}
+.request-taste-toggle { display: inline-flex; align-items: center; gap: 8px; width: fit-content; max-width: 100%; min-height: 44px; margin: 0; font-size: 12px; color: var(--foreground-muted); cursor: pointer; }
+.request-taste-toggle input { width: 16px; height: 16px; margin: 0; flex: none; accent-color: var(--accent-bright); }
+
+.request-taste-controls { min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 0 16px; padding: 0 15px; border-top: 1px solid var(--border); }
+.request-taste-controls .field-help { flex: 1 1 220px; margin: 0; padding: 4px 0 8px; font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.request-taste-controls .field-help:empty { display: none; }
+.request-taste-help { margin: 0 0 20px; color: var(--foreground-muted); font-size: 12px; line-height: 1.6; }
+@media (max-width: 480px) {
+  .history-detail { flex-wrap: wrap; gap: 5px 10px; padding: 10px 12px; }
+  .history-copy { flex-basis: 100%; }
+  .history-main .history-plex { margin-right: 12px; }
+  .request-taste-controls { padding: 0 12px; }
+}
+
+.artist-anime-sort { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin: 12px 0; color: var(--foreground-muted); }
+.artist-anime-sort select { width: auto; max-width: 100%; min-height: 44px; }
+
+.artist-info .release-group-metadata { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Mobile discography: keep the action beside the title, with metadata below both. */
+@media (max-width: 700px) {
+  .artist-discography .artist-card[data-release-group-id] {
+    display: grid;
+    grid-template-columns: 44px minmax(0, 1fr) auto;
+    grid-template-rows: auto auto;
+    column-gap: 15px;
+    row-gap: 3px;
+    align-items: center;
+  }
+  .artist-discography .artist-card[data-release-group-id] > .card-open {
+    display: grid;
+    grid-column: 1 / -1;
+    grid-row: 1 / 3;
+    grid-template-columns: subgrid;
+    grid-template-rows: subgrid;
+    gap: inherit;
+  }
+  .artist-discography .artist-card[data-release-group-id] .artist-info { display: contents; }
+  .artist-discography .artist-card[data-release-group-id] .card-open > :is(.avatar, .cover-art) {
+    grid-column: 1;
+    grid-row: 1 / 3;
+    align-self: center;
+  }
+  .artist-discography .artist-card[data-release-group-id] .artist-info h2 {
+    grid-column: 2;
+    grid-row: 1;
+    min-width: 0;
+    margin: 0;
+    overflow-wrap: anywhere;
+  }
+  .artist-discography .artist-card[data-release-group-id] .release-group-metadata {
+    grid-column: 2 / -1;
+    grid-row: 2;
+    min-width: 0;
+  }
+  .artist-discography .artist-card[data-release-group-id] > .release-group-request {
+    grid-column: 3;
+    grid-row: 1;
+    z-index: 1;
+    margin-left: 0;
+    align-self: start;
+  }
+}
+
+.artist-anime-action-card { display: flex; align-items: center; gap: 12px; padding: 10px 12px; }
+.artist-anime-action-card > .release-anime-theme-link { flex: 1; min-width: 0; padding: 0; border: 0; border-radius: 0; overflow: visible; background: none !important; box-shadow: none !important; transform: none !important; }
+.artist-anime-actions { display: grid; flex: 0 1 auto; gap: 6px; max-width: 45%; }
+.artist-anime-actions select { width: 100%; min-width: 0; min-height: 40px; font-size: 12px; }
+.artist-discography .artist-anime-action-card[data-release-group-id] { display: flex; }
+.artist-anime-action-card .release-group-request { margin-left: 0; }
+@media (max-width: 700px) {
+  .artist-anime-action-card .release-group-request { min-height: 44px; }
 }

@@ -374,6 +374,7 @@ def get(
     force_refresh=False,
     cache_only=False,
     cache_response=True,
+    cache_ttl=None,
     **extra,
 ):
     """Load one metadata resource or collection from MusicBrainz."""
@@ -386,7 +387,7 @@ def get(
         params=params,
         headers={"User-Agent": config["userAgent"]},
         namespace="musicbrainz-metadata",
-        ttl=MUSICBRAINZ_METADATA_CACHE_TTL,
+        ttl=MUSICBRAINZ_METADATA_CACHE_TTL if cache_ttl is None else cache_ttl,
         include_cache_status=include_cache_status,
         priority=priority,
         request_interval_seconds=config["requestIntervalMs"] / 1000,

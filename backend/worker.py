@@ -5,6 +5,7 @@ from threading import Thread
 if __package__:
     from .api_cache import init_cache_db
     from .storage import init_db
+    from .workers import anime_artist_enrichment
     from .workers import anime_metadata as anime_metadata_worker
     from .workers import artist_metadata as artist_metadata_worker
     from .workers import lidarr_downloads as lidarr_download_worker
@@ -14,11 +15,13 @@ if __package__:
     from .workers import plex as plex_worker
     from .workers import plex_history as plex_history_worker
     from .workers import plex_metadata as plex_metadata_worker
+    from .workers import charts as chart_worker
     from .workers import recommendations as recommendation_worker
     from .workers import similar_artists as similar_artist_worker
 else:  # Support `python backend/worker.py` for local development.
     from api_cache import init_cache_db
     from storage import init_db
+    from workers import anime_artist_enrichment
     from workers import anime_metadata as anime_metadata_worker
     from workers import artist_metadata as artist_metadata_worker
     from workers import lidarr_downloads as lidarr_download_worker
@@ -28,6 +31,7 @@ else:  # Support `python backend/worker.py` for local development.
     from workers import plex as plex_worker
     from workers import plex_history as plex_history_worker
     from workers import plex_metadata as plex_metadata_worker
+    from workers import charts as chart_worker
     from workers import recommendations as recommendation_worker
     from workers import similar_artists as similar_artist_worker
 
@@ -48,6 +52,7 @@ def main():
         daemon=True,
     )
     anime_metadata_thread.start()
+    Thread(target=anime_artist_enrichment.run, name="anime-artist-enrichment", daemon=True).start()
     artist_metadata_thread = Thread(
         target=artist_metadata_worker.run,
         name="musicbrainz-artist-revalidation",
@@ -105,6 +110,8 @@ def main():
         daemon=True,
     )
     notification_thread.start()
+    for country in chart_worker.charts.CHART_COUNTRIES:
+        Thread(target=chart_worker.run, args=(country,), name=f"album-chart-{country}", daemon=True).start()
     recommendation_worker.run(RECOMMENDATION_STARTUP_DEADLINE)
 
 

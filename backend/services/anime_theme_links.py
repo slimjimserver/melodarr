@@ -1,13 +1,18 @@
 """Durable reverse associations from MusicBrainz releases to anime themes."""
 
 import time
+from uuid import UUID
+
+import requests
 
 if __package__ == "backend.services":
     from .. import detail_cache
     from ..storage import db
+    from . import anime_artist_links, musicbrainz
 else:  # Support the existing `python backend/app.py` entry point.
     import detail_cache
     from storage import db
+    from services import anime_artist_links, musicbrainz
 
 
 _RESOLVED_STATES = frozenset({"confirmed", "matched", "mapped", "resolved"})
@@ -98,6 +103,7 @@ def sync_anime_theme_mapping(anime, theme, mapping):
     affected_groups = set(release_group_ids)
     changed = False
     with db() as connection:
+        anime_artist_links.sync(connection, anime, theme, mapping, bool(release_group_ids))
         existing = connection.execute(
             "SELECT * FROM anime_theme_release_group_links "
             "WHERE anime_slug = ? AND theme_id = ?",
@@ -161,8 +167,32 @@ def sync_anime_theme_mapping(anime, theme, mapping):
                 ),
             )
             changed = True
+        preferred = mapping.get("preferredReleaseGroupId")
+        updated = connection.execute(
+            "UPDATE anime_theme_release_group_links SET is_preferred=(release_group_mbid=?) "
+            "WHERE anime_slug=? AND theme_id=? AND is_preferred!=(release_group_mbid=?)",
+            (preferred or "", snapshot["anime_slug"], snapshot["theme_id"], preferred or ""),
+        )
+        changed = changed or bool(updated.rowcount)
+        for group in mapping.get("releaseGroups") or mapping.get("release_groups") or mapping.get("targets") or []:
+            group_id = _text(group.get("id") or group.get("releaseGroupId") or group.get("releaseGroupMbid")).casefold()
+            title = _text(group.get("title") or group.get("name") or group.get("releaseGroupTitle"))
+            if group_id in release_group_ids and title:
+                updated = connection.execute(
+                    "UPDATE anime_theme_release_group_links SET release_group_title = ?, updated_at = ? "
+                    "WHERE anime_slug = ? AND theme_id = ? AND release_group_mbid = ? "
+                    "AND release_group_title != ?",
+                    (title, now, snapshot["anime_slug"], snapshot["theme_id"], group_id, title),
+                )
+                changed = changed or bool(updated.rowcount)
+    # Attach current verified identities to the public mapping so initial,
+    # progressive, and manual mapping responses all expose direct artist links.
+    mapping["artistLinks"] = anime_artist_links.musicbrainz_links(
+        (theme.get("song") or {}).get("artists") or []
+    )
     if changed:
         _invalidate_release_groups(affected_groups)
+        detail_cache.invalidate_kind("artist")
     return changed
 
 
@@ -196,3 +226,97 @@ def links_for_release_group(mbid):
         }
         for row in rows
     ]
+
+
+
+def anime_names_for_release_groups(mbids):
+    """Batch the distinct anime names shown on discography release cards."""
+    mbids = sorted({_text(mbid).casefold() for mbid in mbids if _text(mbid)})
+    result = {}
+    if not mbids:
+        return result
+    with db() as connection:
+        for offset in range(0, len(mbids), 400):
+            batch = mbids[offset:offset + 400]
+            placeholders = ",".join("?" for _ in batch)
+            rows = connection.execute(
+                "SELECT DISTINCT release_group_mbid, anime_name "
+                "FROM anime_theme_release_group_links "
+                f"WHERE release_group_mbid IN ({placeholders}) "
+                "ORDER BY anime_name COLLATE NOCASE, anime_name",
+                batch,
+            ).fetchall()
+            for row in rows:
+                result.setdefault(row["release_group_mbid"], []).append(row["anime_name"])
+    return result
+
+
+
+def release_groups_for_performances(performances):
+    """Read saved targets without starting new MusicBrainz matching requests."""
+    song_ids = sorted({item["songId"] for item in performances if item.get("songId")})
+    theme_ids = sorted({item["themeId"] for item in performances if item.get("themeId")})
+    registered = {}
+    observed = {}
+    with db() as connection:
+        for offset in range(0, len(song_ids), 400):
+            batch = song_ids[offset:offset + 400]
+            placeholders = ",".join("?" for _ in batch)
+            rows = connection.execute(
+                "SELECT mapping.song_id, mapping.status, target.release_group_mbid, "
+                "target.release_group_title, target.is_preferred "
+                "FROM anime_song_mappings mapping LEFT JOIN anime_song_mapping_targets target "
+                "ON target.song_id = mapping.song_id "
+                f"WHERE mapping.song_id IN ({placeholders}) "
+                "ORDER BY target.is_preferred DESC, target.release_group_mbid", batch,
+            ).fetchall()
+            for row in rows:
+                targets = registered.setdefault(row["song_id"], [])
+                if row["status"] == "confirmed" and row["release_group_mbid"]:
+                    targets.append({"id": row["release_group_mbid"],
+                                    "title": row["release_group_title"],
+                                    "preferred": bool(row["is_preferred"])})
+        for offset in range(0, len(theme_ids), 400):
+            batch = theme_ids[offset:offset + 400]
+            placeholders = ",".join("?" for _ in batch)
+            rows = connection.execute(
+                "SELECT anime_slug, theme_id, release_group_mbid, release_group_title, is_preferred "
+                "FROM anime_theme_release_group_links "
+                f"WHERE theme_id IN ({placeholders}) ORDER BY release_group_mbid", batch,
+            ).fetchall()
+            for row in rows:
+                observed.setdefault((row["anime_slug"], row["theme_id"]), []).append({
+                    "id": row["release_group_mbid"], "title": row["release_group_title"],
+                    "preferred": bool(row["is_preferred"]),
+                })
+    result = {
+        (item["animeSlug"], item["themeId"]): registered.get(
+            item.get("songId"), observed.get((item["animeSlug"], item["themeId"]), []),
+        ) for item in performances
+    }
+    # Old reverse links contain only the song title. Repair missing release
+    # titles once, outside the database transaction, using cached MB metadata.
+    repaired = {}
+    for groups in result.values():
+        for group in groups:
+            if group["title"]:
+                continue
+            mbid = group["id"]
+            if mbid not in repaired:
+                repaired[mbid] = ""
+                try:
+                    UUID(mbid)
+                    detail = musicbrainz.get(f"/release-group/{mbid}", "")
+                    if detail and str(detail.get("id", "")).casefold() == mbid:
+                        repaired[mbid] = _text(detail.get("title"))
+                except (ValueError, requests.RequestException):
+                    pass
+                if repaired[mbid]:
+                    with db() as connection:
+                        connection.execute(
+                            "UPDATE anime_theme_release_group_links SET release_group_title = ? "
+                            "WHERE release_group_mbid = ? AND release_group_title = ''",
+                            (repaired[mbid], mbid),
+                        )
+            group["title"] = repaired[mbid]
+    return result

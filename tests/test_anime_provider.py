@@ -644,7 +644,7 @@ class AnimeRouteTests(unittest.TestCase):
     @patch("backend.routes.anime.anime_musicbrainz.cached_mapping")
     @patch("backend.routes.anime.musicbrainz.get")
     @patch("backend.routes.anime.animethemes.detail")
-    def test_admin_can_confirm_only_the_recommended_automatic_recording_match(
+    def test_admin_can_confirm_each_listed_automatic_recording_release(
         self,
         detail,
         musicbrainz_get,
@@ -731,6 +731,36 @@ class AnimeRouteTests(unittest.TestCase):
             }],
             preferred_release_group_mbid=group_id,
         )
+
+        alternative = cached_mapping.return_value["releaseGroups"][1]
+        for primary_type in ("Single", "Album", "EP"):
+            alternative["type"] = primary_type
+            upsert_mapping.reset_mock()
+            with self.subTest(primary_type=primary_type):
+                response = self._admin_request(
+                    "PUT", "/api/anime/rezero/themes/1477/mapping",
+                    json={"confirmAutomatic": True, "releaseGroup": alternative["id"]},
+                )
+                self.assertEqual(response.status_code, 200)
+                target = upsert_mapping.call_args.kwargs["targets"][0]
+                self.assertEqual(target["releaseGroupId"], alternative["id"])
+                self.assertEqual(target["primaryType"], primary_type)
+                self.assertEqual(target["recordingIds"], [recording_id])
+        upsert_mapping.reset_mock()
+        response = self._admin_request(
+            "PUT", "/api/anime/rezero/themes/1477/mapping",
+            json={"confirmAutomatic": True, "releaseGroup": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"},
+        )
+        self.assertEqual(response.status_code, 409)
+        upsert_mapping.assert_not_called()
+        evidence = cached_mapping.return_value
+        cached_mapping.return_value = None
+        with patch("backend.routes.anime.anime_musicbrainz.saved_automatic_mapping", return_value=evidence):
+            response = self._admin_request(
+                "PUT", "/api/anime/rezero/themes/1477/mapping",
+                json={"confirmAutomatic": True, "releaseGroup": alternative["id"]},
+            )
+        self.assertEqual(response.status_code, 200)
 
     @patch("backend.routes.anime.anime_musicbrainz.registered_mapping")
     @patch("backend.routes.anime.anime_mapping_registry.upsert_mapping")
@@ -1035,6 +1065,9 @@ class AnimeRouteTests(unittest.TestCase):
     def test_automatic_confirmation_requires_a_current_supported_match(
         self, detail, cached_mapping, upsert_mapping
     ):
+        saved = patch("backend.routes.anime.anime_musicbrainz.saved_automatic_mapping", return_value=None)
+        saved.start()
+        self.addCleanup(saved.stop)
         detail.return_value = {
             "slug": "anime",
             "themes": [{

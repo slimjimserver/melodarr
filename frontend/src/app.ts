@@ -178,6 +178,17 @@ function requiredDescendant<T extends Element>(parent: ParentNode, selector: str
   return element;
 }
 
+function isPlainPrimaryClick(event: MouseEvent) {
+  return (
+    event.button === 0
+    && !event.metaKey
+    && !event.ctrlKey
+    && !event.shiftKey
+    && !event.altKey
+    && !event.defaultPrevented
+  );
+}
+
 function normalizeSearch(value: string) {
   return value
     .normalize("NFKD")
@@ -840,7 +851,7 @@ function showSettingsPage(page: SettingsPage, updateHistory = true) {
     maintenanceRefreshTimer = undefined;
     return;
   }
-  document.querySelectorAll<HTMLButtonElement>("[data-settings-page]").forEach((button) => {
+  document.querySelectorAll<HTMLAnchorElement>("[data-settings-page]").forEach((button) => {
     const isCurrent = button.dataset.settingsPage === page;
     button.classList.toggle("active", isCurrent);
     button.setAttribute("aria-selected", String(isCurrent));
@@ -919,6 +930,11 @@ function setupNavigation() {
 
   function setActiveAccountRoute(page: AccountPage | null) {
     document.querySelectorAll<HTMLAnchorElement>("[data-account-route]").forEach((link) => {
+      const route = link.dataset.accountRoute as AccountPage;
+      const username = activeAccountUsername || currentUser?.username;
+      if (username) {
+        link.href = accountPath(route, username, route === "requests" ? activeAccountRequestPage : 1);
+      }
       const isCurrent = page !== null && link.dataset.accountRoute === page;
       link.classList.toggle("active", isCurrent);
       if (isCurrent) link.setAttribute("aria-current", "page");
@@ -945,8 +961,8 @@ function setupNavigation() {
       accountRenderAbort = undefined;
     }
     document.querySelectorAll(".nav-link, .view").forEach((element) => element.classList.remove("active"));
-    // Account and detail are application views without a matching nav button,
-    // and the header and bottom tab bar both carry a button per view.
+    // Account and detail are application views without a matching navigation link,
+    // and the header and bottom tab bar both carry a link per view.
     document.querySelectorAll<HTMLElement>("[data-view]").forEach((button) => {
       const isCurrent = button.dataset.view === view;
       button.classList.toggle("active", isCurrent);
@@ -986,9 +1002,12 @@ function setupNavigation() {
     return `/${encodedUsername}/settings/${page}`;
   }
 
-  function createHistoryItem(item: JsonObject, route: string) {
+  function createHistoryItem(item: JsonObject, route: string, editableTaste = false) {
     const row = document.createElement("article");
     row.className = "history-item";
+    const main = document.createElement("div");
+    main.className = "history-main";
+    row.append(main);
 
     const detailLink = document.createElement("div");
     detailLink.className = "history-detail";
@@ -1024,8 +1043,48 @@ function setupNavigation() {
     requestedAt.dateTime = requestedAtDate.toISOString();
     requestedAt.textContent = requestedAtDate.toLocaleDateString();
     detailLink.append(copy, requestedAt);
-    row.append(detailLink);
-    appendRequestLifecycle(row, item);
+    main.append(detailLink);
+    appendRequestLifecycle(copy, item);
+    if (editableTaste && item.id !== undefined) {
+      const label = document.createElement("label");
+      label.className = "request-taste-toggle";
+      const toggle = document.createElement("input");
+      toggle.type = "checkbox";
+      toggle.checked = item.use_for_recommendations !== 0 && item.use_for_recommendations !== false;
+      label.append(toggle, "Use for recommendations");
+      toggle.setAttribute("aria-describedby", "request-taste-help");
+      const status = document.createElement("span");
+      status.className = "field-help";
+      status.setAttribute("aria-live", "polite");
+      const controls = document.createElement("div");
+      controls.className = "request-taste-controls";
+      controls.append(label, status);
+      row.append(controls);
+      toggle.addEventListener("change", async () => {
+        const included = toggle.checked;
+        const generation = accountRenderGeneration;
+        const ownerId = currentUser?.id;
+        toggle.disabled = true;
+        try {
+          await api("/api/discover/request-influence", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ requestId: item.id, useForRecommendations: included }),
+            signal: accountRenderAbort?.signal,
+          });
+          if (generation !== accountRenderGeneration || ownerId !== currentUser?.id) return;
+          item.use_for_recommendations = included;
+          status.textContent = included ? "This request shapes your picks." : "Excluded from your taste profile. Your request is unchanged.";
+          window.dispatchEvent(new Event("melodarr-recommendations-changed"));
+        } catch (error) {
+          if (generation !== accountRenderGeneration || ownerId !== currentUser?.id) return;
+          toggle.checked = !included;
+          status.textContent = `Couldn’t save this preference. ${error.message}`;
+        } finally {
+          toggle.disabled = false;
+        }
+      });
+    }
+
 
     if (item.availableInPlex) {
       const destination = mobilePlexDestination(
@@ -1049,7 +1108,7 @@ function setupNavigation() {
       icon.src = "/icons/plex.svg";
       icon.alt = "";
       plexBadge.append(icon);
-      row.append(plexBadge);
+      main.append(plexBadge);
     }
     return row;
   }
@@ -1190,6 +1249,13 @@ function setupNavigation() {
         );
         if (!isCurrentRender()) return;
         content.replaceChildren();
+        if (isOwnAccount) {
+          const tasteHelp = document.createElement("p");
+          tasteHelp.id = "request-taste-help";
+          tasteHelp.className = "request-taste-help";
+          tasteHelp.textContent = "Requested something for someone else? Turn off Use for recommendations to keep it out of your taste profile.";
+          content.append(tasteHelp);
+        }
         const requestGroups: [string, JsonObject[], string][] = [
           ["Artists", data.requests?.artist || [], "artists"],
           ["Release groups", data.requests?.["release-group"] || [], "albums"],
@@ -1200,7 +1266,7 @@ function setupNavigation() {
           const heading = document.createElement("h2"); heading.textContent = title;
           const list = document.createElement("div"); list.className = "results";
           if (!requests.length) { const empty = document.createElement("p"); empty.className = "message"; empty.textContent = "No requests yet."; list.append(empty); }
-          requests.forEach((item: JsonObject) => list.append(createHistoryItem(item, route)));
+          requests.forEach((item: JsonObject) => list.append(createHistoryItem(item, route, isOwnAccount)));
           section.append(heading, list); content.append(section);
         });
 
@@ -1593,12 +1659,14 @@ function setupNavigation() {
     renderAccount(page);
   };
 
-  document.querySelectorAll<HTMLElement>(".nav-link").forEach((button) => {
-    button.addEventListener("click", () => {
-      showView(button.dataset.view as AppView);
-      if (button.dataset.view === "discover") {
+  document.querySelectorAll<HTMLAnchorElement>(".nav-link").forEach((link) => {
+    link.addEventListener("click", (event) => {
+      if (!isPlainPrimaryClick(event)) return;
+      event.preventDefault();
+      showView(link.dataset.view as AppView);
+      if (link.dataset.view === "discover") {
         window.dispatchEvent(new Event("melodarr-home"));
-      } else if (button.dataset.view === "settings" && currentUser?.role === "admin") {
+      } else if (link.dataset.view === "settings" && currentUser?.role === "admin") {
         showSettingsPage("services", false);
         refreshSettings(true).catch(() => {});
       }
@@ -1608,7 +1676,7 @@ function setupNavigation() {
   $(".brand").addEventListener("click", (event) => {
     // Keep the real href as a no-JavaScript fallback, but avoid reloading the
     // entire application when an authenticated user returns home.
-    if (!currentUser || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    if (!currentUser || !isPlainPrimaryClick(event)) return;
     event.preventDefault();
     showView("discover");
     window.dispatchEvent(new Event("melodarr-home"));
@@ -1657,20 +1725,30 @@ function setupNavigation() {
   if (["settings/notifications", "settings/requests", "settings/users", "settings/jobs"].includes(initialView)) showView("settings", false);
   else if (["library", "settings"].includes(initialView)) showView(initialView as AppView, false);
 
-  document.querySelectorAll<HTMLElement>(".tab-bar .nav-link").forEach((button) => button.addEventListener("click", () => {
-    window.scrollTo({ top: 0, behavior: "auto" });
+  document.querySelectorAll<HTMLAnchorElement>(".tab-bar .nav-link").forEach((link) => link.addEventListener("click", (event) => {
+    if (event.defaultPrevented) {
+      window.scrollTo({ top: 0, behavior: "auto" });
+    }
   }));
 
   $<HTMLAnchorElement>("#account-menu").addEventListener("click", (event) => {
-    if (!currentUser || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    if (!currentUser || !isPlainPrimaryClick(event)) return;
     event.preventDefault();
     showAccountPage?.("profile", true, currentUser.username);
   });
-  document.querySelectorAll<HTMLElement>("[data-account-route]").forEach((link) => link.addEventListener("click", (event) => { event.preventDefault(); showAccountPage?.(link.dataset.accountRoute as AccountPage); }));
+  document.querySelectorAll<HTMLAnchorElement>("[data-account-route]").forEach((link) => link.addEventListener("click", (event) => {
+    if (!isPlainPrimaryClick(event)) return;
+    event.preventDefault();
+    showAccountPage?.(link.dataset.accountRoute as AccountPage);
+  }));
   document.querySelector("#account-logout")?.addEventListener("click", () => signOut());
-  const settingsTabs = Array.from(document.querySelectorAll<HTMLButtonElement>("[data-settings-page]"));
+  const settingsTabs = Array.from(document.querySelectorAll<HTMLAnchorElement>("[data-settings-page]"));
   settingsTabs.forEach((button, index) => {
-    button.addEventListener("click", () => showSettingsPage(button.dataset.settingsPage as SettingsPage));
+    button.addEventListener("click", (event) => {
+      if (!isPlainPrimaryClick(event)) return;
+      event.preventDefault();
+      showSettingsPage(button.dataset.settingsPage as SettingsPage);
+    });
     button.addEventListener("keydown", (event) => {
       let nextIndex: number | undefined;
       if (event.key === "ArrowRight") nextIndex = (index + 1) % settingsTabs.length;
@@ -2822,7 +2900,9 @@ function setupLibrary() {
   };
 
   const createArtistCard = (artist: JsonObject) => {
-    const card = document.createElement("div");
+    const card = artist.musicbrainzId
+      ? document.createElement("a")
+      : document.createElement("div");
     card.className = `library-card${artist.musicbrainzId ? " clickable" : ""}`;
     card.dataset.search = artist.search;
     const artwork = document.createElement("div");
@@ -2850,19 +2930,16 @@ function setupLibrary() {
       : `${artist.section} · MusicBrainz match unavailable`;
     info.append(name, section);
     card.append(artwork, info);
-    if (artist.musicbrainzId) {
-      card.tabIndex = 0;
-      card.setAttribute("role", "link");
+    if (card instanceof HTMLAnchorElement) {
+      card.href = `/artists/${encodeURIComponent(String(artist.musicbrainzId))}`;
       const openArtist = () => window.dispatchEvent(new CustomEvent(
         "melodarr-open-detail",
         { detail: { kind: "artist", id: artist.musicbrainzId } },
       ));
-      card.addEventListener("click", openArtist);
-      card.addEventListener("keydown", (event) => {
-        if (event.key === "Enter" || event.key === " ") {
-          event.preventDefault();
-          openArtist();
-        }
+      card.addEventListener("click", (event) => {
+        if (!isPlainPrimaryClick(event)) return;
+        event.preventDefault();
+        openArtist();
       });
     }
     return card;

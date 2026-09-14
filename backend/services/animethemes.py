@@ -306,3 +306,42 @@ def series_detail(slug):
     )
     series = data.get("series") if isinstance(data, dict) else None
     return _normalize_series_detail(series) if isinstance(series, dict) else None
+
+
+def artist_detail(slug, *, force_refresh=False):
+    """Return every song/theme performance for one AnimeThemes artist."""
+    slug = _validate_slug(slug)
+    data = cached_json_get(
+        f"{_ANIMETHEMES_URL}/artist/{quote(slug, safe='')}",
+        params={"include": "songs.animethemes.anime.images"},
+        headers={"User-Agent": USER_AGENT},
+        namespace="animethemes-artist",
+        force_refresh=force_refresh,
+        ttl=_DETAIL_CACHE_TTL,
+    )
+    artist = data.get("artist") if isinstance(data, dict) else None
+    if not isinstance(artist, dict):
+        return None
+    anime = {}
+    seen = set()
+    for song in artist.get("songs") or []:
+        if not isinstance(song, dict):
+            continue
+        for theme in song.get("animethemes") or []:
+            if not isinstance(theme, dict):
+                continue
+            source = theme.get("anime")
+            if not isinstance(source, dict) or not source.get("slug") or not theme.get("id"):
+                continue
+            key = (source["slug"], theme["id"])
+            if key in seen:
+                continue
+            seen.add(key)
+            item = anime.setdefault(source["slug"], {**_normalize_summary(source), "performances": []})
+            item["performances"].append({
+                "animeSlug": source["slug"], "animeName": item["name"],
+                "themeId": theme["id"], "themeType": theme.get("type"),
+                "themeLabel": _theme_label(theme.get("type"), theme.get("sequence")),
+                "songId": song.get("id"), "songTitle": _clean_text(song.get("title")),
+            })
+    return {**_normalize_artist(artist), "anime": list(anime.values())}

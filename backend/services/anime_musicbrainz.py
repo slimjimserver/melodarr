@@ -9,16 +9,20 @@ features the same song.
 import json
 import re
 import unicodedata
+import time
+from uuid import UUID
 
 import requests
 
 if __package__ == "backend.services":
     from ..api_cache import get_cache_document, set_cache_document
     from ..media_urls import release_group_cover_art
+    from ..storage import db
     from . import anime_mapping_registry, musicbrainz
 else:  # Support the existing ``python backend/app.py`` entry point.
     from api_cache import get_cache_document, set_cache_document
     from media_urls import release_group_cover_art
+    from storage import db
     from services import anime_mapping_registry, musicbrainz
 
 
@@ -54,6 +58,10 @@ _VERSION_MARKERS = (
     "rerecorded",
     "rerecording",
     "acoustic",
+    "tvsize",
+    "tvedit",
+    "tvversion",
+    "shortversion",
 )
 _HEPBURN_LONG_VOWELS = {
     "ā": ("aa",),
@@ -173,18 +181,32 @@ def theme_mapping_key(theme):
 
 def cached_mapping(theme):
     """Read a fresh cached mapping for one theme, if present."""
-    return get_cache_document(CACHE_NAMESPACE, theme_mapping_key(theme))
+    return _usable_automatic_mapping(get_cache_document(CACHE_NAMESPACE, theme_mapping_key(theme)))
 
 
 def cache_mapping(theme, mapping):
     """Persist a mapping with a state-appropriate refresh interval."""
+    if mapping.get("mappingSource") in {"local", "seed"}:
+        return
     ttl = {
         "resolved": RESOLVED_CACHE_TTL,
         "ambiguous": AMBIGUOUS_CACHE_TTL,
         "unmatched": UNMATCHED_CACHE_TTL,
         "failed": FAILED_CACHE_TTL,
     }.get(mapping.get("state"), FAILED_CACHE_TTL)
+    if mapping.get("reason") == "artist-recording-catalog-incomplete":
+        ttl = 5 * 60
+    with db() as connection:
+        connection.execute(
+            "INSERT INTO anime_automatic_matches VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(mapping_key) DO UPDATE SET payload=excluded.payload, "
+            "retry_at=excluded.retry_at, updated_at=excluded.updated_at "
+            "WHERE anime_automatic_matches.retry_at IS NOT NULL OR excluded.retry_at IS NULL",
+            (theme_mapping_key(theme), json.dumps(mapping),
+             None if mapping.get("state") == "resolved" else time.time() + ttl, time.time()),
+        )
     set_cache_document(CACHE_NAMESPACE, theme_mapping_key(theme), mapping, ttl)
+    confirm_unique_single(theme, mapping)
 
 
 def _mapping_base(theme):
@@ -464,9 +486,82 @@ def registered_mapping(theme):
     return _mapping_from_registry(theme, document) if document is not None else None
 
 
+def confirm_unique_single(theme, mapping):
+    """Apply the single-release policy without overwriting any reviewed decision."""
+    if not mapping or mapping.get("state") != "resolved" or mapping.get("reason"):
+        return mapping
+    if mapping.get("mappingSource") or mapping.get("registryStatus"):
+        return mapping
+    if mapping.get("matchMethod") not in {"recording-search", "artist-discography-title"}:
+        return mapping
+    song_id = _registry_song_id(theme)
+    groups = mapping.get("releaseGroups") or []
+    if song_id is None or not groups or any(
+        not isinstance(group, dict) or str(group.get("type") or "").casefold() not in {"single", "album", "ep"}
+        for group in groups
+    ):
+        return mapping
+    singles = {group.get("id"): group for group in groups if str(group.get("type")).casefold() == "single"}
+    if len(singles) != 1:
+        return mapping
+    group = next(iter(singles.values()))
+    recording_id = mapping.get("recordingId")
+    if mapping.get("matchMethod") == "recording-search" and not recording_id:
+        return mapping
+    try:
+        group_id = str(UUID(str(group.get("id"))))
+        recording_ids = [str(UUID(str(recording_id)))] if recording_id else []
+        artist_ids = [str(UUID(str(value))) for value in mapping.get("artistIds") or []]
+    except ValueError:
+        return mapping
+    if not artist_ids:
+        return mapping
+    document = anime_mapping_registry.create_mapping_if_absent(
+        song_id, title=_song(theme).get("title") or "Untitled song",
+        artists=_artist_names(theme), status="confirmed", provenance="automatic-unique-single",
+        scope="commercial_full", preferred_release_group_mbid=group_id,
+        targets=[{"releaseGroupId": group_id, "recordingIds": recording_ids,
+                  "artistIds": artist_ids, "releaseGroupTitle": group.get("title") or group.get("name") or "",
+                  "artistName": group.get("artist") or " · ".join(_artist_names(theme)),
+                  "primaryType": "Single", "firstReleaseDate": group.get("date") or "",
+                  "scope": "commercial_full", "preferred": True}],
+    )
+    if document.get("provenance") == "automatic-unique-single":
+        # Keep the original recording evidence and alternatives for inspection.
+        with db() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO anime_automatic_matches VALUES (?, ?, NULL, ?)",
+                (theme_mapping_key(theme), json.dumps(mapping), time.time()),
+            )
+    return _mapping_from_registry(theme, document)
+
+
 def stored_mapping(theme):
     """Read permanent local state before the expiring automated cache."""
-    return registered_mapping(theme) or cached_mapping(theme)
+    manual = registered_mapping(theme)
+    if manual:
+        return manual
+    mapping = saved_automatic_mapping(theme) or cached_mapping(theme)
+    return confirm_unique_single(theme, mapping)
+
+
+def saved_automatic_mapping(theme):
+    """Read original automatic evidence without promoting or changing review state."""
+    with db() as connection:
+        row = connection.execute(
+            "SELECT payload FROM anime_automatic_matches WHERE mapping_key=? "
+            "AND (retry_at IS NULL OR retry_at>?)",
+            (theme_mapping_key(theme), time.time()),
+        ).fetchone()
+    return _usable_automatic_mapping(json.loads(row["payload"])) if row else None
+
+
+def _usable_automatic_mapping(mapping):
+    # The former hard cap could never succeed on a retry; discard only that
+    # obsolete negative result, in both durable and disposable caches.
+    if mapping and mapping.get("reason") == "artist-recording-browse-limit":
+        return None
+    return mapping
 
 
 def failed_mapping(theme, reason="provider-error"):
@@ -584,7 +679,8 @@ def _credits_match(source_names, source_candidates, recording):
                 index
                 for index in sorted(unused)
                 if credits[index]["id"] in candidate_ids
-                or target_name in credits[index]["names"]
+                or (not any(item.get("verified") for item in candidates)
+                    and target_name in credits[index]["names"])
             ),
             None,
         )
@@ -624,9 +720,9 @@ def _release_group_rank(release, recording):
     secondary_rank = int(bool(_LOW_PRIORITY_SECONDARY_TYPES.intersection(secondary)))
     primary = str(group.get("primary-type") or "other").casefold()
     return (
-        _PRIMARY_TYPE_RANK.get(primary, 5),
         status_rank,
         secondary_rank,
+        _PRIMARY_TYPE_RANK.get(primary, 5),
         str(release.get("date") or recording.get("first-release-date") or "9999"),
         str(group.get("id") or ""),
     )
@@ -860,7 +956,80 @@ def _title_only_candidates(theme, title):
     return _result(theme, "unmatched", "missing-artist")
 
 
-def _resolve_theme_live(theme):
+def _recording_catalog(artist_id):
+    """Advance at most ten pages, saving progress for all songs by this artist."""
+    now = time.time()
+    with db() as connection:
+        connection.execute(
+            "INSERT OR IGNORE INTO anime_recording_catalogs (artist_mbid, generation, updated_at) VALUES (?, ?, ?)",
+            (artist_id, now, now),
+        )
+        connection.execute(
+            "UPDATE anime_recording_catalogs SET recordings_json='{}', next_offset=0, complete=0, "
+            "generation=?, updated_at=? WHERE artist_mbid=? AND complete=1 AND updated_at<?",
+            (now, now, artist_id, now - 86400),
+        )
+    for _page in range(10):
+        with db() as connection:
+            row = connection.execute("SELECT * FROM anime_recording_catalogs WHERE artist_mbid=?", (artist_id,)).fetchone()
+        records = json.loads(row["recordings_json"])
+        if row["complete"]:
+            return list(records.values()), True
+        offset = row["next_offset"]
+        response = musicbrainz.get(
+            "/recording", "artist-credits+aliases", artist=artist_id,
+            limit=100, offset=offset, priority="background", cache_ttl=86400,
+        )
+        if not isinstance(response, dict) or not isinstance(response.get("recordings"), list):
+            raise ValueError("Invalid MusicBrainz recording catalog response")
+        page = response["recordings"]
+        total = response.get("recording-count")
+        next_offset = offset + len(page)
+        if not page and total is not None and offset < int(total):
+            raise ValueError("Incomplete MusicBrainz recording catalog page")
+        complete = next_offset >= int(total) if total is not None else len(page) < 100
+        for recording in page:
+            if not isinstance(recording, dict) or not recording.get("id"):
+                raise ValueError("Invalid MusicBrainz recording")
+            records[str(recording["id"])] = recording
+        with db() as connection:
+            # A simultaneous request may have advanced this catalog already.
+            # Never overwrite its progress or a newer catalog generation.
+            connection.execute(
+                "UPDATE anime_recording_catalogs SET recordings_json=?, next_offset=?, complete=?, updated_at=? "
+                "WHERE artist_mbid=? AND next_offset=? AND generation=?",
+                (json.dumps(records), next_offset, int(complete), time.time(),
+                 artist_id, offset, row["generation"]),
+            )
+    with db() as connection:
+        row = connection.execute("SELECT * FROM anime_recording_catalogs WHERE artist_mbid=?", (artist_id,)).fetchone()
+    return list(json.loads(row["recordings_json"]).values()), bool(row["complete"])
+
+
+def _artist_recording_matches(title, source_artists, source_candidates, artist_id):
+    """Compare romaji against a complete, resumable artist recording catalog."""
+    records, complete = _recording_catalog(artist_id)
+    if not complete:
+        return [], False
+    target = _title_comparison_keys(title)
+    matches = {}
+    for recording in records:
+        titles = _title_names(recording)
+        # Translated English aliases must not hide the native title's reading.
+        for native in [recording.get("title"), *[
+            alias.get("name") for alias in recording.get("aliases") or [] if isinstance(alias, dict)
+        ]]:
+            reading = musicbrainz.romanized_release_group_title({"title": native})
+            if reading:
+                titles.update(_title_comparison_keys(reading))
+        if (target.isdisjoint(titles) or _has_version_marker(recording)
+                or not _credits_match(source_artists, source_candidates, recording)):
+            continue
+        matches[str(recording["id"])] = {**recording, "score": 100}
+    return list(matches.values()), True
+
+
+def _resolve_theme_live(theme, verified_artists=None):
     """Resolve one normalized AnimeThemes theme without reading local state."""
     title = str(_song(theme).get("title") or "").strip()
     source_artists = _artist_names(theme)
@@ -872,14 +1041,31 @@ def _resolve_theme_live(theme):
             return _title_only_candidates(theme, title)
         if len(source_artists) > MAX_SOURCE_ARTISTS:
             return _result(theme, "unmatched", "too-many-artists")
-        source_candidates = [_artist_candidates(name) for name in source_artists]
+        if verified_artists is None:
+            # Page-triggered matching uses the same saved identities as the worker.
+            from . import anime_artist_links
+            artists = _song(theme).get("artists") or []
+            identities = anime_artist_links.musicbrainz_links(artists)
+            verified_artists = {artist.get("name"): identities[str(artist["id"])]
+                                for artist in artists if str(artist.get("id")) in identities}
+        verified_artists = verified_artists or {}
+        source_candidates = [
+            [{"id": verified_artists[name], "name": name, "score": 100,
+              "names": {normalize_text(name)}, "verified": True}]
+            if name in verified_artists else _artist_candidates(name)
+            for name in source_artists
+        ]
         if any(not candidates for candidates in source_candidates):
             return _result(theme, "unmatched", "artist-not-found")
 
-        # Searching by the first credited artist is the smallest bounded query
-        # set.  Every returned recording is still checked against all credits.
+        # Prefer a verified identity even when it is a featured collaborator.
+        # Every returned recording is still checked against all source credits.
+        search_candidates = next(
+            (items for items in source_candidates if any(item.get("verified") for item in items)),
+            source_candidates[0],
+        )
         recordings = {}
-        for artist in source_candidates[0][:MAX_RECORDING_SEARCHES]:
+        for artist in search_candidates[:MAX_RECORDING_SEARCHES]:
             query = (
                 f"recording:{_lucene_phrase(title)} AND "
                 f"arid:{artist['id']}"
@@ -901,6 +1087,14 @@ def _resolve_theme_live(theme):
             and _credits_match(source_artists, source_candidates, recording)
             and not _has_version_marker(recording)
         ]
+        used_artist_recordings = False
+        if not exact and verified_artists:
+            verified_id = next(item["id"] for item in search_candidates if item.get("verified"))
+            exact, complete = _artist_recording_matches(
+                title, source_artists, source_candidates, verified_id)
+            used_artist_recordings = True
+            if not complete:
+                return _result(theme, "unmatched", "artist-recording-catalog-incomplete")
         exact.sort(
             key=lambda item: (
                 -_score(item),
@@ -946,8 +1140,24 @@ def _resolve_theme_live(theme):
                 ),
                 matchMethod="artist-discography-title",
                 releaseGroups=group_cards,
+                preferredReleaseGroupId=group_cards[0]["id"],
             )
 
+        if verified_artists:
+            # Search responses can truncate releases. Browse the selected recording
+            # explicitly to find its single and album appearances, with a hard cap.
+            for item in exact[:MAX_RECORDING_CANDIDATES]:
+                releases = list(item.get("releases") or [])
+                for offset in range(0, 300, 100):
+                    response = musicbrainz.get(
+                        "/release", "release-groups+artist-credits",
+                        recording=item["id"], limit=100, offset=offset, priority="background",
+                    )
+                    page = response.get("releases") or []
+                    releases.extend(page)
+                    if len(page) < 100:
+                        break
+                item["releases"] = releases
         candidates = [
             _recording_candidate(item) for item in exact[:MAX_RECORDING_CANDIDATES]
         ]
@@ -966,6 +1176,8 @@ def _resolve_theme_live(theme):
             runner_up is None
             or (top["score"] >= 90 and top["score"] - runner_up["score"] >= 15)
         )
+        if used_artist_recordings and len(exact) > 1:
+            decisive = False
         if not decisive:
             return _result(
                 theme,
@@ -985,13 +1197,17 @@ def _resolve_theme_live(theme):
             artistIds=top["artistIds"],
             confidence=top["score"],
             matchMethod="recording-search",
+            titleMatchMethod="artist-recording-romanization" if used_artist_recordings else "recording-search",
+            sourceSongTitle=title,
             releaseGroups=top["releaseGroups"],
+            preferredReleaseGroupId=top["releaseGroups"][0]["id"],
         )
     except (requests.RequestException, ValueError, TypeError):
         return failed_mapping(theme)
 
 
-def resolve_theme(theme):
+def resolve_theme(theme, *, verified_artists=None):
     """Resolve a theme using registry, cache, then live MusicBrainz lookup."""
     existing = stored_mapping(theme)
-    return existing if existing is not None else _resolve_theme_live(theme)
+    return existing if existing is not None else confirm_unique_single(
+        theme, _resolve_theme_live(theme, verified_artists=verified_artists))

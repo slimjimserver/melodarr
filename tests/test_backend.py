@@ -217,8 +217,11 @@ class ApplicationFactoryTests(DatabaseTestCase):
             for method in rule.methods
             if method not in {"HEAD", "OPTIONS"}
         }
-        self.assertEqual(len(rules), 95)
-        self.assertEqual(len(route_methods), 95)
+        self.assertEqual(len(rules), 103)
+        self.assertEqual(len(route_methods), 103)
+        for route in (("/api/discover/charts", "GET"), ("/api/discover/preferences", "GET"),
+                      ("/api/discover/preferences", "POST"), ("/api/discover/request-influence", "POST")):
+            self.assertIn(route, route_methods)
         self.assertIn(("/api/music/artist/<mbid>/similar", "GET"), route_methods)
         self.assertIn(("/api/settings/musicbrainz", "POST"), route_methods)
         self.assertIn(("/api/settings/musicbrainz/test", "POST"), route_methods)
@@ -470,6 +473,7 @@ class WorkerEntrypointTests(unittest.TestCase):
     ):
         calls = []
         anime_metadata_thread = Mock()
+        anime_enrichment_thread = Mock()
         artist_metadata_thread = Mock()
         similar_artist_thread = Mock()
         lidarr_thread = Mock()
@@ -481,6 +485,7 @@ class WorkerEntrypointTests(unittest.TestCase):
         notification_thread = Mock()
         thread_class.side_effect = [
             anime_metadata_thread,
+            anime_enrichment_thread,
             artist_metadata_thread,
             similar_artist_thread,
             lidarr_thread,
@@ -490,13 +495,14 @@ class WorkerEntrypointTests(unittest.TestCase):
             plex_metadata_thread,
             plex_history_thread,
             notification_thread,
+            Mock(), Mock(),
         ]
         init_db.side_effect = lambda: calls.append("database")
         init_cache_db.side_effect = lambda: calls.append("cache")
         run.side_effect = lambda *_args: calls.append("recommendations")
         worker.main()
         self.assertEqual(calls, ["cache", "database", "recommendations"])
-        self.assertEqual(thread_class.call_count, 10)
+        self.assertEqual(thread_class.call_count, 13)
         thread_class.assert_any_call(
             target=anime_metadata_worker.run,
             name="anime-musicbrainz-resolution",
@@ -555,9 +561,15 @@ class WorkerEntrypointTests(unittest.TestCase):
         plex_metadata_thread.start.assert_called_once_with()
         plex_history_thread.start.assert_called_once_with()
         anime_metadata_thread.start.assert_called_once_with()
+        anime_enrichment_thread.start.assert_called_once_with()
+        thread_class.assert_any_call(target=worker.anime_artist_enrichment.run,
+                                     name="anime-artist-enrichment", daemon=True)
         notification_thread.start.assert_called_once_with()
         artist_metadata_thread.start.assert_called_once_with()
         similar_artist_thread.start.assert_called_once_with()
+        for country in ("us", "jp"):
+            thread_class.assert_any_call(target=worker.chart_worker.run, args=(country,),
+                                         name=f"album-chart-{country}", daemon=True)
         run.assert_called_once_with(worker.RECOMMENDATION_STARTUP_DEADLINE)
 
     @patch("backend.workers.lidarr_library.time.time", return_value=100)
@@ -1958,7 +1970,7 @@ class DeploymentConfigTests(unittest.TestCase):
         )
         self.assertIn('filterInput.addEventListener("input"', discovery_typescript)
         self.assertIn(
-            "[group.date, ...(group.secondaryTypes || []), group.disambiguation]",
+            "[group.date, ...(group.animeNames || []), ...(group.secondaryTypes || []), group.disambiguation]",
             discovery_typescript,
         )
 
@@ -2134,17 +2146,17 @@ class DeploymentConfigTests(unittest.TestCase):
             frontend = file.read()
 
         self.assertIn(
-            '<button class="nav-link" type="button" '
-            'data-view="library">Your library</button>',
+            '<a class="nav-link" href="/library" '
+            'data-view="library">Your library</a>',
             frontend,
         )
         self.assertIn(
-            '<button class="nav-link" type="button" data-view="library">'
-            '<span class="tab-icon" aria-hidden="true">▤</span>Library</button>',
+            '<a class="nav-link" href="/library" data-view="library">'
+            '<span class="tab-icon" aria-hidden="true">▤</span>Library</a>',
             frontend,
         )
         self.assertNotIn(
-            'class="nav-link admin-only" type="button" data-view="library"',
+            'class="nav-link admin-only" href="/library"',
             frontend,
         )
 
@@ -7504,6 +7516,14 @@ class MusicRoutesTests(DatabaseTestCase):
 
 
 class RecommendationAssemblyTests(unittest.TestCase):
+    def setUp(self):
+        # These tests isolate legacy provider assembly and worker behavior.
+        # Personal feed integration has its own database-backed suite.
+        enrichment = patch("backend.recommendation_feed.build_personal_feed",
+                           side_effect=lambda _user, payload, _shared=None: payload)
+        enrichment.start()
+        self.addCleanup(enrichment.stop)
+
     @patch("backend.recommendations.plex.cached_library_index")
     @patch("backend.recommendations.get_plex_listens")
     def test_plex_profile_applies_recency_play_counts_and_snapshot_tags(
@@ -7762,7 +7782,7 @@ class RecommendationAssemblyTests(unittest.TestCase):
         )
 
         self.assertEqual([artist["id"] for artist in artists], ["new-artist"])
-        self.assertEqual(albums, [])
+        self.assertEqual([album["id"] for album in albums], ["owned-artist-album"])
 
     @patch("backend.recommendations._search_release_group")
     @patch("backend.recommendations._musicbrainz_lookup")
@@ -7941,7 +7961,7 @@ class RecommendationAssemblyTests(unittest.TestCase):
             "foreignArtistId": "lidarr-artist",
             "artistName": "Lidarr Artist",
         }]
-        library_albums.return_value = [{"foreignAlbumId": "lidarr-album"}]
+        library_albums.return_value = [{"foreignAlbumId": "lidarr-album", "statistics": {"totalTrackCount": 10, "trackFileCount": 10}}]
         library_snapshot.return_value = {
             "artists": [{
                 "name": "Plex Artist",
