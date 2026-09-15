@@ -8216,6 +8216,26 @@ class RecommendationAssemblyTests(unittest.TestCase):
 
 
 class ArtworkCacheTests(DatabaseTestCase):
+    @patch("backend.artwork_cache.requests.get")
+    def test_oversized_authenticated_artwork_does_not_redirect_or_poison_cache(self, get):
+        get.return_value = Response(
+            headers={"Content-Type": "image/jpeg"}, chunks=(b"too-large",),
+        )
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(artwork_cache, "ARTWORK_CACHE_DIRECTORY", directory),
+            patch.object(artwork_cache, "ARTWORK_MAX_DOWNLOAD_BYTES", 4),
+            self.app.test_request_context(),
+        ):
+            result = self.app.make_response(artwork_cache.cached_artwork(
+                "plex-artist-oversized", "http://plex:32400/thumbnail",
+                headers={"X-Plex-Token": "private-token"},
+            ))
+            self.assertEqual(result.status_code, 502)
+            self.assertNotIn("Location", result.headers)
+            self.assertEqual(result.headers["Cache-Control"], "no-store")
+            self.assertEqual(os.listdir(directory), [])
+
     def artwork_url(self, mbid):
         return f"/api/artwork/release-group/{mbid}"
 
@@ -8713,10 +8733,49 @@ class ArtworkVariantTests(DatabaseTestCase):
                 "100",
                 "/library/metadata/100/thumb/200",
             ),
-            "http://plex:32400/library/metadata/100/thumb/200",
+            "http://plex:32400/photo/:/transcode?"
+            "url=%2Flibrary%2Fmetadata%2F100%2Fthumb%2F200"
+            "&width=640&height=640&minSize=0&upscale=0&format=jpeg",
             headers={"X-Plex-Token": "token"},
             size="card",
         )
+
+    @patch("backend.routes.artwork.plex.cached_library_index")
+    @patch("backend.routes.artwork.get_service")
+    @patch("backend.artwork_cache.requests.get")
+    def test_plex_artwork_failure_stays_on_proxy_and_next_request_recovers(
+        self, get, get_service_mock, library_index
+    ):
+        get_service_mock.return_value = {
+            "url": "http://plex:32400", "token": "private-token",
+        }
+        library_index.return_value = {
+            "artistsByRatingKey": {
+                "101": {"thumb": "/library/metadata/101/thumb/201"},
+            },
+        }
+        get.side_effect = [
+            requests.Timeout("Plex temporarily unavailable"),
+            Response(headers={"Content-Type": "image/jpeg"}, chunks=(encoded_image(640),)),
+        ]
+        self.register()
+        url = "/api/artwork/plex-artist/101?size=card"
+        failed = self.client.get(url)
+        self.assertEqual(failed.status_code, 502)
+        self.assertNotIn("Location", failed.headers)
+        self.assertEqual(failed.headers["Cache-Control"], "no-store")
+
+        recovered = self.client.get(url)
+        cached = self.client.get(url)
+        self.assertEqual(recovered.status_code, 200)
+        self.assertEqual(cached.data, recovered.data)
+        self.assertEqual(get.call_count, 2)
+        self.assertEqual(get.call_args.kwargs["headers"], {"X-Plex-Token": "private-token"})
+        self.assertIn("/photo/:/transcode?", get.call_args.args[0])
+        with Image.open(io.BytesIO(recovered.data)) as image:
+            self.assertEqual(image.size, (384, 384))
+        recovered.close()
+        cached.close()
 
 
 class CompressionTests(DatabaseTestCase):

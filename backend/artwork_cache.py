@@ -483,7 +483,7 @@ def cached_artwork(cache_key, source_url, *, headers=None, size=None):
                 for chunk in provider_response.iter_content(chunk_size=64 * 1024):
                     downloaded += len(chunk)
                     if downloaded > ARTWORK_MAX_DOWNLOAD_BYTES:
-                        raise ValueError("Cover Art Archive image is too large to cache")
+                        raise ValueError("Artwork image is too large to cache")
                     file.write(chunk)
             _replace_cache_file(temporary_path, final_path)
             temporary_path = None
@@ -495,6 +495,10 @@ def cached_artwork(cache_key, source_url, *, headers=None, size=None):
             current_app.logger.warning(
                 "Could not cache artwork %s: %s", cache_key, exc
             )
+            if headers:
+                # A browser redirect cannot carry upstream authentication.
+                # Keep private providers behind the proxy and allow a retry.
+                return "", 502, {"Cache-Control": "no-store"}
             return redirect(resolved_source_url, code=302)
         finally:
             close_response = getattr(provider_response, "close", None)

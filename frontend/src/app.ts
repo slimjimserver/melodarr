@@ -1683,6 +1683,12 @@ function setupNavigation() {
   });
 
   window.addEventListener("popstate", () => {
+    // Fixed application routes take precedence over username routes, including
+    // when authentication restores the current URL after a full page load.
+    if (["/", "/discover", "/library", "/library/"].includes(window.location.pathname)) {
+      showView(window.location.pathname.startsWith("/library") ? "library" : "discover", false);
+      return;
+    }
     if (["/settings", "/settings/notifications", "/settings/requests", "/settings/users", "/settings/jobs"].includes(window.location.pathname)) {
       if (currentUser?.role !== "admin") {
         showView("discover", false);
