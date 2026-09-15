@@ -515,16 +515,6 @@ def plex_listen_stats(*, user_id=None, server_id=None):
     return dict(row)
 
 
-def delete_plex_listens(user_id):
-    """Delete all imported Plex listening history owned by one user."""
-    with db() as connection:
-        cursor = connection.execute(
-            "DELETE FROM plex_listens WHERE user_id = ?",
-            (user_id,),
-        )
-        return cursor.rowcount
-
-
 def _create_pending_lidarr_searches_table(connection):
     connection.execute("""
         CREATE TABLE IF NOT EXISTS pending_lidarr_searches (

@@ -6,8 +6,6 @@ else:  # Support direct execution: python tests/test_lastfm_cache_privacy.py
     from _test_environment import TEST_ROOT
 
 import json
-import os
-import tempfile
 import time
 import unittest
 from unittest.mock import patch

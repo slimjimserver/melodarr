@@ -10,13 +10,11 @@ if __package__ == "backend.routes":
     from ..responses import api_error, request_json_object
     from ..security import admin_required, current_user, login_required
     from ..storage import db
-    from flask import request
 else:
     import notifications
     from responses import api_error, request_json_object
     from security import admin_required, current_user, login_required
     from storage import db
-    from flask import request
 
 
 blueprint = Blueprint("notifications", __name__)

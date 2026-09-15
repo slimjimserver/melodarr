@@ -227,7 +227,6 @@ class AnimeFrontendTests(unittest.TestCase):
         self.assertIn('window.addEventListener("melodarr-signed-out", () => {', self.discovery)
 
     def test_detail_actions_are_session_bound_and_do_not_reuse_cleared_artist_state(self):
-        self.assertIn("function isCurrentDetailSession(generation: number)", self.discovery)
         self.assertIn('getJson("/api/lidarr/options", 30_000, detailSessionAbort.signal)', self.discovery)
         self.assertIn('postJson("/api/request/release-group", {', self.discovery)
         self.assertIn("}, detailSessionAbort.signal);", self.discovery)

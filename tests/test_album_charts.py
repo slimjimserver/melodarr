@@ -7,7 +7,6 @@ else:
     from _test_environment import TEST_ROOT
     from test_backend import DatabaseTestCase
 
-import json
 from datetime import date
 from unittest.mock import patch
 import requests

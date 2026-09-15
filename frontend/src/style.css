@@ -608,8 +608,6 @@ dialog::backdrop { background: rgba(48, 39, 32, .52); }
 .push-device-row .enable-push { flex: 0 0 auto; }
 .notification-devices { max-width: 760px; }
 .notification-devices > .manage-devices-title { margin: 8px 0 20px; color: var(--foreground); font-size: clamp(30px, 5vw, 42px); letter-spacing: -.05em; line-height: 1; }
-.notification-device-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; border: 1px solid var(--border); border-radius: 12px; background: rgba(255, 250, 243, .7); padding: 12px 14px; color: var(--foreground-subtle); font-size: 12px; }
-.notification-device-row button { flex: 0 0 auto; }
 .notification-device-card { display: grid; grid-template-columns: 46px minmax(140px, .8fr) minmax(180px, 1fr) auto; align-items: center; gap: 16px; margin: 12px 0; border: 1px solid var(--border); border-radius: 16px; background: rgba(255, 250, 243, .76); padding: 18px; }
 .notification-device-card > img { width: 42px; height: 42px; object-fit: contain; }
 .notification-device-identity { display: grid; min-width: 0; gap: 4px; }
@@ -705,8 +703,8 @@ details summary { margin-bottom: 17px; color: var(--accent-bright); cursor: poin
   #musicbrainz-settings .service-actions button { width: 100%; }
   .settings-hero { gap: 18px; margin-bottom: 38px; }
   .settings-tabs { margin-top: -14px; }
-  .push-device-row, .notification-device-row { align-items: stretch; flex-direction: column; }
-  .push-device-row .enable-push, .notification-device-row button { width: 100%; }
+  .push-device-row { align-items: stretch; flex-direction: column; }
+  .push-device-row .enable-push { width: 100%; }
   .notification-device-card { grid-template-columns: 42px minmax(0, 1fr); }
   .notification-device-card .notification-device-metadata { grid-column: 1 / -1; margin-top: 4px; }
   .notification-device-card .notification-delete-subscription { grid-column: 1 / -1; width: 100%; }
@@ -1005,7 +1003,6 @@ button,
 :root[data-theme="midnight"] .artist-meta,
 :root[data-theme="midnight"] .notification-card,
 :root[data-theme="midnight"] .notification-preference-card,
-:root[data-theme="midnight"] .notification-device-row,
 :root[data-theme="midnight"] .notification-device-card,
 :root[data-theme="midnight"] .library-card,
 :root[data-theme="midnight"] .discography-nav,

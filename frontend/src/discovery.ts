@@ -99,6 +99,12 @@
     recommendationVisibilityTimers.clear();
   }
 
+  function stopRecommendationTracking(card: Element) {
+    recommendationObserver?.unobserve(card);
+    clearTimeout(recommendationVisibilityTimers.get(card));
+    recommendationVisibilityTimers.delete(card);
+  }
+
   function recommendationActivity(item: JsonObject, action: string) {
     return postJson("/api/discover/activity", {
       events: [{ id: item.id, kind: item.kind, action }],
@@ -315,10 +321,6 @@
       body: JSON.stringify(body),
       signal,
     });
-  }
-
-  function isCurrentDetailSession(generation: number) {
-    return generation === detailSessionGeneration;
   }
 
   function captureDetailActionContext(): DetailActionContext {
@@ -1742,11 +1744,7 @@
         if (previous) {
           // Avoid replacing a focused selector or an active request/feedback control.
           if (!previous.contains(document.activeElement)) {
-            previous.querySelectorAll("[data-personal-recommendation]").forEach(card => {
-              recommendationObserver?.unobserve(card);
-              clearTimeout(recommendationVisibilityTimers.get(card));
-              recommendationVisibilityTimers.delete(card);
-            });
+            previous.querySelectorAll("[data-personal-recommendation]").forEach(stopRecommendationTracking);
             previous.replaceWith(popularAlbumSection(updated));
           } else {
             pollCountryCharts(data);
@@ -1804,11 +1802,7 @@
         + (updated && !Number.isNaN(updated.getTime()) ? ` Chart updated ${updated.toLocaleDateString()}.` : "")
         + (chart.stale ? " Showing the last chart we could load; a retry is scheduled."
           : chart.status === "partial" ? " Some albums are still being matched." : "");
-      results.querySelectorAll("[data-personal-recommendation]").forEach((card) => {
-        recommendationObserver?.unobserve(card);
-        clearTimeout(recommendationVisibilityTimers.get(card));
-        recommendationVisibilityTimers.delete(card);
-      });
+      results.querySelectorAll("[data-personal-recommendation]").forEach(stopRecommendationTracking);
       const albums = data.popularAlbumsByCountry?.[country.value]
         || (country.value === "us" ? data.popularAlbums : []) || [];
       const items = albums.filter((item: JsonObject) =>
