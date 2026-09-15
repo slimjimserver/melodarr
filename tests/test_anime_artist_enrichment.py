@@ -1,4 +1,10 @@
 """Durable artist enrichment, incremental discovery, and review precedence."""
+
+if __package__:
+    from ._test_environment import TEST_ROOT as _TEST_ROOT  # noqa: F401
+else:  # Support unittest discovery with tests/ as the top-level directory.
+    from _test_environment import TEST_ROOT as _TEST_ROOT  # noqa: F401
+
 from . import test_anime_artist_links as fixtures
 from .test_anime_artist_links import ALI, ANIME, theme, mapping
 import unittest

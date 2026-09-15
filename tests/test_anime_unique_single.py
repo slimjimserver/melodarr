@@ -1,4 +1,10 @@
 """A resolved song with one Single needs no manual release choice."""
+
+if __package__:
+    from ._test_environment import TEST_ROOT as _TEST_ROOT  # noqa: F401
+else:  # Support unittest discovery with tests/ as the top-level directory.
+    from _test_environment import TEST_ROOT as _TEST_ROOT  # noqa: F401
+
 import json
 import unittest
 from unittest.mock import patch

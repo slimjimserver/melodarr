@@ -178,6 +178,21 @@ const server = createServer(async (request, response) => {
     signedInAs = "";
     return send(response, 200, { message: "Signed out" });
   }
+  if (url.pathname === "/api/settings") {
+    return send(response, 200, {
+      lidarr: { configured: false, defaults: {} },
+      plex: { configured: false, libraries: [], librarySectionIds: [] },
+      lastfm: { configured: false },
+      musicbrainz: {
+        baseUrl: "https://musicbrainz.org/ws/2",
+        userAgent: "Melodarr fixture",
+        requestIntervalMs: 1100,
+      },
+    });
+  }
+  if (url.pathname === "/api/settings/notifications") {
+    return send(response, 200, { enabled: false, email: {}, webPush: {} });
+  }
   if (url.pathname === "/api/music/artist/fixture-artist/similar") {
     return send(response, 200, similarArtistPage(url));
   }

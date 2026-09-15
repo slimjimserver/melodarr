@@ -5,7 +5,7 @@ import logging
 import os
 import sqlite3
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from hashlib import sha256
 from threading import Lock
 
@@ -23,6 +23,8 @@ CACHE_LOCK_RETRY_DELAYS = (0.05, 0.15)
 _RAISE_ON_LOCK = object()
 _cleanup_lock = Lock()
 _last_cleanup_at = None
+_request_locks_lock = Lock()
+_request_locks = {}
 
 
 def _safe_error_label(error):
@@ -33,6 +35,27 @@ def _safe_error_label(error):
 def _safe_namespace_label(namespace):
     """Return only the non-identifying top-level cache namespace."""
     return str(namespace or "unknown").partition(":")[0] or "unknown"
+
+
+@contextmanager
+def _request_lock(key):
+    """Coalesce simultaneous live cache misses for one opaque cache key."""
+    with _request_locks_lock:
+        entry = _request_locks.get(key)
+        if entry is None:
+            entry = {"lock": Lock(), "users": 0}
+            _request_locks[key] = entry
+        entry["users"] += 1
+        lock = entry["lock"]
+    lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
+        with _request_locks_lock:
+            entry["users"] -= 1
+            if entry["users"] == 0 and _request_locks.get(key) is entry:
+                del _request_locks[key]
 
 
 def _serialize_json(value):
@@ -420,6 +443,56 @@ def cached_json_get(
     if cache_only:
         return (None, False) if include_cache_status else None
 
+    coalescing_lock = _request_lock(key) if not force_refresh else nullcontext()
+    with coalescing_lock:
+        # Another request may have filled the cache while this one waited. This
+        # happens before provider pacing, so followers consume no upstream slot.
+        if not force_refresh:
+            value = _fresh_cache_value(key)
+            if value is not None:
+                return (value, True) if include_cache_status else value
+        return _fetch_json_response(
+            key,
+            url,
+            headers=headers,
+            params=params,
+            namespace=namespace,
+            ttl=ttl,
+            include_cache_status=include_cache_status,
+            before_request=before_request,
+            retry_statuses=retry_statuses,
+            retry_exceptions=retry_exceptions,
+            max_attempts=max_attempts,
+            retry_backoff=retry_backoff,
+            request_timeout=request_timeout,
+            force_refresh=force_refresh,
+            cache_response=cache_response,
+            request_get=request_get,
+            after_response=after_response,
+        )
+
+
+def _fetch_json_response(
+    key,
+    url,
+    *,
+    headers,
+    params,
+    namespace,
+    ttl,
+    include_cache_status,
+    before_request,
+    retry_statuses,
+    retry_exceptions,
+    max_attempts,
+    retry_backoff,
+    request_timeout,
+    force_refresh,
+    cache_response,
+    request_get,
+    after_response,
+):
+    """Perform one cache owner's live request while followers wait."""
     attempts = max(1, int(max_attempts))
     retry_statuses = set(retry_statuses)
     request_get = request_get or requests.get

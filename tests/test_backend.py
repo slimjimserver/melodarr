@@ -4575,6 +4575,131 @@ class ApiCacheTests(DatabaseTestCase):
         self.assertEqual(second, ({"result": "cached"}, True))
         get.assert_called_once()
 
+    def test_simultaneous_cache_misses_share_one_external_request(self):
+        callers_ready = Barrier(3)
+        request_started = Event()
+        release_request = Event()
+        results = []
+        failures = []
+        calls = 0
+
+        def request_get(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            request_started.set()
+            release_request.wait(2)
+            return Response(200, {"result": "shared"})
+
+        def load():
+            try:
+                callers_ready.wait()
+                results.append(cached_json_get(
+                    "https://example.test/simultaneous",
+                    namespace="simultaneous-test",
+                    ttl=60,
+                    include_cache_status=True,
+                    request_get=request_get,
+                ))
+            except (
+                RuntimeError,
+                ValueError,
+                requests.RequestException,
+                sqlite3.Error,
+            ) as exc:  # pragma: no cover - asserted below
+                failures.append(exc)
+
+        threads = [Thread(target=load), Thread(target=load)]
+        for thread in threads:
+            thread.start()
+        callers_ready.wait()
+        self.assertTrue(request_started.wait(1))
+        time.sleep(0.05)
+        release_request.set()
+        for thread in threads:
+            thread.join(2)
+
+        self.assertFalse(failures)
+        self.assertEqual(calls, 1)
+        self.assertCountEqual(
+            results,
+            [({"result": "shared"}, False), ({"result": "shared"}, True)],
+        )
+        self.assertEqual(api_cache._request_locks, {})
+
+    def test_failed_coalesced_cache_misses_clean_up_and_allow_a_later_request(self):
+        url = "https://example.test/coalesced-failure"
+        namespace = "coalesced-failure-test"
+        key = cache_key(namespace, url)
+        callers_ready = Barrier(3)
+        request_started = Event()
+        release_request = Event()
+        results = []
+        failures = []
+        calls = 0
+
+        def failing_request(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            request_started.set()
+            release_request.wait(2)
+            raise requests.ConnectionError("coalesced upstream failure")
+
+        def load():
+            try:
+                callers_ready.wait()
+                results.append(cached_json_get(
+                    url,
+                    namespace=namespace,
+                    ttl=60,
+                    request_get=failing_request,
+                ))
+            except requests.ConnectionError as exc:
+                failures.append(exc)
+
+        threads = [Thread(target=load), Thread(target=load)]
+        for thread in threads:
+            thread.start()
+        callers_ready.wait()
+        self.assertTrue(request_started.wait(1))
+
+        try:
+            deadline = time.monotonic() + 1
+            waiting_users = 0
+            while time.monotonic() < deadline:
+                with api_cache._request_locks_lock:
+                    entry = api_cache._request_locks.get(key)
+                    waiting_users = entry["users"] if entry else 0
+                if waiting_users == 2:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(waiting_users, 2)
+        finally:
+            release_request.set()
+
+        for thread in threads:
+            thread.join(2)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(results, [])
+        self.assertEqual(calls, 2)
+        self.assertEqual(len(failures), 2)
+        self.assertTrue(all(
+            str(failure) == "coalesced upstream failure" for failure in failures
+        ))
+        self.assertEqual(api_cache._request_locks, {})
+
+        recovered = cached_json_get(
+            url,
+            namespace=namespace,
+            ttl=60,
+            request_get=lambda *_args, **_kwargs: Response(
+                200, {"result": "recovered"}
+            ),
+        )
+
+        self.assertEqual(recovered, {"result": "recovered"})
+        self.assertEqual(api_cache._request_locks, {})
+
     @patch("backend.api_cache.requests.get")
     def test_cache_only_miss_does_not_call_external_service(self, get):
         result = cached_json_get(
@@ -8776,6 +8901,138 @@ class ArtworkVariantTests(DatabaseTestCase):
             self.assertEqual(image.size, (384, 384))
         recovered.close()
         cached.close()
+
+
+class StoragePerformanceTests(DatabaseTestCase):
+    def test_request_history_queries_use_recency_indexes(self):
+        with db() as connection:
+            indexes = {
+                row["name"] for row in connection.execute(
+                    "PRAGMA index_list(request_history)"
+                )
+            }
+            user_plan = [
+                row["detail"] for row in connection.execute(
+                    "EXPLAIN QUERY PLAN "
+                    "SELECT id, use_for_recommendations, kind, mbid, name, "
+                    "artist_name, release_type, release_date, anime_slug, "
+                    "anime_name, theme_id, theme_label, song_id, song_title, "
+                    "created_at FROM request_history WHERE user_id = ? "
+                    "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                    (1, 100, 200),
+                )
+            ]
+            admin_plan = [
+                row["detail"] for row in connection.execute(
+                    """
+                    EXPLAIN QUERY PLAN
+                    SELECT
+                        request_history.id AS request_id,
+                        request_history.user_id,
+                        request_history.kind,
+                        request_history.mbid,
+                        request_history.name,
+                        request_history.artist_name,
+                        request_history.release_type,
+                        request_history.release_date,
+                        request_history.anime_slug,
+                        request_history.anime_name,
+                        request_history.theme_id,
+                        request_history.theme_label,
+                        request_history.song_id,
+                        request_history.song_title,
+                        request_history.created_at,
+                        users.username AS local_username,
+                        users.role,
+                        users.plex_id,
+                        users.plex_username,
+                        users.plex_email,
+                        users.plex_avatar
+                    FROM request_history
+                    JOIN users ON users.id = request_history.user_id
+                    ORDER BY request_history.created_at DESC, request_history.id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (100, 200),
+                )
+            ]
+
+        self.assertIn("request_history_user_recent", indexes)
+        self.assertIn("request_history_recent", indexes)
+        self.assertTrue(any(
+            "request_history_user_recent" in detail for detail in user_plan
+        ))
+        self.assertTrue(any(
+            "request_history_recent" in detail for detail in admin_plan
+        ))
+        self.assertFalse(any(
+            detail == "SCAN request_history" for detail in (*user_plan, *admin_plan)
+        ))
+        self.assertFalse(any(
+            "USE TEMP B-TREE" in detail for detail in (*user_plan, *admin_plan)
+        ))
+
+    def test_settings_file_is_parsed_once_and_results_are_isolated(self):
+        storage_module.write_settings_file({
+            "lidarr": {"url": "http://lidarr:8686"},
+            "plex": {"url": "http://plex:32400"},
+        })
+        storage_module._settings_cache_signature = ("stale",)
+        storage_module._settings_cache_value = None
+
+        with patch("backend.storage.json.load", wraps=json.load) as load:
+            first = storage_module.load_settings_file()
+            first["lidarr"]["url"] = "mutated"
+            second = storage_module.load_settings_file()
+
+        self.assertEqual(load.call_count, 1)
+        self.assertEqual(second["lidarr"]["url"], "http://lidarr:8686")
+
+    def test_same_size_external_settings_replacement_invalidates_memo(self):
+        original = {
+            "lidarr": {"url": "http://one.test"},
+            "plex": {"url": "http://plex.test"},
+        }
+        replacement = {
+            "lidarr": {"url": "http://two.test"},
+            "plex": {"url": "http://plex.test"},
+        }
+        write_settings_file(original)
+        primed = storage_module.load_settings_file()
+        original_signature = storage_module._settings_cache_signature
+        original_size = os.stat(storage_module.SETTINGS_FILE).st_size
+
+        replacement_json = json.dumps(replacement, indent=2) + "\n"
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=os.path.dirname(storage_module.SETTINGS_FILE),
+                delete=False,
+            ) as file:
+                file.write(replacement_json)
+                temporary_path = file.name
+            self.assertEqual(os.stat(temporary_path).st_size, original_size)
+            os.replace(temporary_path, storage_module.SETTINGS_FILE)
+            temporary_path = None
+        finally:
+            if temporary_path and os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+
+        replacement_signature = storage_module._settings_file_signature()
+        self.assertEqual(replacement_signature[1], original_signature[1])
+        self.assertNotEqual(replacement_signature, original_signature)
+
+        reloaded = storage_module.load_settings_file()
+        self.assertEqual(primed, original)
+        self.assertEqual(reloaded, replacement)
+
+        reloaded["lidarr"]["url"] = "mutated"
+        self.assertEqual(
+            storage_module.load_settings_file()["lidarr"]["url"],
+            "http://two.test",
+        )
 
 
 class CompressionTests(DatabaseTestCase):

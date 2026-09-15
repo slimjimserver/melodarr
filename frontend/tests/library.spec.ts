@@ -7,6 +7,21 @@ test.beforeEach(async ({ request, page }) => {
 });
 
 test("library survives direct navigation, refresh, and browser history", async ({ page }) => {
+  const discoveryRequests: string[] = [];
+  page.on("request", request => {
+    if (new URL(request.url()).pathname === "/static/discovery.js") {
+      discoveryRequests.push(request.url());
+    }
+  });
+  await page.addInitScript(() => {
+    const trackedWindow = window as Window & { __discoveryInitializations?: number };
+    trackedWindow.__discoveryInitializations = 0;
+    window.addEventListener("melodarr-authenticated", () => {
+      trackedWindow.__discoveryInitializations = (
+        trackedWindow.__discoveryInitializations || 0
+      ) + 1;
+    });
+  });
   await page.goto("/library");
   await expect(page.locator("#library-copy")).toContainText("0 artists available");
   await expect(page.locator("#library")).toBeVisible();
@@ -19,6 +34,10 @@ test("library survives direct navigation, refresh, and browser history", async (
   await expect(page.locator("#library")).toBeVisible();
   await page.goForward();
   await expect(page.locator("#discover")).toBeVisible();
+  expect(discoveryRequests).toHaveLength(1);
+  expect(await page.evaluate(() => (
+    window as Window & { __discoveryInitializations?: number }
+  ).__discoveryInitializations)).toBe(1);
 });
 
 test("versioned Plex images load after filtering and refresh", async ({ page }) => {

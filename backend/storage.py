@@ -5,6 +5,7 @@ import os
 import sqlite3
 import time
 from contextlib import contextmanager
+from copy import deepcopy
 from tempfile import NamedTemporaryFile
 from threading import Lock
 
@@ -16,6 +17,17 @@ else:  # Support the existing `python backend/app.py` entry point.
 
 DATABASE_BUSY_TIMEOUT_MS = 5000
 _settings_lock = Lock()
+_settings_cache_lock = Lock()
+_settings_cache_signature = None
+_settings_cache_value = None
+
+
+def _settings_file_signature():
+    try:
+        metadata = os.stat(SETTINGS_FILE)
+    except FileNotFoundError:
+        return None
+    return (metadata.st_mtime_ns, metadata.st_size, metadata.st_ino)
 
 
 @contextmanager
@@ -45,16 +57,27 @@ def db():
 
 def load_settings_file():
     """Read service configuration from its dedicated persistent JSON file."""
-    if not os.path.exists(SETTINGS_FILE):
-        return None
-    try:
-        with open(SETTINGS_FILE, encoding="utf-8") as file:
-            settings = json.load(file)
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"Could not read Melodarr settings file: {exc}") from exc
-    if not isinstance(settings, dict):
-        raise RuntimeError("Melodarr settings file must contain a JSON object.")
-    return settings
+    global _settings_cache_signature, _settings_cache_value
+    signature = _settings_file_signature()
+    with _settings_cache_lock:
+        if signature == _settings_cache_signature:
+            return deepcopy(_settings_cache_value)
+        if signature is None:
+            _settings_cache_signature = None
+            _settings_cache_value = None
+            return None
+        try:
+            with open(SETTINGS_FILE, encoding="utf-8") as file:
+                settings = json.load(file)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Could not read Melodarr settings file: {exc}") from exc
+        if not isinstance(settings, dict):
+            raise RuntimeError(  # noqa: TRY004 - preserve configuration error contract
+                "Melodarr settings file must contain a JSON object."
+            )
+        _settings_cache_signature = _settings_file_signature()
+        _settings_cache_value = settings
+        return deepcopy(settings)
 
 
 def write_settings_file(settings):
@@ -74,6 +97,10 @@ def write_settings_file(settings):
     finally:
         if os.path.exists(temporary_path):
             os.unlink(temporary_path)
+    global _settings_cache_signature, _settings_cache_value
+    with _settings_cache_lock:
+        _settings_cache_signature = _settings_file_signature()
+        _settings_cache_value = deepcopy(settings)
 
 
 def get_service(service):
@@ -857,6 +884,14 @@ def init_db():
                 created_at REAL NOT NULL
             )
         """)
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS request_history_user_recent "
+            "ON request_history(user_id, created_at DESC, id DESC)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS request_history_recent "
+            "ON request_history(created_at DESC, id DESC)"
+        )
         connection.execute("""
             CREATE TABLE IF NOT EXISTS recommendation_preferences (
                 user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,

@@ -235,6 +235,7 @@ let adminRequestsPagination: AdminRequestPagination = {
   totalPages: 0,
 };
 let discoveryLoad: Promise<void> | undefined;
+let discoverySession: CurrentUser | undefined;
 let accountRenderGeneration = 0;
 let accountRenderAbort: AbortController | undefined;
 let sessionExpiryHandled = false;
@@ -355,6 +356,25 @@ function loadDiscovery() {
     document.body.append(script);
   });
   return discoveryLoad;
+}
+
+async function activateDiscovery() {
+  if (!currentUser) return;
+  await loadDiscovery();
+  if (discoverySession !== currentUser) {
+    discoverySession = currentUser;
+    window.dispatchEvent(new Event("melodarr-authenticated"));
+  }
+}
+
+function pathNeedsDiscovery(pathname = window.location.pathname) {
+  return pathname === "/"
+    || pathname === "/discover"
+    || /^\/(?:artists|albums|releases|anime|series)\/[^/]+\/?$/.test(pathname);
+}
+
+function startDiscovery() {
+  void activateDiscovery().catch((error) => showToast(error.message, true));
 }
 
 async function copyInputValue(input: HTMLInputElement) {
@@ -689,7 +709,25 @@ async function refreshSettings(loadLidarrOptions = true) {
     ? `Lidarr connected${plex.configured ? " · Plex connected" : ""}`
     : "Connect Lidarr in Settings";
   status.className = `status ${lidarr.configured ? "ready" : "warn"}`;
-  await refreshNotificationSettings();
+}
+
+async function refreshServiceStatus() {
+  const services = await api("/api/health");
+  if (typeof services.lidarr !== "boolean" || typeof services.plex !== "boolean") return;
+  const status = $("#status");
+  status.textContent = services.lidarr
+    ? `Lidarr connected${services.plex ? " · Plex connected" : ""}`
+    : "Connect Lidarr in Settings";
+  status.className = `status ${services.lidarr ? "ready" : "warn"}`;
+}
+
+async function refreshAdminStartupState() {
+  if (currentUser?.role !== "admin") return;
+  if (window.location.pathname.startsWith("/settings")) {
+    await refreshSettings(window.location.pathname === "/settings");
+  } else {
+    await refreshServiceStatus();
+  }
 }
 
 async function refreshNotificationSettings() {
@@ -970,6 +1008,9 @@ function setupNavigation() {
       else button.removeAttribute("aria-current");
     });
     $(`#${view}`).classList.add("active");
+    if (view === "discover" && currentUser && discoverySession !== currentUser) {
+      startDiscovery();
+    }
     if (view !== "account") setActiveAccountRoute(null);
     if (view === "library") {
       window.dispatchEvent(new Event("melodarr-library-visible"));
@@ -1776,15 +1817,17 @@ async function applyCurrentUser(user: CurrentUser) {
   currentUser = user;
   document.body.classList.add("authenticated");
   updateSessionChrome();
-  try {
-    await loadDiscovery();
-    window.dispatchEvent(new Event("melodarr-authenticated"));
-    // Re-evaluate a bookmarked view or detail route only after its API calls
-    // have an authenticated session and the lazy discovery route is ready.
-    window.dispatchEvent(new PopStateEvent("popstate"));
-  } catch (error) {
-    showToast(error.message, true);
+  if (pathNeedsDiscovery()) {
+    try {
+      await activateDiscovery();
+    } catch (error) {
+      showToast(error.message, true);
+    }
   }
+  // Re-evaluate the bookmarked route after authentication. Detail routes wait
+  // for their lazy bundle above; Library, Settings, and Account become usable
+  // without downloading or executing discovery code.
+  window.dispatchEvent(new PopStateEvent("popstate"));
 }
 
 function appendRequestLifecycle(container: HTMLElement, item: JsonObject) {
@@ -2396,7 +2439,7 @@ async function completeAuthentication(endpoint: string, form: HTMLFormElement, m
     }
     await applyCurrentUser(user);
     form.reset();
-    if (user.role === "admin") await refreshSettings(window.location.pathname.startsWith("/settings"));
+    await refreshAdminStartupState();
   } catch (error) {
     setMessage(message, error.message, true);
   }
@@ -2470,7 +2513,7 @@ function setupAuth() {
     await startPlexAuthentication("login", regularPlexMessage, async (result) => {
       window.history.replaceState({ view: "discover" }, "", "/");
       await applyCurrentUser(result as CurrentUser);
-      if (result.role === "admin") await refreshSettings();
+      await refreshAdminStartupState();
     });
     regularPlexButton.disabled = false;
   });
@@ -2547,7 +2590,7 @@ function setupAuth() {
       });
       window.history.replaceState({ view: "discover" }, "", "/");
       await applyCurrentUser(user);
-      await refreshSettings();
+      await refreshAdminStartupState();
     } catch (error) {
       setMessage(setupPlexServerMessage, error.message, true);
       finishButton.disabled = false;
@@ -2938,14 +2981,21 @@ function setupLibrary() {
     card.append(artwork, info);
     if (card instanceof HTMLAnchorElement) {
       card.href = `/artists/${encodeURIComponent(String(artist.musicbrainzId))}`;
-      const openArtist = () => window.dispatchEvent(new CustomEvent(
-        "melodarr-open-detail",
-        { detail: { kind: "artist", id: artist.musicbrainzId } },
-      ));
+      const openArtist = async () => {
+        try {
+          await activateDiscovery();
+          window.dispatchEvent(new CustomEvent(
+            "melodarr-open-detail",
+            { detail: { kind: "artist", id: artist.musicbrainzId } },
+          ));
+        } catch (error) {
+          showToast(error.message, true);
+        }
+      };
       card.addEventListener("click", (event) => {
         if (!isPlainPrimaryClick(event)) return;
         event.preventDefault();
-        openArtist();
+        void openArtist();
       });
     }
     return card;
@@ -3119,6 +3169,6 @@ api<CurrentUser>("/api/auth/me")
       window.history.replaceState({ view: "discover" }, "", "/");
     }
     await applyCurrentUser(user);
-    if (user.role === "admin") await refreshSettings(window.location.pathname === "/settings");
+    await refreshAdminStartupState();
   })
   .catch(() => showAuth());
