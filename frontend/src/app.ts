@@ -743,6 +743,7 @@ async function refreshNotificationSettings() {
     const input = (form: HTMLFormElement, name: string) => requiredDescendant<HTMLInputElement | HTMLSelectElement>(form, `[name="${name}"]`);
     (input(globalForm, "enabled") as HTMLInputElement).checked = Boolean(config.enabled);
     (input(globalForm, "applicationUrl") as HTMLInputElement).value = config.applicationUrl || "";
+    (input(globalForm, "delaySeconds") as HTMLInputElement).value = String(config.delaySeconds || 0);
     (input(emailForm, "host") as HTMLInputElement).value = config.email?.host || "";
     (input(emailForm, "port") as HTMLInputElement).value = String(config.email?.port || 587);
     (input(emailForm, "encryption") as HTMLSelectElement).value = config.email?.encryption || "starttls";
@@ -763,7 +764,7 @@ async function refreshNotificationSettings() {
         catch (error) { setMessage(message, error.message, true); }
       });
     };
-    bindSave(globalForm, "/api/settings/notifications/global", () => ({ enabled: (input(globalForm, "enabled") as HTMLInputElement).checked, applicationUrl: (input(globalForm, "applicationUrl") as HTMLInputElement).value }), "Global notification settings saved.");
+    bindSave(globalForm, "/api/settings/notifications/global", () => ({ enabled: (input(globalForm, "enabled") as HTMLInputElement).checked, applicationUrl: (input(globalForm, "applicationUrl") as HTMLInputElement).value, delaySeconds: (input(globalForm, "delaySeconds") as HTMLInputElement).value }), "Global notification settings saved.");
     bindSave(emailForm, "/api/settings/notifications/email", () => ({ enabled: (input(emailForm, "emailEnabled") as HTMLInputElement).checked, host: (input(emailForm, "host") as HTMLInputElement).value, port: (input(emailForm, "port") as HTMLInputElement).value, encryption: (input(emailForm, "encryption") as HTMLSelectElement).value, username: (input(emailForm, "username") as HTMLInputElement).value, senderName: (input(emailForm, "senderName") as HTMLInputElement).value, sender: (input(emailForm, "sender") as HTMLInputElement).value, password: (input(emailForm, "password") as HTMLInputElement).value }), "Email notification settings saved.");
     bindSave(pushForm, "/api/settings/notifications/web-push", () => ({ enabled: (input(pushForm, "webPushEnabled") as HTMLInputElement).checked, contact: (input(pushForm, "contact") as HTMLInputElement).value }), "Web Push notification settings saved.");
     const tests: Array<[HTMLFormElement, string]> = [[emailForm, "/api/settings/notifications/email/test"], [pushForm, "/api/settings/notifications/web-push/test"]];

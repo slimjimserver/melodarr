@@ -73,7 +73,7 @@ def put_global_notifications():
 def put_notification_global_section():
     try:
         return jsonify(notifications.save_global_config(_section_payload(
-            request_json_object(), {"enabled", "applicationUrl"})))
+            request_json_object(), {"enabled", "applicationUrl", "delaySeconds"})))
     except ValueError as exc:
         return api_error(str(exc))
 

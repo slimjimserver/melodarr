@@ -333,6 +333,7 @@
             <fieldset class="notification-card notification-global-card">
               <legend>Global delivery</legend>
               <label>Application URL<small>The public URL used in email and Web Push. Web Push requires HTTPS except localhost.</small><input name="applicationUrl" type="url" placeholder="https://music.example.com"></label>
+              <label>Notification Delay (seconds)<small>Wait after Lidarr reports music available before notifying users. Use 0 for immediate delivery.</small><input name="delaySeconds" type="number" min="0" max="86400" step="1" value="0" inputmode="numeric"></label>
               <label class="checkbox"><input name="enabled" type="checkbox"> Enable Notifications Globally</label>
               <div class="form-actions"><p class="form-message" aria-live="polite"></p><button class="notification-save">Save Global Settings</button></div>
             </fieldset>
