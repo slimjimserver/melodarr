@@ -2152,9 +2152,10 @@ class DeploymentConfigTests(unittest.TestCase):
         )
         self.assertIn(
             '<a class="nav-link" href="/library" data-view="library">'
-            '<span class="tab-icon" aria-hidden="true">▤</span>Library</a>',
+            '<span class="tab-icon" aria-hidden="true"><svg',
             frontend,
         )
+        self.assertIn('</svg></span>Library</a>', frontend)
         self.assertNotIn(
             'class="nav-link admin-only" href="/library"',
             frontend,

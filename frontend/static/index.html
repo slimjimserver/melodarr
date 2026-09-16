@@ -26,7 +26,12 @@
     </nav>
     <div id="status" class="status" role="status" aria-live="polite">Checking services…</div>
     <button id="theme-toggle" class="theme-toggle" type="button">
-      <span class="theme-icon" aria-hidden="true">☾</span>
+      <span class="theme-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" focusable="false">
+          <path class="theme-moon" d="M20.2 15.2A8.2 8.2 0 0 1 8.8 3.8 8.4 8.4 0 1 0 20.2 15.2Z"/>
+          <g class="theme-sun"><circle cx="12" cy="12" r="3.5"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></g>
+        </svg>
+      </span>
       <span class="theme-label">Midnight</span>
     </button>
     <a id="account-menu" class="account-menu" href="/" aria-label="Open account settings" title="Account settings">●</a>
@@ -521,9 +526,9 @@
     </form>
   </dialog>
   <nav class="tab-bar" aria-label="Primary">
-    <a class="nav-link active" href="/" data-view="discover" aria-current="page"><span class="tab-icon" aria-hidden="true">◎</span>Discover</a>
-    <a class="nav-link" href="/library" data-view="library"><span class="tab-icon" aria-hidden="true">▤</span>Library</a>
-    <a class="nav-link admin-only" href="/settings" data-view="settings"><span class="tab-icon" aria-hidden="true">⚙</span>Settings</a>
+    <a class="nav-link active" href="/" data-view="discover" aria-current="page"><span class="tab-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="2.25"/><path d="m14 10 3.5-3.5-3.5 7.5-7.5 3.5L10 14"/></svg></span>Discover</a>
+    <a class="nav-link" href="/library" data-view="library"><span class="tab-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path d="M5 5.5h12.5A1.5 1.5 0 0 1 19 7v12H6.5A1.5 1.5 0 0 1 5 17.5v-12Z"/><path d="M8 2.5h9.5A1.5 1.5 0 0 1 19 4v1.5M8 9h8M8 12.5h8"/></svg></span>Library</a>
+    <a class="nav-link admin-only" href="/settings" data-view="settings"><span class="tab-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><circle cx="12" cy="12" r="3"/><path d="M19 13.5v-3l-2-.6a7 7 0 0 0-.7-1.6l1-1.8-2.1-2.1-1.8 1A7 7 0 0 0 11.8 5l-.6-2h-3l-.6 2a7 7 0 0 0-1.6.7l-1.8-1-2.1 2.1 1 1.8a7 7 0 0 0-.7 1.6l-2 .6v3l2 .6a7 7 0 0 0 .7 1.6l-1 1.8 2.1 2.1 1.8-1a7 7 0 0 0 1.6.7l.6 2h3l.6-2a7 7 0 0 0 1.6-.7l1.8 1 2.1-2.1-1-1.8a7 7 0 0 0 .7-1.6l2-.6Z" transform="translate(2.3 -1) scale(.82)"/></svg></span>Settings</a>
   </nav>
   <div id="toasts" class="toasts" aria-live="polite" aria-atomic="false"></div>
   <button id="back-to-top" type="button" aria-label="Back to top">↑ <span>Top</span></button>

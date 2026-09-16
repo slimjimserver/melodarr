@@ -304,18 +304,19 @@ function setMessage(element: Element, message: string, isError = false) {
   element.textContent = message;
   element.classList.add("message");
   element.classList.toggle("error", isError);
+  if (element instanceof HTMLElement && element.classList.contains("service-state")) {
+    element.dataset.state = isError ? "warning" : "idle";
+  }
 }
 
 function setupTheme() {
   const button = $<HTMLButtonElement>("#theme-toggle");
-  const icon = requiredDescendant<HTMLElement>(button, ".theme-icon");
   const label = requiredDescendant<HTMLElement>(button, ".theme-label");
   const storageKey = "melodarr-theme";
 
   const applyTheme = (theme: ThemeName, persist = false) => {
     const nextTheme: ThemeName = theme === "midnight" ? "warm" : "midnight";
     document.documentElement.dataset.theme = theme;
-    icon.textContent = theme === "midnight" ? "☾" : "☀";
     label.textContent = theme === "midnight" ? "Midnight" : "Warm";
     button.setAttribute("aria-label", `Switch to ${nextTheme === "midnight" ? "Midnight" : "Warm"} theme`);
     button.title = `Switch to ${nextTheme === "midnight" ? "Midnight" : "Warm"} theme`;
@@ -425,6 +426,24 @@ function skeletonBlock(className: string, count = 1) {
     fragment.append(block);
   }
   return fragment;
+}
+
+/** Give intentionally empty surfaces the same clear hierarchy as loaded content. */
+function emptyState(title: string, copy: string) {
+  const state = document.createElement("section");
+  state.className = "empty-state";
+  const heading = document.createElement("h2");
+  heading.textContent = title;
+  const description = document.createElement("p");
+  description.textContent = copy;
+  state.append(heading, description);
+  return state;
+}
+
+function setServiceState(element: HTMLElement, text: string, state: "ready" | "idle" | "warning") {
+  element.textContent = text;
+  element.classList.remove("message", "error");
+  element.dataset.state = state;
 }
 
 async function api<T = JsonObject>(url: string, options: RequestInit = {}): Promise<T> {
@@ -647,10 +666,14 @@ async function refreshSettings(loadLidarrOptions = true) {
   } catch {
     // Keep a useful fallback if the settings response is unexpectedly incomplete.
   }
-  $("#musicbrainz-state").textContent = musicbrainzState;
+  setServiceState($("#musicbrainz-state"), musicbrainzState, "ready");
 
   const lastfmConfigured = Boolean(settings.lastfm?.configured);
-  $("#lastfm-state").textContent = lastfmConfigured ? "API key configured" : "Not configured";
+  setServiceState(
+    $("#lastfm-state"),
+    lastfmConfigured ? "API key configured" : "Not configured",
+    lastfmConfigured ? "ready" : "idle",
+  );
   const lastfmForm = $<LastfmSettingsForm>("#lastfm-settings");
   lastfmForm.apiKey.value = "";
   lastfmForm.apiKey.placeholder = lastfmConfigured
@@ -658,10 +681,16 @@ async function refreshSettings(loadLidarrOptions = true) {
     : "Last.fm API key";
   $("#clear-lastfm-key").hidden = !lastfmConfigured;
 
-  $("#lidarr-state").textContent = lidarr.configured ? `Connected · ${lidarr.url}` : "Not connected";
-  $("#plex-state").textContent = plex.configured
-    ? `Connected · ${plex.serverName || plex.url}`
-    : "Not connected";
+  setServiceState(
+    $("#lidarr-state"),
+    lidarr.configured ? `Connected · ${lidarr.url}` : "Not connected",
+    lidarr.configured ? "ready" : "idle",
+  );
+  setServiceState(
+    $("#plex-state"),
+    plex.configured ? `Connected · ${plex.serverName || plex.url}` : "Not connected",
+    plex.configured ? "ready" : "idle",
+  );
   $("#connect-plex").firstChild!.textContent = plex.configured
     ? "Reconnect with "
     : "Sign in with ";
@@ -739,7 +768,7 @@ async function refreshNotificationSettings() {
   try {
     const config = await api("/api/settings/notifications");
     const state = $<HTMLElement>("#notification-state");
-    state.textContent = config.enabled ? "Enabled" : "Disabled";
+    setServiceState(state, config.enabled ? "Enabled" : "Disabled", config.enabled ? "ready" : "idle");
     const input = (form: HTMLFormElement, name: string) => requiredDescendant<HTMLInputElement | HTMLSelectElement>(form, `[name="${name}"]`);
     (input(globalForm, "enabled") as HTMLInputElement).checked = Boolean(config.enabled);
     (input(globalForm, "applicationUrl") as HTMLInputElement).value = config.applicationUrl || "";
@@ -890,8 +919,10 @@ function showSettingsPage(page: SettingsPage, updateHistory = true) {
     maintenanceRefreshTimer = undefined;
     return;
   }
+  let currentTab: HTMLAnchorElement | undefined;
   document.querySelectorAll<HTMLAnchorElement>("[data-settings-page]").forEach((button) => {
     const isCurrent = button.dataset.settingsPage === page;
+    if (isCurrent) currentTab = button;
     button.classList.toggle("active", isCurrent);
     button.setAttribute("aria-selected", String(isCurrent));
     button.tabIndex = isCurrent ? 0 : -1;
@@ -915,6 +946,9 @@ function showSettingsPage(page: SettingsPage, updateHistory = true) {
     const path = page === "services" ? "/settings" : `/settings/${page}`;
     window.history.pushState({ view: "settings", settings: page }, "", path);
     resetPageScroll();
+  }
+  if (currentTab && window.matchMedia("(max-width: 700px)").matches) {
+    window.requestAnimationFrame(() => currentTab?.scrollIntoView({ block: "nearest", inline: "center" }));
   }
 }
 
@@ -2017,7 +2051,7 @@ function renderAdminRequests() {
     empty.className = "message admin-request-empty";
     empty.textContent = adminRequests.length
       ? "No requests match the current filters."
-      : "No requests have been made yet.";
+      : "No requests yet. Artist and release requests will appear here as users make them.";
     list.append(empty);
   } else {
     visibleRequests.forEach((item) => list.append(createAdminRequestItem(item)));
@@ -2149,7 +2183,9 @@ function renderAdminUsers() {
     const row = document.createElement("tr");
     const empty = tableCell(
       row,
-      adminUsers.length ? `No users match “${$<HTMLInputElement>("#users-search").value.trim()}”.` : "No users have joined Melodarr yet.",
+      adminUsers.length
+        ? `No users match “${$<HTMLInputElement>("#users-search").value.trim()}”.`
+        : "No users have joined yet. Create an invitation from your account to welcome someone in.",
     );
     empty.className = "table-empty";
     empty.colSpan = 6;
@@ -3133,8 +3169,15 @@ function setupLibrary() {
       const artistLabel = library.artistCount === 1 ? "artist" : "artists";
       $("#library-copy").textContent = `${library.artistCount} ${artistLabel} available in your Plex music libraries.`;
       setMessage($("#library-message"), "");
-      filter.hidden = false;
-      filterArtists();
+      filter.hidden = libraryArtists.length === 0;
+      if (libraryArtists.length) {
+        filterArtists();
+      } else {
+        results.append(emptyState(
+          "No music has arrived yet",
+          "Plex did not return any artists from the selected music libraries. Check the Plex library selection, then use Reload to try again.",
+        ));
+      }
       loadState = "loaded";
     } catch (error) {
       results.replaceChildren();

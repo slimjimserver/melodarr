@@ -198,7 +198,7 @@ test("library page describes artist holdings only", async ({ page }) => {
   await expect(summary).not.toContainText("releases");
 });
 
-test("mobile tab bar stays 82px tall including its safe-area padding", async ({ page }) => {
+test("mobile tab bar keeps a compact 48px target above its safe-area padding", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/");
   await signIn(page, "ada");
@@ -220,10 +220,10 @@ test("mobile tab bar stays 82px tall including its safe-area padding", async ({ 
 
   expect(metrics).toEqual({
     bottom: 844,
-    height: 82,
-    mainPaddingBottom: "118px",
+    height: 72,
+    mainPaddingBottom: "108px",
     paddingBottom: "24px",
-    toastBottom: "100px",
+    toastBottom: "90px",
   });
 });
 
