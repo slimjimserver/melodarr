@@ -20,13 +20,18 @@
       <span>melodarr</span>
     </a>
     <nav class="header-nav">
-      <button class="nav-link active" type="button" data-view="discover" aria-current="page">Discover</button>
-      <button class="nav-link" type="button" data-view="library">Your library</button>
-      <button class="nav-link admin-only" type="button" data-view="settings">Settings</button>
+      <a class="nav-link active" href="/" data-view="discover" aria-current="page">Discover</a>
+      <a class="nav-link" href="/library" data-view="library">Your library</a>
+      <a class="nav-link admin-only" href="/settings" data-view="settings">Settings</a>
     </nav>
     <div id="status" class="status" role="status" aria-live="polite">Checking services…</div>
     <button id="theme-toggle" class="theme-toggle" type="button">
-      <span class="theme-icon" aria-hidden="true">☾</span>
+      <span class="theme-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" focusable="false">
+          <path class="theme-moon" d="M20.2 15.2A8.2 8.2 0 0 1 8.8 3.8 8.4 8.4 0 1 0 20.2 15.2Z"/>
+          <g class="theme-sun"><circle cx="12" cy="12" r="3.5"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></g>
+        </svg>
+      </span>
       <span class="theme-label">Midnight</span>
     </button>
     <a id="account-menu" class="account-menu" href="/" aria-label="Open account settings" title="Account settings">●</a>
@@ -143,7 +148,7 @@
     <section id="discover" class="view active">
       <p class="eyebrow">FIND YOUR NEXT FAVORITE</p>
       <h1>What do you want<br>to hear <em>next?</em></h1>
-      <p class="intro">Explore MusicBrainz directly or discover recommendations shaped around your listening history.</p>
+      <p class="intro">Explore MusicBrainz directly or discover recommendations shaped around your requests and listening.</p>
       <form id="search-form" class="search">
         <select id="search-type" aria-label="Search type">
           <option value="artist">Artists</option>
@@ -158,10 +163,11 @@
       <div id="results" class="results" aria-label="Search results"></div>
       <section class="recommendations" aria-labelledby="recommendations-title">
         <div class="recommendations-heading">
-          <div><p class="eyebrow">LINKED ACCOUNTS</p><h2 id="recommendations-title">Recommended for you</h2></div>
-          <button id="load-recommendations" class="outline" type="button">Get recommendations</button>
+          <div><p class="eyebrow">YOUR NEXT FAVORITE</p><h2 id="recommendations-title">Recommended for you</h2></div>
+          <button id="load-recommendations" class="outline" type="button">Refresh picks</button>
         </div>
-        <p id="recommendations-message" class="message" aria-live="polite">Connect ListenBrainz or Last.fm in Linked accounts and we’ll shape recommendations around what you love.</p>
+        <p id="recommendations-message" class="message" aria-live="polite">Your requests and listening help us find your next favorite. Tell us what catches your ear.</p>
+        <div id="recommendation-preferences"></div>
         <div id="recommendation-results" aria-label="Music recommendations"></div>
       </section>
     </section>
@@ -203,11 +209,11 @@
       </div>
 
       <div class="settings-tabs" role="tablist" aria-label="Settings sections">
-        <button id="settings-tab-services" class="active" type="button" role="tab" aria-selected="true" aria-controls="settings-services" data-settings-page="services">Services</button>
-        <button id="settings-tab-notifications" type="button" role="tab" aria-selected="false" aria-controls="settings-notifications" tabindex="-1" data-settings-page="notifications">Notifications</button>
-        <button id="settings-tab-requests" type="button" role="tab" aria-selected="false" aria-controls="settings-requests" tabindex="-1" data-settings-page="requests">Requests</button>
-        <button id="settings-tab-users" type="button" role="tab" aria-selected="false" aria-controls="settings-users" tabindex="-1" data-settings-page="users">Users</button>
-        <button id="settings-tab-jobs" type="button" role="tab" aria-selected="false" aria-controls="settings-jobs" tabindex="-1" data-settings-page="jobs">Jobs &amp; Cache</button>
+        <a id="settings-tab-services" class="active" href="/settings" role="tab" aria-selected="true" aria-controls="settings-services" data-settings-page="services">Services</a>
+        <a id="settings-tab-notifications" href="/settings/notifications" role="tab" aria-selected="false" aria-controls="settings-notifications" tabindex="-1" data-settings-page="notifications">Notifications</a>
+        <a id="settings-tab-requests" href="/settings/requests" role="tab" aria-selected="false" aria-controls="settings-requests" tabindex="-1" data-settings-page="requests">Requests</a>
+        <a id="settings-tab-users" href="/settings/users" role="tab" aria-selected="false" aria-controls="settings-users" tabindex="-1" data-settings-page="users">Users</a>
+        <a id="settings-tab-jobs" href="/settings/jobs" role="tab" aria-selected="false" aria-controls="settings-jobs" tabindex="-1" data-settings-page="jobs">Jobs &amp; Cache</a>
       </div>
 
       <div id="settings-services" class="settings-stack settings-panel" role="tabpanel" aria-labelledby="settings-tab-services" tabindex="0">
@@ -245,6 +251,33 @@
               </fieldset>
             </div>
           </div>
+        </section>
+
+        <section class="settings-section">
+          <div class="service-intro"><img class="service-icon" src="/icons/musicbrainz.svg" width="42" height="42" loading="lazy" decoding="async" alt="MusicBrainz"><div><h2>MusicBrainz</h2><p>Use the hosted WS2 service or a compatible self-hosted server.</p></div><span id="musicbrainz-state" class="service-state">Hosted service</span></div>
+          <form id="musicbrainz-settings" class="service-card">
+            <div class="settings-fields">
+              <label class="wide-field">WS2 base URL
+                <small>Default: <code>https://musicbrainz.org/ws/2/</code> · Self-hosted example: <code>http://musicbrainz.local:5000/ws/2/</code></small>
+                <input name="baseUrl" type="url" placeholder="https://musicbrainz.org/ws/2" required>
+              </label>
+              <label class="wide-field">User agent
+                <small>Identifies this Melodarr instance to the MusicBrainz server.</small>
+                <input name="userAgent" autocomplete="off" required>
+              </label>
+              <label>Request interval (ms)
+                <small>Keep 1100 ms for musicbrainz.org; a local server can usually use 0 ms.</small>
+                <input name="requestIntervalMs" type="number" inputmode="numeric" min="0" max="60000" step="1" required>
+              </label>
+            </div>
+            <div class="form-actions">
+              <p class="form-message" aria-live="polite"></p>
+              <div class="service-actions">
+                <button type="button" id="test-musicbrainz" class="secondary-action">Test connection</button>
+                <button type="submit" id="save-musicbrainz">Save MusicBrainz settings</button>
+              </div>
+            </div>
+          </form>
         </section>
 
         <section class="settings-section">
@@ -305,6 +338,7 @@
             <fieldset class="notification-card notification-global-card">
               <legend>Global delivery</legend>
               <label>Application URL<small>The public URL used in email and Web Push. Web Push requires HTTPS except localhost.</small><input name="applicationUrl" type="url" placeholder="https://music.example.com"></label>
+              <label>Notification Delay (seconds)<small>Wait after Lidarr reports music available before notifying users. Use 0 for immediate delivery.</small><input name="delaySeconds" type="number" min="0" max="86400" step="1" value="0" inputmode="numeric"></label>
               <label class="checkbox"><input name="enabled" type="checkbox"> Enable Notifications Globally</label>
               <div class="form-actions"><p class="form-message" aria-live="polite"></p><button class="notification-save">Save Global Settings</button></div>
             </fieldset>
@@ -492,9 +526,9 @@
     </form>
   </dialog>
   <nav class="tab-bar" aria-label="Primary">
-    <button class="nav-link active" type="button" data-view="discover" aria-current="page"><span class="tab-icon" aria-hidden="true">◎</span>Discover</button>
-    <button class="nav-link" type="button" data-view="library"><span class="tab-icon" aria-hidden="true">▤</span>Library</button>
-    <button class="nav-link admin-only" type="button" data-view="settings"><span class="tab-icon" aria-hidden="true">⚙</span>Settings</button>
+    <a class="nav-link active" href="/" data-view="discover" aria-current="page"><span class="tab-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="2.25"/><path d="m14 10 3.5-3.5-3.5 7.5-7.5 3.5L10 14"/></svg></span>Discover</a>
+    <a class="nav-link" href="/library" data-view="library"><span class="tab-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path d="M5 5.5h12.5A1.5 1.5 0 0 1 19 7v12H6.5A1.5 1.5 0 0 1 5 17.5v-12Z"/><path d="M8 2.5h9.5A1.5 1.5 0 0 1 19 4v1.5M8 9h8M8 12.5h8"/></svg></span>Library</a>
+    <a class="nav-link admin-only" href="/settings" data-view="settings"><span class="tab-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><circle cx="12" cy="12" r="3"/><path d="M19 13.5v-3l-2-.6a7 7 0 0 0-.7-1.6l1-1.8-2.1-2.1-1.8 1A7 7 0 0 0 11.8 5l-.6-2h-3l-.6 2a7 7 0 0 0-1.6.7l-1.8-1-2.1 2.1 1 1.8a7 7 0 0 0-.7 1.6l-2 .6v3l2 .6a7 7 0 0 0 .7 1.6l-1 1.8 2.1 2.1 1.8-1a7 7 0 0 0 1.6.7l.6 2h3l.6-2a7 7 0 0 0 1.6-.7l1.8 1 2.1-2.1-1-1.8a7 7 0 0 0 .7-1.6l2-.6Z" transform="translate(2.3 -1) scale(.82)"/></svg></span>Settings</a>
   </nav>
   <div id="toasts" class="toasts" aria-live="polite" aria-atomic="false"></div>
   <button id="back-to-top" type="button" aria-label="Back to top">↑ <span>Top</span></button>

@@ -66,7 +66,7 @@ jobs:
         run: python -m pip install -r backend/requirements.txt
 
       - name: Run regression suite
-        run: python -m unittest discover -s tests -v
+        run: python -m unittest discover -s tests -t . -v
 
   container:
     name: Docker image
@@ -81,4 +81,4 @@ jobs:
         run: docker build --tag melodarr-ci .
 
       - name: Run regression suite in image
-        run: docker run --rm melodarr-ci python -m unittest discover -s tests -v
+        run: docker run --rm melodarr-ci python -m unittest discover -s tests -t . -v

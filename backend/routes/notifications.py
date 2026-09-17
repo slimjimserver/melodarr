@@ -10,13 +10,11 @@ if __package__ == "backend.routes":
     from ..responses import api_error, request_json_object
     from ..security import admin_required, current_user, login_required
     from ..storage import db
-    from flask import request
 else:
     import notifications
     from responses import api_error, request_json_object
     from security import admin_required, current_user, login_required
     from storage import db
-    from flask import request
 
 
 blueprint = Blueprint("notifications", __name__)
@@ -73,7 +71,7 @@ def put_global_notifications():
 def put_notification_global_section():
     try:
         return jsonify(notifications.save_global_config(_section_payload(
-            request_json_object(), {"enabled", "applicationUrl"})))
+            request_json_object(), {"enabled", "applicationUrl", "delaySeconds"})))
     except ValueError as exc:
         return api_error(str(exc))
 

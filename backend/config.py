@@ -19,6 +19,7 @@ def _path_from_environment(name, default):
     return value
 
 MUSICBRAINZ_URL = "https://musicbrainz.org/ws/2"
+MUSICBRAINZ_REQUEST_INTERVAL_MS = 1100
 COVER_ART_ARCHIVE_URL = "https://coverartarchive.org"
 LIDARR_METADATA_URL = "https://api.lidarr.audio/api/v0.4"
 LISTENBRAINZ_URL = "https://api.listenbrainz.org/1"

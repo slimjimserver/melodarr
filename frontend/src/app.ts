@@ -138,6 +138,12 @@ type LastfmSettingsForm = HTMLFormElement & {
   apiKey: HTMLInputElement;
 };
 
+type MusicBrainzSettingsForm = HTMLFormElement & {
+  baseUrl: HTMLInputElement;
+  userAgent: HTMLInputElement;
+  requestIntervalMs: HTMLInputElement;
+};
+
 interface PlexConnection extends JsonObject {
   uri: string;
   local: boolean;
@@ -170,6 +176,17 @@ function requiredDescendant<T extends Element>(parent: ParentNode, selector: str
   const element = parent.querySelector<T>(selector);
   if (!element) throw new Error(`Required descendant not found: ${selector}`);
   return element;
+}
+
+function isPlainPrimaryClick(event: MouseEvent) {
+  return (
+    event.button === 0
+    && !event.metaKey
+    && !event.ctrlKey
+    && !event.shiftKey
+    && !event.altKey
+    && !event.defaultPrevented
+  );
 }
 
 function normalizeSearch(value: string) {
@@ -218,6 +235,7 @@ let adminRequestsPagination: AdminRequestPagination = {
   totalPages: 0,
 };
 let discoveryLoad: Promise<void> | undefined;
+let discoverySession: CurrentUser | undefined;
 let accountRenderGeneration = 0;
 let accountRenderAbort: AbortController | undefined;
 let sessionExpiryHandled = false;
@@ -286,18 +304,19 @@ function setMessage(element: Element, message: string, isError = false) {
   element.textContent = message;
   element.classList.add("message");
   element.classList.toggle("error", isError);
+  if (element instanceof HTMLElement && element.classList.contains("service-state")) {
+    element.dataset.state = isError ? "warning" : "idle";
+  }
 }
 
 function setupTheme() {
   const button = $<HTMLButtonElement>("#theme-toggle");
-  const icon = requiredDescendant<HTMLElement>(button, ".theme-icon");
   const label = requiredDescendant<HTMLElement>(button, ".theme-label");
   const storageKey = "melodarr-theme";
 
   const applyTheme = (theme: ThemeName, persist = false) => {
     const nextTheme: ThemeName = theme === "midnight" ? "warm" : "midnight";
     document.documentElement.dataset.theme = theme;
-    icon.textContent = theme === "midnight" ? "☾" : "☀";
     label.textContent = theme === "midnight" ? "Midnight" : "Warm";
     button.setAttribute("aria-label", `Switch to ${nextTheme === "midnight" ? "Midnight" : "Warm"} theme`);
     button.title = `Switch to ${nextTheme === "midnight" ? "Midnight" : "Warm"} theme`;
@@ -338,6 +357,25 @@ function loadDiscovery() {
     document.body.append(script);
   });
   return discoveryLoad;
+}
+
+async function activateDiscovery() {
+  if (!currentUser) return;
+  await loadDiscovery();
+  if (discoverySession !== currentUser) {
+    discoverySession = currentUser;
+    window.dispatchEvent(new Event("melodarr-authenticated"));
+  }
+}
+
+function pathNeedsDiscovery(pathname = window.location.pathname) {
+  return pathname === "/"
+    || pathname === "/discover"
+    || /^\/(?:artists|albums|releases|anime|series)\/[^/]+\/?$/.test(pathname);
+}
+
+function startDiscovery() {
+  void activateDiscovery().catch((error) => showToast(error.message, true));
 }
 
 async function copyInputValue(input: HTMLInputElement) {
@@ -388,6 +426,24 @@ function skeletonBlock(className: string, count = 1) {
     fragment.append(block);
   }
   return fragment;
+}
+
+/** Give intentionally empty surfaces the same clear hierarchy as loaded content. */
+function emptyState(title: string, copy: string) {
+  const state = document.createElement("section");
+  state.className = "empty-state";
+  const heading = document.createElement("h2");
+  heading.textContent = title;
+  const description = document.createElement("p");
+  description.textContent = copy;
+  state.append(heading, description);
+  return state;
+}
+
+function setServiceState(element: HTMLElement, text: string, state: "ready" | "idle" | "warning") {
+  element.textContent = text;
+  element.classList.remove("message", "error");
+  element.dataset.state = state;
 }
 
 async function api<T = JsonObject>(url: string, options: RequestInit = {}): Promise<T> {
@@ -594,8 +650,30 @@ async function refreshSettings(loadLidarrOptions = true) {
   const { lidarr, plex } = settings;
   lidarrDefaults = lidarr.defaults || {};
 
+  const musicbrainz = settings.musicbrainz || {};
+  const musicbrainzForm = $<MusicBrainzSettingsForm>("#musicbrainz-settings");
+  musicbrainzForm.baseUrl.value = musicbrainz.baseUrl || "";
+  musicbrainzForm.userAgent.value = musicbrainz.userAgent || "";
+  musicbrainzForm.requestIntervalMs.value = String(
+    musicbrainz.requestIntervalMs ?? 1100,
+  );
+  let musicbrainzState = "Self-hosted service";
+  try {
+    const host = new URL(musicbrainz.baseUrl).hostname;
+    musicbrainzState = host === "musicbrainz.org"
+      ? "Hosted service"
+      : `Self-hosted · ${host}`;
+  } catch {
+    // Keep a useful fallback if the settings response is unexpectedly incomplete.
+  }
+  setServiceState($("#musicbrainz-state"), musicbrainzState, "ready");
+
   const lastfmConfigured = Boolean(settings.lastfm?.configured);
-  $("#lastfm-state").textContent = lastfmConfigured ? "API key configured" : "Not configured";
+  setServiceState(
+    $("#lastfm-state"),
+    lastfmConfigured ? "API key configured" : "Not configured",
+    lastfmConfigured ? "ready" : "idle",
+  );
   const lastfmForm = $<LastfmSettingsForm>("#lastfm-settings");
   lastfmForm.apiKey.value = "";
   lastfmForm.apiKey.placeholder = lastfmConfigured
@@ -603,10 +681,16 @@ async function refreshSettings(loadLidarrOptions = true) {
     : "Last.fm API key";
   $("#clear-lastfm-key").hidden = !lastfmConfigured;
 
-  $("#lidarr-state").textContent = lidarr.configured ? `Connected · ${lidarr.url}` : "Not connected";
-  $("#plex-state").textContent = plex.configured
-    ? `Connected · ${plex.serverName || plex.url}`
-    : "Not connected";
+  setServiceState(
+    $("#lidarr-state"),
+    lidarr.configured ? `Connected · ${lidarr.url}` : "Not connected",
+    lidarr.configured ? "ready" : "idle",
+  );
+  setServiceState(
+    $("#plex-state"),
+    plex.configured ? `Connected · ${plex.serverName || plex.url}` : "Not connected",
+    plex.configured ? "ready" : "idle",
+  );
   $("#connect-plex").firstChild!.textContent = plex.configured
     ? "Reconnect with "
     : "Sign in with ";
@@ -654,7 +738,25 @@ async function refreshSettings(loadLidarrOptions = true) {
     ? `Lidarr connected${plex.configured ? " · Plex connected" : ""}`
     : "Connect Lidarr in Settings";
   status.className = `status ${lidarr.configured ? "ready" : "warn"}`;
-  await refreshNotificationSettings();
+}
+
+async function refreshServiceStatus() {
+  const services = await api("/api/health");
+  if (typeof services.lidarr !== "boolean" || typeof services.plex !== "boolean") return;
+  const status = $("#status");
+  status.textContent = services.lidarr
+    ? `Lidarr connected${services.plex ? " · Plex connected" : ""}`
+    : "Connect Lidarr in Settings";
+  status.className = `status ${services.lidarr ? "ready" : "warn"}`;
+}
+
+async function refreshAdminStartupState() {
+  if (currentUser?.role !== "admin") return;
+  if (window.location.pathname.startsWith("/settings")) {
+    await refreshSettings(window.location.pathname === "/settings");
+  } else {
+    await refreshServiceStatus();
+  }
 }
 
 async function refreshNotificationSettings() {
@@ -666,10 +768,11 @@ async function refreshNotificationSettings() {
   try {
     const config = await api("/api/settings/notifications");
     const state = $<HTMLElement>("#notification-state");
-    state.textContent = config.enabled ? "Enabled" : "Disabled";
+    setServiceState(state, config.enabled ? "Enabled" : "Disabled", config.enabled ? "ready" : "idle");
     const input = (form: HTMLFormElement, name: string) => requiredDescendant<HTMLInputElement | HTMLSelectElement>(form, `[name="${name}"]`);
     (input(globalForm, "enabled") as HTMLInputElement).checked = Boolean(config.enabled);
     (input(globalForm, "applicationUrl") as HTMLInputElement).value = config.applicationUrl || "";
+    (input(globalForm, "delaySeconds") as HTMLInputElement).value = String(config.delaySeconds || 0);
     (input(emailForm, "host") as HTMLInputElement).value = config.email?.host || "";
     (input(emailForm, "port") as HTMLInputElement).value = String(config.email?.port || 587);
     (input(emailForm, "encryption") as HTMLSelectElement).value = config.email?.encryption || "starttls";
@@ -690,7 +793,7 @@ async function refreshNotificationSettings() {
         catch (error) { setMessage(message, error.message, true); }
       });
     };
-    bindSave(globalForm, "/api/settings/notifications/global", () => ({ enabled: (input(globalForm, "enabled") as HTMLInputElement).checked, applicationUrl: (input(globalForm, "applicationUrl") as HTMLInputElement).value }), "Global notification settings saved.");
+    bindSave(globalForm, "/api/settings/notifications/global", () => ({ enabled: (input(globalForm, "enabled") as HTMLInputElement).checked, applicationUrl: (input(globalForm, "applicationUrl") as HTMLInputElement).value, delaySeconds: (input(globalForm, "delaySeconds") as HTMLInputElement).value }), "Global notification settings saved.");
     bindSave(emailForm, "/api/settings/notifications/email", () => ({ enabled: (input(emailForm, "emailEnabled") as HTMLInputElement).checked, host: (input(emailForm, "host") as HTMLInputElement).value, port: (input(emailForm, "port") as HTMLInputElement).value, encryption: (input(emailForm, "encryption") as HTMLSelectElement).value, username: (input(emailForm, "username") as HTMLInputElement).value, senderName: (input(emailForm, "senderName") as HTMLInputElement).value, sender: (input(emailForm, "sender") as HTMLInputElement).value, password: (input(emailForm, "password") as HTMLInputElement).value }), "Email notification settings saved.");
     bindSave(pushForm, "/api/settings/notifications/web-push", () => ({ enabled: (input(pushForm, "webPushEnabled") as HTMLInputElement).checked, contact: (input(pushForm, "contact") as HTMLInputElement).value }), "Web Push notification settings saved.");
     const tests: Array<[HTMLFormElement, string]> = [[emailForm, "/api/settings/notifications/email/test"], [pushForm, "/api/settings/notifications/web-push/test"]];
@@ -816,8 +919,10 @@ function showSettingsPage(page: SettingsPage, updateHistory = true) {
     maintenanceRefreshTimer = undefined;
     return;
   }
-  document.querySelectorAll<HTMLButtonElement>("[data-settings-page]").forEach((button) => {
+  let currentTab: HTMLAnchorElement | undefined;
+  document.querySelectorAll<HTMLAnchorElement>("[data-settings-page]").forEach((button) => {
     const isCurrent = button.dataset.settingsPage === page;
+    if (isCurrent) currentTab = button;
     button.classList.toggle("active", isCurrent);
     button.setAttribute("aria-selected", String(isCurrent));
     button.tabIndex = isCurrent ? 0 : -1;
@@ -841,6 +946,9 @@ function showSettingsPage(page: SettingsPage, updateHistory = true) {
     const path = page === "services" ? "/settings" : `/settings/${page}`;
     window.history.pushState({ view: "settings", settings: page }, "", path);
     resetPageScroll();
+  }
+  if (currentTab && window.matchMedia("(max-width: 700px)").matches) {
+    window.requestAnimationFrame(() => currentTab?.scrollIntoView({ block: "nearest", inline: "center" }));
   }
 }
 
@@ -895,6 +1003,11 @@ function setupNavigation() {
 
   function setActiveAccountRoute(page: AccountPage | null) {
     document.querySelectorAll<HTMLAnchorElement>("[data-account-route]").forEach((link) => {
+      const route = link.dataset.accountRoute as AccountPage;
+      const username = activeAccountUsername || currentUser?.username;
+      if (username) {
+        link.href = accountPath(route, username, route === "requests" ? activeAccountRequestPage : 1);
+      }
       const isCurrent = page !== null && link.dataset.accountRoute === page;
       link.classList.toggle("active", isCurrent);
       if (isCurrent) link.setAttribute("aria-current", "page");
@@ -921,8 +1034,8 @@ function setupNavigation() {
       accountRenderAbort = undefined;
     }
     document.querySelectorAll(".nav-link, .view").forEach((element) => element.classList.remove("active"));
-    // Account and detail are application views without a matching nav button,
-    // and the header and bottom tab bar both carry a button per view.
+    // Account and detail are application views without a matching navigation link,
+    // and the header and bottom tab bar both carry a link per view.
     document.querySelectorAll<HTMLElement>("[data-view]").forEach((button) => {
       const isCurrent = button.dataset.view === view;
       button.classList.toggle("active", isCurrent);
@@ -930,6 +1043,9 @@ function setupNavigation() {
       else button.removeAttribute("aria-current");
     });
     $(`#${view}`).classList.add("active");
+    if (view === "discover" && currentUser && discoverySession !== currentUser) {
+      startDiscovery();
+    }
     if (view !== "account") setActiveAccountRoute(null);
     if (view === "library") {
       window.dispatchEvent(new Event("melodarr-library-visible"));
@@ -962,9 +1078,12 @@ function setupNavigation() {
     return `/${encodedUsername}/settings/${page}`;
   }
 
-  function createHistoryItem(item: JsonObject, route: string) {
+  function createHistoryItem(item: JsonObject, route: string, editableTaste = false) {
     const row = document.createElement("article");
     row.className = "history-item";
+    const main = document.createElement("div");
+    main.className = "history-main";
+    row.append(main);
 
     const detailLink = document.createElement("div");
     detailLink.className = "history-detail";
@@ -1000,8 +1119,48 @@ function setupNavigation() {
     requestedAt.dateTime = requestedAtDate.toISOString();
     requestedAt.textContent = requestedAtDate.toLocaleDateString();
     detailLink.append(copy, requestedAt);
-    row.append(detailLink);
-    appendRequestLifecycle(row, item);
+    main.append(detailLink);
+    appendRequestLifecycle(copy, item);
+    if (editableTaste && item.id !== undefined) {
+      const label = document.createElement("label");
+      label.className = "request-taste-toggle";
+      const toggle = document.createElement("input");
+      toggle.type = "checkbox";
+      toggle.checked = item.use_for_recommendations !== 0 && item.use_for_recommendations !== false;
+      label.append(toggle, "Use for recommendations");
+      toggle.setAttribute("aria-describedby", "request-taste-help");
+      const status = document.createElement("span");
+      status.className = "field-help";
+      status.setAttribute("aria-live", "polite");
+      const controls = document.createElement("div");
+      controls.className = "request-taste-controls";
+      controls.append(label, status);
+      row.append(controls);
+      toggle.addEventListener("change", async () => {
+        const included = toggle.checked;
+        const generation = accountRenderGeneration;
+        const ownerId = currentUser?.id;
+        toggle.disabled = true;
+        try {
+          await api("/api/discover/request-influence", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ requestId: item.id, useForRecommendations: included }),
+            signal: accountRenderAbort?.signal,
+          });
+          if (generation !== accountRenderGeneration || ownerId !== currentUser?.id) return;
+          item.use_for_recommendations = included;
+          status.textContent = included ? "This request shapes your picks." : "Excluded from your taste profile. Your request is unchanged.";
+          window.dispatchEvent(new Event("melodarr-recommendations-changed"));
+        } catch (error) {
+          if (generation !== accountRenderGeneration || ownerId !== currentUser?.id) return;
+          toggle.checked = !included;
+          status.textContent = `Couldn’t save this preference. ${error.message}`;
+        } finally {
+          toggle.disabled = false;
+        }
+      });
+    }
+
 
     if (item.availableInPlex) {
       const destination = mobilePlexDestination(
@@ -1025,7 +1184,7 @@ function setupNavigation() {
       icon.src = "/icons/plex.svg";
       icon.alt = "";
       plexBadge.append(icon);
-      row.append(plexBadge);
+      main.append(plexBadge);
     }
     return row;
   }
@@ -1166,6 +1325,13 @@ function setupNavigation() {
         );
         if (!isCurrentRender()) return;
         content.replaceChildren();
+        if (isOwnAccount) {
+          const tasteHelp = document.createElement("p");
+          tasteHelp.id = "request-taste-help";
+          tasteHelp.className = "request-taste-help";
+          tasteHelp.textContent = "Requested something for someone else? Turn off Use for recommendations to keep it out of your taste profile.";
+          content.append(tasteHelp);
+        }
         const requestGroups: [string, JsonObject[], string][] = [
           ["Artists", data.requests?.artist || [], "artists"],
           ["Release groups", data.requests?.["release-group"] || [], "albums"],
@@ -1176,7 +1342,7 @@ function setupNavigation() {
           const heading = document.createElement("h2"); heading.textContent = title;
           const list = document.createElement("div"); list.className = "results";
           if (!requests.length) { const empty = document.createElement("p"); empty.className = "message"; empty.textContent = "No requests yet."; list.append(empty); }
-          requests.forEach((item: JsonObject) => list.append(createHistoryItem(item, route)));
+          requests.forEach((item: JsonObject) => list.append(createHistoryItem(item, route, isOwnAccount)));
           section.append(heading, list); content.append(section);
         });
 
@@ -1569,12 +1735,14 @@ function setupNavigation() {
     renderAccount(page);
   };
 
-  document.querySelectorAll<HTMLElement>(".nav-link").forEach((button) => {
-    button.addEventListener("click", () => {
-      showView(button.dataset.view as AppView);
-      if (button.dataset.view === "discover") {
+  document.querySelectorAll<HTMLAnchorElement>(".nav-link").forEach((link) => {
+    link.addEventListener("click", (event) => {
+      if (!isPlainPrimaryClick(event)) return;
+      event.preventDefault();
+      showView(link.dataset.view as AppView);
+      if (link.dataset.view === "discover") {
         window.dispatchEvent(new Event("melodarr-home"));
-      } else if (button.dataset.view === "settings" && currentUser?.role === "admin") {
+      } else if (link.dataset.view === "settings" && currentUser?.role === "admin") {
         showSettingsPage("services", false);
         refreshSettings(true).catch(() => {});
       }
@@ -1584,13 +1752,19 @@ function setupNavigation() {
   $(".brand").addEventListener("click", (event) => {
     // Keep the real href as a no-JavaScript fallback, but avoid reloading the
     // entire application when an authenticated user returns home.
-    if (!currentUser || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    if (!currentUser || !isPlainPrimaryClick(event)) return;
     event.preventDefault();
     showView("discover");
     window.dispatchEvent(new Event("melodarr-home"));
   });
 
   window.addEventListener("popstate", () => {
+    // Fixed application routes take precedence over username routes, including
+    // when authentication restores the current URL after a full page load.
+    if (["/", "/discover", "/library", "/library/"].includes(window.location.pathname)) {
+      showView(window.location.pathname.startsWith("/library") ? "library" : "discover", false);
+      return;
+    }
     if (["/settings", "/settings/notifications", "/settings/requests", "/settings/users", "/settings/jobs"].includes(window.location.pathname)) {
       if (currentUser?.role !== "admin") {
         showView("discover", false);
@@ -1633,20 +1807,30 @@ function setupNavigation() {
   if (["settings/notifications", "settings/requests", "settings/users", "settings/jobs"].includes(initialView)) showView("settings", false);
   else if (["library", "settings"].includes(initialView)) showView(initialView as AppView, false);
 
-  document.querySelectorAll<HTMLElement>(".tab-bar .nav-link").forEach((button) => button.addEventListener("click", () => {
-    window.scrollTo({ top: 0, behavior: "auto" });
+  document.querySelectorAll<HTMLAnchorElement>(".tab-bar .nav-link").forEach((link) => link.addEventListener("click", (event) => {
+    if (event.defaultPrevented) {
+      window.scrollTo({ top: 0, behavior: "auto" });
+    }
   }));
 
   $<HTMLAnchorElement>("#account-menu").addEventListener("click", (event) => {
-    if (!currentUser || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    if (!currentUser || !isPlainPrimaryClick(event)) return;
     event.preventDefault();
     showAccountPage?.("profile", true, currentUser.username);
   });
-  document.querySelectorAll<HTMLElement>("[data-account-route]").forEach((link) => link.addEventListener("click", (event) => { event.preventDefault(); showAccountPage?.(link.dataset.accountRoute as AccountPage); }));
+  document.querySelectorAll<HTMLAnchorElement>("[data-account-route]").forEach((link) => link.addEventListener("click", (event) => {
+    if (!isPlainPrimaryClick(event)) return;
+    event.preventDefault();
+    showAccountPage?.(link.dataset.accountRoute as AccountPage);
+  }));
   document.querySelector("#account-logout")?.addEventListener("click", () => signOut());
-  const settingsTabs = Array.from(document.querySelectorAll<HTMLButtonElement>("[data-settings-page]"));
+  const settingsTabs = Array.from(document.querySelectorAll<HTMLAnchorElement>("[data-settings-page]"));
   settingsTabs.forEach((button, index) => {
-    button.addEventListener("click", () => showSettingsPage(button.dataset.settingsPage as SettingsPage));
+    button.addEventListener("click", (event) => {
+      if (!isPlainPrimaryClick(event)) return;
+      event.preventDefault();
+      showSettingsPage(button.dataset.settingsPage as SettingsPage);
+    });
     button.addEventListener("keydown", (event) => {
       let nextIndex: number | undefined;
       if (event.key === "ArrowRight") nextIndex = (index + 1) % settingsTabs.length;
@@ -1668,15 +1852,17 @@ async function applyCurrentUser(user: CurrentUser) {
   currentUser = user;
   document.body.classList.add("authenticated");
   updateSessionChrome();
-  try {
-    await loadDiscovery();
-    window.dispatchEvent(new Event("melodarr-authenticated"));
-    // Re-evaluate a bookmarked view or detail route only after its API calls
-    // have an authenticated session and the lazy discovery route is ready.
-    window.dispatchEvent(new PopStateEvent("popstate"));
-  } catch (error) {
-    showToast(error.message, true);
+  if (pathNeedsDiscovery()) {
+    try {
+      await activateDiscovery();
+    } catch (error) {
+      showToast(error.message, true);
+    }
   }
+  // Re-evaluate the bookmarked route after authentication. Detail routes wait
+  // for their lazy bundle above; Library, Settings, and Account become usable
+  // without downloading or executing discovery code.
+  window.dispatchEvent(new PopStateEvent("popstate"));
 }
 
 function appendRequestLifecycle(container: HTMLElement, item: JsonObject) {
@@ -1865,7 +2051,7 @@ function renderAdminRequests() {
     empty.className = "message admin-request-empty";
     empty.textContent = adminRequests.length
       ? "No requests match the current filters."
-      : "No requests have been made yet.";
+      : "No requests yet. Artist and release requests will appear here as users make them.";
     list.append(empty);
   } else {
     visibleRequests.forEach((item) => list.append(createAdminRequestItem(item)));
@@ -1997,7 +2183,9 @@ function renderAdminUsers() {
     const row = document.createElement("tr");
     const empty = tableCell(
       row,
-      adminUsers.length ? `No users match “${$<HTMLInputElement>("#users-search").value.trim()}”.` : "No users have joined Melodarr yet.",
+      adminUsers.length
+        ? `No users match “${$<HTMLInputElement>("#users-search").value.trim()}”.`
+        : "No users have joined yet. Create an invitation from your account to welcome someone in.",
     );
     empty.className = "table-empty";
     empty.colSpan = 6;
@@ -2288,7 +2476,7 @@ async function completeAuthentication(endpoint: string, form: HTMLFormElement, m
     }
     await applyCurrentUser(user);
     form.reset();
-    if (user.role === "admin") await refreshSettings(window.location.pathname.startsWith("/settings"));
+    await refreshAdminStartupState();
   } catch (error) {
     setMessage(message, error.message, true);
   }
@@ -2362,7 +2550,7 @@ function setupAuth() {
     await startPlexAuthentication("login", regularPlexMessage, async (result) => {
       window.history.replaceState({ view: "discover" }, "", "/");
       await applyCurrentUser(result as CurrentUser);
-      if (result.role === "admin") await refreshSettings();
+      await refreshAdminStartupState();
     });
     regularPlexButton.disabled = false;
   });
@@ -2439,7 +2627,7 @@ function setupAuth() {
       });
       window.history.replaceState({ view: "discover" }, "", "/");
       await applyCurrentUser(user);
-      await refreshSettings();
+      await refreshAdminStartupState();
     } catch (error) {
       setMessage(setupPlexServerMessage, error.message, true);
       finishButton.disabled = false;
@@ -2513,6 +2701,64 @@ function setupLidarrSettings() {
       submitButton.disabled = false;
     }
   });
+}
+
+function setupMusicBrainzSettings() {
+  const form = $<MusicBrainzSettingsForm>("#musicbrainz-settings");
+  const testButton = $<HTMLButtonElement>("#test-musicbrainz");
+  const saveButton = $<HTMLButtonElement>("#save-musicbrainz");
+  const message = requiredDescendant<HTMLElement>(form, ".form-message");
+
+  const payload = () => ({
+    baseUrl: form.baseUrl.value,
+    userAgent: form.userAgent.value,
+    requestIntervalMs: Number(form.requestIntervalMs.value),
+  });
+  const setBusy = (busy: boolean) => {
+    testButton.disabled = busy;
+    saveButton.disabled = busy;
+    form.toggleAttribute("aria-busy", busy);
+  };
+
+  testButton.addEventListener("click", async () => {
+    if (!form.reportValidity()) return;
+    setBusy(true);
+    setMessage(message, "Testing MusicBrainz connection…");
+    try {
+      const result = await api("/api/settings/musicbrainz/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload()),
+      });
+      setMessage(message, `${result.message} (${result.latencyMs} ms)`);
+    } catch (error) {
+      setMessage(message, error.message, true);
+    } finally {
+      setBusy(false);
+    }
+  });
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!form.reportValidity()) return;
+    setBusy(true);
+    setMessage(message, "Saving MusicBrainz settings…");
+    try {
+      const result = await api("/api/settings/musicbrainz", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload()),
+      });
+      setMessage(message, result.message || "MusicBrainz settings saved.");
+      await refreshSettings(false);
+    } catch (error) {
+      setMessage(message, error.message, true);
+    } finally {
+      setBusy(false);
+    }
+  });
+
+  form.addEventListener("input", () => setMessage(message, ""));
 }
 
 function setupLastfmSettings() {
@@ -2740,7 +2986,9 @@ function setupLibrary() {
   };
 
   const createArtistCard = (artist: JsonObject) => {
-    const card = document.createElement("div");
+    const card = artist.musicbrainzId
+      ? document.createElement("a")
+      : document.createElement("div");
     card.className = `library-card${artist.musicbrainzId ? " clickable" : ""}`;
     card.dataset.search = artist.search;
     const artwork = document.createElement("div");
@@ -2768,19 +3016,23 @@ function setupLibrary() {
       : `${artist.section} · MusicBrainz match unavailable`;
     info.append(name, section);
     card.append(artwork, info);
-    if (artist.musicbrainzId) {
-      card.tabIndex = 0;
-      card.setAttribute("role", "link");
-      const openArtist = () => window.dispatchEvent(new CustomEvent(
-        "melodarr-open-detail",
-        { detail: { kind: "artist", id: artist.musicbrainzId } },
-      ));
-      card.addEventListener("click", openArtist);
-      card.addEventListener("keydown", (event) => {
-        if (event.key === "Enter" || event.key === " ") {
-          event.preventDefault();
-          openArtist();
+    if (card instanceof HTMLAnchorElement) {
+      card.href = `/artists/${encodeURIComponent(String(artist.musicbrainzId))}`;
+      const openArtist = async () => {
+        try {
+          await activateDiscovery();
+          window.dispatchEvent(new CustomEvent(
+            "melodarr-open-detail",
+            { detail: { kind: "artist", id: artist.musicbrainzId } },
+          ));
+        } catch (error) {
+          showToast(error.message, true);
         }
+      };
+      card.addEventListener("click", (event) => {
+        if (!isPlainPrimaryClick(event)) return;
+        event.preventDefault();
+        void openArtist();
       });
     }
     return card;
@@ -2917,8 +3169,15 @@ function setupLibrary() {
       const artistLabel = library.artistCount === 1 ? "artist" : "artists";
       $("#library-copy").textContent = `${library.artistCount} ${artistLabel} available in your Plex music libraries.`;
       setMessage($("#library-message"), "");
-      filter.hidden = false;
-      filterArtists();
+      filter.hidden = libraryArtists.length === 0;
+      if (libraryArtists.length) {
+        filterArtists();
+      } else {
+        results.append(emptyState(
+          "No music has arrived yet",
+          "Plex did not return any artists from the selected music libraries. Check the Plex library selection, then use Reload to try again.",
+        ));
+      }
       loadState = "loaded";
     } catch (error) {
       results.replaceChildren();
@@ -2941,6 +3200,7 @@ setupNavigation();
 setupAdminRequests();
 setupAdminUsers();
 setupStandalonePullToRefresh();
+setupMusicBrainzSettings();
 setupLidarrSettings();
 setupLastfmSettings();
 setupPlexSettings();
@@ -2953,6 +3213,6 @@ api<CurrentUser>("/api/auth/me")
       window.history.replaceState({ view: "discover" }, "", "/");
     }
     await applyCurrentUser(user);
-    if (user.role === "admin") await refreshSettings(window.location.pathname === "/settings");
+    await refreshAdminStartupState();
   })
   .catch(() => showAuth());

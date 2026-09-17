@@ -153,7 +153,6 @@ def listenbrainz_recommendations(
         if (
             release_group_mbid
             and release_group_mbid not in excluded_album_ids
-            and album_artist_name.casefold() not in excluded_artist_names
             and (album_artist_name.casefold(), album_name.casefold())
             not in excluded_album_names
             and album_name
@@ -423,6 +422,7 @@ def seeded_lastfm_recommendations(
                 else "Matched to your recent listening"
             ),
             "score": round(candidate["score"], 4),
+            "seedNames": sorted(candidate["seedNames"]),
             "coverArt": artist_cover_art(candidate["id"]),
         })
 
@@ -489,6 +489,9 @@ def seeded_lastfm_recommendations(
                 "date": date,
                 "score": round(score, 4),
                 "tasteTags": taste_tags,
+                "artistId": artist["id"],
+                "seedNames": artist.get("seedNames", []),
+                "reason": artist.get("type", "Matched to your listening"),
                 "coverArt": release_group_cover_art(mbid),
             }
             if mbid not in albums or score > albums[mbid]["score"]:
@@ -791,7 +794,7 @@ def _service_recommendation_exclusions():
                     excluded["artist_names"].add(name)
             for album in lidarr.library_albums(lidarr_config):
                 mbid = album.get("foreignAlbumId")
-                if mbid:
+                if mbid and lidarr.album_availability(album)["fullyAvailable"]:
                     excluded["album_ids"].add(mbid)
         except (ValueError, requests.RequestException) as exc:
             logger.warning(
@@ -856,7 +859,13 @@ def _deduplicate_recommendations(items):
     """Merge provider results by MusicBrainz entity while retaining provenance."""
     merged = {}
     ordered_ids = []
-    for item in items:
+    provider_counts = {}
+    for original in items:
+        item = dict(original)
+        source = item.get("recommendationSource", "Listening")
+        rank = provider_counts.get(source, 0)
+        provider_counts[source] = rank + 1
+        item["providerRanks"] = {source: rank}
         item_id = str(item.get("id") or "")
         if not item_id:
             continue
@@ -865,6 +874,7 @@ def _deduplicate_recommendations(items):
             ordered_ids.append(item_id)
             continue
         existing = merged[item_id]
+        existing.setdefault("providerRanks", {}).update(item["providerRanks"])
         for key, value in item.items():
             if key not in existing or existing[key] in (None, "", []):
                 existing[key] = value
@@ -1144,28 +1154,23 @@ def build_recommendation_cache(user, *, shared_exclusions=None):
 def refresh_recommendation_cache():
     retry_required = False
     shared_exclusions = None
-    lastfm_api_key = get_lastfm_api_key()
     for user in recommendation_users():
         try:
-            has_provider = bool(
-                _user_value(user, "listenbrainz_username")
-                or (
-                    _user_value(user, "lastfm_username")
-                    and lastfm_api_key
-                )
-                or (
-                    _user_value(user, "plex_id")
-                    and get_service("plex")
-                    and lastfm_api_key
-                )
-            )
-            if has_provider and shared_exclusions is None:
+            if shared_exclusions is None:
                 shared_exclusions = _service_recommendation_exclusions()
             payload = build_recommendation_cache(
                 user,
                 shared_exclusions=shared_exclusions,
             )
+            if __package__:
+                from .recommendation_feed import build_personal_feed
+            else:
+                from recommendation_feed import build_personal_feed
+            payload = build_personal_feed(user, payload, shared_exclusions)
             save_recommendation_cache(user["id"], payload)
+            if (payload.get("requestStatus") == "unavailable"
+                    or payload.get("catalogStatus") in {"partial", "unavailable"}):
+                retry_required = True
             if any(
                 status in {"partial", "unavailable"}
                 for status in payload.get("providerStatus", {}).values()

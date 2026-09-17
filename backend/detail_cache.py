@@ -123,3 +123,14 @@ def invalidate(key):
     with _lock:
         _entries.pop(key, None)
         _generation += 1
+
+
+
+def invalidate_kind(kind):
+    """Drop a detail category whose embedded metadata has changed."""
+    global _generation
+    with _lock:
+        for key in list(_entries):
+            if key[0] == kind:
+                del _entries[key]
+        _generation += 1

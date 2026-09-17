@@ -5,6 +5,7 @@ import os
 import sqlite3
 import time
 from contextlib import contextmanager
+from copy import deepcopy
 from tempfile import NamedTemporaryFile
 from threading import Lock
 
@@ -16,6 +17,17 @@ else:  # Support the existing `python backend/app.py` entry point.
 
 DATABASE_BUSY_TIMEOUT_MS = 5000
 _settings_lock = Lock()
+_settings_cache_lock = Lock()
+_settings_cache_signature = None
+_settings_cache_value = None
+
+
+def _settings_file_signature():
+    try:
+        metadata = os.stat(SETTINGS_FILE)
+    except FileNotFoundError:
+        return None
+    return (metadata.st_mtime_ns, metadata.st_size, metadata.st_ino)
 
 
 @contextmanager
@@ -45,16 +57,27 @@ def db():
 
 def load_settings_file():
     """Read service configuration from its dedicated persistent JSON file."""
-    if not os.path.exists(SETTINGS_FILE):
-        return None
-    try:
-        with open(SETTINGS_FILE, encoding="utf-8") as file:
-            settings = json.load(file)
-    except (OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"Could not read Melodarr settings file: {exc}") from exc
-    if not isinstance(settings, dict):
-        raise RuntimeError("Melodarr settings file must contain a JSON object.")
-    return settings
+    global _settings_cache_signature, _settings_cache_value
+    signature = _settings_file_signature()
+    with _settings_cache_lock:
+        if signature == _settings_cache_signature:
+            return deepcopy(_settings_cache_value)
+        if signature is None:
+            _settings_cache_signature = None
+            _settings_cache_value = None
+            return None
+        try:
+            with open(SETTINGS_FILE, encoding="utf-8") as file:
+                settings = json.load(file)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Could not read Melodarr settings file: {exc}") from exc
+        if not isinstance(settings, dict):
+            raise RuntimeError(  # noqa: TRY004 - preserve configuration error contract
+                "Melodarr settings file must contain a JSON object."
+            )
+        _settings_cache_signature = _settings_file_signature()
+        _settings_cache_value = settings
+        return deepcopy(settings)
 
 
 def write_settings_file(settings):
@@ -74,6 +97,10 @@ def write_settings_file(settings):
     finally:
         if os.path.exists(temporary_path):
             os.unlink(temporary_path)
+    global _settings_cache_signature, _settings_cache_value
+    with _settings_cache_lock:
+        _settings_cache_signature = _settings_file_signature()
+        _settings_cache_value = deepcopy(settings)
 
 
 def get_service(service):
@@ -104,7 +131,7 @@ def get_request_history(user_id, limit=100, offset=0):
     """Return the most recent private request-history rows for one user."""
     with db() as connection:
         return connection.execute(
-            "SELECT kind, mbid, name, artist_name, release_type, release_date, "
+            "SELECT id, use_for_recommendations, kind, mbid, name, artist_name, release_type, release_date, "
             "anime_slug, anime_name, theme_id, theme_label, song_id, song_title, "
             "created_at FROM request_history "
             "WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
@@ -119,6 +146,15 @@ def count_request_history(user_id):
             "SELECT COUNT(*) AS total FROM request_history WHERE user_id = ?",
             (user_id,),
         ).fetchone()["total"]
+
+
+def _wake_recommendations():
+    # Import lazily: the worker itself depends on storage.
+    if __package__:
+        from .workers.recommendations import request_refresh
+    else:
+        from workers.recommendations import request_refresh
+    request_refresh()
 
 
 def record_request(
@@ -169,6 +205,8 @@ def record_request(
                 "SELECT id, ? FROM pending_lidarr_searches WHERE mbid = ?",
                 (user_id, mbid),
             )
+
+    _wake_recommendations()
 
 
 def enqueue_lidarr_search(
@@ -233,7 +271,9 @@ def enqueue_lidarr_search(
                 now,
             ),
         )
-        return bool(cursor.rowcount)
+        inserted = bool(cursor.rowcount)
+    _wake_recommendations()
+    return inserted
 
 
 def pending_lidarr_search(mbid):
@@ -475,16 +515,6 @@ def plex_listen_stats(*, user_id=None, server_id=None):
     return dict(row)
 
 
-def delete_plex_listens(user_id):
-    """Delete all imported Plex listening history owned by one user."""
-    with db() as connection:
-        cursor = connection.execute(
-            "DELETE FROM plex_listens WHERE user_id = ?",
-            (user_id,),
-        )
-        return cursor.rowcount
-
-
 def _create_pending_lidarr_searches_table(connection):
     connection.execute("""
         CREATE TABLE IF NOT EXISTS pending_lidarr_searches (
@@ -720,6 +750,37 @@ def init_db():
         # WAL lets request threads read account and queue state while a
         # background worker commits unrelated updates.
         connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("""CREATE TABLE IF NOT EXISTS anime_automatic_matches (
+            mapping_key TEXT PRIMARY KEY, payload TEXT NOT NULL,
+            retry_at REAL, updated_at REAL NOT NULL)""")
+        connection.execute("""CREATE TABLE IF NOT EXISTS anime_recording_catalogs (
+            artist_mbid TEXT PRIMARY KEY, recordings_json TEXT NOT NULL DEFAULT '{}',
+            next_offset INTEGER NOT NULL DEFAULT 0, complete INTEGER NOT NULL DEFAULT 0,
+            generation REAL NOT NULL, updated_at REAL NOT NULL)""")
+        connection.execute("""CREATE TABLE IF NOT EXISTS anime_artist_refresh_jobs (
+            artist_id INTEGER PRIMARY KEY, artist_mbid TEXT NOT NULL, slug TEXT NOT NULL,
+            due_at REAL NOT NULL DEFAULT 0, lease_until REAL NOT NULL DEFAULT 0,
+            snapshot TEXT, updated_at REAL, failures INTEGER NOT NULL DEFAULT 0)""")
+        connection.execute("""CREATE TABLE IF NOT EXISTS anime_performance_jobs (
+            anime_slug TEXT NOT NULL, theme_id INTEGER NOT NULL, song_id INTEGER NOT NULL,
+            due_at REAL NOT NULL DEFAULT 0, lease_until REAL NOT NULL DEFAULT 0,
+            failures INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(anime_slug, theme_id))""")
+
+        # Retry negatives produced by the removed hard catalog cap. Reviewed
+        # mappings and successful automatic evidence are not touched.
+        for row in connection.execute(
+            "SELECT mapping_key, payload FROM anime_automatic_matches "
+            "WHERE payload LIKE '%artist-recording-browse-limit%'"
+        ).fetchall():
+            result = json.loads(row["payload"])
+            if result.get("state") != "unmatched" or result.get("reason") != "artist-recording-browse-limit":
+                continue
+            song_id = str(result.get("sourceSongId") or "")
+            if song_id.isdigit():
+                connection.execute("UPDATE anime_performance_jobs SET due_at=0 WHERE song_id=?", (int(song_id),))
+            connection.execute("DELETE FROM anime_automatic_matches WHERE mapping_key=?", (row["mapping_key"],))
+
         # AI recommendations were removed. This intentionally deletes only the
         # obsolete derived profiles; every account, request, and library table
         # remains untouched.
@@ -811,6 +872,46 @@ def init_db():
                 song_id INTEGER,
                 song_title TEXT,
                 created_at REAL NOT NULL
+            )
+        """)
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS request_history_user_recent "
+            "ON request_history(user_id, created_at DESC, id DESC)"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS request_history_recent "
+            "ON request_history(created_at DESC, id DESC)"
+        )
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS recommendation_preferences (
+                user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                mode TEXT NOT NULL DEFAULT 'balanced' CHECK(mode IN ('familiar', 'balanced', 'discovery')),
+                artists_json TEXT NOT NULL DEFAULT '[]',
+                revision INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS recommendation_feedback (
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL CHECK(kind IN ('artist', 'release-group')),
+                mbid TEXT NOT NULL,
+                action TEXT NOT NULL CHECK(action IN ('dismiss', 'more')),
+                item_json TEXT NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY(user_id, kind, mbid)
+            )
+        """)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS recommendation_exposures (
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL CHECK(kind IN ('artist', 'release-group')),
+                mbid TEXT NOT NULL,
+                day INTEGER NOT NULL,
+                item_json TEXT NOT NULL,
+                shown_at REAL NOT NULL,
+                opened INTEGER NOT NULL DEFAULT 0,
+                listened INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(user_id, kind, mbid, day)
             )
         """)
         # Notification rows deliberately retain event and target snapshots.  This
@@ -976,6 +1077,7 @@ def init_db():
             for row in connection.execute("PRAGMA table_info(request_history)")
         }
         request_optional_columns = {
+            "use_for_recommendations": "INTEGER NOT NULL DEFAULT 1 CHECK(use_for_recommendations IN (0, 1))",
             "artist_name": "TEXT",
             "release_type": "TEXT",
             "release_date": "TEXT",
@@ -1116,6 +1218,17 @@ def init_db():
                 PRIMARY KEY(anime_slug, theme_id, release_group_mbid)
             )
         """)
+        theme_link_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(anime_theme_release_group_links)")
+        }
+        if "is_preferred" not in theme_link_columns:
+            connection.execute("ALTER TABLE anime_theme_release_group_links "
+                               "ADD COLUMN is_preferred INTEGER NOT NULL DEFAULT 0")
+        if "release_group_title" not in theme_link_columns:
+            connection.execute(
+                "ALTER TABLE anime_theme_release_group_links ADD COLUMN "
+                "release_group_title TEXT NOT NULL DEFAULT ''"
+            )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS anime_theme_links_release_group "
             "ON anime_theme_release_group_links"
@@ -1124,6 +1237,23 @@ def init_db():
         connection.execute(
             "CREATE INDEX IF NOT EXISTS anime_theme_links_theme "
             "ON anime_theme_release_group_links(anime_slug, theme_id)"
+        )
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS anime_artist_links (
+                anime_slug TEXT NOT NULL,
+                theme_id INTEGER NOT NULL,
+                artist_mbid TEXT NOT NULL,
+                animethemes_artist_id INTEGER NOT NULL,
+                artist_slug TEXT NOT NULL,
+                artist_name TEXT NOT NULL,
+                credited_as TEXT NOT NULL,
+                verified INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(anime_slug, theme_id, artist_mbid, animethemes_artist_id)
+            )
+        """)
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS anime_artist_links_mbid "
+            "ON anime_artist_links(artist_mbid)"
         )
         _migrate_pending_lidarr_searches(connection)
         # Release-group requests always use RefreshAlbum. Convert work queued

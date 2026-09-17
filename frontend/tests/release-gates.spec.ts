@@ -138,22 +138,67 @@ test("linked-account partial success refreshes the authoritative account state",
 test("SPA navigation moves focus to the main landmark", async ({ page }) => {
   await page.goto("/");
   await signIn(page, "ada");
-  await page.getByRole("button", { name: "Your library" }).click();
+  await page.getByRole("link", { name: "Your library" }).click();
   await expect(page.locator("#main-content")).toBeFocused();
   await expect(page.locator("#main-content")).toHaveCSS("outline-style", "none");
+});
+
+test("detail controls expose native new-tab links without losing SPA navigation", async ({ page, context }) => {
+  await page.goto("/artists/fixture-artist");
+  await signIn(page, "ada");
+  await expect(page.locator("#detail-title")).toHaveText("Fixture Artist");
+
+  const albumLink = page.getByRole("link", { name: "Open details for Fixture Album" });
+  await expect(albumLink).toHaveAttribute("href", "/albums/fixture-album");
+  await expect(albumLink).toHaveJSProperty("tagName", "A");
+  const currentUrl = page.url();
+
+  const newPagePromise = context.waitForEvent("page");
+  await albumLink.click({ button: "middle" });
+  const newPage = await newPagePromise;
+  await newPage.waitForURL("**/albums/fixture-album");
+  expect(new URL(newPage.url()).pathname).toBe("/albums/fixture-album");
+  expect(page.url()).toBe(currentUrl);
+  await newPage.close();
+
+  const modifierClickAllowed = await albumLink.evaluate((element) => (
+    element.dispatchEvent(new MouseEvent("click", {
+      bubbles: true,
+      button: 0,
+      cancelable: true,
+      ctrlKey: true,
+    }))
+  ));
+  expect(modifierClickAllowed).toBe(true);
+
+  await albumLink.click();
+  await expect(page).toHaveURL(/\/albums\/fixture-album$/);
+});
+
+test("release-group editions remain clickable and open their tracklists", async ({ page }) => {
+  await page.goto("/albums/fixture-album");
+  await signIn(page, "ada");
+  await expect(page.locator("#detail-title")).toHaveText("Fixture Album");
+
+  const releaseLink = page.getByRole("link", { name: "Open details for Fixture Album" });
+  await expect(releaseLink).toHaveAttribute("href", "/releases/fixture-release");
+  await releaseLink.click();
+
+  await expect(page).toHaveURL(/\/releases\/fixture-release$/);
+  await expect(page.locator("#detail-results")).toContainText("Fixture Track");
 });
 
 test("library page describes artist holdings only", async ({ page }) => {
   await page.goto("/");
   await signIn(page, "ada");
-  await page.getByRole("button", { name: "Your library" }).click();
+  await page.getByRole("link", { name: "Your library" }).click();
 
   const summary = page.locator("#library-copy");
   await expect(summary).toHaveText("0 artists available in your Plex music libraries.");
   await expect(summary).not.toContainText("releases");
 });
 
-test("mobile tab bar stays 82px tall including its safe-area padding", async ({ page }) => {
+test("mobile tab bar keeps a compact 48px target above its safe-area padding", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/");
   await signIn(page, "ada");
@@ -175,10 +220,10 @@ test("mobile tab bar stays 82px tall including its safe-area padding", async ({ 
 
   expect(metrics).toEqual({
     bottom: 844,
-    height: 82,
-    mainPaddingBottom: "118px",
+    height: 72,
+    mainPaddingBottom: "108px",
     paddingBottom: "24px",
-    toastBottom: "100px",
+    toastBottom: "90px",
   });
 });
 
@@ -235,7 +280,7 @@ for (const viewport of [
     await page.getByRole("button", { name: "Show more similar artists" }).click();
     await secondPage;
     await expect(similarView.locator(".recommendation-card")).toHaveCount(18);
-    await expect(page.getByRole("button", { name: "Open details for Similar Artist 13" })).toBeFocused();
+    await expect(page.getByRole("link", { name: "Open details for Similar Artist 13" })).toBeFocused();
     const expandedTops = await list.locator(".recommendation-card").evaluateAll((cards) => (
       cards.map((card) => card.getBoundingClientRect().top)
     ));

@@ -95,7 +95,7 @@ class AnimeFrontendTests(unittest.TestCase):
         self.assertIn('mapping?.mappingSource === "local"', self.discovery)
         self.assertIn('mapping?.mappingSource === "seed"', self.discovery)
         self.assertIn('seedMapping ? "Suppress" : "Unlink"', self.discovery)
-        self.assertIn('"Confirm recommended match"', self.discovery)
+        self.assertIn('"Confirm this release"', self.discovery)
         self.assertIn("confirmAutomatic: true", self.discovery)
         self.assertIn('"Suggest a mapping"', self.discovery)
         self.assertIn('"Mapping suggestion pending"', self.discovery)
@@ -103,8 +103,7 @@ class AnimeFrontendTests(unittest.TestCase):
         self.assertIn('`${proposalEndpoint}/approve`', self.discovery)
         self.assertIn('method: "DELETE"', self.discovery)
         self.assertIn('theme.proposals || mapping?.proposals', self.discovery)
-        self.assertIn('automaticMatchMethod === "recording-search"', self.discovery)
-        self.assertIn('automaticMatchMethod === "artist-discography-title"', self.discovery)
+        self.assertIn('["recording-search", "artist-discography-title"].includes(automaticMatchMethod)', self.discovery)
         self.assertIn('"Manual · confirmed"', self.discovery)
         self.assertIn(".anime-mapping-editor", self.stylesheet)
         self.assertIn(".anime-mapping-confirmation", self.stylesheet)
@@ -170,13 +169,13 @@ class AnimeFrontendTests(unittest.TestCase):
         self.assertIn('"service-icon-link anime-candidate-plex"', self.discovery)
 
     def test_admin_can_confirm_an_ambiguous_candidate_in_management_mode(self):
-        self.assertIn('const canConfirmAmbiguousCandidate = currentUser?.role === "admin"', self.discovery)
-        self.assertIn('&& state === "ambiguous"', self.discovery)
+        self.assertIn('const canConfirmCandidate = currentUser?.role === "admin"', self.discovery)
+        self.assertIn('state === "ambiguous" || (state === "resolved"', self.discovery)
         self.assertIn('&& groups.length > 0', self.discovery)
         self.assertNotIn('supportedAmbiguousConfirmation', self.discovery)
         self.assertIn('&& !mapping?.mappingSource', self.discovery)
         self.assertIn('confirm.className = "anime-candidate-confirm"', self.discovery)
-        self.assertIn('confirm.textContent = "Confirm match"', self.discovery)
+        self.assertIn('confirm.textContent = "Confirm this release"', self.discovery)
         self.assertIn('confirmAutomatic: true', self.discovery)
         self.assertIn('releaseGroup: releaseGroupId', self.discovery)
         self.assertIn('.anime-candidate-confirm { grid-area: confirmation;', self.stylesheet)
@@ -228,7 +227,6 @@ class AnimeFrontendTests(unittest.TestCase):
         self.assertIn('window.addEventListener("melodarr-signed-out", () => {', self.discovery)
 
     def test_detail_actions_are_session_bound_and_do_not_reuse_cleared_artist_state(self):
-        self.assertIn("function isCurrentDetailSession(generation: number)", self.discovery)
         self.assertIn('getJson("/api/lidarr/options", 30_000, detailSessionAbort.signal)', self.discovery)
         self.assertIn('postJson("/api/request/release-group", {', self.discovery)
         self.assertIn("}, detailSessionAbort.signal);", self.discovery)

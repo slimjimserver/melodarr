@@ -135,6 +135,50 @@ class NotificationStorageTests(unittest.TestCase):
         with storage.db() as connection:
             self.assertEqual(connection.execute("SELECT fully_available FROM release_availability_state").fetchone()[0], 0)
 
+    def test_availability_notification_waits_for_configured_delay(self):
+        album = {
+            "fullyAvailable": False,
+            "title": "Album",
+            "artistMbid": "22222222-2222-2222-2222-222222222222",
+            "artistName": "Artist",
+        }
+        with storage.db() as connection:
+            connection.execute(
+                "UPDATE user_notification_preferences "
+                "SET notification_email='user@example.test' WHERE user_id=?",
+                (self.user_id,),
+            )
+        with patch(
+            "backend.notifications.global_channels",
+            return_value=(True, True, False),
+        ), patch(
+            "backend.notifications.notification_config",
+            return_value={"delaySeconds": 2},
+        ), patch("backend.notifications.time.time", return_value=1000):
+            notifications.observe_availability(
+                {"11111111-1111-1111-1111-111111111111": album}
+            )
+            album["fullyAvailable"] = True
+            notifications.observe_availability(
+                {"11111111-1111-1111-1111-111111111111": album}
+            )
+
+        with storage.db() as connection:
+            delivery = connection.execute(
+                "SELECT next_attempt_at FROM notification_deliveries"
+            ).fetchone()
+        self.assertEqual(delivery["next_attempt_at"], 1002)
+        with patch(
+            "backend.workers.notifications.global_channels",
+            return_value=(True, True, False),
+        ), patch("backend.workers.notifications.time.time", return_value=1001):
+            self.assertIsNone(notification_worker.claim_due_delivery())
+        with patch(
+            "backend.workers.notifications.global_channels",
+            return_value=(True, True, False),
+        ), patch("backend.workers.notifications.time.time", return_value=1002):
+            self.assertIsNotNone(notification_worker.claim_due_delivery())
+
     def test_lease_is_claimed_before_sender_and_retries(self):
         with storage.db() as connection:
             event = connection.execute("INSERT INTO notification_events (release_mbid,generation,artist_mbid,artist_name,release_title,created_at) VALUES ('11111111-1111-1111-1111-111111111111',1,'','Artist','Album',0)")
@@ -246,6 +290,7 @@ class NotificationStorageTests(unittest.TestCase):
         notification_panel = html[html.index('id="settings-notifications"'):html.index('id="settings-requests"')]
         expected_admin_order = [
             "Application URL",
+            "Notification Delay (seconds)",
             "Enable Notifications Globally",
             "Enable Email Delivery",
             "SMTP Host",
@@ -375,13 +420,14 @@ class NotificationStorageTests(unittest.TestCase):
         previous = notifications.notification_config()
         self.addCleanup(storage.save_service, "notifications", previous)
         storage.save_service("notifications", {
-            "enabled": False, "applicationUrl": "https://old.example",
+            "enabled": False, "applicationUrl": "https://old.example", "delaySeconds": 2,
             "email": {"enabled": False, "host": "smtp.old", "port": 587, "encryption": "starttls", "username": "old", "password": "secret", "sender": "old@example.test"},
             "webPush": {"enabled": False, "contact": "mailto:old@example.test"},
         })
         notifications.save_email_config({"enabled": True, "host": "smtp.new", "port": 465, "encryption": "tls", "username": "new", "senderName": "Melodarr", "sender": "new@example.test", "password": ""})
         saved = notifications.notification_config()
         self.assertEqual(saved["applicationUrl"], "https://old.example")
+        self.assertEqual(saved["delaySeconds"], 2)
         self.assertEqual(saved["webPush"]["contact"], "mailto:old@example.test")
         self.assertEqual(saved["email"]["password"], "secret")
         self.assertEqual(saved["email"]["senderName"], "Melodarr")
@@ -558,6 +604,32 @@ class NotificationStorageTests(unittest.TestCase):
         self.assertNotIn("password", public["email"])
         self.assertTrue(public["email"]["passwordConfigured"])
 
+    def test_notification_delay_is_validated_and_public(self):
+        previous = notifications.notification_config()
+        self.addCleanup(storage.save_service, "notifications", previous)
+        base = {
+            "enabled": False,
+            "applicationUrl": "",
+            "email": {
+                "enabled": False,
+                "host": "",
+                "port": 587,
+                "encryption": "starttls",
+                "username": "",
+                "password": "",
+                "sender": "",
+                "senderName": "",
+            },
+            "webPush": {"enabled": False, "contact": ""},
+        }
+        saved = notifications.save_config({**base, "delaySeconds": "2"})
+        self.assertEqual(saved["delaySeconds"], 2)
+        capped = notifications.save_config({**base, "delaySeconds": 86400})
+        self.assertEqual(capped["delaySeconds"], 86400)
+        for value in (-1, 86401, 1.5, True, "later"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                notifications.save_config({**base, "delaySeconds": value})
+
     def test_web_push_contact_requires_a_real_bounded_destination(self):
         base = {"enabled": False, "applicationUrl": "", "email": {"enabled": False, "host": "", "port": 587, "encryption": "starttls", "username": "", "password": "", "sender": ""}}
         for contact in ("https://", "mailto:not-an-email", "https://" + "a" * 600):
@@ -663,7 +735,7 @@ class NotificationRouteTests(unittest.TestCase):
         self._login_as(self.admin_id)
         headers = {"X-CSRF-Token": "csrf"}
         storage.save_service("notifications", {
-            "enabled": False, "applicationUrl": "https://old.example",
+            "enabled": False, "applicationUrl": "https://old.example", "delaySeconds": 2,
             "email": {"enabled": False, "host": "smtp.old", "port": 587, "encryption": "starttls", "username": "old", "password": "secret", "sender": "old@example.test"},
             "webPush": {"enabled": False, "contact": "mailto:old@example.test"},
         })
@@ -678,8 +750,24 @@ class NotificationRouteTests(unittest.TestCase):
                 self.assertEqual(self.client.put(path, json=payload, headers=headers).status_code, 400)
         saved = notifications.notification_config()
         self.assertEqual(saved["applicationUrl"], "https://old.example")
+        self.assertEqual(saved["delaySeconds"], 2)
         self.assertEqual(saved["email"]["host"], "smtp.old")
         self.assertEqual(saved["webPush"]["contact"], "mailto:old@example.test")
+
+    def test_global_notification_route_saves_delay(self):
+        self._login_as(self.admin_id)
+        response = self.client.put(
+            "/api/settings/notifications/global",
+            json={
+                "enabled": False,
+                "applicationUrl": "",
+                "delaySeconds": "2",
+            },
+            headers={"X-CSRF-Token": "csrf"},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["delaySeconds"], 2)
+        self.assertEqual(notifications.notification_config()["delaySeconds"], 2)
 
     def test_web_push_test_targets_all_and_only_current_admin_devices(self):
         self._login_as(self.admin_id)

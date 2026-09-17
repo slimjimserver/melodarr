@@ -4,128 +4,71 @@
 
 # Melodarr
 
-## 1. Overview
+Melodarr is a self-hosted music discovery and request app for Lidarr. It gives users a friendly place to find artists, explore albums, get personal recommendations, and request new music without needing access to Lidarr itself.
 
-Melodarr is a self-hosted music discovery and request app for Lidarr. It gives household members a simple interface for finding artists and albums, exploring personalized recommendations, and sending requests to Lidarr, while optional Plex integration prevents suggestions for music that is already in your library.
-
-Melodarr uses MusicBrainz for music metadata and can use ListenBrainz and Last.fm listening history for recommendations. It includes private accounts, administrator-managed invitations, persistent request history, background library scans, and local metadata and artwork caches.
-
-## 2. Preview
-
-
-### 📱 Screenshots
+## Screenshots
 
 | Discover | Artist |
 | :---: | :---: |
-| <img src="https://raw.githubusercontent.com/slimjimserver/melodarr/main/docs/screenshots/melodarr_discover_page.png" alt="discover" width="100%" /> | <img src="https://raw.githubusercontent.com/slimjimserver/melodarr/main/docs/screenshots/melodarr_artist_page.png" alt="artist" width="100%" /> |
+| <img src="https://raw.githubusercontent.com/slimjimserver/melodarr/main/docs/screenshots/melodarr_discover_page.png" alt="Melodarr Discover page" width="100%" /> | <img src="https://raw.githubusercontent.com/slimjimserver/melodarr/main/docs/screenshots/melodarr_artist_page.png" alt="Melodarr artist page" width="100%" /> |
 | **Release Group** | **Linked Accounts** |
-| <img src="https://raw.githubusercontent.com/slimjimserver/melodarr/main/docs/screenshots/melodarr_release_group_page.png" alt="release-group" width="100%" /> | <img src="https://raw.githubusercontent.com/slimjimserver/melodarr/main/docs/screenshots/melodarr_linked_account_page.png" alt="linked-accounts" width="100%" /> |
+| <img src="https://raw.githubusercontent.com/slimjimserver/melodarr/main/docs/screenshots/melodarr_release_group_page.png" alt="Melodarr release group page" width="100%" /> | <img src="https://raw.githubusercontent.com/slimjimserver/melodarr/main/docs/screenshots/melodarr_linked_account_page.png" alt="Melodarr linked accounts page" width="100%" /> |
 
+## Feature highlights
 
-## 3. Features
+### Find and request music
 
-- Search MusicBrainz for artists and albums, then browse discographies, releases, and tracklists.
-- Search AnimeThemes for an anime's openings, endings, episode ranges, and related series, then request conservatively matched MusicBrainz releases through Lidarr. Administrators can confirm the recommended automatic recording match or supply a correction; the selected recording, artist, and release-group MBIDs are stored permanently in the local SQLite registry ahead of the disposable API cache.
-- Request a complete artist or an individual release group through Lidarr.
-- Apply Lidarr root folder, quality profile, metadata profile, monitoring, tag, and automatic-search defaults.
-- Discover personalized artists and albums from linked ListenBrainz and Last.fm accounts.
-- Filter recommendations and request controls using existing Lidarr entries, previous requests, and selected Plex music libraries.
-- Browse the artists and album-level releases already available in Plex, with links back to Plex.
-- Track queued Lidarr searches and album availability with automatic background jobs.
-- Cache metadata and artwork locally to reduce upstream requests, while revalidating viewed artist discographies in the background.
-- Create private user accounts through one-time, seven-day administrator invitations.
-- Inspect job status, run maintenance jobs, and flush individual caches from the administrator dashboard.
+Search MusicBrainz for artists and albums, browse full discographies and tracklists, then request an individual release or an artist's complete catalog through Lidarr.
 
-## 4. Quick start
+Melodarr keeps an eye on pending requests, queued searches, and music you already own so you always know what is available and what is on the way.
 
-Melodarr is designed to run with Docker Compose. The included [`docker-compose.yml`](docker-compose.yml) uses the published `slimjimserver/melodarr:latest` image and persists application data in `./data`.
+### Recommendations that feel personal
 
-1. Download or copy the docker compose file from the repository.
-2. Create the data directory before starting the container:
+The Discover page brings together music related to artists you love, albums inspired by previous requests, and something new when you feel like exploring.
 
-   ```bash
-   mkdir -p data
-   ```
+Connect ListenBrainz, Last.fm, or Plex to make recommendations more personal. You can also choose favorite artists, decide whether you want familiar picks or more discovery, and fine-tune the feed with **More like this** and **Not interested**.
 
-   On Linux, give Melodarr's fixed container user ownership of the directory:
+### See what is popular
 
-   ```bash
-   chown -R 1000:1000 data
-   ```
+Browse popular artists from Last.fm or check Apple Music's current Top 100 albums in the United States and Japan. Switch between recent releases and the full chart, while Melodarr filters out music already in your library or request queue.
 
-   The image runs directly as UID/GID `1000:1000`. It does not start as root or change bind-mount ownership during startup.
+### Discover music from anime
 
-3. Start Melodarr:
+Search AnimeThemes for openings and endings, see where each song appears in a series, and follow related anime. Melodarr matches those songs to MusicBrainz releases so they can be requested through Lidarr, with administrator review when a match needs a second look.
 
-   ```bash
-   docker compose up -d
-   ```
+### Know what is already in your library
 
-4. Open [http://localhost:5056](http://localhost:5056) and create the owner account. The first account is the administrator.
-5. Open **Settings**, connect Lidarr, test the connection, and choose the defaults for new requests. Plex is optional.
+Connect Plex to browse the artists and albums you already own, open them directly in Plex, and keep duplicates out of recommendations and requests.
 
+### Made for households
 
-## 5. Configuration
+Each person gets a private account, personal recommendations, and their own request history. Administrators can invite new users, choose the defaults used for Lidarr requests, and manage the service from a built-in dashboard.
 
-### Environment variables
+### Fast, tidy, and self-hosted
 
-No additional environment variables are required for the included Docker Compose setup. It already stores the main database and metadata cache beneath the persistent `/app/data` mount.
+Melodarr caches artwork and music metadata locally, refreshes the library in the background, and keeps its data on your server. It is designed to run with Docker Compose and works well alongside an existing Lidarr and Plex setup.
+
+## Environment variables
+
+The included Docker Compose setup does not require any extra environment variables. By default, it keeps the main database and metadata cache under the persistent `/app/data` mount.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `MELODARR_DATABASE` | `<project>/melodarr.db` | Main SQLite database containing accounts, invitations, request history, and queued work. The image and Compose set this to `/app/data/melodarr.db`. |
-| `MELODARR_CACHE_DATABASE` | `cache/metadata.db` beside the main database | Disposable external API-response cache. The image and Compose set this to `/app/data/cache/metadata.db`. |
-| `MELODARR_SETTINGS` | `settings.json` beside the main database | Service configuration and credentials saved through the web UI. |
-| `MELODARR_SECRET_KEY_FILE` | `session-secret.key` beside the main database | Persistent generated session-signing key file. |
-| `MELODARR_VAPID_PRIVATE_KEY_FILE` | `vapid-private.pem` beside the main database | Persistent stable Web Push/VAPID identity. Back up and restore it with the database. |
-| `MELODARR_SECRET_KEY` | Generated and saved to the key file | Explicit session-signing secret. Normally leave unset so Melodarr manages a persistent key in the data volume. |
-| `MELODARR_ARTWORK_CACHE` | `<project>/data/cache/artwork` | Directory used for downloaded artist and album artwork. |
-| `MELODARR_COOKIE_SECURE` | `false` | Set to `true` when Melodarr is served through HTTPS so session cookies are marked secure. |
-| `PORT` | `5056` | Port used only by the local Flask development server. The production Gunicorn container listens on port `5056`. |
-| `FLASK_DEBUG` | unset | Set to `1` only when running the local development server. Do not enable it in production. |
+| `MELODARR_DATABASE` | `<project>/melodarr.db` | Main SQLite database for accounts, invitations, request history, and queued work. The image and Compose file set this to `/app/data/melodarr.db`. |
+| `MELODARR_CACHE_DATABASE` | `cache/metadata.db` beside the main database | Disposable cache for external API responses. The image and Compose file set this to `/app/data/cache/metadata.db`. |
+| `MELODARR_SETTINGS` | `settings.json` beside the main database | Service settings and credentials saved through the web interface. |
+| `MELODARR_SECRET_KEY_FILE` | `session-secret.key` beside the main database | Persistent generated session-signing key. |
+| `MELODARR_VAPID_PRIVATE_KEY_FILE` | `vapid-private.pem` beside the main database | Stable Web Push/VAPID identity. Back it up and restore it with the database. |
+| `MELODARR_SECRET_KEY` | Generated and saved to the key file | Explicit session-signing secret. Normally leave this unset and let Melodarr manage the key in the data volume. |
+| `MELODARR_ARTWORK_CACHE` | `<project>/data/cache/artwork` | Directory for downloaded artist and album artwork. |
+| `MELODARR_COOKIE_SECURE` | `false` | Set to `true` when serving Melodarr over HTTPS so session cookies are marked secure. |
+| `PORT` | `5056` | Port used by the local Flask development server. The production Gunicorn container listens on `5056`. |
+| `FLASK_DEBUG` | unset | Set to `1` only for the local development server. Do not enable it in production. |
 
-### Unraid Community Applications
+### Backing up your data
 
-Use this volume mapping:
+For a consistent backup, stop Melodarr cleanly before copying the database and settings files. If the service must stay online, use SQLite's online backup API; do not make a raw copy of a live database because recent data may still be in its WAL file.
 
-```text
-Host:      /mnt/user/appdata/melodarr
-Container: /app/data
-```
-
-Do not map a host directory to `/app`; doing so hides Melodarr's application files. Only `/app/data` should be used for persistent storage.
-
-To use Unraid's native `nobody:users` identity, prepare the directory once from the Unraid terminal:
-
-```bash
-mkdir -p /mnt/user/appdata/melodarr
-chown -R 99:100 /mnt/user/appdata/melodarr
-```
-
-Then add this in the container's **Extra Parameters** field:
-
-```text
---user 99:100
-```
-
-Remove any `PUID` or `PGID` variables from an older template; Melodarr no longer uses them. Docker's `--user` override starts Melodarr directly as `99:100`, without a root entrypoint.
-
-For an HTTPS deployment, add this to the service's `environment` block in `docker-compose.yml`:
-
-```yaml
-MELODARR_COOKIE_SECURE: "true"
-```
-
-### Service configuration
-
-Service credentials are normally configured after signing in.
-
-- **Lidarr (required for requests):** hostname or IP address, port, SSL choice, API key, and optionally an external browser-facing URL. After testing the connection, choose the root folder, quality and metadata profiles, monitoring behavior, tags, and automatic-search behavior.
-- **Plex (optional):** sign in with the Plex account that owns the server, choose one of its advertised connections, and select one or more music libraries to scan. Plex tokens are retrieved through the secure Plex PIN flow and are never pasted into Melodarr.
-- **ListenBrainz (optional, per user):** public ListenBrainz username.
-- **Last.fm API access (optional, administrator-managed):** the owner or an administrator saves one Last.fm API key for the whole Melodarr instance. The key is never returned by the API or shown again after it is saved.
-- **Last.fm listening history (optional, per user):** each user can add their own public Last.fm username to receive recommendations based on their listening history. Individual users do not need Last.fm API keys.
-
-Settings and service credentials are stored in `data/settings.json` when using Docker. Keep the data directory private. For a consistent backup, stop Melodarr cleanly before copying `melodarr.db`, `settings.json`, `session-secret.key`, and `vapid-private.pem`. The VAPID file is the stable Web Push identity; restore it with the database to avoid invalidating existing browser subscriptions. Set `MELODARR_VAPID_PRIVATE_KEY_FILE` only when placing that key in another private persistent location. If the service must remain online, back up `melodarr.db` with SQLite's online backup API or the SQLite shell's `.backup` command; do not make a raw copy of a live database because committed data may still be in its WAL file. The reproducible `cache/` directory can be excluded from backups.
+## License
 
 Melodarr is licensed under the [GNU General Public License v3.0](LICENSE).

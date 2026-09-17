@@ -21,6 +21,7 @@ EMAIL_RE = re.compile(r"^[^\s@]{1,64}@[^\s@]{1,253}$")
 MAX_ENDPOINT = 2048
 MAX_PUSH_KEY = 512
 MAX_DEVICE_TEXT = 100
+MAX_NOTIFICATION_DELAY_SECONDS = 86400
 _vapid_lock = Lock()
 _notification_config_lock = RLock()
 
@@ -29,6 +30,27 @@ def _bool(values, key, default=False):
     value = values.get(key, default)
     if not isinstance(value, bool):
         raise ValueError(f"{key} must be true or false.")
+    return value
+
+
+def _delay_seconds(values, key="delaySeconds", default=0):
+    value = values.get(key, default)
+    if isinstance(value, bool) or (
+        isinstance(value, float) and not value.is_integer()
+    ):
+        raise ValueError(
+            f"Notification delay must be a whole number of seconds between 0 and {MAX_NOTIFICATION_DELAY_SECONDS}."
+        )
+    try:
+        value = int(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Notification delay must be a whole number of seconds between 0 and {MAX_NOTIFICATION_DELAY_SECONDS}."
+        ) from exc
+    if not 0 <= value <= MAX_NOTIFICATION_DELAY_SECONDS:
+        raise ValueError(
+            f"Notification delay must be a whole number of seconds between 0 and {MAX_NOTIFICATION_DELAY_SECONDS}."
+        )
     return value
 
 
@@ -135,6 +157,7 @@ def public_config():
     return {
         "enabled": bool(config.get("enabled")),
         "applicationUrl": str(config.get("applicationUrl") or ""),
+        "delaySeconds": _delay_seconds(config),
         "email": {
             "enabled": bool(email.get("enabled")), "configured": bool(email.get("host") and email.get("sender")),
             "host": str(email.get("host") or ""), "port": int(email.get("port") or 0),
@@ -212,6 +235,7 @@ def _validated_config(values, old):
         raise ValueError("Web Push contact is required when Web Push is enabled.")
     result = {
         "enabled": _bool(values, "enabled"), "applicationUrl": _url(values.get("applicationUrl"), required=False),
+        "delaySeconds": _delay_seconds(values),
         "email": {"enabled": _bool(email_values, "enabled"), "host": host, "port": port,
                   "encryption": encryption, "username": username, "password": password, "sender": sender,
                   "senderName": sender_name},
@@ -231,6 +255,7 @@ def _merged_config(section, values):
         merged = {
             "enabled": bool(old.get("enabled")),
             "applicationUrl": str(old.get("applicationUrl") or ""),
+            "delaySeconds": _delay_seconds(old),
             "email": {"enabled": bool(old_email.get("enabled")), "host": str(old_email.get("host") or ""),
                       "port": old_email.get("port") or 587, "encryption": str(old_email.get("encryption") or "starttls"),
                       "username": str(old_email.get("username") or ""), "password": str(old_email.get("password") or ""),
@@ -472,6 +497,7 @@ def observe_availability(albums):
     """Persist a complete successful scan. Missing albums are deliberately unknown."""
     master, email_on, push_on = global_channels()
     now = time.time()
+    available_at = now + _delay_seconds(notification_config())
     events = 0
     with db() as connection:
         for release_mbid, album in albums.items():
@@ -509,10 +535,10 @@ def observe_availability(albums):
                 if email_on and pref["email_enabled"]:
                     target = str(pref["notification_email"] or pref["plex_email"] or "").strip()
                     if valid_email(target):
-                        connection.execute("INSERT OR IGNORE INTO notification_deliveries (event_id,user_id,channel,email_target,status,attempts,next_attempt_at,created_at,updated_at) VALUES (?,?,'email',?,'pending',0,?,?,?)", (event_id, pref["user_id"], target, now, now, now))
+                        connection.execute("INSERT OR IGNORE INTO notification_deliveries (event_id,user_id,channel,email_target,status,attempts,next_attempt_at,created_at,updated_at) VALUES (?,?,'email',?,'pending',0,?,?,?)", (event_id, pref["user_id"], target, available_at, now, now))
                 if push_on and pref["web_push_enabled"]:
                     subscriptions = connection.execute("SELECT id, endpoint, p256dh, auth FROM web_push_subscriptions WHERE user_id=?", (pref["user_id"],)).fetchall()
                     for subscription in subscriptions:
-                        connection.execute("INSERT OR IGNORE INTO notification_deliveries (event_id,user_id,channel,subscription_id,push_endpoint,push_p256dh,push_auth,status,attempts,next_attempt_at,created_at,updated_at) VALUES (?,?,'web-push',?,?,?,?, 'pending',0,?,?,?)", (event_id, pref["user_id"], subscription["id"], subscription["endpoint"], subscription["p256dh"], subscription["auth"], now, now, now))
+                        connection.execute("INSERT OR IGNORE INTO notification_deliveries (event_id,user_id,channel,subscription_id,push_endpoint,push_p256dh,push_auth,status,attempts,next_attempt_at,created_at,updated_at) VALUES (?,?,'web-push',?,?,?,?, 'pending',0,?,?,?)", (event_id, pref["user_id"], subscription["id"], subscription["endpoint"], subscription["p256dh"], subscription["auth"], available_at, now, now))
             events += 1
     return events

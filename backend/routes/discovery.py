@@ -8,10 +8,12 @@ from flask import Blueprint, jsonify, request
 
 if __package__ == "backend.routes":
     from .. import recommendations as recommendation_engine
+    from .. import recommendation_activity, recommendation_feed, recommendation_preferences, recommendation_preferences
+    from ..workers import recommendations as recommendation_worker
     from ..media_urls import artist_cover_art, release_group_cover_art
     from ..responses import api_error
     from ..security import current_user, login_required
-    from ..services import animethemes, lastfm, musicbrainz, plex
+    from ..services import animethemes, lastfm, musicbrainz, plex, charts
     from ..storage import (
         get_lastfm_api_key,
         get_recommendation_cache,
@@ -19,10 +21,12 @@ if __package__ == "backend.routes":
     )
 else:  # Support the existing `python backend/app.py` entry point.
     import recommendations as recommendation_engine
+    import recommendation_activity, recommendation_feed
+    from workers import recommendations as recommendation_worker
     from media_urls import artist_cover_art, release_group_cover_art
     from responses import api_error
     from security import current_user, login_required
-    from services import animethemes, lastfm, musicbrainz, plex
+    from services import animethemes, lastfm, musicbrainz, plex, charts
     from storage import get_lastfm_api_key, get_recommendation_cache, get_service
 
 
@@ -367,23 +371,120 @@ def lastfm_tag_albums():
         return api_error(f"Last.fm albums for {tag_name} could not be loaded.", 502)
 
 
+def _personal_snapshot(user_id):
+    row = get_recommendation_cache(user_id)
+    preferences = recommendation_preferences.preferences_for(user_id)
+    payload = json.loads(row["value"]) if row else {}
+    # A worker may finish an older build after a taste setting was saved. Never
+    # display that build as if it reflects the user's new inputs.
+    pending = row is None or payload.get("tasteRevision", 0) != preferences["revision"]
+    if pending:
+        payload = {"feedVersion": recommendation_feed.FEED_VERSION, "candidates": [], "sections": []}
+    if pending or payload.get("feedVersion") != recommendation_feed.FEED_VERSION:
+        if not recommendation_worker.running.is_set():
+            recommendation_worker.request_refresh()
+    return row, preferences, payload, pending
+
+
 @blueprint.get("/api/discover")
 @login_required
 def cached_discover():
-    row = get_recommendation_cache(current_user()["id"])
-    if not row:
-        return jsonify({
-            "pending": True,
-            "artists": [],
-            "albums": [],
-            "chartArtists": [],
-            "tagRows": [],
-        })
-    return jsonify({
-        "pending": False,
-        "refreshedAt": row["refreshed_at"],
-        **json.loads(row["value"]),
-    })
+    user_id = current_user()["id"]
+    row, preferences, payload, pending = _personal_snapshot(user_id)
+    payload = charts.with_cached_charts(payload)
+    payload = recommendation_feed.current_feed(user_id, payload)
+    return jsonify({**payload, "pending": pending, "tastePreferences": preferences,
+                    "refreshedAt": row["refreshed_at"] if row else 0})
+
+
+@blueprint.get("/api/discover/charts")
+@login_required
+def cached_discover_charts():
+    user_id = current_user()["id"]
+    _, _, payload, _ = _personal_snapshot(user_id)
+    result = recommendation_feed.current_feed(user_id, charts.with_cached_charts(payload))
+    return jsonify({key: result[key] for key in
+                    ("popularChart", "popularCharts", "popularAlbums", "popularAlbumsByCountry")})
+
+
+@blueprint.get("/api/discover/preferences")
+@login_required
+def discover_preferences():
+    return jsonify(recommendation_preferences.preferences_for(current_user()["id"]))
+
+
+@blueprint.post("/api/discover/preferences")
+@login_required
+def save_discover_preferences():
+    try:
+        result = recommendation_preferences.save_preferences(current_user()["id"], request.get_json(silent=True))
+        return jsonify({**result, "message": "Taste preferences saved. Your picks are being refreshed."})
+    except ValueError as exc:
+        return api_error(str(exc))
+
+
+@blueprint.post("/api/discover/request-influence")
+@login_required
+def request_influence():
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return api_error("A request preference is required.")
+    try:
+        found = recommendation_preferences.set_request_influence(
+            current_user()["id"], body.get("requestId"), body.get("useForRecommendations"))
+    except ValueError as exc:
+        return api_error(str(exc))
+    if not found:
+        return api_error("Request not found.", 404)
+    return jsonify({"message": "Request preference saved. Your picks are being refreshed."})
+
+
+@blueprint.post("/api/discover/refresh")
+@login_required
+def refresh_discover():
+    recommendation_worker.request_refresh()
+    return jsonify({"message": "Refreshing your picks. New suggestions will appear when ready."}), 202
+
+
+@blueprint.post("/api/discover/activity")
+@login_required
+def discover_activity():
+    body = request.get_json(silent=True)
+    events = body.get("events") if isinstance(body, dict) else None
+    if not isinstance(events, list) or not 1 <= len(events) <= 24:
+        return api_error("Send between 1 and 24 recommendation events.")
+    user_id = current_user()["id"]
+    row = get_recommendation_cache(user_id)
+    payload = charts.with_cached_charts(json.loads(row["value"]) if row else {})
+    candidates = {(item["kind"], item["id"]): item for item in [
+        *payload.get("candidates", []), *payload.get("popularCandidates", []),
+    ]}
+    resolved = []
+    for event in events:
+        if not isinstance(event, dict):
+            return api_error("Invalid recommendation event.")
+        action, kind, mbid = event.get("action"), event.get("kind"), event.get("id")
+        if (not isinstance(action, str) or action not in {"impression", "open", "listen", "dismiss", "more", "undo"}
+                or not isinstance(kind, str) or kind not in {"artist", "release-group"}
+                or not isinstance(mbid, str) or not 1 <= len(mbid) <= 100):
+            return api_error("Invalid recommendation event.")
+        item = candidates.get((kind, mbid))
+        if item is None and action == "undo":
+            item = recommendation_activity.prior_item(user_id, kind, mbid)
+        if item is None:
+            return api_error("This suggestion has expired. Refresh your recommendations.", 409)
+        resolved.append((item, action))
+    for item, action in resolved:
+        recommendation_activity.record_activity(user_id, item, action)
+    if any(action in {"dismiss", "more", "undo"} for _, action in resolved):
+        recommendation_worker.request_refresh()
+    return jsonify({"ok": True})
+
+
+@blueprint.get("/api/discover/metrics")
+@login_required
+def discover_metrics():
+    return jsonify(recommendation_activity.metrics_for(current_user()["id"]))
 
 
 @blueprint.get("/api/search")
@@ -406,8 +507,12 @@ def search():
             )
     try:
         response = musicbrainz.search(query, search_type, plain_search=True)
-    except requests.RequestException:
-        return api_error("MusicBrainz could not be reached. Try again shortly.", 502)
+    except requests.RequestException as exc:
+        message = musicbrainz.search_error_message(exc)
+        return api_error(
+            message or "MusicBrainz could not be reached. Try again shortly.",
+            502,
+        )
 
     if search_type == "artist":
         plex_artists = _plex_search_artists()

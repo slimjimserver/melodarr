@@ -270,7 +270,7 @@ def _automatic_candidate_groups(mapping):
 
 def _automatic_confirmation_target(theme, requested_release_group=None):
     """Return a verified cached automatic target safe for local confirmation."""
-    mapping = anime_musicbrainz.cached_mapping(theme)
+    mapping = anime_musicbrainz.cached_mapping(theme) or anime_musicbrainz.saved_automatic_mapping(theme)
     if not mapping:
         raise AutomaticMatchUnavailable(
             "The automatic match is no longer available. "
@@ -313,16 +313,12 @@ def _automatic_confirmation_target(theme, requested_release_group=None):
             if requested_release_group
             else recommended_id
         )
-        if requested_id != recommended_id:
-            raise AutomaticMatchUnavailable(
-                "Only the recommended release group can be confirmed directly. "
-                "Use Override mapping to select a different release group."
-            )
-        candidate = _automatic_candidate_groups(mapping).get(recommended_id)
+        candidate = _automatic_candidate_groups(mapping).get(requested_id)
         if candidate is None:
             raise AutomaticMatchUnavailable(
-                "The recommended release group is no longer part of this match."
+                "That release group is not part of the current automatic candidates."
             )
+        confirmation_kind = "recommended" if requested_id == recommended_id else "candidate"
         group = candidate["group"]
         recording_ids = [recording_id] if recording_id else []
         artist_ids = [

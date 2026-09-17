@@ -1,6 +1,7 @@
 """Artist and release-group artwork routes."""
 
 from uuid import UUID
+from urllib.parse import urlencode
 
 from flask import Blueprint, request
 
@@ -82,7 +83,17 @@ def plex_artist_artwork(rating_key):
     if not artist or not artist.get("thumb"):
         return "", 404
     server_id = config.get("machineIdentifier") or config.get("url", "")
-    source_url = f"{config['url'].rstrip('/')}/{artist['thumb'].lstrip('/')}"
+    # Ask Plex for a bounded JPEG instead of downloading an arbitrarily large
+    # original before resizing it locally. All local variants fit within 640px.
+    query = urlencode({
+        "url": artist["thumb"],
+        "width": 640,
+        "height": 640,
+        "minSize": 0,
+        "upscale": 0,
+        "format": "jpeg",
+    })
+    source_url = f"{config['url'].rstrip('/')}/photo/:/transcode?{query}"
     return cached_artwork(
         plex_artist_artwork_key(server_id, rating_key, artist["thumb"]),
         source_url,

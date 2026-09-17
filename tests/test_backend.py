@@ -217,9 +217,14 @@ class ApplicationFactoryTests(DatabaseTestCase):
             for method in rule.methods
             if method not in {"HEAD", "OPTIONS"}
         }
-        self.assertEqual(len(rules), 93)
-        self.assertEqual(len(route_methods), 93)
+        self.assertEqual(len(rules), 103)
+        self.assertEqual(len(route_methods), 103)
+        for route in (("/api/discover/charts", "GET"), ("/api/discover/preferences", "GET"),
+                      ("/api/discover/preferences", "POST"), ("/api/discover/request-influence", "POST")):
+            self.assertIn(route, route_methods)
         self.assertIn(("/api/music/artist/<mbid>/similar", "GET"), route_methods)
+        self.assertIn(("/api/settings/musicbrainz", "POST"), route_methods)
+        self.assertIn(("/api/settings/musicbrainz/test", "POST"), route_methods)
         notification_routes = {
             ("/api/settings/notifications", "GET"),
             ("/api/settings/notifications", "PUT"),
@@ -468,6 +473,7 @@ class WorkerEntrypointTests(unittest.TestCase):
     ):
         calls = []
         anime_metadata_thread = Mock()
+        anime_enrichment_thread = Mock()
         artist_metadata_thread = Mock()
         similar_artist_thread = Mock()
         lidarr_thread = Mock()
@@ -479,6 +485,7 @@ class WorkerEntrypointTests(unittest.TestCase):
         notification_thread = Mock()
         thread_class.side_effect = [
             anime_metadata_thread,
+            anime_enrichment_thread,
             artist_metadata_thread,
             similar_artist_thread,
             lidarr_thread,
@@ -488,13 +495,14 @@ class WorkerEntrypointTests(unittest.TestCase):
             plex_metadata_thread,
             plex_history_thread,
             notification_thread,
+            Mock(), Mock(),
         ]
         init_db.side_effect = lambda: calls.append("database")
         init_cache_db.side_effect = lambda: calls.append("cache")
         run.side_effect = lambda *_args: calls.append("recommendations")
         worker.main()
         self.assertEqual(calls, ["cache", "database", "recommendations"])
-        self.assertEqual(thread_class.call_count, 10)
+        self.assertEqual(thread_class.call_count, 13)
         thread_class.assert_any_call(
             target=anime_metadata_worker.run,
             name="anime-musicbrainz-resolution",
@@ -553,9 +561,15 @@ class WorkerEntrypointTests(unittest.TestCase):
         plex_metadata_thread.start.assert_called_once_with()
         plex_history_thread.start.assert_called_once_with()
         anime_metadata_thread.start.assert_called_once_with()
+        anime_enrichment_thread.start.assert_called_once_with()
+        thread_class.assert_any_call(target=worker.anime_artist_enrichment.run,
+                                     name="anime-artist-enrichment", daemon=True)
         notification_thread.start.assert_called_once_with()
         artist_metadata_thread.start.assert_called_once_with()
         similar_artist_thread.start.assert_called_once_with()
+        for country in ("us", "jp"):
+            thread_class.assert_any_call(target=worker.chart_worker.run, args=(country,),
+                                         name=f"album-chart-{country}", daemon=True)
         run.assert_called_once_with(worker.RECOMMENDATION_STARTUP_DEADLINE)
 
     @patch("backend.workers.lidarr_library.time.time", return_value=100)
@@ -1760,6 +1774,28 @@ class DeploymentConfigTests(unittest.TestCase):
             discovery_typescript,
         )
 
+    def test_musicbrainz_service_settings_support_self_hosting_and_testing(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(
+            os.path.join(project_root, "frontend", "static", "index.html"),
+            encoding="utf-8",
+        ) as file:
+            frontend = file.read()
+        with open(
+            os.path.join(project_root, "frontend", "src", "app.ts"),
+            encoding="utf-8",
+        ) as file:
+            app_typescript = file.read()
+
+        self.assertIn('id="musicbrainz-settings"', frontend)
+        self.assertIn('name="baseUrl"', frontend)
+        self.assertIn('name="userAgent"', frontend)
+        self.assertIn('name="requestIntervalMs"', frontend)
+        self.assertNotIn("Cache lifetime (days)", frontend)
+        self.assertIn('"/api/settings/musicbrainz"', app_typescript)
+        self.assertIn('"/api/settings/musicbrainz/test"', app_typescript)
+        self.assertIn("setupMusicBrainzSettings();", app_typescript)
+
     def test_lastfm_key_is_admin_managed_and_user_forms_only_collect_usernames(self):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with open(
@@ -1934,7 +1970,7 @@ class DeploymentConfigTests(unittest.TestCase):
         )
         self.assertIn('filterInput.addEventListener("input"', discovery_typescript)
         self.assertIn(
-            "[group.date, ...(group.secondaryTypes || []), group.disambiguation]",
+            "[group.date, ...(group.animeNames || []), ...(group.secondaryTypes || []), group.disambiguation]",
             discovery_typescript,
         )
 
@@ -2110,17 +2146,18 @@ class DeploymentConfigTests(unittest.TestCase):
             frontend = file.read()
 
         self.assertIn(
-            '<button class="nav-link" type="button" '
-            'data-view="library">Your library</button>',
+            '<a class="nav-link" href="/library" '
+            'data-view="library">Your library</a>',
             frontend,
         )
         self.assertIn(
-            '<button class="nav-link" type="button" data-view="library">'
-            '<span class="tab-icon" aria-hidden="true">▤</span>Library</button>',
+            '<a class="nav-link" href="/library" data-view="library">'
+            '<span class="tab-icon" aria-hidden="true"><svg',
             frontend,
         )
+        self.assertIn('</svg></span>Library</a>', frontend)
         self.assertNotIn(
-            'class="nav-link admin-only" type="button" data-view="library"',
+            'class="nav-link admin-only" href="/library"',
             frontend,
         )
 
@@ -2235,6 +2272,8 @@ class AuthenticationTests(DatabaseTestCase):
             "/api/request/release-group",
             "/api/settings/lidarr",
             "/api/settings/lidarr/test",
+            "/api/settings/musicbrainz",
+            "/api/settings/musicbrainz/test",
             "/api/auth/plex/start",
             "/api/auth/plex/poll",
             "/api/auth/plex/inspect",
@@ -3948,6 +3987,78 @@ class SettingsMaintenanceTests(DatabaseTestCase):
         self.assertEqual(response.status_code, 403)
         self.assertFalse(get_service("lastfm"))
 
+    @patch("backend.routes.settings.musicbrainz.test_connection")
+    def test_admin_can_save_and_test_self_hosted_musicbrainz(self, test_connection):
+        token = self.register()
+        initial = self.client.get("/api/settings")
+        self.assertEqual(initial.status_code, 200)
+        self.assertEqual(initial.get_json()["musicbrainz"], {
+            "baseUrl": "https://musicbrainz.org/ws/2",
+            "userAgent": backend_config.USER_AGENT,
+            "requestIntervalMs": 1100,
+        })
+
+        proposed = {
+            "baseUrl": "http://192.168.1.10:5000/ws/2/",
+            "userAgent": "Melodarr Self Hosted/1.0",
+            "requestIntervalMs": 0,
+        }
+        saved = self.client.post(
+            "/api/settings/musicbrainz",
+            json=proposed,
+            headers={"X-CSRF-Token": token},
+        )
+        self.assertEqual(saved.status_code, 200)
+        expected = {**proposed, "baseUrl": proposed["baseUrl"].rstrip("/")}
+        self.assertEqual(saved.get_json()["musicbrainz"], expected)
+        self.assertEqual(get_service("musicbrainz"), expected)
+        self.assertEqual(
+            self.client.get("/api/settings").get_json()["musicbrainz"],
+            expected,
+        )
+
+        test_connection.return_value = {
+            "message": "Connected to MusicBrainz WS2.",
+            "baseUrl": expected["baseUrl"],
+            "latencyMs": 12,
+            "recording": {
+                "id": musicbrainz.TEST_RECORDING_ID,
+                "title": "Intro",
+            },
+        }
+        tested = self.client.post(
+            "/api/settings/musicbrainz/test",
+            json=proposed,
+            headers={"X-CSRF-Token": token},
+        )
+        self.assertEqual(tested.status_code, 200)
+        self.assertEqual(tested.get_json()["latencyMs"], 12)
+        test_connection.assert_called_once_with(proposed)
+
+    def test_invalid_musicbrainz_settings_are_not_saved(self):
+        token = self.register()
+        valid = {
+            "baseUrl": "http://musicbrainz.local:5000/ws/2",
+            "userAgent": "Melodarr Test/1.0",
+            "requestIntervalMs": 0,
+        }
+        invalid_values = (
+            {**valid, "baseUrl": "ftp://musicbrainz.local/ws/2"},
+            {**valid, "userAgent": "   "},
+            {**valid, "requestIntervalMs": -1},
+            {**valid, "requestIntervalMs": 1.5},
+        )
+
+        for values in invalid_values:
+            with self.subTest(values=values):
+                response = self.client.post(
+                    "/api/settings/musicbrainz",
+                    json=values,
+                    headers={"X-CSRF-Token": token},
+                )
+                self.assertEqual(response.status_code, 400)
+        self.assertIsNone(get_service("musicbrainz"))
+
     @patch("backend.routes.settings.plex_history_worker.request_full_sync")
     @patch("backend.routes.settings.lidarr_library_worker.request_scan")
     @patch("backend.routes.settings.plex_metadata_worker.request_enrichment")
@@ -4464,6 +4575,131 @@ class ApiCacheTests(DatabaseTestCase):
         self.assertEqual(first, ({"result": "cached"}, False))
         self.assertEqual(second, ({"result": "cached"}, True))
         get.assert_called_once()
+
+    def test_simultaneous_cache_misses_share_one_external_request(self):
+        callers_ready = Barrier(3)
+        request_started = Event()
+        release_request = Event()
+        results = []
+        failures = []
+        calls = 0
+
+        def request_get(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            request_started.set()
+            release_request.wait(2)
+            return Response(200, {"result": "shared"})
+
+        def load():
+            try:
+                callers_ready.wait()
+                results.append(cached_json_get(
+                    "https://example.test/simultaneous",
+                    namespace="simultaneous-test",
+                    ttl=60,
+                    include_cache_status=True,
+                    request_get=request_get,
+                ))
+            except (
+                RuntimeError,
+                ValueError,
+                requests.RequestException,
+                sqlite3.Error,
+            ) as exc:  # pragma: no cover - asserted below
+                failures.append(exc)
+
+        threads = [Thread(target=load), Thread(target=load)]
+        for thread in threads:
+            thread.start()
+        callers_ready.wait()
+        self.assertTrue(request_started.wait(1))
+        time.sleep(0.05)
+        release_request.set()
+        for thread in threads:
+            thread.join(2)
+
+        self.assertFalse(failures)
+        self.assertEqual(calls, 1)
+        self.assertCountEqual(
+            results,
+            [({"result": "shared"}, False), ({"result": "shared"}, True)],
+        )
+        self.assertEqual(api_cache._request_locks, {})
+
+    def test_failed_coalesced_cache_misses_clean_up_and_allow_a_later_request(self):
+        url = "https://example.test/coalesced-failure"
+        namespace = "coalesced-failure-test"
+        key = cache_key(namespace, url)
+        callers_ready = Barrier(3)
+        request_started = Event()
+        release_request = Event()
+        results = []
+        failures = []
+        calls = 0
+
+        def failing_request(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            request_started.set()
+            release_request.wait(2)
+            raise requests.ConnectionError("coalesced upstream failure")
+
+        def load():
+            try:
+                callers_ready.wait()
+                results.append(cached_json_get(
+                    url,
+                    namespace=namespace,
+                    ttl=60,
+                    request_get=failing_request,
+                ))
+            except requests.ConnectionError as exc:
+                failures.append(exc)
+
+        threads = [Thread(target=load), Thread(target=load)]
+        for thread in threads:
+            thread.start()
+        callers_ready.wait()
+        self.assertTrue(request_started.wait(1))
+
+        try:
+            deadline = time.monotonic() + 1
+            waiting_users = 0
+            while time.monotonic() < deadline:
+                with api_cache._request_locks_lock:
+                    entry = api_cache._request_locks.get(key)
+                    waiting_users = entry["users"] if entry else 0
+                if waiting_users == 2:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(waiting_users, 2)
+        finally:
+            release_request.set()
+
+        for thread in threads:
+            thread.join(2)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(results, [])
+        self.assertEqual(calls, 2)
+        self.assertEqual(len(failures), 2)
+        self.assertTrue(all(
+            str(failure) == "coalesced upstream failure" for failure in failures
+        ))
+        self.assertEqual(api_cache._request_locks, {})
+
+        recovered = cached_json_get(
+            url,
+            namespace=namespace,
+            ttl=60,
+            request_get=lambda *_args, **_kwargs: Response(
+                200, {"result": "recovered"}
+            ),
+        )
+
+        self.assertEqual(recovered, {"result": "recovered"})
+        self.assertEqual(api_cache._request_locks, {})
 
     @patch("backend.api_cache.requests.get")
     def test_cache_only_miss_does_not_call_external_service(self, get):
@@ -5944,6 +6180,122 @@ class MusicBrainzClientTests(unittest.TestCase):
         if hasattr(musicbrainz._session_state, "session"):
             del musicbrainz._session_state.session
 
+    @patch("backend.services.musicbrainz.get_service")
+    def test_configuration_normalizes_self_hosted_settings(self, get_service):
+        get_service.return_value = {
+            "baseUrl": "http://musicbrainz.local:5000/ws/2/",
+            "userAgent": "  Melodarr Local/1.0  ",
+            "requestIntervalMs": "0",
+        }
+
+        self.assertEqual(musicbrainz.configuration(), {
+            "baseUrl": "http://musicbrainz.local:5000/ws/2",
+            "userAgent": "Melodarr Local/1.0",
+            "requestIntervalMs": 0,
+        })
+
+    @patch("backend.services.musicbrainz.cached_json_get")
+    @patch("backend.services.musicbrainz.configuration")
+    def test_metadata_uses_configured_endpoint_user_agent_and_interval(
+        self, configuration, cached_get
+    ):
+        configuration.return_value = {
+            "baseUrl": "http://musicbrainz.local:5000/ws/2",
+            "userAgent": "Melodarr Local/1.0",
+            "requestIntervalMs": 0,
+        }
+        cached_get.return_value = {"id": "artist-id"}
+
+        result = musicbrainz.get("/artist/artist-id", "genres")
+
+        self.assertEqual(result, {"id": "artist-id"})
+        self.assertEqual(
+            cached_get.call_args.args[0],
+            "http://musicbrainz.local:5000/ws/2/artist/artist-id",
+        )
+        self.assertEqual(
+            cached_get.call_args.kwargs["headers"],
+            {"User-Agent": "Melodarr Local/1.0"},
+        )
+        with patch.object(musicbrainz, "_wait_for_request_slot") as wait_for_slot:
+            cached_get.call_args.kwargs["before_request"]()
+        wait_for_slot.assert_called_once_with("interactive", 0.0)
+
+    @patch("backend.services.musicbrainz.time.sleep")
+    @patch("backend.services.musicbrainz.time.monotonic")
+    @patch("backend.services.musicbrainz._http_get")
+    def test_connection_probe_resolves_a_known_ws2_recording(
+        self, http_get, monotonic, sleep
+    ):
+        monotonic.side_effect = [10.0, 10.042]
+        http_get.side_effect = [
+            Response(200, {
+                "id": musicbrainz.TEST_RECORDING_ID,
+                "title": "Intro",
+            }),
+            Response(200, {
+                "artists": [{"id": "artist-id", "name": "3 Doors Down"}],
+            }),
+        ]
+        proposed = {
+            "baseUrl": "http://musicbrainz.local:5000/ws/2/",
+            "userAgent": "Melodarr Local/1.0",
+            "requestIntervalMs": 1100,
+        }
+
+        result = musicbrainz.test_connection(proposed)
+
+        self.assertEqual(result["latencyMs"], 42)
+        self.assertEqual(result["recording"]["title"], "Intro")
+        sleep.assert_called_once_with(1.1)
+        self.assertEqual(http_get.call_count, 2)
+        lookup_call, search_call = http_get.call_args_list
+        self.assertEqual(
+            lookup_call.args[0],
+            f"http://musicbrainz.local:5000/ws/2/recording/"
+            f"{musicbrainz.TEST_RECORDING_ID}",
+        )
+        self.assertEqual(lookup_call.kwargs, {
+            "params": {"fmt": "json"},
+            "headers": {
+                "Accept": "application/json",
+                "User-Agent": "Melodarr Local/1.0",
+            },
+            "timeout": 15,
+            "allow_redirects": False,
+        })
+        self.assertEqual(
+            search_call.args[0],
+            "http://musicbrainz.local:5000/ws/2/artist/",
+        )
+        self.assertEqual(search_call.kwargs["params"], {
+            "query": "3 Doors Down",
+            "fmt": "json",
+            "limit": 1,
+            "dismax": "true",
+        })
+
+    @patch("backend.services.musicbrainz._http_get")
+    def test_connection_rejects_a_server_with_broken_search(self, http_get):
+        http_get.side_effect = [
+            Response(200, {
+                "id": musicbrainz.TEST_RECORDING_ID,
+                "title": "Intro",
+            }),
+            Response(503, {
+                "error": "Can't connect to search:8983 (No address associated)",
+            }),
+        ]
+
+        with self.assertRaises(musicbrainz.SearchUnavailableError) as raised:
+            musicbrainz.test_connection({
+                "baseUrl": "http://musicbrainz.local:5000/ws/2",
+                "userAgent": "Melodarr Local/1.0",
+                "requestIntervalMs": 0,
+            })
+
+        self.assertIn("search/Solr service", str(raised.exception))
+
     @patch("backend.services.musicbrainz.requests.Session")
     def test_musicbrainz_reuses_a_thread_local_http_session(self, session_factory):
         session = session_factory.return_value
@@ -6010,10 +6362,18 @@ class MusicBrainzClientTests(unittest.TestCase):
     @patch("backend.services.musicbrainz.time.monotonic")
     def test_live_request_slots_are_shared_and_spaced(self, monotonic, sleep):
         monotonic.side_effect = [10.0, 10.2, 11.1]
-        musicbrainz._wait_for_request_slot()
-        musicbrainz._wait_for_request_slot()
+        musicbrainz._wait_for_request_slot(request_interval_seconds=1.1)
+        musicbrainz._wait_for_request_slot(request_interval_seconds=1.1)
         sleep.assert_called_once_with(0.9000000000000004)
         self.assertAlmostEqual(musicbrainz._next_request_at, 12.2)
+
+    @patch("backend.services.musicbrainz.time.sleep")
+    @patch("backend.services.musicbrainz.time.monotonic", return_value=10.0)
+    def test_zero_request_interval_does_not_sleep(self, _monotonic, sleep):
+        musicbrainz._wait_for_request_slot(request_interval_seconds=0)
+
+        sleep.assert_not_called()
+        self.assertEqual(musicbrainz._next_request_at, 10.0)
 
     @patch("backend.services.musicbrainz._wait_for_request_slot")
     @patch("backend.services.musicbrainz.cached_json_get")
@@ -6026,12 +6386,12 @@ class MusicBrainzClientTests(unittest.TestCase):
 
         wait_for_slot.assert_not_called()
         before_request()
-        wait_for_slot.assert_called_once_with("background")
+        wait_for_slot.assert_called_once_with("background", 1.1)
 
         wait_for_slot.reset_mock()
         musicbrainz.get("/release-group/group", "", priority="prefetch")
         cached_get.call_args.kwargs["before_request"]()
-        wait_for_slot.assert_called_once_with("prefetch")
+        wait_for_slot.assert_called_once_with("prefetch", 1.1)
 
     @patch("backend.services.musicbrainz.cached_json_get")
     def test_critical_discography_calls_get_extended_retries(self, cached_get):
@@ -6238,6 +6598,27 @@ class LastFmDiscoveryTests(DatabaseTestCase):
 
 
 class DiscoveryRoutesTests(DatabaseTestCase):
+    @patch("backend.routes.discovery.musicbrainz.search")
+    def test_musicbrainz_503_reports_an_unavailable_search_service(self, search):
+        failure_response = Response(503, {
+            "error": "Could not retrieve results from search:8983",
+        })
+        error = requests.HTTPError("HTTP 503")
+        error.response = failure_response
+        search.side_effect = error
+
+        response = self.client.get(
+            "/api/search?q=3%20doors%20down&type=artist",
+            headers={"X-CSRF-Token": self.register()},
+        )
+
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(
+            response.get_json()["error"],
+            musicbrainz.SEARCH_UNAVAILABLE_MESSAGE,
+        )
+        self.assertNotIn("search:8983", response.get_data(as_text=True))
+
     @patch("backend.routes.discovery.animethemes.search")
     def test_anime_search_uses_the_anime_provider(self, search):
         search.return_value = [{
@@ -7261,6 +7642,14 @@ class MusicRoutesTests(DatabaseTestCase):
 
 
 class RecommendationAssemblyTests(unittest.TestCase):
+    def setUp(self):
+        # These tests isolate legacy provider assembly and worker behavior.
+        # Personal feed integration has its own database-backed suite.
+        enrichment = patch("backend.recommendation_feed.build_personal_feed",
+                           side_effect=lambda _user, payload, _shared=None: payload)
+        enrichment.start()
+        self.addCleanup(enrichment.stop)
+
     @patch("backend.recommendations.plex.cached_library_index")
     @patch("backend.recommendations.get_plex_listens")
     def test_plex_profile_applies_recency_play_counts_and_snapshot_tags(
@@ -7519,7 +7908,7 @@ class RecommendationAssemblyTests(unittest.TestCase):
         )
 
         self.assertEqual([artist["id"] for artist in artists], ["new-artist"])
-        self.assertEqual(albums, [])
+        self.assertEqual([album["id"] for album in albums], ["owned-artist-album"])
 
     @patch("backend.recommendations._search_release_group")
     @patch("backend.recommendations._musicbrainz_lookup")
@@ -7698,7 +8087,7 @@ class RecommendationAssemblyTests(unittest.TestCase):
             "foreignArtistId": "lidarr-artist",
             "artistName": "Lidarr Artist",
         }]
-        library_albums.return_value = [{"foreignAlbumId": "lidarr-album"}]
+        library_albums.return_value = [{"foreignAlbumId": "lidarr-album", "statistics": {"totalTrackCount": 10, "trackFileCount": 10}}]
         library_snapshot.return_value = {
             "artists": [{
                 "name": "Plex Artist",
@@ -7953,6 +8342,26 @@ class RecommendationAssemblyTests(unittest.TestCase):
 
 
 class ArtworkCacheTests(DatabaseTestCase):
+    @patch("backend.artwork_cache.requests.get")
+    def test_oversized_authenticated_artwork_does_not_redirect_or_poison_cache(self, get):
+        get.return_value = Response(
+            headers={"Content-Type": "image/jpeg"}, chunks=(b"too-large",),
+        )
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(artwork_cache, "ARTWORK_CACHE_DIRECTORY", directory),
+            patch.object(artwork_cache, "ARTWORK_MAX_DOWNLOAD_BYTES", 4),
+            self.app.test_request_context(),
+        ):
+            result = self.app.make_response(artwork_cache.cached_artwork(
+                "plex-artist-oversized", "http://plex:32400/thumbnail",
+                headers={"X-Plex-Token": "private-token"},
+            ))
+            self.assertEqual(result.status_code, 502)
+            self.assertNotIn("Location", result.headers)
+            self.assertEqual(result.headers["Cache-Control"], "no-store")
+            self.assertEqual(os.listdir(directory), [])
+
     def artwork_url(self, mbid):
         return f"/api/artwork/release-group/{mbid}"
 
@@ -8450,9 +8859,180 @@ class ArtworkVariantTests(DatabaseTestCase):
                 "100",
                 "/library/metadata/100/thumb/200",
             ),
-            "http://plex:32400/library/metadata/100/thumb/200",
+            "http://plex:32400/photo/:/transcode?"
+            "url=%2Flibrary%2Fmetadata%2F100%2Fthumb%2F200"
+            "&width=640&height=640&minSize=0&upscale=0&format=jpeg",
             headers={"X-Plex-Token": "token"},
             size="card",
+        )
+
+    @patch("backend.routes.artwork.plex.cached_library_index")
+    @patch("backend.routes.artwork.get_service")
+    @patch("backend.artwork_cache.requests.get")
+    def test_plex_artwork_failure_stays_on_proxy_and_next_request_recovers(
+        self, get, get_service_mock, library_index
+    ):
+        get_service_mock.return_value = {
+            "url": "http://plex:32400", "token": "private-token",
+        }
+        library_index.return_value = {
+            "artistsByRatingKey": {
+                "101": {"thumb": "/library/metadata/101/thumb/201"},
+            },
+        }
+        get.side_effect = [
+            requests.Timeout("Plex temporarily unavailable"),
+            Response(headers={"Content-Type": "image/jpeg"}, chunks=(encoded_image(640),)),
+        ]
+        self.register()
+        url = "/api/artwork/plex-artist/101?size=card"
+        failed = self.client.get(url)
+        self.assertEqual(failed.status_code, 502)
+        self.assertNotIn("Location", failed.headers)
+        self.assertEqual(failed.headers["Cache-Control"], "no-store")
+
+        recovered = self.client.get(url)
+        cached = self.client.get(url)
+        self.assertEqual(recovered.status_code, 200)
+        self.assertEqual(cached.data, recovered.data)
+        self.assertEqual(get.call_count, 2)
+        self.assertEqual(get.call_args.kwargs["headers"], {"X-Plex-Token": "private-token"})
+        self.assertIn("/photo/:/transcode?", get.call_args.args[0])
+        with Image.open(io.BytesIO(recovered.data)) as image:
+            self.assertEqual(image.size, (384, 384))
+        recovered.close()
+        cached.close()
+
+
+class StoragePerformanceTests(DatabaseTestCase):
+    def test_request_history_queries_use_recency_indexes(self):
+        with db() as connection:
+            indexes = {
+                row["name"] for row in connection.execute(
+                    "PRAGMA index_list(request_history)"
+                )
+            }
+            user_plan = [
+                row["detail"] for row in connection.execute(
+                    "EXPLAIN QUERY PLAN "
+                    "SELECT id, use_for_recommendations, kind, mbid, name, "
+                    "artist_name, release_type, release_date, anime_slug, "
+                    "anime_name, theme_id, theme_label, song_id, song_title, "
+                    "created_at FROM request_history WHERE user_id = ? "
+                    "ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                    (1, 100, 200),
+                )
+            ]
+            admin_plan = [
+                row["detail"] for row in connection.execute(
+                    """
+                    EXPLAIN QUERY PLAN
+                    SELECT
+                        request_history.id AS request_id,
+                        request_history.user_id,
+                        request_history.kind,
+                        request_history.mbid,
+                        request_history.name,
+                        request_history.artist_name,
+                        request_history.release_type,
+                        request_history.release_date,
+                        request_history.anime_slug,
+                        request_history.anime_name,
+                        request_history.theme_id,
+                        request_history.theme_label,
+                        request_history.song_id,
+                        request_history.song_title,
+                        request_history.created_at,
+                        users.username AS local_username,
+                        users.role,
+                        users.plex_id,
+                        users.plex_username,
+                        users.plex_email,
+                        users.plex_avatar
+                    FROM request_history
+                    JOIN users ON users.id = request_history.user_id
+                    ORDER BY request_history.created_at DESC, request_history.id DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (100, 200),
+                )
+            ]
+
+        self.assertIn("request_history_user_recent", indexes)
+        self.assertIn("request_history_recent", indexes)
+        self.assertTrue(any(
+            "request_history_user_recent" in detail for detail in user_plan
+        ))
+        self.assertTrue(any(
+            "request_history_recent" in detail for detail in admin_plan
+        ))
+        self.assertFalse(any(
+            detail == "SCAN request_history" for detail in (*user_plan, *admin_plan)
+        ))
+        self.assertFalse(any(
+            "USE TEMP B-TREE" in detail for detail in (*user_plan, *admin_plan)
+        ))
+
+    def test_settings_file_is_parsed_once_and_results_are_isolated(self):
+        storage_module.write_settings_file({
+            "lidarr": {"url": "http://lidarr:8686"},
+            "plex": {"url": "http://plex:32400"},
+        })
+        storage_module._settings_cache_signature = ("stale",)
+        storage_module._settings_cache_value = None
+
+        with patch("backend.storage.json.load", wraps=json.load) as load:
+            first = storage_module.load_settings_file()
+            first["lidarr"]["url"] = "mutated"
+            second = storage_module.load_settings_file()
+
+        self.assertEqual(load.call_count, 1)
+        self.assertEqual(second["lidarr"]["url"], "http://lidarr:8686")
+
+    def test_same_size_external_settings_replacement_invalidates_memo(self):
+        original = {
+            "lidarr": {"url": "http://one.test"},
+            "plex": {"url": "http://plex.test"},
+        }
+        replacement = {
+            "lidarr": {"url": "http://two.test"},
+            "plex": {"url": "http://plex.test"},
+        }
+        write_settings_file(original)
+        primed = storage_module.load_settings_file()
+        original_signature = storage_module._settings_cache_signature
+        original_size = os.stat(storage_module.SETTINGS_FILE).st_size
+
+        replacement_json = json.dumps(replacement, indent=2) + "\n"
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=os.path.dirname(storage_module.SETTINGS_FILE),
+                delete=False,
+            ) as file:
+                file.write(replacement_json)
+                temporary_path = file.name
+            self.assertEqual(os.stat(temporary_path).st_size, original_size)
+            os.replace(temporary_path, storage_module.SETTINGS_FILE)
+            temporary_path = None
+        finally:
+            if temporary_path and os.path.exists(temporary_path):
+                os.unlink(temporary_path)
+
+        replacement_signature = storage_module._settings_file_signature()
+        self.assertEqual(replacement_signature[1], original_signature[1])
+        self.assertNotEqual(replacement_signature, original_signature)
+
+        reloaded = storage_module.load_settings_file()
+        self.assertEqual(primed, original)
+        self.assertEqual(reloaded, replacement)
+
+        reloaded["lidarr"]["url"] = "mutated"
+        self.assertEqual(
+            storage_module.load_settings_file()["lidarr"]["url"],
+            "http://two.test",
         )
 
 

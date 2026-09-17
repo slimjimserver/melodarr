@@ -9,7 +9,7 @@ if __package__ == "backend.routes":
     from ..detail_cache import invalidate_all as invalidate_detail_payloads
     from ..responses import api_error, request_json_object
     from ..security import admin_required, login_required
-    from ..services import lastfm, lidarr
+    from ..services import lastfm, lidarr, musicbrainz
     from ..storage import (
         clear_recommendation_cache,
         get_service,
@@ -18,8 +18,8 @@ if __package__ == "backend.routes":
         recommendation_cache_stats,
         save_service,
     )
-    from ..workers import lidarr_searches as lidarr_search_worker
     from ..workers import lidarr_library as lidarr_library_worker
+    from ..workers import lidarr_searches as lidarr_search_worker
     from ..workers import plex as plex_worker
     from ..workers import plex_history as plex_history_worker
     from ..workers import plex_metadata as plex_metadata_worker
@@ -30,7 +30,7 @@ else:  # Support the existing `python backend/app.py` entry point.
     from detail_cache import invalidate_all as invalidate_detail_payloads
     from responses import api_error, request_json_object
     from security import admin_required, login_required
-    from services import lastfm, lidarr
+    from services import lastfm, lidarr, musicbrainz
     from storage import (
         clear_recommendation_cache,
         get_service,
@@ -39,8 +39,8 @@ else:  # Support the existing `python backend/app.py` entry point.
         recommendation_cache_stats,
         save_service,
     )
-    from workers import lidarr_searches as lidarr_search_worker
     from workers import lidarr_library as lidarr_library_worker
+    from workers import lidarr_searches as lidarr_search_worker
     from workers import plex as plex_worker
     from workers import plex_history as plex_history_worker
     from workers import plex_metadata as plex_metadata_worker
@@ -75,6 +75,7 @@ def settings():
     lidarr_config = get_service("lidarr")
     plex_config = get_service("plex")
     lastfm_config = get_service("lastfm") or {}
+    musicbrainz_config = musicbrainz.configuration()
     return jsonify({
         "lidarr": {
             "configured": bool(lidarr_config),
@@ -94,6 +95,7 @@ def settings():
                 str(lastfm_config.get("apiKey") or "").strip()
             ),
         },
+        "musicbrainz": musicbrainz_config,
     })
 
 
@@ -314,6 +316,55 @@ def configure_lidarr():
         return jsonify({"message": f"Connected to Lidarr {status.json().get('version', '')}.", "options": options})
     except requests.RequestException:
         return api_error("Could not connect to Lidarr. Check the URL, port, and API key.", 502)
+
+
+@blueprint.post("/api/settings/musicbrainz")
+@admin_required
+def configure_musicbrainz():
+    """Validate and save the application-wide MusicBrainz client settings."""
+    values = request_json_object()
+    if values is None:
+        return api_error("Request body must be a JSON object.")
+    try:
+        old_config = musicbrainz.configuration()
+        config = musicbrainz.configuration(values)
+    except musicbrainz.ConfigurationError as exc:
+        return api_error(str(exc))
+
+    save_service("musicbrainz", config)
+    musicbrainz.reset_request_pacing()
+    if config["baseUrl"] != old_config["baseUrl"]:
+        for namespace in (
+            "musicbrainz-search",
+            "musicbrainz-metadata",
+            "musicbrainz-artist-revalidation",
+        ):
+            clear_cache(namespace)
+        invalidate_detail_payloads()
+    return jsonify({
+        "message": "MusicBrainz settings saved.",
+        "musicbrainz": config,
+    })
+
+
+@blueprint.post("/api/settings/musicbrainz/test")
+@admin_required
+def test_musicbrainz():
+    """Test a proposed MusicBrainz endpoint without saving it."""
+    values = request_json_object()
+    if values is None:
+        return api_error("Request body must be a JSON object.")
+    try:
+        return jsonify(musicbrainz.test_connection(values))
+    except musicbrainz.ConfigurationError as exc:
+        return api_error(str(exc))
+    except musicbrainz.IncompatibleServerError as exc:
+        return api_error(str(exc), 502)
+    except requests.RequestException:
+        return api_error(
+            "Could not connect to MusicBrainz. Check the WS2 URL and port.",
+            502,
+        )
 
 
 @blueprint.post("/api/settings/lastfm")

@@ -39,7 +39,7 @@ jobs:
         run: docker build --file Dockerfile --tag "$IMAGE_NAME:$GITHUB_SHA" .
 
       - name: Test image
-        run: docker run --rm "$IMAGE_NAME:$GITHUB_SHA" python -m unittest discover -s tests -v
+        run: docker run --rm "$IMAGE_NAME:$GITHUB_SHA" python -m unittest discover -s tests -t . -v
 
       - name: Test default rootless runtime
         run: |
