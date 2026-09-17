@@ -65,6 +65,10 @@ The included Docker Compose setup does not require any extra environment variabl
 | `PORT` | `5056` | Port used by the local Flask development server. The production Gunicorn container listens on `5056`. |
 | `FLASK_DEBUG` | unset | Set to `1` only for the local development server. Do not enable it in production. |
 
+### Backing up your data
+
+For a consistent backup, stop Melodarr cleanly before copying the database and settings files. If the service must stay online, use SQLite's online backup API; do not make a raw copy of a live database because recent data may still be in its WAL file.
+
 ## License
 
 Melodarr is licensed under the [GNU General Public License v3.0](LICENSE).
