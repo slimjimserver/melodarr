@@ -11,6 +11,7 @@ COPY frontend/static ./static
 RUN pnpm run build
 
 FROM python:3.13-slim
+ARG MELODARR_VERSION=development
 WORKDIR /app
 COPY backend/requirements.txt .
 RUN apt-get update \
@@ -31,6 +32,7 @@ RUN apt-get update \
 COPY . .
 COPY --from=frontend-build /app/frontend/static /app/frontend/static
 ENV HOME=/app/data \
+    MELODARR_VERSION=${MELODARR_VERSION} \
     MELODARR_DATABASE=/app/data/melodarr.db \
     MELODARR_CACHE_DATABASE=/app/data/cache/metadata.db
 EXPOSE 5056

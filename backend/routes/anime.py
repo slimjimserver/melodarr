@@ -8,7 +8,12 @@ from flask import Blueprint, jsonify, request
 
 if __package__ == "backend.routes":
     from ..responses import api_error
-    from ..security import admin_required, current_user, login_required
+    from ..security import (
+        admin_required,
+        current_user,
+        login_or_api_key_required,
+        login_required,
+    )
     from ..services import (
         anime_mapping_registry,
         anime_musicbrainz,
@@ -22,7 +27,12 @@ if __package__ == "backend.routes":
     from ..workers import anime_metadata as anime_metadata_worker
 else:  # Support the existing `python backend/app.py` entry point.
     from responses import api_error
-    from security import admin_required, current_user, login_required
+    from security import (
+        admin_required,
+        current_user,
+        login_or_api_key_required,
+        login_required,
+    )
     from services import (
         anime_mapping_registry,
         anime_musicbrainz,
@@ -188,6 +198,15 @@ def _release_group_mbid(value):
         return str(UUID(raw))
     except (ValueError, AttributeError) as exc:
         raise ValueError("MusicBrainz release-group MBID must be a valid UUID.") from exc
+
+
+def _request_mbid(value, label):
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} must be a valid UUID.")
+    try:
+        return str(UUID(value.strip()))
+    except (ValueError, AttributeError) as exc:
+        raise ValueError(f"{label} must be a valid UUID.") from exc
 
 
 def _musicbrainz_release_group(mbid):
@@ -451,6 +470,44 @@ def _provider_error(exc, subject="Anime"):
         if status == 404:
             return api_error(f"{subject} was not found on AnimeThemes.", 404)
     return api_error(f"AnimeThemes could not load this {subject.casefold()}.", 502)
+
+
+@blueprint.post("/api/v1/animethemes/resolve")
+@login_or_api_key_required
+def resolve_animethemes_series():
+    """Resolve MusicBrainz release-group or recording MBIDs to series."""
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return api_error("Request body must be a JSON object.")
+    try:
+        release_group_id = None
+        if "releaseGroupId" in body and body["releaseGroupId"] is not None:
+            release_group_id = _request_mbid(
+                body["releaseGroupId"], "releaseGroupId"
+            )
+        raw_recording_ids = body.get("recordingIds", [])
+        if raw_recording_ids is None:
+            raw_recording_ids = []
+        if not isinstance(raw_recording_ids, list):
+            return api_error("recordingIds must be a list of UUIDs.")
+        recording_ids = []
+        for value in raw_recording_ids:
+            recording_id = _request_mbid(value, "Each recording ID")
+            if recording_id not in recording_ids:
+                recording_ids.append(recording_id)
+        if release_group_id is None and not recording_ids:
+            return api_error(
+                "Provide releaseGroupId, at least one recordingIds entry, or both."
+            )
+        series = anime_theme_links.resolve_series(
+            release_group_id=release_group_id,
+            recording_ids=recording_ids,
+        )
+    except ValueError as exc:
+        return api_error(str(exc))
+    except requests.RequestException:
+        return api_error("AnimeThemes could not resolve this music.", 502)
+    return jsonify({"series": series})
 
 
 @blueprint.get("/api/anime/<slug>")

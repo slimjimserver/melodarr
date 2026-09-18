@@ -289,7 +289,6 @@ class NotificationStorageTests(unittest.TestCase):
 
         notification_panel = html[html.index('id="settings-notifications"'):html.index('id="settings-requests"')]
         expected_admin_order = [
-            "Application URL",
             "Notification Delay (seconds)",
             "Enable Notifications Globally",
             "Enable Email Delivery",
@@ -304,6 +303,11 @@ class NotificationStorageTests(unittest.TestCase):
             "VAPID Contact",
         ]
         self.assertEqual(sorted(expected_admin_order, key=notification_panel.index), expected_admin_order)
+        self.assertNotIn("Application URL", notification_panel)
+        self.assertLess(
+            services.index("Application URL"),
+            services.index('id="plex-settings"'),
+        )
         self.assertIn('/icons/email.svg', notification_panel)
         self.assertIn('/icons/web-push.svg', notification_panel)
         self.assertIn('id="notification-global-settings"', notification_panel)

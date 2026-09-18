@@ -127,6 +127,21 @@ def save_service(service, values):
         write_settings_file(settings)
 
 
+def update_service(service, updater):
+    """Atomically transform one settings section and return its new value."""
+    with _settings_lock:
+        settings = load_settings_file() or {}
+        current = settings.get(service)
+        current = deepcopy(current) if isinstance(current, dict) else {}
+        updated = updater(current)
+        if not isinstance(updated, dict):
+            raise TypeError("Service settings updates must return an object.")
+        if settings.get(service) != updated:
+            settings[service] = updated
+            write_settings_file(settings)
+        return deepcopy(updated)
+
+
 def get_request_history(user_id, limit=100, offset=0):
     """Return the most recent private request-history rows for one user."""
     with db() as connection:
@@ -1205,7 +1220,9 @@ def init_db():
         connection.execute("""
             CREATE TABLE IF NOT EXISTS anime_theme_release_group_links (
                 anime_slug TEXT NOT NULL,
+                anime_id INTEGER,
                 anime_name TEXT NOT NULL,
+                anime_series_json TEXT NOT NULL DEFAULT '[]',
                 theme_id INTEGER NOT NULL CHECK(theme_id > 0),
                 theme_label TEXT NOT NULL,
                 theme_type TEXT NOT NULL,
@@ -1213,6 +1230,7 @@ def init_db():
                 song_id INTEGER CHECK(song_id IS NULL OR song_id > 0),
                 song_title TEXT NOT NULL,
                 release_group_mbid TEXT NOT NULL,
+                recording_mbids_json TEXT NOT NULL DEFAULT '[]',
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL,
                 PRIMARY KEY(anime_slug, theme_id, release_group_mbid)
@@ -1221,6 +1239,20 @@ def init_db():
         theme_link_columns = {
             row["name"] for row in connection.execute("PRAGMA table_info(anime_theme_release_group_links)")
         }
+        if "anime_id" not in theme_link_columns:
+            connection.execute(
+                "ALTER TABLE anime_theme_release_group_links ADD COLUMN anime_id INTEGER"
+            )
+        if "anime_series_json" not in theme_link_columns:
+            connection.execute(
+                "ALTER TABLE anime_theme_release_group_links ADD COLUMN "
+                "anime_series_json TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "recording_mbids_json" not in theme_link_columns:
+            connection.execute(
+                "ALTER TABLE anime_theme_release_group_links ADD COLUMN "
+                "recording_mbids_json TEXT NOT NULL DEFAULT '[]'"
+            )
         if "is_preferred" not in theme_link_columns:
             connection.execute("ALTER TABLE anime_theme_release_group_links "
                                "ADD COLUMN is_preferred INTEGER NOT NULL DEFAULT 0")

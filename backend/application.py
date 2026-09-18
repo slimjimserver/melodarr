@@ -14,8 +14,10 @@ if __package__:
     from .config import (
         FRONTEND_ROOT,
         assert_test_storage_isolation,
+        load_automation_api_key,
         load_session_secret,
     )
+    from .instance_settings import ensure_instance_settings
     from .routes.account import blueprint as account_blueprint
     from .routes.admin import blueprint as admin_blueprint
     from .routes.anime import blueprint as anime_blueprint
@@ -33,7 +35,13 @@ if __package__:
 else:  # Support the existing `python backend/app.py` entry point.
     import track_search_index
     from api_cache import init_cache_db, migrate_legacy_cache
-    from config import FRONTEND_ROOT, assert_test_storage_isolation, load_session_secret
+    from config import (
+        FRONTEND_ROOT,
+        assert_test_storage_isolation,
+        load_automation_api_key,
+        load_session_secret,
+    )
+    from instance_settings import ensure_instance_settings
     from routes.account import blueprint as account_blueprint
     from routes.admin import blueprint as admin_blueprint
     from routes.anime import blueprint as anime_blueprint
@@ -162,6 +170,7 @@ def create_app(config=None):
         static_url_path="/static",
     )
     app.config.update(
+        AUTOMATION_API_KEY_OVERRIDE=load_automation_api_key(),
         SECRET_KEY=load_session_secret(),
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
@@ -176,6 +185,17 @@ def create_app(config=None):
     migrate_legacy_cache()
     track_search_index.initialize()
     init_db()
+    explicit_api_key = str(app.config.get("AUTOMATION_API_KEY") or "").strip()
+    api_key_override = str(
+        app.config.get("AUTOMATION_API_KEY_OVERRIDE") or ""
+    ).strip()
+    instance = ensure_instance_settings(api_key_override)
+    app.config["AUTOMATION_API_KEY"] = (
+        explicit_api_key or instance["apiKey"]
+    )
+    app.config["AUTOMATION_API_KEY_MANAGED_BY_ENVIRONMENT"] = bool(
+        api_key_override and not explicit_api_key
+    )
     app.before_request(verify_csrf_token)
     app.before_request(serve_precompressed_static)
     app.after_request(cache_static_assets)

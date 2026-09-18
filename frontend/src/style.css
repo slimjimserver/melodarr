@@ -449,6 +449,7 @@ h1 em { font-style: normal; }
 .settings-tabs a.active { border-bottom-color: var(--accent-bright); color: var(--foreground); background: rgba(168, 68, 45, .07); }
 .settings-panel[hidden] { display: none; }
 .settings-section { max-width: none; border-top: 1px solid var(--border); padding: 26px 0 32px; }
+.melodarr-settings-section { border-top: 0; padding-top: 0; }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; margin: -1px; clip: rect(0 0 0 0); white-space: nowrap; }
 .users-section:first-child { border-top: 0; padding-top: 0; }
 .users-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; margin-bottom: 20px; }
@@ -551,6 +552,13 @@ h1 em { font-style: normal; }
 .wide-field { grid-column: 1 / -1; }
 label { display: grid; gap: 7px; color: var(--foreground-subtle); font-size: 13px; font-weight: 600; letter-spacing: 0; }
 .service-card button { height: var(--control-height); padding: 0 16px; }
+.secret-field { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 9px; }
+.secret-field input { min-width: 0; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+.secret-field .secret-toggle { display: grid; width: var(--control-height); place-items: center; padding: 0; }
+.secret-toggle svg { width: 19px; height: 19px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.secret-toggle .secret-eye-slash { display: block; }
+.secret-toggle[aria-pressed="true"] .secret-eye-slash { display: none; }
+.melodarr-settings-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 9px; }
 .form-message { min-height: 16px; margin: 0; color: var(--foreground-muted); font-size: 12px; }
 .message.error:not(:empty), .form-message.error:not(:empty) { border-left: 2px solid var(--danger); border-radius: 0 var(--radius-control) var(--radius-control) 0; background: color-mix(in srgb, var(--danger) 8%, transparent); padding: 8px 10px; line-height: 1.45; }
 hr { width: 100%; border: 0; border-top: 1px solid var(--border); }

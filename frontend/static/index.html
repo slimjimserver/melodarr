@@ -217,6 +217,30 @@
       </div>
 
       <div id="settings-services" class="settings-stack settings-panel" role="tabpanel" aria-labelledby="settings-tab-services" tabindex="0">
+        <section class="settings-section melodarr-settings-section">
+          <div class="service-intro"><img class="service-icon" src="/icons/melodarr.svg" width="42" height="42" loading="lazy" decoding="async" alt="Melodarr"><div><h2>Melodarr</h2><p>Configure this instance and its AnimeThemes automation credential.</p></div><span id="melodarr-version" class="service-state">Loading…</span></div>
+          <form id="melodarr-settings" class="service-card">
+            <div class="settings-fields">
+              <label>Application title
+                <small>The name shown in the browser and Melodarr header.</small>
+                <input name="applicationTitle" maxlength="80" autocomplete="off" required>
+              </label>
+              <label>Application URL
+                <small>The public URL used in email and Web Push links.</small>
+                <input name="applicationUrl" type="url" placeholder="https://music.example.com">
+              </label>
+              <label class="wide-field">API key
+                <small id="melodarr-api-key-help">Send this secret in <code>X-Api-Key</code> when calling the AnimeThemes resolver.</small>
+                <span class="secret-field"><input name="apiKey" type="password" readonly autocomplete="off" aria-describedby="melodarr-api-key-help"><button id="toggle-melodarr-api-key" class="outline secret-toggle" type="button" aria-label="Show API key" title="Show API key"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path class="secret-eye" d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z"/><circle class="secret-eye" cx="12" cy="12" r="2.5"/><path class="secret-eye-slash" d="m3 3 18 18"/></svg></button><button id="copy-melodarr-api-key" class="outline" type="button">Copy</button></span>
+              </label>
+            </div>
+            <div class="form-actions">
+              <p class="form-message" aria-live="polite"></p>
+              <div class="melodarr-settings-actions"><button id="regenerate-melodarr-api-key" class="secondary-action" type="button">Regenerate API key</button><button type="submit">Save Melodarr settings</button></div>
+            </div>
+          </form>
+        </section>
+
         <section class="settings-section">
           <div class="service-intro"><img class="service-icon" src="/icons/plex.svg" width="42" height="42" loading="lazy" decoding="async" alt="Plex"><div><h2>Plex library</h2><p>Detect artists you already own and open them directly in Plex.</p></div><span id="plex-state" class="service-state">Not connected</span></div>
           <div id="plex-settings" class="service-card plex-connect-card">
@@ -337,7 +361,6 @@
           <form id="notification-global-settings" class="notification-settings-form notification-card-form">
             <fieldset class="notification-card notification-global-card">
               <legend>Global delivery</legend>
-              <label>Application URL<small>The public URL used in email and Web Push. Web Push requires HTTPS except localhost.</small><input name="applicationUrl" type="url" placeholder="https://music.example.com"></label>
               <label>Notification Delay (seconds)<small>Wait after Lidarr reports music available before notifying users. Use 0 for immediate delivery.</small><input name="delaySeconds" type="number" min="0" max="86400" step="1" value="0" inputmode="numeric"></label>
               <label class="checkbox"><input name="enabled" type="checkbox"> Enable Notifications Globally</label>
               <div class="form-actions"><p class="form-message" aria-live="polite"></p><button class="notification-save">Save Global Settings</button></div>

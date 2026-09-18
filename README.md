@@ -48,6 +48,12 @@ Each person gets a private account, personal recommendations, and their own requ
 
 Melodarr caches artwork and music metadata locally, refreshes the library in the background, and keeps its data on your server. It is designed to run with Docker Compose and works well alongside an existing Lidarr and Plex setup.
 
+## AnimeThemes resolver API
+
+Authenticated clients can call `POST /api/v1/animethemes/resolve` with a MusicBrainz `releaseGroupId`, a `recordingIds` array, or both. Browser clients continue to use their signed-in session and CSRF token. Trusted automation can instead send the API key shown under **Settings → Services → Melodarr** in the `X-Api-Key` header; API-key requests to this endpoint do not need a session cookie or CSRF token. Melodarr generates and securely persists this key on first start. The response contains every unique higher-level AnimeThemes series linked to the supplied music. Release-group evidence takes precedence when the same series also matches a recording, and unknown MBIDs return an empty `series` array.
+
+AnimeThemes does not assign every anime to a higher-level series. In that case, Melodarr returns the individual anime as an explicit fallback with `animeThemesSeriesId: null`, its `animeThemesAnimeId`, and `fallback: "anime"`; it never invents a series ID.
+
 ## Environment variables
 
 The included Docker Compose setup does not require any extra environment variables. By default, it keeps the main database and metadata cache under the persistent `/app/data` mount.
@@ -60,6 +66,8 @@ The included Docker Compose setup does not require any extra environment variabl
 | `MELODARR_SECRET_KEY_FILE` | `session-secret.key` beside the main database | Persistent generated session-signing key. |
 | `MELODARR_VAPID_PRIVATE_KEY_FILE` | `vapid-private.pem` beside the main database | Stable Web Push/VAPID identity. Back it up and restore it with the database. |
 | `MELODARR_SECRET_KEY` | Generated and saved to the key file | Explicit session-signing secret. Normally leave this unset and let Melodarr manage the key in the data volume. |
+| `MELODARR_AUTOMATION_API_KEY` | auto-generated | Optional secret override of at least 32 characters accepted in `X-Api-Key` by machine-enabled endpoints such as the AnimeThemes resolver. When unset, Melodarr generates and persists a key in `settings.json`; an override can only be rotated by changing the environment variable. |
+| `MELODARR_VERSION` | `development` | Installed version shown in Settings. Published container images set this automatically from their branch or release tag. |
 | `MELODARR_ARTWORK_CACHE` | `<project>/data/cache/artwork` | Directory for downloaded artist and album artwork. |
 | `MELODARR_COOKIE_SECURE` | `false` | Set to `true` when serving Melodarr over HTTPS so session cookies are marked secure. |
 | `PORT` | `5056` | Port used by the local Flask development server. The production Gunicorn container listens on `5056`. |

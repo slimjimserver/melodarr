@@ -30,6 +30,7 @@ from backend import artwork_cache
 from backend import cache_memo
 from backend import config as backend_config
 from backend import detail_cache
+from backend import instance_settings
 from backend import recommendations as recommendation_engine
 from backend import security
 from backend import storage as storage_module
@@ -220,14 +221,20 @@ class ApplicationFactoryTests(DatabaseTestCase):
             for method in rule.methods
             if method not in {"HEAD", "OPTIONS"}
         }
-        self.assertEqual(len(rules), 103)
-        self.assertEqual(len(route_methods), 103)
+        self.assertEqual(len(rules), 107)
+        self.assertEqual(len(route_methods), 107)
         for route in (("/api/discover/charts", "GET"), ("/api/discover/preferences", "GET"),
                       ("/api/discover/preferences", "POST"), ("/api/discover/request-influence", "POST")):
             self.assertIn(route, route_methods)
         self.assertIn(("/api/music/artist/<mbid>/similar", "GET"), route_methods)
+        self.assertIn(("/api/v1/animethemes/resolve", "POST"), route_methods)
         self.assertIn(("/api/settings/musicbrainz", "POST"), route_methods)
         self.assertIn(("/api/settings/musicbrainz/test", "POST"), route_methods)
+        self.assertIn(("/api/settings/melodarr", "POST"), route_methods)
+        self.assertIn(
+            ("/api/settings/melodarr/api-key/regenerate", "POST"),
+            route_methods,
+        )
         notification_routes = {
             ("/api/settings/notifications", "GET"),
             ("/api/settings/notifications", "PUT"),
@@ -250,6 +257,56 @@ class ApplicationFactoryTests(DatabaseTestCase):
     def test_factory_applies_test_configuration(self):
         self.assertTrue(self.app.config["TESTING"])
         self.assertEqual(self.app.config["SECRET_KEY"], "test-secret")
+
+    def test_automation_api_key_uses_the_environment_configuration(self):
+        with patch.dict(
+            os.environ,
+            {"MELODARR_AUTOMATION_API_KEY": "a" * 32},
+        ):
+            self.assertEqual(backend_config.load_automation_api_key(), "a" * 32)
+
+        with patch.dict(
+            os.environ,
+            {"MELODARR_AUTOMATION_API_KEY": "too-short"},
+        ):
+            with self.assertRaisesRegex(RuntimeError, "at least 32 characters"):
+                backend_config.load_automation_api_key()
+
+    def test_first_start_api_key_is_generated_once_and_persisted(self):
+        with tempfile.TemporaryDirectory(prefix="melodarr-api-key-") as directory:
+            settings_path = os.path.join(directory, "settings.json")
+            with patch.object(storage_module, "SETTINGS_FILE", settings_path):
+                storage_module._settings_cache_signature = None
+                storage_module._settings_cache_value = None
+                first = instance_settings.ensure_instance_settings()
+                second = instance_settings.ensure_instance_settings()
+
+                self.assertGreaterEqual(len(first["apiKey"]), 32)
+                self.assertEqual(first["apiKey"], second["apiKey"])
+                self.assertEqual(
+                    storage_module.get_service("melodarr")["apiKey"],
+                    first["apiKey"],
+                )
+            storage_module._settings_cache_signature = None
+            storage_module._settings_cache_value = None
+
+    def test_environment_api_key_is_not_copied_to_persistent_settings(self):
+        override = "environment-owned-api-key-0123456789"
+        with tempfile.TemporaryDirectory(prefix="melodarr-api-key-") as directory:
+            settings_path = os.path.join(directory, "settings.json")
+            with patch.object(storage_module, "SETTINGS_FILE", settings_path):
+                storage_module._settings_cache_signature = None
+                storage_module._settings_cache_value = None
+                result = instance_settings.ensure_instance_settings(override)
+
+                self.assertEqual(result["apiKey"], override)
+                self.assertTrue(result["apiKeyManagedByEnvironment"])
+                self.assertNotIn(
+                    "apiKey",
+                    storage_module.get_service("melodarr"),
+                )
+            storage_module._settings_cache_signature = None
+            storage_module._settings_cache_value = None
 
     def test_empty_session_secret_file_is_replaced(self):
         with tempfile.TemporaryDirectory(prefix="melodarr-secret-") as directory:
@@ -1776,6 +1833,45 @@ class DeploymentConfigTests(unittest.TestCase):
             'window.addEventListener("melodarr-lidarr-settings-changed"',
             discovery_typescript,
         )
+
+    def test_melodarr_settings_precede_plex_and_manage_the_automation_key(self):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(
+            os.path.join(project_root, "frontend", "static", "index.html"),
+            encoding="utf-8",
+        ) as file:
+            frontend = file.read()
+        with open(
+            os.path.join(project_root, "frontend", "src", "app.ts"),
+            encoding="utf-8",
+        ) as file:
+            typescript = file.read()
+
+        self.assertLess(
+            frontend.index('id="melodarr-settings"'),
+            frontend.index('id="plex-settings"'),
+        )
+        self.assertIn('id="melodarr-version"', frontend)
+        self.assertIn('id="copy-melodarr-api-key"', frontend)
+        self.assertIn('id="toggle-melodarr-api-key"', frontend)
+        self.assertIn('id="regenerate-melodarr-api-key"', frontend)
+        self.assertIn('name="applicationTitle"', frontend)
+        self.assertIn('name="applicationUrl"', frontend)
+        self.assertIn('name="apiKey" type="password"', frontend)
+        self.assertNotIn(
+            'id="notification-global-settings" class="notification-settings-form '
+            'notification-card-form">\n            <fieldset class="notification-card '
+            'notification-global-card">\n              <legend>Global delivery</legend>\n'
+            '              <label>Application URL',
+            frontend,
+        )
+        self.assertIn('"/api/settings/melodarr"', typescript)
+        self.assertIn(
+            '"/api/settings/melodarr/api-key/regenerate"',
+            typescript,
+        )
+        self.assertIn("copyInputValue(form.apiKey)", typescript)
+        self.assertIn('form.apiKey.type === "password"', typescript)
 
     def test_musicbrainz_service_settings_support_self_hosting_and_testing(self):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -3827,6 +3923,127 @@ class AdminUsersTests(DatabaseTestCase):
 
 
 class SettingsMaintenanceTests(DatabaseTestCase):
+    def test_admin_can_view_and_save_melodarr_instance_settings(self):
+        token = self.register()
+
+        initial = self.client.get("/api/settings")
+        self.assertEqual(initial.status_code, 200)
+        melodarr = initial.get_json()["melodarr"]
+        self.assertEqual(melodarr["applicationTitle"], "Melodarr")
+        self.assertEqual(melodarr["version"], backend_config.APPLICATION_VERSION)
+        self.assertEqual(
+            melodarr["apiKey"],
+            self.app.config["AUTOMATION_API_KEY"],
+        )
+
+        without_csrf = self.client.post(
+            "/api/settings/melodarr",
+            json={
+                "applicationTitle": "Family Music",
+                "applicationUrl": "https://music.example.com",
+            },
+        )
+        self.assertEqual(without_csrf.status_code, 403)
+
+        saved = self.client.post(
+            "/api/settings/melodarr",
+            json={
+                "applicationTitle": "Family Music",
+                "applicationUrl": "https://music.example.com/",
+            },
+            headers={"X-CSRF-Token": token},
+        )
+
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(saved.get_json()["melodarr"]["applicationTitle"], "Family Music")
+        self.assertEqual(
+            saved.get_json()["melodarr"]["applicationUrl"],
+            "https://music.example.com",
+        )
+        self.assertEqual(
+            get_service("melodarr")["applicationUrl"],
+            "https://music.example.com",
+        )
+        self.assertEqual(
+            self.client.get("/api/settings/notifications").get_json()["applicationUrl"],
+            "https://music.example.com",
+        )
+
+    def test_regenerating_api_key_immediately_replaces_resolver_access(self):
+        token = self.register()
+        old_key = self.app.config["AUTOMATION_API_KEY"]
+
+        rotated = self.client.post(
+            "/api/settings/melodarr/api-key/regenerate",
+            headers={"X-CSRF-Token": token},
+        )
+
+        self.assertEqual(rotated.status_code, 200)
+        new_key = rotated.get_json()["melodarr"]["apiKey"]
+        self.assertNotEqual(new_key, old_key)
+        self.assertEqual(get_service("melodarr")["apiKey"], new_key)
+        with self.client.session_transaction() as session:
+            session.clear()
+        payload = {"releaseGroupId": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"}
+        old_access = self.client.post(
+            "/api/v1/animethemes/resolve",
+            json=payload,
+            headers={"X-Api-Key": old_key},
+        )
+        new_access = self.client.post(
+            "/api/v1/animethemes/resolve",
+            json=payload,
+            headers={"X-Api-Key": new_key},
+        )
+        self.assertEqual(old_access.status_code, 401)
+        self.assertEqual(new_access.status_code, 200)
+        self.assertEqual(new_access.get_json(), {"series": []})
+
+    def test_environment_managed_api_key_cannot_be_regenerated_in_ui(self):
+        token = self.register()
+        self.app.config["AUTOMATION_API_KEY_MANAGED_BY_ENVIRONMENT"] = True
+        original = self.app.config["AUTOMATION_API_KEY"]
+
+        response = self.client.post(
+            "/api/settings/melodarr/api-key/regenerate",
+            headers={"X-CSRF-Token": token},
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(self.app.config["AUTOMATION_API_KEY"], original)
+        self.assertIn("MELODARR_AUTOMATION_API_KEY", response.get_json()["error"])
+
+    def test_melodarr_settings_validate_title_url_and_payload_shape(self):
+        token = self.register()
+        headers = {"X-CSRF-Token": token}
+
+        blank_title = self.client.post(
+            "/api/settings/melodarr",
+            json={"applicationTitle": " ", "applicationUrl": ""},
+            headers=headers,
+        )
+        credential_url = self.client.post(
+            "/api/settings/melodarr",
+            json={
+                "applicationTitle": "Melodarr",
+                "applicationUrl": "https://user:secret@example.com",
+            },
+            headers=headers,
+        )
+        extra_field = self.client.post(
+            "/api/settings/melodarr",
+            json={
+                "applicationTitle": "Melodarr",
+                "applicationUrl": "",
+                "apiKey": "caller-must-not-set-this",
+            },
+            headers=headers,
+        )
+
+        self.assertEqual(blank_title.status_code, 400)
+        self.assertEqual(credential_url.status_code, 400)
+        self.assertEqual(extra_field.status_code, 400)
+
     def test_legacy_user_key_is_promoted_and_per_user_copies_are_scrubbed(self):
         self.register()
         with db() as connection:
