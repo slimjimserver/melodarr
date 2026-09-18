@@ -2,38 +2,50 @@
 
 import json
 import logging
+import re
+import unicodedata
 
 import requests
 from flask import Blueprint, jsonify, request
 
 if __package__ == "backend.routes":
+    from .. import (
+        recommendation_activity,
+        recommendation_feed,
+        recommendation_preferences,
+        track_search_index,
+    )
     from .. import recommendations as recommendation_engine
-    from .. import recommendation_activity, recommendation_feed, recommendation_preferences, recommendation_preferences
-    from ..workers import recommendations as recommendation_worker
     from ..media_urls import artist_cover_art, release_group_cover_art
     from ..responses import api_error
     from ..security import current_user, login_required
-    from ..services import animethemes, lastfm, musicbrainz, plex, charts
+    from ..services import animethemes, charts, lastfm, musicbrainz, plex
     from ..storage import (
         get_lastfm_api_key,
         get_recommendation_cache,
         get_service,
     )
+    from ..workers import recommendations as recommendation_worker
 else:  # Support the existing `python backend/app.py` entry point.
+    import recommendation_activity
+    import recommendation_feed
+    import recommendation_preferences
     import recommendations as recommendation_engine
-    import recommendation_activity, recommendation_feed
-    from workers import recommendations as recommendation_worker
+    import track_search_index
     from media_urls import artist_cover_art, release_group_cover_art
     from responses import api_error
     from security import current_user, login_required
-    from services import animethemes, lastfm, musicbrainz, plex, charts
+    from services import animethemes, charts, lastfm, musicbrainz, plex
     from storage import get_lastfm_api_key, get_recommendation_cache, get_service
+    from workers import recommendations as recommendation_worker
 
 
 blueprint = Blueprint("discovery", __name__)
 logger = logging.getLogger(__name__)
 
 _SEARCH_RESULT_LIMIT = 25
+_DUPLICATE_TITLE_LIMIT = 2
+_INFERRED_ARTIST_QUERY_BOOST = 2
 _PRIMARY_RELEASE_TYPE_RANK = {
     "single": 0,
     "album": 1,
@@ -41,6 +53,524 @@ _PRIMARY_RELEASE_TYPE_RANK = {
     "broadcast": 3,
     "other": 4,
 }
+_TRACK_VERSION_INTENTS = {
+    "radio edit": ("radio edit",),
+    "instrumental": ("instrumental",),
+    "acoustic": ("acoustic", "unplugged"),
+    "remaster": ("remaster", "remastered"),
+    "remix": ("remix",),
+    "live": ("live",),
+    "demo": ("demo",),
+}
+_ALBUM_INTENT_ALIASES = {
+    "soundtrack": ("soundtrack", "ost"),
+    "compilation": ("compilation",),
+    "album": ("album", "lp"),
+    "ep": ("ep",),
+    "single": ("single",),
+}
+_ISRC_PATTERN = re.compile(
+    r"^(?:ISRC[\s:-]*)?([A-Z]{2})[-\s]?([A-Z0-9]{3})[-\s]?(\d{2})[-\s]?(\d{5})$",
+    re.IGNORECASE,
+)
+
+
+def _normalize_search_text(value):
+    """Return a punctuation-insensitive string for deterministic comparisons."""
+    decomposed = unicodedata.normalize("NFKD", str(value or "").casefold())
+    without_marks = "".join(
+        character
+        for character in decomposed
+        if not unicodedata.combining(character)
+    )
+    return " ".join(re.findall(r"[^\W_]+", without_marks, flags=re.UNICODE))
+
+
+def _album_query_interpretations(query):
+    """Return the literal title query plus conservative title/artist splits."""
+    words = str(query or "").split()
+    interpretations = [(str(query or "").strip(), "")]
+    if len(words) < 2:
+        return interpretations
+    for split_at in range(1, len(words)):
+        interpretations.append((
+            " ".join(words[:split_at]),
+            " ".join(words[split_at:]),
+        ))
+    return interpretations
+
+
+def _lucene_phrase(value):
+    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _lucene_all_words(value):
+    return "(" + " AND ".join(
+        _lucene_phrase(word) for word in _normalize_search_text(value).split()
+    ) + ")"
+
+
+def _lucene_fuzzy_words(value):
+    """Allow one edit on substantial title words without broad fuzzy matching."""
+    return "(" + " AND ".join(
+        f"{word}~1" if len(word) >= 4 else _lucene_phrase(word)
+        for word in _normalize_search_text(value).split()
+    ) + ")"
+
+
+def _album_musicbrainz_query(query):
+    """Build one fielded query when an artist suffix can be inferred safely."""
+    interpretations = _album_query_interpretations(query)
+    if len(interpretations) == 1:
+        return query, True
+    literal_query = interpretations[0][0]
+    clauses = [
+        f"(releasegroup:{_lucene_phrase(literal_query)} OR "
+        f"releasegroup:{_lucene_all_words(literal_query)} OR "
+        f"releasegroup:{_lucene_fuzzy_words(literal_query)})"
+    ]
+    clauses.extend(
+        f"(releasegroup:{_lucene_phrase(title)} AND "
+        f"artist:{_lucene_phrase(artist)})"
+        for title, artist in interpretations[1:]
+    )
+    return " OR ".join(clauses), False
+
+
+def _album_intents(query):
+    words = set(_normalize_search_text(query).split())
+    return tuple(
+        intent
+        for intent, aliases in _ALBUM_INTENT_ALIASES.items()
+        if words.intersection(aliases)
+    )
+
+
+def _album_base_title(query, intents):
+    words = _normalize_search_text(query).split()
+    ignored = {
+        alias
+        for intent in intents
+        for alias in _ALBUM_INTENT_ALIASES[intent]
+    }
+    base = " ".join(word for word in words if word not in ignored)
+    return base or _normalize_search_text(query)
+
+
+def _release_group_intents_satisfied(group, intents):
+    if not intents:
+        return True
+    primary = _normalize_search_text(group.get("primary-type"))
+    secondary = {
+        _normalize_search_text(value)
+        for value in group.get("secondary-types") or []
+    }
+    descriptive_words = set(_normalize_search_text(" ".join((
+        str(group.get("title") or ""),
+        str(group.get("disambiguation") or ""),
+        " ".join(str(value) for value in group.get("secondary-types") or []),
+    ))).split())
+    checks = {
+        "soundtrack": "soundtrack" in secondary
+        or bool(descriptive_words.intersection({"soundtrack", "ost"})),
+        "compilation": "compilation" in secondary or primary == "compilation",
+        "album": primary == "album",
+        "ep": primary == "ep",
+        "single": primary == "single",
+    }
+    return all(checks[intent] for intent in intents)
+
+
+def _normalized_isrc(query):
+    match = _ISRC_PATTERN.fullmatch(str(query or "").strip())
+    return "".join(match.groups()).upper() if match else ""
+
+
+def _explicit_track_artist(query):
+    """Split only unambiguous song/artist separators."""
+    value = str(query or "").strip()
+    match = re.fullmatch(r"(.+?)\s+[-–—]\s+(.+?)", value)
+    if not match:
+        match = re.fullmatch(r"(.+?)\s+by\s+(.+?)", value, flags=re.IGNORECASE)
+        if (
+            match
+            and len(match.group(2).split()) < 2
+            and " by " not in value
+        ):
+            match = None
+    if not match:
+        return value, ""
+    title, artist = (part.strip() for part in match.groups())
+    return (title, artist) if title and artist else (value, "")
+
+
+def _track_version_intents(query):
+    normalized = _normalize_search_text(query)
+    padded = f" {normalized} "
+    return tuple(
+        intent
+        for intent, aliases in _TRACK_VERSION_INTENTS.items()
+        if any(f" {alias} " in padded for alias in aliases)
+    )
+
+
+def _track_base_title(query, intents):
+    normalized = _normalize_search_text(query)
+    for intent in intents:
+        for alias in _TRACK_VERSION_INTENTS[intent]:
+            normalized = re.sub(
+                rf"(?:^|\s){re.escape(alias)}(?:$|\s)",
+                " ",
+                normalized,
+            )
+    return " ".join(normalized.split()) or _normalize_search_text(query)
+
+
+def _track_search_plan(query):
+    """Describe one MusicBrainz query and the local ranking intent."""
+    isrc = _normalized_isrc(query)
+    if isrc:
+        return {
+            "query": f"isrc:{isrc}",
+            "plainSearch": False,
+            "title": "",
+            "artist": "",
+            "versions": (),
+            "isrc": isrc,
+            "literalTitle": "",
+            "interpretations": (),
+            "resolvedArtists": (),
+        }
+
+    title, artist = _explicit_track_artist(query)
+    interpretations = [{
+        "title": str(query).strip(),
+        "artist": "",
+        "source": "literal",
+    }]
+    if artist:
+        interpretations.append({
+            "title": title,
+            "artist": artist,
+            "source": "explicit",
+        })
+    else:
+        words = str(query).split()
+        interpretations.extend(
+            {
+                "title": " ".join(words[:split_at]),
+                "artist": " ".join(words[split_at:]),
+                "source": "inferred",
+            }
+            for split_at in range(1, len(words))
+        )
+
+    search_query = query
+    plain_search = True
+    artist_interpretations = [
+        interpretation
+        for interpretation in interpretations
+        if interpretation["artist"]
+    ]
+    if artist_interpretations:
+        artist_clauses = [
+            f"(recording:{_lucene_phrase(interpretation['title'])} AND "
+            f"(artist:{_lucene_phrase(interpretation['artist'])} OR "
+            f"artistname:{_lucene_phrase(interpretation['artist'])}))"
+            for interpretation in artist_interpretations
+        ]
+        if artist:
+            search_query = " OR ".join(artist_clauses)
+        else:
+            literal_clause = (
+                f"(recording:{_lucene_phrase(query)} OR "
+                f"recording:{_lucene_all_words(query)})"
+            )
+            boosted_artist_clauses = [
+                f"({clause}^{_INFERRED_ARTIST_QUERY_BOOST})"
+                for clause in artist_clauses
+            ]
+            search_query = " OR ".join([
+                literal_clause,
+                *boosted_artist_clauses,
+            ])
+        plain_search = False
+    versions = _track_version_intents(title)
+    return {
+        "query": search_query,
+        "plainSearch": plain_search,
+        "title": title,
+        "artist": artist,
+        "versions": versions,
+        "isrc": "",
+        "literalTitle": str(query).strip(),
+        "interpretations": tuple(interpretations),
+        "resolvedArtists": (),
+    }
+
+
+def _text_match_quality(query, value):
+    query = _normalize_search_text(query)
+    value = _normalize_search_text(value)
+    if not query or not value:
+        return 0
+    if value == query:
+        return 4
+    if value.startswith(f"{query} "):
+        return 3
+    if f" {query} " in f" {value} ":
+        return 2
+    query_words = query.split()
+    value_words = set(value.split())
+    if len(query_words) > 1 and all(word in value_words for word in query_words):
+        return 1
+    return 0
+
+
+def _release_group_artist_names(group):
+    names = []
+    for credit in group.get("artist-credit") or []:
+        artist = credit.get("artist") or {}
+        names.extend((
+            credit.get("name"),
+            artist.get("name"),
+            artist.get("sort-name"),
+        ))
+        names.extend(alias.get("name") for alias in artist.get("aliases") or [])
+    return [name for name in names if name]
+
+
+def _release_group_title_quality(group, query):
+    titles = [group.get("title")]
+    titles.extend(alias.get("name") for alias in group.get("aliases") or [])
+    return max(
+        (_text_match_quality(query, title) for title in titles if title),
+        default=0,
+    )
+
+
+def _release_group_artist_quality(group, query):
+    return max(
+        (_text_match_quality(query, name) for name in _release_group_artist_names(group)),
+        default=0,
+    )
+
+
+def _release_group_search_score(group):
+    try:
+        return max(0, min(100, int(group.get("score") or 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _release_group_type_quality(group):
+    primary_type = _normalize_search_text(group.get("primary-type"))
+    secondary_types = {
+        _normalize_search_text(value)
+        for value in group.get("secondary-types") or []
+    }
+    quality = {
+        "album": 3,
+        "ep": 2,
+        "single": 1,
+    }.get(primary_type, 0)
+    if "soundtrack" in secondary_types:
+        quality += 1
+    if "compilation" in secondary_types:
+        quality -= 1
+    return quality
+
+
+def _release_group_year(group):
+    match = re.match(r"\d{4}", str(group.get("first-release-date") or ""))
+    return int(match.group()) if match else 0
+
+
+def _release_group_rank(group, interpretations, position):
+    """Sort by title, artist, MusicBrainz score, type, then release year."""
+    match = max(
+        (
+            _release_group_title_quality(group, title_query),
+            _release_group_artist_quality(group, artist_query) if artist_query else 0,
+        )
+        for title_query, artist_query in interpretations
+    )
+    return (
+        -match[0],
+        -match[1],
+        -_release_group_search_score(group),
+        -_release_group_type_quality(group),
+        -_release_group_year(group),
+        position,
+        str(group.get("id") or ""),
+    )
+
+
+def _diversify_release_group_titles(groups):
+    """Keep repeated normalized titles from consuming the first result page."""
+    first_page_indices = []
+    title_counts = {}
+    for position, group in enumerate(groups):
+        title_key = _normalize_search_text(group.get("title"))
+        if title_key and title_counts.get(title_key, 0) >= _DUPLICATE_TITLE_LIMIT:
+            continue
+        first_page_indices.append(position)
+        title_counts[title_key] = title_counts.get(title_key, 0) + 1
+        if len(first_page_indices) == _SEARCH_RESULT_LIMIT:
+            break
+
+    target_size = min(_SEARCH_RESULT_LIMIT, len(groups))
+    selected = set(first_page_indices)
+    if len(selected) < target_size:
+        for position in range(len(groups)):
+            if position in selected:
+                continue
+            first_page_indices.append(position)
+            selected.add(position)
+            if len(selected) == target_size:
+                break
+    return [
+        *(groups[position] for position in first_page_indices),
+        *(group for position, group in enumerate(groups) if position not in selected),
+    ]
+
+
+def _rank_release_groups(groups, query):
+    """Rerank MusicBrainz candidates without discarding its relevance score."""
+    interpretations = _album_query_interpretations(query)
+    ranked = sorted(
+        enumerate(groups),
+        key=lambda item: _release_group_rank(item[1], interpretations, item[0]),
+    )
+    return _diversify_release_group_titles([group for _, group in ranked])
+
+
+def _local_album_interpretations(query):
+    """Return literal and locally validated title/artist interpretations."""
+    literal_intents = _album_intents(query)
+    interpretations = [{
+        "title": str(query).strip(),
+        "baseTitle": _album_base_title(query, literal_intents),
+        "artist": "",
+        "artistMbid": "",
+        "intents": literal_intents,
+        "source": "literal",
+    }]
+    words = str(query or "").split()
+    for split_at in range(1, len(words)):
+        title = " ".join(words[:split_at])
+        artist = " ".join(words[split_at:])
+        resolution = track_search_index.resolve_artist(artist)
+        if resolution["status"] != "unique":
+            continue
+        intents = _album_intents(title)
+        interpretations.append({
+            "title": title,
+            "baseTitle": _album_base_title(title, intents),
+            "artist": artist,
+            "artistMbid": resolution["mbid"],
+            "intents": intents,
+            "source": "artist-qualified",
+        })
+    return interpretations
+
+
+def _local_album_match(group, interpretation):
+    title_quality = max(
+        _release_group_title_quality(group, interpretation["title"]),
+        _release_group_title_quality(group, interpretation["baseTitle"]),
+    )
+    artist_quality = 0
+    artist_mbid = interpretation["artistMbid"]
+    if artist_mbid:
+        if artist_mbid not in _artist_credit_ids(group):
+            return None
+        artist_quality = 4
+    intents_satisfied = _release_group_intents_satisfied(
+        group,
+        interpretation["intents"],
+    )
+    return {
+        "titleQuality": title_quality,
+        "artistQuality": artist_quality,
+        "intentsSatisfied": intents_satisfied,
+        "intentCount": len(interpretation["intents"]),
+    }
+
+
+def _local_album_rank(group, match):
+    return (
+        -match["titleQuality"],
+        -match["artistQuality"],
+        -match["intentCount"],
+        -_release_group_type_quality(group),
+        -_release_group_year(group),
+        str(group.get("id") or ""),
+    )
+
+
+def _confident_local_album_match(match):
+    if not match or not match["intentsSatisfied"]:
+        return False
+    if match["titleQuality"] == 4:
+        return True
+    return bool(
+        match["titleQuality"] >= 3
+        and (match["artistQuality"] == 4 or match["intentCount"])
+    )
+
+
+def _local_album_resolution(query):
+    """Return ranked local groups only when the strongest match is confident."""
+    candidates = {}
+    for interpretation in _local_album_interpretations(query):
+        groups = track_search_index.search_release_groups(
+            interpretation["baseTitle"],
+            interpretation["artistMbid"],
+        )
+        for group in groups:
+            match = _local_album_match(group, interpretation)
+            if (
+                match is None
+                or not match["titleQuality"]
+                or not match["intentsSatisfied"]
+            ):
+                continue
+            rank = _local_album_rank(group, match)
+            existing = candidates.get(group["id"])
+            if existing is None or rank < existing["rank"]:
+                candidates[group["id"]] = {
+                    "group": group,
+                    "match": match,
+                    "rank": rank,
+                }
+    ranked = sorted(candidates.values(), key=lambda candidate: candidate["rank"])
+    if not ranked or not _confident_local_album_match(ranked[0]["match"]):
+        return []
+    groups = _diversify_release_group_titles([
+        candidate["group"] for candidate in ranked
+    ])[:100]
+    return [
+        {
+            "id": group["id"],
+            "name": group.get("title", "Untitled release"),
+            "romanizedTitle": (
+                group.get("romanizedTitle")
+                or musicbrainz.romanized_release_group_title(group)
+            ),
+            "artist": _artist_credit_name(group),
+            "date": group.get("first-release-date", ""),
+            "type": group.get("primary-type") or "Album",
+            "secondaryTypes": [
+                name for name in group.get("secondary-types") or [] if name
+            ],
+            "disambiguation": group.get("disambiguation", ""),
+            "score": 0,
+            "coverArt": release_group_cover_art(group["id"]),
+        }
+        for group in groups
+    ]
 
 
 def _plex_search_artists():
@@ -79,6 +609,39 @@ def _artist_credit_name(entity):
     return " · ".join(name for name in names if name)
 
 
+def _artist_credit_ids(entity):
+    return {
+        str((credit.get("artist") or {}).get("id") or "").casefold()
+        for credit in entity.get("artist-credit") or []
+        if isinstance(credit, dict)
+        and (credit.get("artist") or {}).get("id")
+    }
+
+
+def _resolved_artist_mbid(plan, artist_query):
+    normalized = _normalize_search_text(artist_query)
+    return next((
+        resolved["mbid"]
+        for resolved in plan.get("resolvedArtists") or ()
+        if _normalize_search_text(resolved["artist"]) == normalized
+    ), "")
+
+
+def _with_resolved_artist(plan, interpretation, artist_mbid):
+    resolved = {
+        "title": interpretation["title"],
+        "artist": interpretation["artist"],
+        "mbid": artist_mbid.casefold(),
+    }
+    return {
+        **plan,
+        "resolvedArtists": (
+            *(plan.get("resolvedArtists") or ()),
+            resolved,
+        ),
+    }
+
+
 def _recording_score(recording):
     try:
         return int(recording.get("score") or 0)
@@ -86,8 +649,351 @@ def _recording_score(recording):
         return 0
 
 
-def _track_release_rank(recording, release, recording_position, release_position):
-    """Prefer strong recording matches, then original official editions."""
+def _recording_title_quality(recording, title_query, versions=()):
+    if not title_query:
+        return 0
+    base_query = _track_base_title(title_query, versions)
+    titles = [recording.get("title")]
+    titles.extend(alias.get("name") for alias in recording.get("aliases") or [])
+    return max(
+        (
+            max(
+                _text_match_quality(title_query, title),
+                _text_match_quality(base_query, title),
+            )
+            for title in titles
+            if title
+        ),
+        default=0,
+    )
+
+
+def _strict_recording_title_match(recording, title_query):
+    """Protect true literal titles without erasing meaningful punctuation."""
+    query = " ".join(str(title_query or "").casefold().split())
+    if not query:
+        return False
+    titles = [recording.get("title")]
+    titles.extend(alias.get("name") for alias in recording.get("aliases") or [])
+    return any(
+        " ".join(str(title).casefold().split()) == query
+        for title in titles
+        if title
+    )
+
+
+def _recording_artist_quality(recording, artist_query):
+    if not artist_query:
+        return 0
+    return max(
+        (
+            _text_match_quality(artist_query, name)
+            for name in _release_group_artist_names(recording)
+        ),
+        default=0,
+    )
+
+
+def _recording_interpretation_quality(recording, plan):
+    """Choose the strongest validated title/artist interpretation."""
+    literal_quality = _recording_title_quality(
+        recording,
+        plan["literalTitle"],
+    )
+    best = (literal_quality, literal_quality, 0)
+    for interpretation in plan["interpretations"]:
+        artist_query = interpretation["artist"]
+        if not artist_query:
+            continue
+        title_quality = _recording_title_quality(
+            recording,
+            interpretation["title"],
+            _track_version_intents(interpretation["title"]),
+        )
+        resolved_mbid = _resolved_artist_mbid(plan, artist_query)
+        artist_quality = (
+            4
+            if resolved_mbid and resolved_mbid in _artist_credit_ids(recording)
+            else _recording_artist_quality(recording, artist_query)
+        )
+        if not title_quality or artist_quality < 2:
+            continue
+        best = max(
+            best,
+            (title_quality + artist_quality, title_quality, artist_quality),
+        )
+    return (
+        int(
+            not plan["artist"]
+            and _strict_recording_title_match(recording, plan["literalTitle"])
+        ),
+        *best,
+    )
+
+
+def _track_release_artist_quality(recording, release, plan):
+    """Prefer release groups whose credit supports a validated artist split."""
+    group = release.get("release-group") or {}
+    release_artist_names = [
+        *_release_group_artist_names(group),
+        *_release_group_artist_names(release),
+    ]
+    if not release_artist_names:
+        return 0
+
+    quality = 0
+    for interpretation in plan["interpretations"]:
+        artist_query = interpretation["artist"]
+        if not artist_query:
+            continue
+        title_quality = _recording_title_quality(
+            recording,
+            interpretation["title"],
+            _track_version_intents(interpretation["title"]),
+        )
+        recording_artist_quality = _recording_artist_quality(
+            recording,
+            artist_query,
+        )
+        resolved_mbid = _resolved_artist_mbid(plan, artist_query)
+        if resolved_mbid and resolved_mbid in _artist_credit_ids(recording):
+            recording_artist_quality = 4
+        if not title_quality or recording_artist_quality < 2:
+            continue
+        release_artist_quality = max(
+            (
+                _text_match_quality(artist_query, name)
+                for name in release_artist_names
+            ),
+            default=0,
+        )
+        if resolved_mbid and resolved_mbid in {
+            *_artist_credit_ids(group),
+            *_artist_credit_ids(release),
+        }:
+            release_artist_quality = 4
+        quality = max(quality, release_artist_quality)
+    return quality
+
+
+def _local_release_group_rank(group):
+    secondary_types = {
+        _normalize_search_text(value)
+        for value in group.get("secondary-types") or []
+    }
+    if "compilation" in secondary_types:
+        secondary_rank = 2
+    elif secondary_types:
+        secondary_rank = 1
+    else:
+        secondary_rank = 0
+    primary_type = _normalize_search_text(group.get("primary-type") or "other")
+    return (
+        secondary_rank,
+        _PRIMARY_RELEASE_TYPE_RANK.get(primary_type, 5),
+        group.get("first-release-date") or "9999",
+        str(group.get("id") or ""),
+    )
+
+
+def _local_track_resolution(plan):
+    """Resolve exact local title+artist hits without making provider requests."""
+    resolved = []
+    for interpretation in plan["interpretations"]:
+        artist_query = interpretation["artist"]
+        if not artist_query:
+            continue
+        resolution = track_search_index.resolve_artist(artist_query)
+        if resolution["status"] != "unique":
+            continue
+        resolved.append((interpretation, resolution["mbid"]))
+
+    distinct_artists = {artist_mbid for _, artist_mbid in resolved}
+    if len(distinct_artists) != 1:
+        return {"plan": plan, "results": []}
+    artist_mbid = next(iter(distinct_artists))
+    matches = []
+    chosen_interpretation = None
+    for interpretation, _ in sorted(
+        resolved,
+        key=lambda item: -len(_normalize_search_text(item[0]["title"])),
+    ):
+        candidate_matches = track_search_index.exact_track_matches(
+            artist_mbid,
+            interpretation["title"],
+        )
+        if candidate_matches:
+            chosen_interpretation = interpretation
+            matches = candidate_matches
+            break
+    fallback_interpretation = max(
+        (interpretation for interpretation, _ in resolved),
+        key=lambda item: len(_normalize_search_text(item["title"])),
+    )
+    resolved_plan = _with_resolved_artist(
+        plan,
+        chosen_interpretation or fallback_interpretation,
+        artist_mbid,
+    )
+    if not matches or chosen_interpretation is None:
+        return {"plan": resolved_plan, "results": []}
+
+    group_ids = {match["release_group_mbid"] for match in matches}
+    groups = track_search_index.cached_release_groups(group_ids)
+    results = []
+    for group_id in sorted(group_ids):
+        group = groups.get(group_id)
+        if not group:
+            continue
+        artist_name = _artist_credit_name(group)
+        if not group.get("title") or not artist_name:
+            continue
+        results.append({
+            "id": group_id,
+            "name": group["title"],
+            "romanizedTitle": musicbrainz.romanized_release_group_title(group),
+            "artist": artist_name,
+            "date": group.get("first-release-date") or "",
+            "type": group.get("primary-type") or "Other",
+            "secondaryTypes": [
+                name for name in group.get("secondary-types") or [] if name
+            ],
+            "disambiguation": group.get("disambiguation") or "",
+            "score": 100,
+            "matchedTrack": chosen_interpretation["title"],
+            "matchedTrackArtist": artist_name,
+            "_rank": _local_release_group_rank(group),
+        })
+    results.sort(key=lambda result: result["_rank"])
+    for result in results:
+        result.pop("_rank", None)
+    return {"plan": resolved_plan, "results": results[:_SEARCH_RESULT_LIMIT]}
+
+
+def _artist_mbid_recording_query(title, artist_mbid):
+    return (
+        f"(recording:{_lucene_phrase(title)} OR "
+        f"recording:{_lucene_all_words(title)}) AND arid:{artist_mbid}"
+    )
+
+
+def _has_strong_recording_match(response, plan):
+    for recording in response.get("recordings") or []:
+        for interpretation in plan["interpretations"]:
+            if not interpretation["artist"]:
+                continue
+            title_quality = _recording_title_quality(
+                recording,
+                interpretation["title"],
+                _track_version_intents(interpretation["title"]),
+            )
+            artist_quality = _recording_artist_quality(
+                recording,
+                interpretation["artist"],
+            )
+            if title_quality >= 3 and artist_quality >= 2:
+                return True
+    return False
+
+
+def _has_exact_literal_recording(response, plan):
+    return any(
+        _strict_recording_title_match(recording, plan["literalTitle"])
+        for recording in response.get("recordings") or []
+    )
+
+
+def _alias_fallback_interpretation(plan):
+    explicit = next((
+        interpretation
+        for interpretation in plan["interpretations"]
+        if interpretation["source"] == "explicit"
+    ), None)
+    if explicit:
+        return explicit
+    words = _normalize_search_text(plan["literalTitle"]).split()
+    if len(words) < 3:
+        return None
+    return next((
+        interpretation
+        for interpretation in reversed(plan["interpretations"])
+        if interpretation["source"] == "inferred"
+    ), None)
+
+
+def _musicbrainz_alias_resolution(plan):
+    interpretation = _alias_fallback_interpretation(plan)
+    if interpretation is None:
+        return None
+    artist_query = interpretation["artist"]
+    response = musicbrainz.search(
+        artist_query,
+        "artist",
+        plain_search=True,
+        limit=10,
+    )
+    query_keys = {
+        track_search_index.normalize_text(artist_query),
+        track_search_index.normalize_text(artist_query).replace(" ", ""),
+    }
+    matches = []
+    for artist in response.get("artists") or []:
+        names = [artist.get("name"), artist.get("sort-name")]
+        names.extend(
+            alias.get("name")
+            for alias in artist.get("aliases") or []
+            if isinstance(alias, dict)
+        )
+        romanized = musicbrainz.romanized_artist_name(artist)
+        if romanized:
+            names.append(romanized)
+        artist_keys = {
+            value
+            for name in names
+            if name
+            for normalized in [track_search_index.normalize_text(name)]
+            for value in (normalized, normalized.replace(" ", ""))
+            if value
+        }
+        if query_keys & artist_keys and artist.get("id"):
+            matches.append(artist)
+    unique = {artist["id"]: artist for artist in matches}
+    if len(unique) != 1:
+        return None
+    artist = next(iter(unique.values()))
+    track_search_index.cache_aliases(artist, artist_query)
+    return interpretation, artist["id"]
+
+
+def _track_version_quality(recording, release, intents):
+    if not intents:
+        return 0
+    group = release.get("release-group") or {}
+    version_text = _normalize_search_text(" ".join((
+        str(recording.get("title") or ""),
+        str(recording.get("disambiguation") or ""),
+        str(release.get("title") or ""),
+        str(release.get("disambiguation") or ""),
+        " ".join(str(value) for value in group.get("secondary-types") or []),
+    )))
+    padded = f" {version_text} "
+    return sum(
+        any(
+            f" {_normalize_search_text(alias)} " in padded
+            for alias in _TRACK_VERSION_INTENTS[intent]
+        )
+        for intent in intents
+    )
+
+
+def _track_release_rank(
+    recording,
+    release,
+    recording_position,
+    release_position,
+    plan,
+):
+    """Prefer title/artist intent before score, then useful official editions."""
     group = release.get("release-group") or {}
     secondary_types = [
         str(name).casefold() for name in group.get("secondary-types") or []
@@ -102,10 +1008,14 @@ def _track_release_rank(recording, release, recording_position, release_position
     status = str(release.get("status") or "").casefold()
     status_rank = 0 if status == "official" else (1 if not status else 2)
     primary_type = str(group.get("primary-type") or "other").casefold()
+    interpretation_quality = _recording_interpretation_quality(recording, plan)
     return (
+        *(-value for value in interpretation_quality),
+        -_track_release_artist_quality(recording, release, plan),
+        -_track_version_quality(recording, release, plan["versions"]),
         -_recording_score(recording),
-        status_rank,
         secondary_type_rank,
+        status_rank,
         _PRIMARY_RELEASE_TYPE_RANK.get(primary_type, 5),
         release.get("date") or recording.get("first-release-date") or "9999",
         recording_position,
@@ -113,7 +1023,7 @@ def _track_release_rank(recording, release, recording_position, release_position
     )
 
 
-def _recording_release_group_candidates(response):
+def _recording_release_group_candidates(response, plan):
     """Flatten recording releases and retain the best edition per release group."""
     candidates = {}
     for recording_position, recording in enumerate(response.get("recordings") or []):
@@ -124,7 +1034,11 @@ def _recording_release_group_candidates(response):
                 continue
 
             rank = _track_release_rank(
-                recording, release, recording_position, release_position
+                recording,
+                release,
+                recording_position,
+                release_position,
+                plan,
             )
             existing = candidates.get(group_id)
             if existing and existing["rank"] <= rank:
@@ -165,9 +1079,9 @@ def _recording_release_group_candidates(response):
     ]
 
 
-def _recording_release_group_results(response):
+def _recording_release_group_results(response, plan):
     """Return canonical, ranked release groups reached through recording matches."""
-    candidates = _recording_release_group_candidates(response)
+    candidates = _recording_release_group_candidates(response, plan)
     canonical_groups = {}
     if candidates:
         query = " OR ".join(f"rgid:{candidate['id']}" for candidate in candidates)
@@ -505,14 +1419,84 @@ def search():
             return api_error(
                 "AnimeThemes could not be reached. Try again shortly.", 502
             )
+    search_query = query
+    plain_search = True
+    track_plan = None
+    if search_type == "album":
+        local_results = _local_album_resolution(query)
+        if local_results:
+            return jsonify({
+                "results": local_results,
+                "type": search_type,
+                "candidateCount": len(local_results),
+            })
+        search_query, plain_search = _album_musicbrainz_query(query)
+    elif search_type == "track":
+        track_plan = _track_search_plan(query)
+        local_resolution = _local_track_resolution(track_plan)
+        track_plan = local_resolution["plan"]
+        if local_resolution["results"]:
+            return jsonify({
+                "results": local_resolution["results"],
+                "type": search_type,
+                "candidateCount": len(local_resolution["results"]),
+            })
+        search_query = track_plan["query"]
+        plain_search = track_plan["plainSearch"]
+        if track_plan["resolvedArtists"]:
+            resolved = track_plan["resolvedArtists"][-1]
+            search_query = _artist_mbid_recording_query(
+                resolved["title"],
+                resolved["mbid"],
+            )
+            plain_search = False
+    search_options = {"plain_search": plain_search}
+    if track_plan and any(
+        interpretation["artist"]
+        for interpretation in track_plan["interpretations"]
+    ):
+        search_options["limit"] = 50
     try:
-        response = musicbrainz.search(query, search_type, plain_search=True)
+        response = musicbrainz.search(
+            search_query,
+            search_type,
+            **search_options,
+        )
     except requests.RequestException as exc:
         message = musicbrainz.search_error_message(exc)
         return api_error(
             message or "MusicBrainz could not be reached. Try again shortly.",
             502,
         )
+
+    if (
+        search_type == "track"
+        and not track_plan["resolvedArtists"]
+        and not _has_strong_recording_match(response, track_plan)
+        and not _has_exact_literal_recording(response, track_plan)
+    ):
+        try:
+            alias_resolution = _musicbrainz_alias_resolution(track_plan)
+            if alias_resolution:
+                interpretation, artist_mbid = alias_resolution
+                track_plan = _with_resolved_artist(
+                    track_plan,
+                    interpretation,
+                    artist_mbid,
+                )
+                response = musicbrainz.search(
+                    _artist_mbid_recording_query(
+                        interpretation["title"],
+                        artist_mbid,
+                    ),
+                    "track",
+                    plain_search=False,
+                    limit=50,
+                )
+        except requests.RequestException:
+            # Alias resolution is an optional recovery path. Preserve the
+            # original recording results when either fallback request fails.
+            pass
 
     if search_type == "artist":
         plex_artists = _plex_search_artists()
@@ -531,21 +1515,29 @@ def search():
             for artist in response.get("artists", [])
         ]
     elif search_type == "album":
+        candidates = response.get("release-groups", [])
+        track_search_index.index_release_groups(candidates)
+        ranked_albums = _rank_release_groups(candidates, query)
         results = [
             {
                 "id": album["id"],
                 "name": album.get("title", "Untitled release"),
                 "romanizedTitle": musicbrainz.romanized_release_group_title(album),
-                "artist": " · ".join(
-                    credit.get("name", "") for credit in album.get("artist-credit", [])
-                ),
+                "artist": _artist_credit_name(album),
                 "date": album.get("first-release-date", ""),
                 "type": album.get("primary-type", "Album"),
+                "secondaryTypes": [
+                    name for name in album.get("secondary-types") or [] if name
+                ],
                 "disambiguation": album.get("disambiguation", ""),
                 "score": album.get("score", 0),
             }
-            for album in response.get("release-groups", [])
+            for album in ranked_albums
         ]
     else:
-        results = _recording_release_group_results(response)
-    return jsonify({"results": results, "type": search_type})
+        results = _recording_release_group_results(response, track_plan)
+    return jsonify({
+        "results": results,
+        "type": search_type,
+        "candidateCount": len(results),
+    })

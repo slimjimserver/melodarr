@@ -22,6 +22,7 @@ from unittest.mock import Mock, patch
 from werkzeug.security import check_password_hash, generate_password_hash
 
 import requests
+from flask import Flask
 from PIL import Image
 
 from backend import api_cache
@@ -32,6 +33,7 @@ from backend import detail_cache
 from backend import recommendations as recommendation_engine
 from backend import security
 from backend import storage as storage_module
+from backend import track_search_index
 from backend.api_cache import (
     cache_db,
     cache_key,
@@ -44,6 +46,7 @@ from backend.api_cache import (
 )
 from backend.application import create_app
 from backend.config import ARTWORK_CACHE_DIRECTORY
+from backend.routes import discovery
 from backend.services import (
     anime_theme_links,
     lidarr,
@@ -1986,7 +1989,7 @@ class DeploymentConfigTests(unittest.TestCase):
         self.assertNotIn("getPlexArtists", discovery_typescript)
         self.assertNotIn("normalizedArtistName", discovery_typescript)
         self.assertIn(
-            "result.plex ? createPlexArtistCard",
+            "createPlexArtistCard(result, description, result.plex)",
             discovery_typescript,
         )
 
@@ -6438,7 +6441,15 @@ class MusicBrainzClientTests(unittest.TestCase):
         self.assertTrue(cached_get.call_args.args[0].endswith("/release-group/"))
         self.assertEqual(kwargs["namespace"], "musicbrainz-search")
         self.assertTrue(kwargs["include_cache_status"])
-        self.assertEqual(kwargs["params"]["limit"], 25)
+        self.assertEqual(kwargs["params"]["limit"], 100)
+
+    @patch("backend.services.musicbrainz.cached_json_get")
+    def test_artist_search_keeps_the_default_candidate_limit(self, cached_get):
+        cached_get.return_value = {"artists": []}
+
+        musicbrainz.search("Test", "artist")
+
+        self.assertEqual(cached_get.call_args.kwargs["params"]["limit"], 25)
 
     @patch("backend.services.musicbrainz.cached_json_get")
     def test_track_search_uses_recording_resource(self, cached_get):
@@ -6456,6 +6467,7 @@ class MusicBrainzClientTests(unittest.TestCase):
             cached_get.call_args.kwargs["params"]["dismax"],
             "true",
         )
+        self.assertEqual(cached_get.call_args.kwargs["params"]["limit"], 25)
 
     @patch("backend.services.musicbrainz.cached_json_get")
     def test_metadata_lookup_forwards_includes_and_paging(self, cached_get):
@@ -6595,6 +6607,1052 @@ class LastFmDiscoveryTests(DatabaseTestCase):
             limit=20,
         )
         self.assertNotIn("admin-shared-key", response.get_data(as_text=True))
+
+
+def _release_group_fixture(
+    identifier,
+    title,
+    *,
+    score=80,
+    date="2020-01-01",
+    artist="Example Artist",
+    primary_type="Album",
+    secondary_types=None,
+):
+    return {
+        "id": identifier,
+        "title": title,
+        "score": score,
+        "first-release-date": date,
+        "primary-type": primary_type,
+        "secondary-types": secondary_types or [],
+        "artist-credit": [{
+            "name": artist,
+            "artist": {"name": artist, "sort-name": artist},
+        }],
+    }
+
+
+class ReleaseGroupRankingTests(unittest.TestCase):
+    @staticmethod
+    def _recording(
+        identifier,
+        title,
+        *,
+        score=80,
+        artist="Example Artist",
+        disambiguation="",
+        primary_type="Album",
+        secondary_types=None,
+    ):
+        return {
+            "id": f"recording-{identifier}",
+            "title": title,
+            "score": score,
+            "disambiguation": disambiguation,
+            "artist-credit": [{
+                "name": artist,
+                "artist": {"name": artist, "sort-name": artist},
+            }],
+            "releases": [{
+                "id": f"release-{identifier}",
+                "title": title,
+                "status": "Official",
+                "date": "2020-01-01",
+                "release-group": {
+                    "id": f"group-{identifier}",
+                    "primary-type": primary_type,
+                    "secondary-types": secondary_types or [],
+                },
+            }],
+        }
+
+    def test_album_ranking_prefers_exact_and_strong_title_matches(self):
+        candidates = [
+            _release_group_fixture(
+                "substring",
+                "Music From The Odyssey Sessions",
+                score=100,
+                date="2026-01-01",
+            ),
+            _release_group_fixture(
+                "prefix-old",
+                "The Odyssey: A Journey",
+                score=80,
+                date="2000-01-01",
+            ),
+            _release_group_fixture(
+                "exact",
+                "The Odyssey",
+                score=60,
+                date="1990-01-01",
+            ),
+            _release_group_fixture(
+                "prefix-new",
+                "The Odyssey: Original Motion Picture Soundtrack",
+                score=80,
+                date="2026-01-01",
+            ),
+        ]
+
+        ranked = discovery._rank_release_groups(candidates, "The Odyssey")
+
+        self.assertEqual(
+            [group["id"] for group in ranked],
+            ["exact", "prefix-new", "prefix-old", "substring"],
+        )
+
+    def test_album_ranking_keeps_relevance_ahead_of_recency(self):
+        candidates = [
+            _release_group_fixture(
+                "newer",
+                "The Odyssey: New Recording",
+                score=70,
+                date="2026-01-01",
+            ),
+            _release_group_fixture(
+                "stronger",
+                "The Odyssey: Definitive Recording",
+                score=95,
+                date="1980-01-01",
+            ),
+        ]
+
+        ranked = discovery._rank_release_groups(candidates, "The Odyssey")
+
+        self.assertEqual([group["id"] for group in ranked], ["stronger", "newer"])
+
+    def test_album_ranking_diversifies_duplicate_titles_deterministically(self):
+        candidates = [
+            _release_group_fixture(f"exact-{index}", "The Odyssey", score=100 - index)
+            for index in range(6)
+        ]
+        candidates.extend(
+            _release_group_fixture(
+                f"related-{index}",
+                f"The Odyssey: Related Album {index}",
+                score=80 - index,
+            )
+            for index in range(30)
+        )
+
+        first = discovery._rank_release_groups(candidates, "The Odyssey")
+        second = discovery._rank_release_groups(candidates, "The Odyssey")
+
+        self.assertEqual(
+            sum(group["title"] == "The Odyssey" for group in first[:25]),
+            2,
+        )
+        self.assertEqual(
+            {group["id"] for group in first},
+            {group["id"] for group in candidates},
+        )
+        self.assertEqual(
+            [group["id"] for group in first],
+            [group["id"] for group in second],
+        )
+
+    @patch("backend.routes.discovery.musicbrainz.search")
+    def test_artist_qualified_album_search_uses_one_fielded_request(self, search):
+        search.return_value = {"release-groups": [
+            _release_group_fixture(
+                "qualified",
+                "The Odyssey",
+                score=75,
+                artist="Ludwig Göransson",
+            ),
+            _release_group_fixture(
+                "literal",
+                "The Odyssey Ludwig Göransson",
+                score=75,
+                artist="Someone Else",
+            ),
+        ]}
+
+        app = Flask(__name__)
+        with app.test_request_context(
+            "/api/search?q=The%20Odyssey%20Ludwig%20G%C3%B6ransson&type=album"
+        ):
+            response = discovery.search.__wrapped__()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["results"][0]["id"], "qualified")
+        search.assert_called_once()
+        search_query = search.call_args.args[0]
+        self.assertIn('releasegroup:"The Odyssey"', search_query)
+        self.assertIn('artist:"Ludwig Göransson"', search_query)
+        self.assertFalse(search.call_args.kwargs["plain_search"])
+
+    @patch("backend.routes.discovery.musicbrainz.search")
+    def test_album_search_supports_a_one_word_artist_suffix(self, search):
+        search.return_value = {"release-groups": [
+            _release_group_fixture(
+                "drake-album",
+                "Nothing Was the Same",
+                score=90,
+                artist="Drake",
+            ),
+            _release_group_fixture(
+                "literal",
+                "Nothing Was the Same Drake",
+                score=95,
+                artist="Someone Else",
+            ),
+        ]}
+
+        app = Flask(__name__)
+        with app.test_request_context(
+            "/api/search?q=Nothing%20Was%20the%20same%20Drake&type=album"
+        ):
+            response = discovery.search.__wrapped__()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["results"][0]["id"], "drake-album")
+        search.assert_called_once()
+        search_query = search.call_args.args[0]
+        self.assertIn('releasegroup:"Nothing Was the same"', search_query)
+        self.assertIn('artist:"Drake"', search_query)
+        self.assertFalse(search.call_args.kwargs["plain_search"])
+
+    @patch("backend.routes.discovery.musicbrainz.search")
+    def test_album_search_adds_conservative_title_typo_tolerance(self, search):
+        search.return_value = {"release-groups": [
+            _release_group_fixture(
+                "mamma-mia",
+                "Mamma Mia! Here We Go Again",
+                score=100,
+                artist="Benny Andersson · Björn Ulvaeus",
+                secondary_types=["Soundtrack"],
+            ),
+        ]}
+
+        app = Flask(__name__)
+        with app.test_request_context(
+            "/api/search?q=Mama%20Mia%20here%20we%20go%20again&type=album"
+        ):
+            response = discovery.search.__wrapped__()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["results"][0]["id"], "mamma-mia")
+        search.assert_called_once()
+        search_query = search.call_args.args[0]
+        self.assertIn("releasegroup:(mama~1", search_query)
+        self.assertIn('AND "mia"', search_query)
+        self.assertFalse(search.call_args.kwargs["plain_search"])
+
+    def test_track_title_quality_precedes_musicbrainz_score(self):
+        recordings = [
+            self._recording(
+                "all-terms",
+                "Lights After Blinding",
+                score=100,
+            ),
+            self._recording(
+                "phrase",
+                "The Blinding Lights Theme",
+                score=95,
+            ),
+            self._recording(
+                "prefix",
+                "Blinding Lights Extended",
+                score=90,
+            ),
+            self._recording("exact", "Blinding Lights", score=70),
+        ]
+        plan = discovery._track_search_plan("Blinding Lights")
+
+        first = discovery._recording_release_group_candidates(
+            {"recordings": recordings},
+            plan,
+        )
+        second = discovery._recording_release_group_candidates(
+            {"recordings": recordings},
+            plan,
+        )
+
+        expected = ["group-exact", "group-prefix", "group-phrase", "group-all-terms"]
+        self.assertEqual([candidate["id"] for candidate in first], expected)
+        self.assertEqual([candidate["id"] for candidate in second], expected)
+
+    def test_explicit_track_artist_match_precedes_musicbrainz_score(self):
+        plan = discovery._track_search_plan("Blinding Lights - The Weeknd")
+        recordings = [
+            self._recording(
+                "wrong-artist",
+                "Blinding Lights",
+                score=100,
+                artist="Example Band",
+            ),
+            self._recording(
+                "right-artist",
+                "Blinding Lights",
+                score=75,
+                artist="The Weeknd",
+            ),
+        ]
+
+        candidates = discovery._recording_release_group_candidates(
+            {"recordings": recordings},
+            plan,
+        )
+
+        self.assertEqual(candidates[0]["id"], "group-right-artist")
+        self.assertIn('recording:"Blinding Lights"', plan["query"])
+        self.assertIn('artist:"The Weeknd"', plan["query"])
+        self.assertFalse(plan["plainSearch"])
+
+    def test_track_version_intent_beats_a_generic_higher_score(self):
+        plan = discovery._track_search_plan("Numb live")
+        recordings = [
+            self._recording("studio", "Numb", score=100),
+            self._recording(
+                "live",
+                "Numb",
+                score=70,
+                disambiguation="live",
+                secondary_types=["Live"],
+            ),
+        ]
+
+        candidates = discovery._recording_release_group_candidates(
+            {"recordings": recordings},
+            plan,
+        )
+
+        self.assertEqual(candidates[0]["id"], "group-live")
+
+    def test_track_query_parsing_supports_space_suffixes_and_isrc(self):
+        by_plan = discovery._track_search_plan("Blinding Lights by The Weeknd")
+        one_word_by_plan = discovery._track_search_plan("yellow by coldplay")
+        space_only = discovery._track_search_plan("Blinding Lights The Weeknd")
+        yellow = discovery._track_search_plan("Yellow Coldplay")
+        title_with_by = discovery._track_search_plan("Stand By Me")
+        isrc = discovery._track_search_plan("US-RC1-76-07839")
+
+        self.assertEqual(by_plan["title"], "Blinding Lights")
+        self.assertEqual(by_plan["artist"], "The Weeknd")
+        self.assertEqual(one_word_by_plan["title"], "yellow")
+        self.assertEqual(one_word_by_plan["artist"], "coldplay")
+        self.assertNotIn('recording:"yellow by coldplay"', one_word_by_plan["query"])
+        self.assertIn('recording:"yellow"', one_word_by_plan["query"])
+        self.assertIn('artist:"coldplay"', one_word_by_plan["query"])
+        self.assertIn(
+            {"title": "Blinding Lights", "artist": "The Weeknd", "source": "inferred"},
+            space_only["interpretations"],
+        )
+        self.assertIn(
+            {"title": "Yellow", "artist": "Coldplay", "source": "inferred"},
+            yellow["interpretations"],
+        )
+        self.assertIn('artistname:"Coldplay"))^2', yellow["query"])
+        self.assertFalse(space_only["plainSearch"])
+        self.assertEqual(title_with_by["artist"], "")
+        self.assertEqual(title_with_by["literalTitle"], "Stand By Me")
+        self.assertIn(
+            {"title": "Stand By Me", "artist": "", "source": "literal"},
+            title_with_by["interpretations"],
+        )
+        self.assertEqual(isrc["query"], "isrc:USRC17607839")
+        self.assertFalse(isrc["plainSearch"])
+
+    def test_space_only_track_search_uses_the_strongest_valid_split(self):
+        plan = discovery._track_search_plan("Blinding Lights The Weeknd")
+        recordings = [
+            self._recording(
+                "generic",
+                "Blinding Lights The",
+                score=100,
+                artist="Someone Else",
+            ),
+            self._recording(
+                "qualified",
+                "Blinding Lights",
+                score=70,
+                artist="The Weeknd",
+            ),
+        ]
+
+        candidates = discovery._recording_release_group_candidates(
+            {"recordings": recordings},
+            plan,
+        )
+
+        self.assertEqual(candidates[0]["id"], "group-qualified")
+
+    def test_exact_literal_track_title_precedes_an_inferred_split(self):
+        plan = discovery._track_search_plan("Yellow Coldplay")
+        recordings = [
+            self._recording(
+                "qualified",
+                "Yellow",
+                score=100,
+                artist="Coldplay",
+            ),
+            self._recording(
+                "literal",
+                "Yellow Coldplay",
+                score=60,
+                artist="Someone Else",
+            ),
+        ]
+
+        candidates = discovery._recording_release_group_candidates(
+            {"recordings": recordings},
+            plan,
+        )
+
+        self.assertEqual(candidates[0]["id"], "group-literal")
+
+    def test_parenthetical_cover_does_not_beat_matching_artist_album(self):
+        plan = discovery._track_search_plan("Yellow Coldplay")
+        cover = self._recording(
+            "cover",
+            "Yellow (Coldplay)",
+            score=100,
+            artist="Cover Artist",
+        )
+        coldplay = self._recording(
+            "parachutes",
+            "Yellow",
+            score=76,
+            artist="Coldplay",
+        )
+        coldplay["releases"][0].update({
+            "title": "Parachutes",
+            "status": "",
+            "date": "2000-07-10",
+            "artist-credit": [{
+                "name": "Coldplay",
+                "artist": {"name": "Coldplay", "sort-name": "Coldplay"},
+            }],
+        })
+        coldplay["releases"][0]["release-group"].update({
+            "id": "1dc4c347-a1db-32aa-b14f-bc9cc507b843",
+            "title": "Parachutes",
+            "artist-credit": [{
+                "name": "Coldplay",
+                "artist": {"name": "Coldplay", "sort-name": "Coldplay"},
+            }],
+        })
+        compilation = self._recording(
+            "compilation",
+            "Yellow",
+            score=76,
+            artist="Coldplay",
+            secondary_types=["Compilation"],
+        )
+        compilation["releases"][0]["release-group"]["artist-credit"] = [{
+            "name": "Various Artists",
+            "artist": {
+                "name": "Various Artists",
+                "sort-name": "Various Artists",
+            },
+        }]
+
+        candidates = discovery._recording_release_group_candidates(
+            {"recordings": [cover, compilation, coldplay]},
+            plan,
+        )
+
+        self.assertEqual(
+            candidates[0]["id"],
+            "1dc4c347-a1db-32aa-b14f-bc9cc507b843",
+        )
+        self.assertEqual(candidates[0]["name"], "Parachutes")
+
+    def test_exact_title_with_by_still_beats_artist_interpretation(self):
+        plan = discovery._track_search_plan("Stand By Me")
+        recordings = [
+            self._recording(
+                "qualified",
+                "Stand",
+                score=100,
+                artist="Me",
+            ),
+            self._recording(
+                "literal",
+                "Stand By Me",
+                score=60,
+                artist="Ben E. King",
+            ),
+        ]
+
+        candidates = discovery._recording_release_group_candidates(
+            {"recordings": recordings},
+            plan,
+        )
+
+        self.assertEqual(candidates[0]["id"], "group-literal")
+
+    @patch(
+        "backend.routes.discovery._recording_release_group_results",
+        return_value=[],
+    )
+    @patch("backend.routes.discovery.musicbrainz.search")
+    def test_track_route_uses_the_structured_plan_without_parser_lookup(
+        self,
+        search,
+        release_group_results,
+    ):
+        search.return_value = {"recordings": [self._recording(
+            "weeknd",
+            "Blinding Lights",
+            artist="The Weeknd",
+        )]}
+        app = Flask(__name__)
+        with app.test_request_context(
+            "/api/search?q=Blinding%20Lights%20-%20The%20Weeknd&type=track"
+        ):
+            response = discovery.search.__wrapped__()
+
+        self.assertEqual(response.status_code, 200)
+        search.assert_called_once()
+        query, search_type = search.call_args.args
+        self.assertEqual(search_type, "track")
+        self.assertIn('recording:"Blinding Lights"', query)
+        self.assertIn('artist:"The Weeknd"', query)
+        self.assertEqual(
+            search.call_args.kwargs,
+            {"plain_search": False, "limit": 50},
+        )
+        plan = release_group_results.call_args.args[1]
+        self.assertEqual(plan["title"], "Blinding Lights")
+        self.assertEqual(plan["artist"], "The Weeknd")
+
+    @patch(
+        "backend.routes.discovery._recording_release_group_results",
+        return_value=[],
+    )
+    @patch("backend.routes.discovery.musicbrainz.search")
+    def test_space_only_artist_aware_track_route_fetches_50_candidates(
+        self,
+        search,
+        release_group_results,
+    ):
+        search.return_value = {"recordings": []}
+        app = Flask(__name__)
+        with app.test_request_context(
+            "/api/search?q=Yellow%20Coldplay&type=track"
+        ):
+            response = discovery.search.__wrapped__()
+
+        self.assertEqual(response.status_code, 200)
+        search.assert_called_once()
+        self.assertEqual(
+            search.call_args.kwargs,
+            {"plain_search": False, "limit": 50},
+        )
+        plan = release_group_results.call_args.args[1]
+        self.assertEqual(plan["artist"], "")
+        self.assertIn(
+            {"title": "Yellow", "artist": "Coldplay", "source": "inferred"},
+            plan["interpretations"],
+        )
+
+
+class LocalTrackSearchIndexTests(unittest.TestCase):
+    artist_mbid = "11111111-1111-4111-8111-111111111111"
+    second_artist_mbid = "11111111-1111-4111-8111-222222222222"
+    release_group_mbid = "22222222-2222-4222-8222-222222222222"
+    recording_mbid = "33333333-3333-4333-8333-333333333333"
+    release_mbid = "44444444-4444-4444-8444-444444444444"
+
+    def setUp(self):
+        api_cache.init_cache_db()
+        track_search_index.initialize()
+        with api_cache.cache_db() as connection:
+            connection.execute("DELETE FROM track_search_artist_names")
+            connection.execute("DELETE FROM track_search_relations")
+            connection.execute("DELETE FROM track_search_release_group_refs")
+            connection.execute(
+                "DELETE FROM api_cache WHERE cache_key LIKE 'track-search-test:%'"
+            )
+            connection.executemany(
+                "DELETE FROM api_cache WHERE cache_key = ?",
+                ((key,) for key in self._metadata_keys()),
+            )
+
+    def tearDown(self):
+        with api_cache.cache_db() as connection:
+            connection.execute("DELETE FROM track_search_artist_names")
+            connection.execute("DELETE FROM track_search_relations")
+            connection.execute("DELETE FROM track_search_release_group_refs")
+            connection.execute(
+                "DELETE FROM api_cache WHERE cache_key LIKE 'track-search-test:%'"
+            )
+            connection.executemany(
+                "DELETE FROM api_cache WHERE cache_key = ?",
+                ((key,) for key in self._metadata_keys()),
+            )
+
+    def _metadata_keys(self):
+        return (
+            musicbrainz.metadata_cache_key(
+                f"/artist/{self.artist_mbid}",
+                "aliases+url-rels+genres",
+            ),
+            musicbrainz.metadata_cache_key(
+                "/release-group",
+                "aliases",
+                artist=self.artist_mbid,
+                limit=100,
+                offset=0,
+            ),
+            musicbrainz.metadata_cache_key(
+                f"/release/{self.release_mbid}",
+                "recordings+artist-credits",
+            ),
+        )
+
+    def _artist(self, mbid=None, name="羊文学", aliases=None):
+        return {
+            "id": mbid or self.artist_mbid,
+            "name": name,
+            "sort-name": name,
+            "aliases": aliases or [{"name": "Hitsuji Bungaku"}],
+        }
+
+    def _group(self):
+        artist = self._artist()
+        return {
+            "id": self.release_group_mbid,
+            "title": "12 hugs (like butterflies)",
+            "first-release-date": "2023-12-06",
+            "primary-type": "Album",
+            "secondary-types": [],
+            "artist-credit": [{"name": "羊文学", "artist": artist}],
+        }
+
+    def _release(self):
+        group = self._group()
+        return {
+            "id": self.release_mbid,
+            "title": "12 hugs (like butterflies)",
+            "release-group": group,
+            "artist-credit": group["artist-credit"],
+            "media": [{"tracks": [{
+                "title": "more than words",
+                "artist-credit": group["artist-credit"],
+                "recording": {
+                    "id": self.recording_mbid,
+                    "title": "more than words",
+                    "artist-credit": group["artist-credit"],
+                },
+            }]}],
+        }
+
+    def _seed_complete_index(self):
+        artist = self._artist()
+        group = self._group()
+        page = {"release-groups": [group], "release-group-count": 1}
+        api_cache.set_cache_document(
+            "track-search-test",
+            "groups",
+            page,
+            3600,
+        )
+        cache_key = api_cache.document_cache_key(
+            "track-search-test",
+            "groups",
+        )
+        track_search_index.index_artist(artist)
+        track_search_index.index_release_group_page(page, cache_key)
+        release = self._release()
+        track_search_index.index_release(release, cache_key)
+        track_search_index.index_release(release, cache_key)
+
+    def test_rebuild_imports_only_compact_identity_and_pointer_rows(self):
+        artist = self._artist()
+        page = {
+            "release-groups": [self._group()],
+            "release-group-count": 1,
+        }
+        commit_json_responses([
+            musicbrainz.metadata_cache_record(
+                f"/artist/{self.artist_mbid}",
+                "aliases+url-rels+genres",
+                artist,
+            ),
+            musicbrainz.metadata_cache_record(
+                "/release-group",
+                "aliases",
+                page,
+                artist=self.artist_mbid,
+                limit=100,
+                offset=0,
+            ),
+            musicbrainz.metadata_cache_record(
+                f"/release/{self.release_mbid}",
+                "recordings+artist-credits",
+                self._release(),
+            ),
+        ])
+
+        stats = track_search_index.rebuild_from_cache()
+
+        self.assertEqual(stats["trackRelationRows"], 1)
+        self.assertGreaterEqual(stats["artistNameRows"], 3)
+        self.assertGreaterEqual(stats["releaseGroupRefRows"], 1)
+        with api_cache.cache_db() as connection:
+            relation_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(track_search_relations)"
+                )
+            }
+        self.assertEqual(relation_columns, {
+            "normalized_title",
+            "artist_mbid",
+            "recording_mbid",
+            "release_group_mbid",
+            "source_mask",
+        })
+
+    @patch("backend.routes.discovery.musicbrainz.search")
+    def test_transliterated_and_canonical_queries_use_zero_musicbrainz_calls(
+        self,
+        search,
+    ):
+        self._seed_complete_index()
+        app = Flask(__name__)
+        queries = (
+            "more%20than%20words%20Hitsujibungaku",
+            "more%20than%20words%20Hitsuji%20Bungaku",
+            "more%20than%20words%20%E7%BE%8A%E6%96%87%E5%AD%A6",
+        )
+        responses = []
+        for query in queries:
+            with app.test_request_context(f"/api/search?q={query}&type=track"):
+                responses.append(discovery.search.__wrapped__().get_json())
+
+        self.assertEqual(
+            [payload["results"][0]["id"] for payload in responses],
+            [self.release_group_mbid] * 3,
+        )
+        self.assertEqual(
+            responses[0]["results"][0]["name"],
+            "12 hugs (like butterflies)",
+        )
+        search.assert_not_called()
+        stats = track_search_index.stats()
+        self.assertEqual(stats["trackRelationRows"], 1)
+
+    @patch(
+        "backend.routes.discovery._recording_release_group_results",
+        return_value=[],
+    )
+    @patch("backend.routes.discovery.musicbrainz.search")
+    def test_ambiguous_alias_is_not_guessed(self, search, release_results):
+        track_search_index.index_artist(self._artist())
+        track_search_index.index_artist(self._artist(
+            self.second_artist_mbid,
+            name="Hitsujibungaku",
+            aliases=[],
+        ))
+        search.side_effect = [
+            {"recordings": []},
+            {"artists": [self._artist(), self._artist(self.second_artist_mbid)]},
+        ]
+        app = Flask(__name__)
+        with app.test_request_context(
+            "/api/search?q=more%20than%20words%20Hitsujibungaku&type=track"
+        ):
+            response = discovery.search.__wrapped__()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn("arid:", search.call_args_list[0].args[0])
+        self.assertEqual(len(search.call_args_list), 2)
+        release_results.assert_called_once()
+
+    @patch(
+        "backend.routes.discovery._recording_release_group_results",
+        return_value=[],
+    )
+    @patch("backend.routes.discovery.musicbrainz.search")
+    def test_incomplete_local_track_index_falls_back_with_resolved_artist(
+        self,
+        search,
+        release_results,
+    ):
+        track_search_index.index_artist(self._artist())
+        search.return_value = {"recordings": []}
+        app = Flask(__name__)
+        with app.test_request_context(
+            "/api/search?q=more%20than%20words%20Hitsujibungaku&type=track"
+        ):
+            response = discovery.search.__wrapped__()
+
+        self.assertEqual(response.status_code, 200)
+        search.assert_called_once()
+        self.assertIn(f"arid:{self.artist_mbid}", search.call_args.args[0])
+        self.assertEqual(search.call_args.args[1], "track")
+        release_results.assert_called_once()
+
+    @patch(
+        "backend.routes.discovery._recording_release_group_results",
+        return_value=[],
+    )
+    @patch("backend.routes.discovery.musicbrainz.search")
+    def test_alias_fallback_is_cached_for_the_next_search(
+        self,
+        search,
+        release_results,
+    ):
+        search.side_effect = [
+            {"recordings": []},
+            {"artists": [self._artist()]},
+            {"recordings": []},
+        ]
+        app = Flask(__name__)
+        url = "/api/search?q=more%20than%20words%20Hitsujibungaku&type=track"
+        with app.test_request_context(url):
+            first = discovery.search.__wrapped__()
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(len(search.call_args_list), 3)
+        self.assertEqual(search.call_args_list[1].args[1], "artist")
+
+        search.reset_mock()
+        search.side_effect = None
+        search.return_value = {"recordings": []}
+        with app.test_request_context(url):
+            second = discovery.search.__wrapped__()
+
+        self.assertEqual(second.status_code, 200)
+        search.assert_called_once()
+        self.assertIn(f"arid:{self.artist_mbid}", search.call_args.args[0])
+        release_results.assert_called()
+
+
+class LocalAlbumSearchIndexTests(unittest.TestCase):
+    coldplay_mbid = "11111111-1111-4111-8111-111111111111"
+    hitsuji_mbid = "22222222-2222-4222-8222-222222222222"
+    ludwig_mbid = "33333333-3333-4333-8333-333333333333"
+    other_mbid = "44444444-4444-4444-8444-444444444444"
+
+    def setUp(self):
+        api_cache.init_cache_db()
+        track_search_index.initialize()
+        with api_cache.cache_db() as connection:
+            connection.execute("DELETE FROM track_search_release_group_artists")
+            connection.execute("DELETE FROM track_search_release_groups")
+            connection.execute("DELETE FROM track_search_artist_names")
+
+    def tearDown(self):
+        with api_cache.cache_db() as connection:
+            connection.execute("DELETE FROM track_search_release_group_artists")
+            connection.execute("DELETE FROM track_search_release_groups")
+            connection.execute("DELETE FROM track_search_artist_names")
+
+    @staticmethod
+    def _artist(mbid, name, aliases=None):
+        return {
+            "id": mbid,
+            "name": name,
+            "sort-name": name,
+            "aliases": aliases or [],
+        }
+
+    def _group(
+        self,
+        mbid,
+        title,
+        artist,
+        *,
+        primary_type="Album",
+        secondary_types=None,
+        date="2020-01-01",
+    ):
+        return {
+            "id": mbid,
+            "title": title,
+            "first-release-date": date,
+            "primary-type": primary_type,
+            "secondary-types": secondary_types or [],
+            "artist-credit": [{"name": artist["name"], "artist": artist}],
+        }
+
+    def _search(self, query):
+        app = Flask(__name__)
+        with app.test_request_context(f"/api/search?q={query}&type=album"):
+            return discovery.search.__wrapped__()
+
+    @patch("backend.routes.discovery.musicbrainz.search")
+    def test_exact_local_album_uses_no_musicbrainz_request(self, search):
+        coldplay = self._artist(self.coldplay_mbid, "Coldplay")
+        group = self._group(
+            "1dc4c347-a1db-32aa-b14f-bc9cc507b843",
+            "Parachutes",
+            coldplay,
+            date="2000-07-10",
+        )
+        track_search_index.index_release_groups([group])
+
+        response = self._search("Parachutes")
+
+        self.assertEqual(response.status_code, 200)
+        result = response.get_json()["results"][0]
+        self.assertEqual(result["id"], group["id"])
+        self.assertEqual(result["artist"], "Coldplay")
+        self.assertEqual(
+            result["coverArt"],
+            f"/api/artwork/release-group/{group['id']}?size=thumb",
+        )
+        search.assert_not_called()
+
+    @patch("backend.routes.discovery.musicbrainz.search")
+    def test_artist_qualified_and_romanized_album_searches_are_local(self, search):
+        hitsuji = self._artist(
+            self.hitsuji_mbid,
+            "羊文学",
+            aliases=[{"name": "Hitsuji Bungaku", "locale": "en"}],
+        )
+        group = self._group(
+            "55555555-5555-4555-8555-555555555555",
+            "12 hugs (like butterflies)",
+            hitsuji,
+            date="2023-12-06",
+        )
+        track_search_index.index_release_groups([group])
+
+        spaced = self._search("12%20hugs%20like%20butterflies%20Hitsujibungaku")
+        canonical = self._search(
+            "12%20hugs%20like%20butterflies%20%E7%BE%8A%E6%96%87%E5%AD%A6"
+        )
+
+        self.assertEqual(spaced.get_json()["results"][0]["id"], group["id"])
+        self.assertEqual(canonical.get_json()["results"][0]["id"], group["id"])
+        search.assert_not_called()
+
+    @patch("backend.routes.discovery.musicbrainz.search")
+    def test_soundtrack_intent_requires_matching_local_metadata(self, search):
+        ludwig = self._artist(self.ludwig_mbid, "Ludwig Göransson")
+        generic = self._group(
+            "66666666-6666-4666-8666-666666666666",
+            "The Odyssey",
+            ludwig,
+        )
+        soundtrack = self._group(
+            "77777777-7777-4777-8777-777777777777",
+            "The Odyssey: Original Motion Picture Soundtrack",
+            ludwig,
+            secondary_types=["Soundtrack"],
+            date="2026-03-20",
+        )
+        track_search_index.index_release_groups([generic])
+        search.return_value = {"release-groups": []}
+
+        fallback = self._search("The%20Odyssey%20soundtrack")
+
+        self.assertEqual(fallback.status_code, 200)
+        search.assert_called_once()
+
+        search.reset_mock()
+        track_search_index.index_release_groups([soundtrack])
+        local = self._search("The%20Odyssey%20soundtrack")
+
+        self.assertEqual(local.get_json()["results"][0]["id"], soundtrack["id"])
+        search.assert_not_called()
+
+    @patch("backend.routes.discovery.musicbrainz.search")
+    def test_weak_and_unknown_local_album_matches_fall_back(self, search):
+        coldplay = self._artist(self.coldplay_mbid, "Coldplay")
+        track_search_index.index_release_groups([self._group(
+            "88888888-8888-4888-8888-888888888888",
+            "Parachutes Live Sessions",
+            coldplay,
+        )])
+        search.return_value = {"release-groups": []}
+
+        weak = self._search("Parachutes")
+        unknown = self._search("Unknown%20Album")
+
+        self.assertEqual(weak.status_code, 200)
+        self.assertEqual(unknown.status_code, 200)
+        self.assertEqual(search.call_count, 2)
+
+    @patch("backend.routes.discovery.musicbrainz.search")
+    def test_ambiguous_artist_alias_falls_back_instead_of_guessing(self, search):
+        first = self._artist(
+            self.hitsuji_mbid,
+            "羊文学",
+            aliases=[{"name": "Hitsujibungaku"}],
+        )
+        second = self._artist(
+            self.other_mbid,
+            "Hitsujibungaku",
+            aliases=[{"name": "Hitsujibungaku"}],
+        )
+        track_search_index.index_release_groups([self._group(
+            "99999999-9999-4999-8999-999999999999",
+            "12 hugs (like butterflies)",
+            first,
+        )])
+        track_search_index.index_artist(second)
+        search.return_value = {"release-groups": []}
+
+        response = self._search(
+            "12%20hugs%20like%20butterflies%20Hitsujibungaku"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        search.assert_called_once()
+
+    @patch("backend.routes.discovery.musicbrainz.search")
+    def test_remote_album_candidates_are_indexed_for_the_next_search(self, search):
+        coldplay = self._artist(self.coldplay_mbid, "Coldplay")
+        group = self._group(
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "A Rush of Blood to the Head",
+            coldplay,
+        )
+        search.return_value = {"release-groups": [group]}
+
+        first = self._search("A%20Rush%20of%20Blood%20to%20the%20Head")
+        self.assertEqual(first.status_code, 200)
+        search.assert_called_once()
+
+        search.reset_mock()
+        second = self._search("A%20Rush%20of%20Blood%20to%20the%20Head")
+
+        self.assertEqual(second.get_json()["results"][0]["id"], group["id"])
+        search.assert_not_called()
+        self.assertEqual(track_search_index.stats()["releaseGroupRows"], 1)
+
+    def test_compact_index_deduplicates_and_removes_stale_lidarr_groups(self):
+        payload = {
+            "artists": {
+                self.coldplay_mbid: {"name": "Coldplay"},
+            },
+            "albums": {
+                "1dc4c347-a1db-32aa-b14f-bc9cc507b843": {
+                    "title": "Parachutes",
+                    "artistMbid": self.coldplay_mbid,
+                    "artistName": "Coldplay",
+                    "type": "Album",
+                    "releaseDate": "2000-07-10",
+                },
+            },
+        }
+        track_search_index.index_lidarr_library(payload)
+        track_search_index.index_lidarr_library(payload)
+
+        stats = track_search_index.stats()
+        self.assertEqual(stats["releaseGroupRows"], 1)
+        self.assertEqual(stats["releaseGroupArtistRows"], 1)
+        with api_cache.cache_db() as connection:
+            columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(track_search_release_groups)"
+                )
+            }
+        self.assertNotIn("artwork", columns)
+        self.assertNotIn("payload", columns)
+
+        track_search_index.index_lidarr_library({"artists": {}, "albums": {}})
+
+        self.assertEqual(track_search_index.stats()["releaseGroupRows"], 0)
 
 
 class DiscoveryRoutesTests(DatabaseTestCase):
@@ -6837,10 +7895,14 @@ class DiscoveryRoutesTests(DatabaseTestCase):
             payload["results"][1]["secondaryTypes"],
             ["Compilation"],
         )
-        self.assertEqual(search.call_args_list[0].args, ("example song", "track"))
+        recording_query, recording_type = search.call_args_list[0].args
+        self.assertEqual(recording_type, "track")
+        self.assertIn('recording:"example song"', recording_query)
+        self.assertIn('recording:"example"', recording_query)
+        self.assertIn('artist:"song"', recording_query)
         self.assertEqual(
             search.call_args_list[0].kwargs,
-            {"plain_search": True},
+            {"plain_search": False, "limit": 50},
         )
         enrichment_query, enrichment_type = search.call_args_list[1].args
         self.assertEqual(enrichment_type, "album")

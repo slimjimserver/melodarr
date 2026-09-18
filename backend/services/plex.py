@@ -9,6 +9,7 @@ from uuid import UUID
 import requests
 
 if __package__ == "backend.services":
+    from .. import track_search_index
     from ..api_cache import (
         get_cache_document,
         replace_cache_documents,
@@ -20,6 +21,7 @@ if __package__ == "backend.services":
     from ..detail_cache import invalidate_all as invalidate_detail_payloads
     from ..media_urls import plex_artist_artwork
 else:  # Support the existing `python backend/app.py` entry point.
+    import track_search_index
     from api_cache import (
         get_cache_document,
         replace_cache_documents,
@@ -438,6 +440,7 @@ def _save_snapshot(
     set_cache_document(
         "plex-library", _snapshot_id(config), payload, PLEX_LIBRARY_CACHE_TTL
     )
+    track_search_index.index_plex_library(payload)
     invalidate_document(_index_key(_snapshot_id(config)))
     invalidate_detail_payloads()
     documents = _guid_documents(config, guid_inventory or payload)
@@ -723,6 +726,7 @@ def apply_release_group_mappings(config, mappings, *, artist_mappings=None):
         set_cache_document(
             "plex-library", _snapshot_id(config), payload, PLEX_LIBRARY_CACHE_TTL
         )
+        track_search_index.index_plex_library(payload)
         invalidate_document(_index_key(_snapshot_id(config)))
         invalidate_detail_payloads()
         documents = _guid_documents(config, {

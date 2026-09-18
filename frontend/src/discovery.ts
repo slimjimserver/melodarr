@@ -3998,10 +3998,57 @@
 
   applySearchMode(activeSearchType);
 
-  function searchResultMessage(type: string, count: number) {
+  const searchResultPageSize = 25;
+
+  function searchResultMessage(type: string, shown: number, total = shown) {
+    if (shown < total) return `Showing ${shown} of ${total} matches`;
     const noun = copyForSearchType(type).noun;
-    const summary = `${count} ${noun}${count === 1 ? "" : "s"} found`;
+    const summary = `${total} ${noun}${total === 1 ? "" : "s"} found`;
     return type === "track" ? `${summary} for matching tracks` : summary;
+  }
+
+  function appendSearchResult(
+    container: HTMLElement,
+    result: JsonObject,
+    type: string,
+  ) {
+    const description = type === "anime"
+      ? [result.format, result.season, result.year].filter(Boolean).join(" · ")
+      : type === "artist"
+      ? [result.type, result.country, result.disambiguation].filter(Boolean).join(" · ")
+      : [
+        result.artist,
+        result.type,
+        ...(result.secondaryTypes || []),
+        result.date,
+        result.disambiguation,
+        type === "track" && result.matchedTrack
+          ? `Matched track: ${result.matchedTrack}`
+          : "",
+      ].filter(Boolean).join(" · ");
+    if (type === "anime") {
+      container.append(createCard(
+        String(result.name || "Anime"),
+        description,
+        () => showDetail("anime", String(result.slug || result.id)),
+        result.coverArt,
+        "anime",
+        String(result.slug || result.id),
+      ));
+      return;
+    }
+    container.append(type === "artist"
+      ? (result.plex
+        ? createPlexArtistCard(result, description, result.plex)
+        : createSearchArtistCard(result, description))
+      : createCard(
+        releaseGroupDisplayTitle(result),
+        description,
+        () => showDetail("release-group", result.id),
+        result.coverArt,
+        "release-group",
+        result.id,
+      ));
   }
 
   function animeSearchResultsByFormat(results: JsonObject[]) {
@@ -4079,49 +4126,31 @@
       );
       if (requestVersion !== searchRequestVersion) return;
       results.replaceChildren();
-      $("#search-message").textContent = data.results.length
-        ? searchResultMessage(type, data.results.length)
-        : "We couldn’t find a match. Try a different spelling or search type.";
       const orderedResults = type === "anime"
         ? animeSearchResultsByFormat(data.results)
-        : data.results;
-      orderedResults.forEach((result: JsonObject) => {
-        const description = type === "anime"
-          ? [result.format, result.season, result.year].filter(Boolean).join(" · ")
-          : type === "artist"
-          ? [result.type, result.country, result.disambiguation].filter(Boolean).join(" · ")
-          : [
-            result.artist,
-            result.type,
-            ...(result.secondaryTypes || []),
-            result.date,
-            result.disambiguation,
-            type === "track" && result.matchedTrack
-              ? `Matched track: ${result.matchedTrack}`
-              : "",
-          ].filter(Boolean).join(" · ");
-        if (type === "anime") {
-          results.append(createCard(
-            String(result.name || "Anime"),
-            description,
-            () => showDetail("anime", String(result.slug || result.id)),
-            result.coverArt,
-            "anime",
-            String(result.slug || result.id),
-          ));
-        } else {
-          results.append(type === "artist"
-            ? (result.plex ? createPlexArtistCard(result, description, result.plex) : createSearchArtistCard(result, description))
-            : createCard(
-                releaseGroupDisplayTitle(result),
-                description,
-                () => showDetail("release-group", result.id),
-                result.coverArt,
-                "release-group",
-                result.id,
-              ));
+        : data.results as JsonObject[];
+      let shown = 0;
+      const appendNextPage = () => {
+        results.querySelector(".search-show-more")?.remove();
+        const next = orderedResults.slice(shown, shown + searchResultPageSize);
+        next.forEach((result: JsonObject) => appendSearchResult(results, result, type));
+        shown += next.length;
+        $("#search-message").textContent = orderedResults.length
+          ? searchResultMessage(type, shown, orderedResults.length)
+          : "We couldn’t find a match. Try a different spelling or search type.";
+        if (shown < orderedResults.length) {
+          const showMore = document.createElement("button");
+          showMore.type = "button";
+          showMore.className = "outline search-show-more";
+          showMore.textContent = `Show ${Math.min(
+            searchResultPageSize,
+            orderedResults.length - shown,
+          )} more`;
+          showMore.addEventListener("click", appendNextPage);
+          results.append(showMore);
         }
-      });
+      };
+      appendNextPage();
     } catch (error) {
       if (requestVersion !== searchRequestVersion) return;
       results.replaceChildren();

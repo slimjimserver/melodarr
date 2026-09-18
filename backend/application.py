@@ -9,6 +9,7 @@ from flask import Flask, current_app, request, send_file
 from werkzeug.utils import safe_join
 
 if __package__:
+    from . import track_search_index
     from .api_cache import init_cache_db, migrate_legacy_cache
     from .config import (
         FRONTEND_ROOT,
@@ -23,13 +24,14 @@ if __package__:
     from .routes.discovery import blueprint as discovery_blueprint
     from .routes.library import blueprint as library_blueprint
     from .routes.music import blueprint as music_blueprint
+    from .routes.notifications import blueprint as notifications_blueprint
     from .routes.pages import blueprint as pages_blueprint
     from .routes.requests import blueprint as requests_blueprint
     from .routes.settings import blueprint as settings_blueprint
-    from .routes.notifications import blueprint as notifications_blueprint
     from .security import verify_csrf_token
     from .storage import init_db
 else:  # Support the existing `python backend/app.py` entry point.
+    import track_search_index
     from api_cache import init_cache_db, migrate_legacy_cache
     from config import FRONTEND_ROOT, assert_test_storage_isolation, load_session_secret
     from routes.account import blueprint as account_blueprint
@@ -40,10 +42,10 @@ else:  # Support the existing `python backend/app.py` entry point.
     from routes.discovery import blueprint as discovery_blueprint
     from routes.library import blueprint as library_blueprint
     from routes.music import blueprint as music_blueprint
+    from routes.notifications import blueprint as notifications_blueprint
     from routes.pages import blueprint as pages_blueprint
     from routes.requests import blueprint as requests_blueprint
     from routes.settings import blueprint as settings_blueprint
-    from routes.notifications import blueprint as notifications_blueprint
     from security import verify_csrf_token
     from storage import init_db
 
@@ -172,6 +174,7 @@ def create_app(config=None):
 
     init_cache_db()
     migrate_legacy_cache()
+    track_search_index.initialize()
     init_db()
     app.before_request(verify_csrf_token)
     app.before_request(serve_precompressed_static)

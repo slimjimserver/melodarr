@@ -85,6 +85,41 @@ test("homepage explains album picks and separates global charts", async ({ page 
   await page.screenshot({ path: resolve(__dirname, "../../.venv-recommendations/homepage-desktop.jpg"), type: "jpeg", quality: 65 });
 });
 
+test("album search reveals cached candidates without another request", async ({ page }) => {
+  let searchRequests = 0;
+  await fixture(page);
+  await page.route("**/api/search?*", async route => {
+    const url = new URL(route.request().url());
+    if (url.searchParams.get("type") !== "album") return route.fallback();
+    searchRequests += 1;
+    await route.fulfill({ json: {
+      type: "album",
+      candidateCount: 30,
+      results: Array.from({ length: 30 }, (_, index) => ({
+        id: `album-${index + 1}`,
+        name: `The Odyssey ${index + 1}`,
+        artist: "Fixture Composer",
+        type: "Album",
+        date: "2026",
+      })),
+    } });
+  });
+  await page.goto("/");
+  await signIn(page);
+
+  await page.locator("#search-type").selectOption("album");
+  await page.locator("#search-input").fill("The Odyssey");
+  await page.locator("#search-submit").click();
+
+  await expect(page.locator("#results .artist-card")).toHaveCount(25);
+  await expect(page.locator("#search-message")).toHaveText("Showing 25 of 30 matches");
+  const requestsBeforeShowMore = searchRequests;
+  await page.getByRole("button", { name: "Show 5 more" }).click();
+  await expect(page.locator("#results .artist-card")).toHaveCount(30);
+  await expect(page.locator("#search-message")).toHaveText("30 albums found");
+  expect(searchRequests).toBe(requestsBeforeShowMore);
+});
+
 test("feedback persists through reload and dismissal can be undone", async ({ page }) => {
   const { events } = await fixture(page);
   await page.goto("/");

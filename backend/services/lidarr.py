@@ -11,11 +11,12 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import requests
 
 if __package__ == "backend.services":
+    from .. import track_search_index
     from ..api_cache import cached_json_get, get_cache_document, set_cache_document
     from ..cache_memo import invalidate_document, memoized_document
     from ..config import (
-        LIDARR_LIBRARY_CACHE_TTL,
         LIDARR_DOWNLOAD_CACHE_TTL,
+        LIDARR_LIBRARY_CACHE_TTL,
         LIDARR_METADATA_CACHE_TTL,
         LIDARR_METADATA_URL,
         LIDARR_OPTIONS_CACHE_TTL,
@@ -24,11 +25,12 @@ if __package__ == "backend.services":
     from ..detail_cache import invalidate_all as invalidate_detail_payloads
     from ..storage import get_service
 else:  # Support the existing `python backend/app.py` entry point.
+    import track_search_index
     from api_cache import cached_json_get, get_cache_document, set_cache_document
     from cache_memo import invalidate_document, memoized_document
     from config import (
-        LIDARR_LIBRARY_CACHE_TTL,
         LIDARR_DOWNLOAD_CACHE_TTL,
+        LIDARR_LIBRARY_CACHE_TTL,
         LIDARR_METADATA_CACHE_TTL,
         LIDARR_METADATA_URL,
         LIDARR_OPTIONS_CACHE_TTL,
@@ -405,6 +407,8 @@ def album_availability(album):
         "monitored": bool(album.get("monitored")),
         "artistMbid": str(album.get("foreignArtistId") or (album.get("artist") or {}).get("foreignArtistId") or ""),
         "artistName": str(album.get("artistName") or (album.get("artist") or {}).get("artistName") or (album.get("artist") or {}).get("name") or ""),
+        "type": str(album.get("albumType") or ""),
+        "releaseDate": str(album.get("releaseDate") or "")[:10],
     }
 
 
@@ -430,6 +434,7 @@ def scan_library_availability(config=None):
             albums[str(release_group_id).casefold()] = normalized
     payload = {"artists": artists, "albums": albums}
     set_cache_document("lidarr-library", "albums", payload, LIDARR_LIBRARY_CACHE_TTL)
+    track_search_index.index_lidarr_library(payload)
     invalidate_document(LIBRARY_INDEX_KEY)
     invalidate_detail_payloads()
     # This receives only a complete successful scan; absent records remain unknown.

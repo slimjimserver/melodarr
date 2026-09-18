@@ -9,7 +9,7 @@ import requests
 from flask import Blueprint, jsonify, request
 
 if __package__ == "backend.routes":
-    from .. import detail_cache
+    from .. import detail_cache, track_search_index
     from ..media_urls import (
         artist_cover_art,
         artist_large_cover_art,
@@ -17,7 +17,14 @@ if __package__ == "backend.routes":
     )
     from ..responses import api_error
     from ..security import login_required
-    from ..services import anime_artist_links, anime_theme_links, lastfm, lidarr, musicbrainz, plex
+    from ..services import (
+        anime_artist_links,
+        anime_theme_links,
+        lastfm,
+        lidarr,
+        musicbrainz,
+        plex,
+    )
     from ..storage import (
         get_lastfm_api_key,
         get_service,
@@ -27,6 +34,7 @@ if __package__ == "backend.routes":
     from ..workers import similar_artists as similar_artist_worker
 else:
     import detail_cache
+    import track_search_index
     from media_urls import (
         artist_cover_art,
         artist_large_cover_art,
@@ -34,7 +42,14 @@ else:
     )
     from responses import api_error
     from security import login_required
-    from services import anime_artist_links, anime_theme_links, lastfm, lidarr, musicbrainz, plex
+    from services import (
+        anime_artist_links,
+        anime_theme_links,
+        lastfm,
+        lidarr,
+        musicbrainz,
+        plex,
+    )
     from storage import (
         get_lastfm_api_key,
         get_service,
@@ -398,6 +413,7 @@ def _artist_detail_payload(
         )
         if data is None:
             return None
+        track_search_index.index_artist(data)
         raw_groups, offset = [], 0
         while True:
             page = musicbrainz.get(
@@ -408,6 +424,16 @@ def _artist_detail_payload(
             )
             if page is None:
                 return None
+            track_search_index.index_release_group_page(
+                page,
+                musicbrainz.metadata_cache_key(
+                    "/release-group",
+                    "aliases",
+                    artist=mbid,
+                    limit=100,
+                    offset=offset,
+                ),
+            )
             batch = page.get("release-groups", [])
             raw_groups.extend(batch)
             total = page.get("release-group-count", len(raw_groups))
@@ -658,6 +684,13 @@ def _release_group_detail_payload(mbid, priority, *, cache_only=False):
     )
     if data is None:
         return None
+    track_search_index.index_release_group_page(
+        {"release-groups": [data]},
+        musicbrainz.metadata_cache_key(
+            f"/release-group/{mbid}",
+            "aliases+artist-credits+url-rels",
+        ),
+    )
     raw_releases, offset = [], 0
     while True:
         page = musicbrainz.get(
@@ -857,6 +890,13 @@ def _release_detail_payload(mbid, priority, *, cache_only=False):
     )
     if data is None:
         return None
+    track_search_index.index_release(
+        data,
+        musicbrainz.metadata_cache_key(
+            f"/release/{mbid}",
+            "recordings+artist-credits",
+        ),
+    )
     tracks = [
         {
             "number": track.get("number", ""), "title": track.get("title", "Untitled"),
