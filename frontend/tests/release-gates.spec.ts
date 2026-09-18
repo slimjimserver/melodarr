@@ -198,6 +198,52 @@ test("library page describes artist holdings only", async ({ page }) => {
   await expect(summary).not.toContainText("releases");
 });
 
+test("artist track search shows every cached release group containing the track", async ({ page }) => {
+  await page.route("**/api/music/artist/fixture-artist/tracks?**", async (route) => {
+    const query = new URL(route.request().url()).searchParams.get("q");
+    expect(query).toBe("Fixture Track");
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        candidateCount: 2,
+        results: [
+          {
+            id: "fixture-album",
+            title: "Fixture Album",
+            type: "Album",
+            date: "2026-01-01",
+            secondaryTypes: [],
+            matchedTracks: ["fixture track"],
+          },
+          {
+            id: "fixture-single",
+            title: "Fixture Single",
+            type: "Single",
+            date: "2025-06-01",
+            secondaryTypes: [],
+            matchedTracks: ["fixture track"],
+          },
+        ],
+      }),
+    });
+  });
+  await page.goto("/artists/fixture-artist");
+  await signIn(page, "ada");
+
+  const search = page.getByLabel("Search releases or tracks");
+  await expect(page.locator('[data-release-group-id="fixture-single"]')).toHaveCount(0);
+  await search.fill("Fixture Track");
+
+  await expect(page.locator('[data-release-group-id="fixture-album"]')).toBeVisible();
+  await expect(page.locator('[data-release-group-id="fixture-single"]')).toBeVisible();
+  await expect(page.getByText("2 release groups contain matching tracks.")).toBeVisible();
+
+  await search.clear();
+  await expect(page.locator('[data-release-group-id="fixture-single"]')).toHaveCount(0);
+  await expect(page.locator('[data-release-group-id="fixture-album"]')).toBeVisible();
+});
+
 test("mobile tab bar keeps a compact 48px target above its safe-area padding", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/");

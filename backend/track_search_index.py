@@ -17,7 +17,9 @@ else:  # Support the existing `python backend/app.py` entry point.
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = "2"
+# Version 4 can attach legacy release payloads, which omitted `release-group`,
+# to one unambiguous cached group by artist and normalized release title.
+SCHEMA_VERSION = "4"
 SOURCE_MUSICBRAINZ = 1
 SOURCE_LIDARR = 2
 SOURCE_PLEX = 4
@@ -304,6 +306,65 @@ def _add_release_group(
             if credit_name:
                 current["credit_name"] = credit_name
                 current["normalized_credit_name"] = normalize_text(credit_name)
+
+
+def _compact_group_payload(row, group_artist_rows):
+    group_mbid = row["release_group_mbid"]
+    try:
+        secondary_types = json.loads(row["secondary_types"])
+    except (TypeError, json.JSONDecodeError):
+        secondary_types = []
+    credits = []
+    for (candidate_group, artist_mbid), artist_row in group_artist_rows.items():
+        if candidate_group != group_mbid:
+            continue
+        name = artist_row["credit_name"]
+        credits.append({
+            "name": name,
+            "artist": {"id": artist_mbid, "name": name},
+        })
+    return {
+        "id": group_mbid,
+        "title": row["title"],
+        "artist-credit": credits,
+        "primary-type": row["primary_type"],
+        "secondary-types": secondary_types,
+        "first-release-date": row["first_release_date"],
+        "disambiguation": row["disambiguation"],
+    }
+
+
+def _infer_release_group(release, group_rows, group_artist_rows):
+    """Return one safe cached group match for a legacy release payload."""
+    normalized_title = normalize_text((release or {}).get("title"))
+    artist_mbids = {
+        str(artist.get("id") or "").casefold()
+        for artist in _credit_artists(release or {})
+        if _valid_mbid(artist.get("id"))
+    }
+    if not normalized_title or not artist_mbids:
+        return None
+    candidates = []
+    for group_mbid, row in group_rows.items():
+        titles = {
+            row["normalized_title"],
+            row["normalized_romanized_title"],
+        }
+        if normalized_title not in titles:
+            continue
+        group_artist_mbids = {
+            artist_mbid
+            for candidate_group, artist_mbid in group_artist_rows
+            if candidate_group == group_mbid
+        }
+        if artist_mbids.isdisjoint(group_artist_mbids):
+            continue
+        candidates.append(row)
+        if len(candidates) > 1:
+            return None
+    if len(candidates) != 1:
+        return None
+    return _compact_group_payload(candidates[0], group_artist_rows)
 
 
 def _add_release(
@@ -669,6 +730,7 @@ def rebuild_from_cache():
     group_refs = set()
     release_group_rows = {}
     release_group_artist_rows = {}
+    legacy_releases = []
     with cache_db() as connection:
         rows = connection.execute(
             "SELECT cache_key, value FROM api_cache"
@@ -689,6 +751,12 @@ def rebuild_from_cache():
                 release_group_rows,
                 release_group_artist_rows,
             )
+            if (
+                isinstance(payload, dict)
+                and payload.get("media")
+                and not payload.get("release-group")
+            ):
+                legacy_releases.append((payload, row["cache_key"]))
         elif namespace in {"lidarr-library", "plex-library"}:
             _harvest_local_document(
                 payload,
@@ -698,6 +766,24 @@ def rebuild_from_cache():
                 release_group_artist_rows,
                 group_refs,
             )
+
+    for release, cache_key in legacy_releases:
+        group = _infer_release_group(
+            release,
+            release_group_rows,
+            release_group_artist_rows,
+        )
+        if group is None:
+            continue
+        _add_release(
+            relation_rows,
+            artist_rows,
+            group_refs,
+            {**release, "release-group": group},
+            cache_key,
+            release_group_rows,
+            release_group_artist_rows,
+        )
 
     with cache_db() as connection:
         connection.execute("DELETE FROM track_search_artist_names")
@@ -798,6 +884,125 @@ def index_release(release, cache_key):
             release_group_rows,
             release_group_artist_rows,
         )
+
+
+def index_recording_search(response):
+    """Index recording-search release relationships for on-demand track lookup."""
+    if not _index_writable():
+        return
+    artist_rows = {}
+    relation_rows = {}
+    group_refs = set()
+    release_group_rows = {}
+    release_group_artist_rows = {}
+    for recording in (response or {}).get("recordings") or []:
+        if not isinstance(recording, dict):
+            continue
+        track = {
+            "title": recording.get("title"),
+            "artist-credit": recording.get("artist-credit") or [],
+            "recording": recording,
+        }
+        for release in recording.get("releases") or []:
+            if not isinstance(release, dict):
+                continue
+            _add_release(
+                relation_rows,
+                artist_rows,
+                group_refs,
+                {
+                    **release,
+                    "artist-credit": (
+                        release.get("artist-credit")
+                        or recording.get("artist-credit")
+                        or []
+                    ),
+                    "media": [{"tracks": [track]}],
+                },
+                "",
+                release_group_rows,
+                release_group_artist_rows,
+            )
+    with cache_db() as connection:
+        _upsert_rows(
+            connection,
+            artist_rows,
+            relation_rows,
+            group_refs,
+            release_group_rows,
+            release_group_artist_rows,
+        )
+
+
+def index_cached_release(cache_key):
+    """Backfill one cached MusicBrainz release without a provider request."""
+    if not _index_writable() or not cache_key:
+        return False
+    try:
+        with cache_db() as connection:
+            row = connection.execute(
+                "SELECT value FROM api_cache WHERE cache_key = ?",
+                (cache_key,),
+            ).fetchone()
+        if row is None:
+            return False
+        release = json.loads(row["value"])
+    except (
+        OSError,
+        sqlite3.Error,
+        TypeError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as exc:
+        logger.warning(
+            "Cached release could not be added to the track index: %s",
+            type(exc).__name__,
+        )
+        return False
+    if not isinstance(release, dict):
+        return False
+    if not release.get("release-group"):
+        normalized_title = normalize_text(release.get("title"))
+        artist_mbids = {
+            str(artist.get("id") or "").casefold()
+            for artist in _credit_artists(release)
+            if _valid_mbid(artist.get("id"))
+        }
+        if not normalized_title or not artist_mbids:
+            return False
+        placeholders = ",".join("?" for _artist in artist_mbids)
+        with cache_db() as connection:
+            candidates = connection.execute(
+                "SELECT DISTINCT groups.* "
+                "FROM track_search_release_groups AS groups "
+                "JOIN track_search_release_group_artists AS artists "
+                "ON artists.release_group_mbid = groups.release_group_mbid "
+                "WHERE (groups.normalized_title = ? "
+                "OR groups.normalized_romanized_title = ?) "
+                f"AND artists.artist_mbid IN ({placeholders}) "
+                "ORDER BY groups.release_group_mbid LIMIT 2",
+                (normalized_title, normalized_title, *sorted(artist_mbids)),
+            ).fetchall()
+            if len(candidates) != 1:
+                return False
+            group_mbid = candidates[0]["release_group_mbid"]
+            artist_rows = connection.execute(
+                "SELECT * FROM track_search_release_group_artists "
+                "WHERE release_group_mbid = ? ORDER BY artist_mbid",
+                (group_mbid,),
+            ).fetchall()
+        release = {
+            **release,
+            "release-group": _compact_group_payload(
+                candidates[0],
+                {
+                    (row["release_group_mbid"], row["artist_mbid"]): row
+                    for row in artist_rows
+                },
+            ),
+        }
+    index_release(release, cache_key)
+    return True
 
 
 def _clear_source(connection, source_mask):
@@ -939,6 +1144,39 @@ def exact_track_matches(artist_mbid, title):
     return [dict(row) for row in rows]
 
 
+def search_artist_tracks(artist_mbid, title):
+    """Return cached track-title relations for one artist without provider I/O."""
+    try:
+        initialize()
+    except (OSError, sqlite3.Error) as exc:
+        logger.warning("Local track index is unavailable: %s", type(exc).__name__)
+        return []
+    normalized = normalize_text(title)
+    artist_mbid = str(artist_mbid or "").casefold()
+    if not normalized or not _valid_mbid(artist_mbid):
+        return []
+    terms = normalized.split()
+    conditions = " AND ".join("normalized_title LIKE ?" for _term in terms)
+    parameters = [artist_mbid, *(f"%{term}%" for term in terms), normalized]
+    try:
+        with cache_db() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT normalized_title, release_group_mbid
+                FROM track_search_relations
+                WHERE artist_mbid = ? AND {conditions}
+                GROUP BY normalized_title, release_group_mbid
+                ORDER BY CASE WHEN normalized_title = ? THEN 0 ELSE 1 END,
+                         normalized_title, release_group_mbid
+                """,
+                parameters,
+            ).fetchall()
+    except (OSError, sqlite3.Error) as exc:
+        logger.warning("Local artist track lookup failed: %s", type(exc).__name__)
+        return []
+    return [dict(row) for row in rows]
+
+
 def search_release_groups(title, artist_mbid="", limit=250):
     """Return compact locally known groups matching all normalized title terms."""
     try:
@@ -1037,7 +1275,7 @@ def search_release_groups(title, artist_mbid="", limit=250):
 
 
 def cached_release_groups(group_ids):
-    """Read group display metadata through pointers to existing cache payloads."""
+    """Read group display metadata from raw or compact cached metadata."""
     wanted = {str(group_id).casefold() for group_id in group_ids if group_id}
     if not wanted:
         return {}
@@ -1075,8 +1313,58 @@ def cached_release_groups(group_ids):
             for group in candidates
             if str(group.get("id") or "").casefold() == group_mbid
         ), None)
-        if match is not None:
+        if match is not None and match.get("primary-type"):
             groups[group_mbid] = match
+
+    missing = wanted.difference(groups)
+    if missing:
+        placeholders = ",".join("?" for _ in missing)
+        with cache_db() as connection:
+            compact_rows = connection.execute(
+                "SELECT * FROM track_search_release_groups "
+                f"WHERE release_group_mbid IN ({placeholders}) "
+                "ORDER BY release_group_mbid",
+                tuple(sorted(missing)),
+            ).fetchall()
+            artist_rows = connection.execute(
+                "SELECT * FROM track_search_release_group_artists "
+                f"WHERE release_group_mbid IN ({placeholders}) "
+                "ORDER BY release_group_mbid, artist_mbid",
+                tuple(sorted(missing)),
+            ).fetchall()
+        artists_by_group = {}
+        for row in artist_rows:
+            artists_by_group.setdefault(row["release_group_mbid"], []).append({
+                "name": row["credit_name"],
+                "artist": {
+                    "id": row["artist_mbid"],
+                    "name": row["credit_name"],
+                },
+            })
+        for row in compact_rows:
+            try:
+                secondary_types = json.loads(row["secondary_types"])
+            except (TypeError, json.JSONDecodeError):
+                secondary_types = []
+            aliases = []
+            if row["romanized_title"]:
+                aliases.append({
+                    "name": row["romanized_title"],
+                    "locale": "en",
+                })
+            groups[row["release_group_mbid"]] = {
+                "id": row["release_group_mbid"],
+                "title": row["title"],
+                "aliases": aliases,
+                "artist-credit": artists_by_group.get(
+                    row["release_group_mbid"],
+                    [],
+                ),
+                "primary-type": row["primary_type"],
+                "secondary-types": secondary_types,
+                "first-release-date": row["first_release_date"],
+                "disambiguation": row["disambiguation"],
+            }
     return groups
 
 

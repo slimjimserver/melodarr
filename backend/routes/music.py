@@ -60,6 +60,8 @@ else:
 
 
 blueprint = Blueprint("music", __name__)
+RELEASE_TRACK_INCLUDES = "recordings+artist-credits+release-groups"
+LEGACY_RELEASE_TRACK_INCLUDES = "recordings+artist-credits"
 
 
 def _prefetch_cache_miss():
@@ -360,6 +362,102 @@ def artist_availability(mbid):
             available_in_plex=available_in_plex,
         ),
     })
+
+
+@blueprint.get("/api/music/artist/<mbid>/tracks")
+@login_required
+def artist_track_search(mbid):
+    """Find cached release groups containing a matching track by this artist."""
+    try:
+        mbid = str(UUID(mbid))
+    except ValueError:
+        return api_error("Invalid MusicBrainz artist ID.")
+    query = request.args.get("q", "").strip()
+    if len(query) < 2:
+        return api_error("Enter at least two characters.")
+    matches = track_search_index.search_artist_tracks(mbid, query)
+    if not matches:
+        escaped_query = query.replace("\\", "\\\\").replace('"', '\\"')
+        words = track_search_index.normalize_text(query).split()
+        clauses = [f'recording:"{escaped_query}"']
+        if words:
+            clauses.append("(" + " AND ".join(
+                f'recording:"{word}"' for word in words
+            ) + ")")
+        recording_query = (
+            f"({' OR '.join(clauses)}) AND arid:{mbid}"
+        )
+        try:
+            response = musicbrainz.search(
+                recording_query,
+                "track",
+                priority="interactive",
+                plain_search=False,
+                limit=50,
+            )
+            track_search_index.index_recording_search(response)
+            matches = track_search_index.search_artist_tracks(mbid, query)
+        except requests.RequestException:
+            # Release-title filtering remains useful when MusicBrainz is busy.
+            pass
+    group_ids = list(dict.fromkeys(
+        match["release_group_mbid"] for match in matches
+    ))
+    groups = track_search_index.cached_release_groups(group_ids)
+    matched_tracks = {}
+    for match in matches:
+        matched_tracks.setdefault(match["release_group_mbid"], []).append(
+            match["normalized_title"]
+        )
+
+    plex_groups = _plex_release_group_inventory() if group_ids else {}
+    lidarr_groups = lidarr.cached_library_availability() if group_ids else {}
+    download_groups = _download_snapshot() if group_ids else {}
+    pending_groups = pending_lidarr_search_mbids(group_ids)
+    anime_names = anime_theme_links.anime_names_for_release_groups(group_ids)
+    results = []
+    for group_id in group_ids:
+        group = groups.get(group_id)
+        if not group:
+            continue
+        lidarr_group = lidarr_groups.get(group_id.casefold())
+        request_status, download_status = _release_group_lifecycle(
+            group_id,
+            lidarr_group,
+            download_groups.get(group_id.casefold()),
+            group_id.casefold() in pending_groups,
+        )
+        results.append({
+            "id": group_id,
+            "title": group.get("title") or "Untitled",
+            "romanizedTitle": musicbrainz.romanized_release_group_title(group),
+            "date": group.get("first-release-date") or "",
+            "type": group.get("primary-type") or "Other",
+            "secondaryTypes": [
+                name for name in group.get("secondary-types") or [] if name
+            ],
+            "disambiguation": group.get("disambiguation") or "",
+            "coverArt": release_group_cover_art(group_id),
+            "animeNames": anime_names.get(group_id.casefold(), []),
+            "availableInPlex": group_id in plex_groups,
+            "availableInLidarr": bool(lidarr_group),
+            "fullyAvailableInLidarr": bool(
+                lidarr_group and lidarr_group.get("fullyAvailable")
+            ),
+            "requestStatus": request_status,
+            "downloadStatus": download_status,
+            "plexReleases": [
+                _plex_release_summary(item)
+                for item in plex_groups.get(group_id, [])
+            ],
+            "matchedTracks": list(dict.fromkeys(matched_tracks[group_id])),
+        })
+    response = jsonify({
+        "results": results,
+        "candidateCount": len(results),
+    })
+    response.headers["Cache-Control"] = "private, max-age=30"
+    return response
 
 
 @blueprint.get("/api/music/release-group/<mbid>/availability")
@@ -884,7 +982,7 @@ def release_group_detail(mbid):
 def _release_detail_payload(mbid, priority, *, cache_only=False):
     data = musicbrainz.get(
         f"/release/{quote(mbid)}",
-        "recordings+artist-credits",
+        RELEASE_TRACK_INCLUDES,
         priority=priority,
         cache_only=cache_only,
     )
@@ -894,7 +992,7 @@ def _release_detail_payload(mbid, priority, *, cache_only=False):
         data,
         musicbrainz.metadata_cache_key(
             f"/release/{mbid}",
-            "recordings+artist-credits",
+            RELEASE_TRACK_INCLUDES,
         ),
     )
     tracks = [
@@ -912,6 +1010,22 @@ def _release_detail_payload(mbid, priority, *, cache_only=False):
     }
 
 
+def _index_cached_release_detail(mbid):
+    indexed = track_search_index.index_cached_release(
+        musicbrainz.metadata_cache_key(
+            f"/release/{mbid}",
+            RELEASE_TRACK_INCLUDES,
+        )
+    )
+    if not indexed:
+        track_search_index.index_cached_release(
+            musicbrainz.metadata_cache_key(
+                f"/release/{mbid}",
+                LEGACY_RELEASE_TRACK_INCLUDES,
+            )
+        )
+
+
 @blueprint.get("/api/music/release/<mbid>")
 @login_required
 def release_detail(mbid):
@@ -919,10 +1033,12 @@ def release_detail(mbid):
         cache_key = ("release", mbid.casefold())
         assembled = detail_cache.cached_response(cache_key)
         if assembled is not None:
+            _index_cached_release_detail(mbid)
             return assembled
         with detail_cache.build_lock(cache_key) as generation:
             assembled = detail_cache.cached_response(cache_key)
             if assembled is not None:
+                _index_cached_release_detail(mbid)
                 return assembled
             prefetch = request.args.get("prefetch") == "1"
             payload = _release_detail_payload(

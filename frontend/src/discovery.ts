@@ -964,7 +964,11 @@
 
   function artistReleaseGroups(data: JsonObject) {
     const groups = (Object.values(data.sections || {}) as JsonObject[][]).flat();
-    return [...new Map([...groups, ...(data.animeReleaseGroups || [])]
+    return [...new Map([
+      ...groups,
+      ...(data.animeReleaseGroups || []),
+      ...(data.trackSearchGroups || []),
+    ]
       .map((group: JsonObject) => [String(group.id), group])).values()];
   }
 
@@ -2076,14 +2080,25 @@
     const byPrimary = new Map<string, JsonObject[]>(primaryOrder.map((name) => [name, []]));
     const secondaryCounts = new Map<string, number>();
     const searchText = new Map<JsonObject, string>();
+    const canonicalGroupIds = new Set<string>();
+    const trackMatches = new Map<string, JsonObject>();
     let releaseQuery = "";
     let wasSearching = false;
     let filterFrame: number | undefined;
+    let trackSearchTimer: ReturnType<typeof setTimeout> | undefined;
+    let trackSearchVersion = 0;
+    let trackSearchPending = false;
+    let trackSearchFailed = false;
+
+    const primaryType = (group: JsonObject) => (
+      primaryOrder.includes(String(group.type)) ? String(group.type) : "Other"
+    );
 
     (Object.values(data.sections || {}) as JsonObject[][]).forEach((groups) => {
       groups.forEach((group) => {
-        const primary = primaryOrder.includes(group.type) ? group.type : "Other";
+        const primary = primaryType(group);
         byPrimary.get(primary)!.push(group);
+        canonicalGroupIds.add(String(group.id));
         searchText.set(group, normalizeSearch(
           `${String(group.title || "")} ${String(group.romanizedTitle || "")} ${String(group.disambiguation || "")}`,
         ));
@@ -2102,7 +2117,9 @@
 
     const enabledSecondary = new Set<string>();
     const isVisible = (group: JsonObject) => (
-      (!releaseQuery || searchText.get(group)?.includes(releaseQuery))
+      (!releaseQuery
+        || searchText.get(group)?.includes(releaseQuery)
+        || trackMatches.has(String(group.id)))
       && (Boolean(releaseQuery) || (group.secondaryTypes || [])
         .every((secondary: string) => enabledSecondary.has(secondary)))
     );
@@ -2115,11 +2132,11 @@
     filter.className = "discography-filter";
     const filterLabel = document.createElement("label");
     filterLabel.htmlFor = "discography-search";
-    filterLabel.textContent = "Search releases";
+    filterLabel.textContent = "Search releases or tracks";
     const filterInput = document.createElement("input");
     filterInput.id = "discography-search";
     filterInput.type = "search";
-    filterInput.placeholder = "Search this artist's releases…";
+    filterInput.placeholder = "Search this artist's releases or tracks…";
     filterInput.autocomplete = "off";
     const filterCount = document.createElement("span");
     filterCount.setAttribute("aria-live", "polite");
@@ -2147,14 +2164,27 @@
       element: HTMLDetailsElement;
       summary: HTMLElement;
       link: HTMLAnchorElement;
+      primary: string;
       groups: JsonObject[];
       rendered: boolean;
       openBeforeSearch: boolean;
     }> = [];
 
+    function visibleSectionGroups(section: (typeof sections)[number]) {
+      const visible = section.groups.filter(isVisible);
+      if (!releaseQuery) return visible;
+      const supplemental = [...trackMatches.values()].filter((group) => (
+        !canonicalGroupIds.has(String(group.id))
+        && primaryType(group) === section.primary
+      ));
+      return [...visible, ...supplemental].sort(
+        (first, second) => (second.date || "").localeCompare(first.date || ""),
+      );
+    }
+
     function renderSection(
       section: (typeof sections)[number],
-      visible = section.groups.filter(isVisible),
+      visible = visibleSectionGroups(section),
     ) {
       section.summary.textContent = `${section.element.dataset.label} (${visible.length})`;
       section.element.hidden = visible.length === 0;
@@ -2185,6 +2215,7 @@
         element: section,
         summary,
         link,
+        primary,
         groups,
         rendered: false,
         openBeforeSearch: section.open,
@@ -2347,24 +2378,34 @@
     function refreshSections() {
       let visible = 0;
       sections.forEach((section) => {
-        const visibleGroups = section.groups.filter(isVisible);
+        const visibleGroups = visibleSectionGroups(section);
         visible += visibleGroups.length;
         if (releaseQuery && visibleGroups.length) section.element.open = true;
         renderSection(section, visibleGroups);
       });
       filterCount.textContent = releaseQuery
-        ? `${visible} of ${totalReleaseCount} releases`
+        ? `${visible} matching ${visible === 1 ? "release" : "releases"}`
         : `${totalReleaseCount} releases`;
-      filterMessage.textContent = releaseQuery && !visible
-        ? `No releases match “${filterInput.value.trim()}”.`
-        : "";
+      if (trackSearchPending) {
+        filterMessage.textContent = "Searching cached tracks…";
+      } else if (trackSearchFailed) {
+        filterMessage.textContent = "Track matches are unavailable; release-title matches are still shown.";
+      } else if (releaseQuery && !visible) {
+        filterMessage.textContent = `No releases or tracks match “${filterInput.value.trim()}”.`;
+      } else if (releaseQuery && trackMatches.size) {
+        const count = trackMatches.size;
+        filterMessage.textContent = `${count} release ${count === 1 ? "group contains" : "groups contain"} matching tracks.`;
+      } else {
+        filterMessage.textContent = "";
+      }
     }
 
     filterInput.addEventListener("input", () => {
       if (filterFrame !== undefined) return;
       filterFrame = window.requestAnimationFrame(() => {
         filterFrame = undefined;
-        const nextQuery = normalizeSearch(filterInput.value);
+        const rawQuery = filterInput.value.trim();
+        const nextQuery = normalizeSearch(rawQuery);
         const isSearching = Boolean(nextQuery);
         if (!wasSearching && isSearching) {
           sections.forEach((section) => {
@@ -2378,7 +2419,44 @@
           });
         }
         wasSearching = isSearching;
+        clearTimeout(trackSearchTimer);
+        const version = ++trackSearchVersion;
+        trackMatches.clear();
+        data.trackSearchGroups = [];
+        trackSearchFailed = false;
+        trackSearchPending = nextQuery.length >= 2;
         refreshSections();
+        if (!trackSearchPending) return;
+        trackSearchTimer = setTimeout(async () => {
+          try {
+            const payload = await getJson(
+              `/api/music/artist/${encodeURIComponent(data.id)}/tracks?q=${encodeURIComponent(rawQuery)}`,
+              30_000,
+              detailSessionAbort.signal,
+            );
+            if (
+              version !== trackSearchVersion
+              || !container.isConnected
+              || currentDetail?.kind !== "artist"
+              || currentDetail.id !== String(data.id)
+            ) return;
+            (payload.results || []).forEach((group: JsonObject) => {
+              trackMatches.set(String(group.id), group);
+            });
+            data.trackSearchGroups = [...trackMatches.values()];
+            trackSearchPending = false;
+            refreshSections();
+          } catch (error) {
+            if (
+              version !== trackSearchVersion
+              || !container.isConnected
+              || error.name === "AbortError"
+            ) return;
+            trackSearchPending = false;
+            trackSearchFailed = true;
+            refreshSections();
+          }
+        }, 250);
       });
     });
 

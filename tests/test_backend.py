@@ -1972,6 +1972,8 @@ class DeploymentConfigTests(unittest.TestCase):
             1,
         )
         self.assertIn('filterInput.addEventListener("input"', discovery_typescript)
+        self.assertIn("Search releases or tracks", discovery_typescript)
+        self.assertIn("/tracks?q=", discovery_typescript)
         self.assertIn(
             "[group.date, ...(group.animeNames || []), ...(group.secondaryTypes || []), group.disambiguation]",
             discovery_typescript,
@@ -7308,6 +7310,151 @@ class LocalTrackSearchIndexTests(unittest.TestCase):
             "source_mask",
         })
 
+    def test_schema_upgrade_backfills_tracks_from_cached_releases(self):
+        legacy_release = self._release()
+        legacy_release.pop("release-group")
+        commit_json_responses([
+            musicbrainz.metadata_cache_record(
+                "/release-group",
+                "aliases",
+                {"release-groups": [self._group()]},
+                artist=self.artist_mbid,
+                limit=100,
+                offset=0,
+            ),
+            musicbrainz.metadata_cache_record(
+                f"/release/{self.release_mbid}",
+                "recordings+artist-credits",
+                legacy_release,
+            ),
+        ])
+        with api_cache.cache_db() as connection:
+            connection.execute("DELETE FROM track_search_relations")
+            connection.execute(
+                "INSERT OR REPLACE INTO track_search_meta (key, value) "
+                "VALUES ('schema-version', '3')"
+            )
+
+        with patch.object(track_search_index, "_initialized", False):
+            track_search_index.initialize()
+
+        matches = track_search_index.search_artist_tracks(
+            self.artist_mbid,
+            "more than words",
+        )
+        self.assertEqual(
+            [match["release_group_mbid"] for match in matches],
+            [self.release_group_mbid],
+        )
+
+    def test_cached_release_can_backfill_a_missing_track_relation(self):
+        cache_key = musicbrainz.metadata_cache_key(
+            f"/release/{self.release_mbid}",
+            "recordings+artist-credits",
+        )
+        legacy_release = self._release()
+        legacy_release.pop("release-group")
+        track_search_index.index_release_group_page(
+            {"release-groups": [self._group()]},
+            "track-search-test:groups",
+        )
+        commit_json_responses([
+            musicbrainz.metadata_cache_record(
+                f"/release/{self.release_mbid}",
+                "recordings+artist-credits",
+                legacy_release,
+            ),
+        ])
+
+        self.assertTrue(track_search_index.index_cached_release(cache_key))
+        self.assertEqual(
+            track_search_index.search_artist_tracks(
+                self.artist_mbid,
+                "more than words",
+            )[0]["release_group_mbid"],
+            self.release_group_mbid,
+        )
+
+    def test_artist_track_lookup_returns_every_matching_release_group(self):
+        self._seed_complete_index()
+        single_group_id = "55555555-5555-4555-8555-555555555555"
+        single = self._release()
+        single["id"] = "66666666-6666-4666-8666-666666666666"
+        single["release-group"] = {
+            **self._group(),
+            "id": single_group_id,
+            "title": "more than words",
+            "primary-type": "Single",
+        }
+        track_search_index.index_release(single, "track-search-test:single")
+
+        matches = track_search_index.search_artist_tracks(
+            self.artist_mbid,
+            "more words",
+        )
+
+        self.assertEqual(
+            {match["release_group_mbid"] for match in matches},
+            {self.release_group_mbid, single_group_id},
+        )
+        self.assertEqual(
+            track_search_index.search_artist_tracks(
+                self.second_artist_mbid,
+                "more words",
+            ),
+            [],
+        )
+
+    def test_recording_search_populates_track_release_group_relations(self):
+        group = self._group()
+        recording = {
+            "id": self.recording_mbid,
+            "title": "more than words",
+            "artist-credit": group["artist-credit"],
+            "releases": [{
+                "id": self.release_mbid,
+                "title": group["title"],
+                "release-group": group,
+            }],
+        }
+
+        track_search_index.index_recording_search({"recordings": [recording]})
+
+        matches = track_search_index.search_artist_tracks(
+            self.artist_mbid,
+            "more than words",
+        )
+        self.assertEqual(
+            [match["release_group_mbid"] for match in matches],
+            [self.release_group_mbid],
+        )
+
+    def test_cached_group_uses_compact_metadata_after_source_cache_expires(self):
+        self._seed_complete_index()
+        cache_key = api_cache.document_cache_key(
+            "track-search-test",
+            "groups",
+        )
+        with api_cache.cache_db() as connection:
+            connection.execute(
+                "DELETE FROM api_cache WHERE cache_key = ?",
+                (cache_key,),
+            )
+
+        groups = track_search_index.cached_release_groups([
+            self.release_group_mbid,
+        ])
+
+        self.assertEqual(
+            groups[self.release_group_mbid]["title"],
+            "12 hugs (like butterflies)",
+        )
+        self.assertEqual(groups[self.release_group_mbid]["primary-type"], "Album")
+        self.assertEqual(
+            groups[self.release_group_mbid]["artist-credit"][0]["artist"]["id"],
+            self.artist_mbid,
+        )
+
     @patch("backend.routes.discovery.musicbrainz.search")
     def test_transliterated_and_canonical_queries_use_zero_musicbrainz_calls(
         self,
@@ -7949,6 +8096,145 @@ class DiscoveryRoutesTests(DatabaseTestCase):
 
 
 class MusicRoutesTests(DatabaseTestCase):
+    @patch("backend.routes.music.track_search_index.cached_release_groups")
+    @patch("backend.routes.music.track_search_index.search_artist_tracks")
+    def test_artist_track_search_returns_cached_release_group_cards(
+        self,
+        search_tracks,
+        cached_groups,
+    ):
+        artist_id = "11111111-1111-4111-8111-111111111111"
+        album_id = "22222222-2222-4222-8222-222222222222"
+        single_id = "33333333-3333-4333-8333-333333333333"
+        search_tracks.return_value = [
+            {
+                "normalized_title": "honeymoon avenue",
+                "release_group_mbid": album_id,
+            },
+            {
+                "normalized_title": "honeymoon avenue",
+                "release_group_mbid": single_id,
+            },
+        ]
+        cached_groups.return_value = {
+            album_id: {
+                "id": album_id,
+                "title": "Yours Truly",
+                "primary-type": "Album",
+                "secondary-types": [],
+                "first-release-date": "2013-08-30",
+            },
+            single_id: {
+                "id": single_id,
+                "title": "Honeymoon Avenue",
+                "primary-type": "Single",
+                "secondary-types": [],
+                "first-release-date": "2013",
+            },
+        }
+
+        response = self.client.get(
+            f"/api/music/artist/{artist_id}/tracks?q=Honeymoon%20Avenue",
+            headers={"X-CSRF-Token": self.register()},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["candidateCount"], 2)
+        self.assertEqual(
+            [(group["title"], group["type"]) for group in payload["results"]],
+            [("Yours Truly", "Album"), ("Honeymoon Avenue", "Single")],
+        )
+        self.assertTrue(all(
+            group["matchedTracks"] == ["honeymoon avenue"]
+            for group in payload["results"]
+        ))
+        search_tracks.assert_called_once_with(artist_id, "Honeymoon Avenue")
+
+    @patch("backend.routes.music.track_search_index.index_recording_search")
+    @patch("backend.routes.music.track_search_index.cached_release_groups")
+    @patch("backend.routes.music.track_search_index.search_artist_tracks")
+    @patch("backend.routes.music.musicbrainz.search")
+    def test_artist_track_search_populates_a_new_artist_on_demand(
+        self,
+        search,
+        search_tracks,
+        cached_groups,
+        index_recording_search,
+    ):
+        artist_id = "020bfbb4-05c3-4c86-b372-17825c262094"
+        album_id = "22222222-2222-4222-8222-222222222222"
+        response = {"recordings": [{"id": "recording-id"}]}
+        search.return_value = response
+        search_tracks.side_effect = [
+            [],
+            [{
+                "normalized_title": "like a stone",
+                "release_group_mbid": album_id,
+            }],
+        ]
+        cached_groups.return_value = {
+            album_id: {
+                "id": album_id,
+                "title": "Audioslave",
+                "primary-type": "Album",
+                "secondary-types": [],
+                "first-release-date": "2002-11-19",
+            },
+        }
+
+        result = self.client.get(
+            f"/api/music/artist/{artist_id}/tracks?q=Like%20a%20Stone",
+            headers={"X-CSRF-Token": self.register()},
+        )
+
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(result.get_json()["results"][0]["title"], "Audioslave")
+        recording_query, search_type = search.call_args.args
+        self.assertIn('recording:"Like a Stone"', recording_query)
+        self.assertIn(f"arid:{artist_id}", recording_query)
+        self.assertEqual(search_type, "track")
+        self.assertEqual(search.call_args.kwargs, {
+            "priority": "interactive",
+            "plain_search": False,
+            "limit": 50,
+        })
+        index_recording_search.assert_called_once_with(response)
+        self.assertEqual(search_tracks.call_count, 2)
+
+    @patch("backend.routes.music.track_search_index.index_cached_release")
+    @patch("backend.routes.music.detail_cache.cached_response")
+    @patch("backend.routes.music.musicbrainz.get")
+    def test_cached_release_response_backfills_the_track_index(
+        self,
+        get,
+        cached_response,
+        index_cached_release,
+    ):
+        cached_response.return_value = {"id": "release-id"}
+        index_cached_release.side_effect = [False, True]
+
+        response = self.client.get(
+            "/api/music/release/release-id",
+            headers={"X-CSRF-Token": self.register()},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        get.assert_not_called()
+        self.assertEqual(
+            [item.args[0] for item in index_cached_release.call_args_list],
+            [
+                musicbrainz.metadata_cache_key(
+                    "/release/release-id",
+                    "recordings+artist-credits+release-groups",
+                ),
+                musicbrainz.metadata_cache_key(
+                    "/release/release-id",
+                    "recordings+artist-credits",
+                ),
+            ],
+        )
+
     @patch("backend.routes.music.lastfm.get_public")
     @patch("backend.routes.music.get_lastfm_api_key", return_value="")
     def test_similar_artists_is_empty_without_a_shared_lastfm_key(
@@ -8267,6 +8553,10 @@ class MusicRoutesTests(DatabaseTestCase):
         self.assertEqual(response.headers["Cache-Control"], "no-store")
         get.assert_called_once()
         self.assertTrue(get.call_args.kwargs["cache_only"])
+        self.assertEqual(
+            get.call_args.args[1],
+            "recordings+artist-credits+release-groups",
+        )
 
     @patch("backend.routes.music.musicbrainz.get")
     def test_artist_detail_returns_english_alias(self, get):
