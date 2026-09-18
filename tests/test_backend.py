@@ -6903,6 +6903,138 @@ class ReleaseGroupRankingTests(unittest.TestCase):
         self.assertIn('artist:"The Weeknd"', plan["query"])
         self.assertFalse(plan["plainSearch"])
 
+    def test_track_search_matches_a_transliterated_pseudo_release_title(self):
+        plan = discovery._track_search_plan("Kessen Spirit chico")
+        target = self._recording(
+            "kessen-spirit",
+            "決戦スピリット (アニメsize)",
+            score=68,
+            artist="CHiCO with HoneyWorks",
+            primary_type="Single",
+        )
+        target["releases"] = [{
+            "id": "release-kessen-spirit",
+            "title": "Kessen Spirit",
+            "status": "Pseudo-Release",
+            "date": "2020-02-26",
+            "artist-credit": target["artist-credit"],
+            "release-group": {
+                "id": "4a81a32b-c395-4e01-90db-52e80a270491",
+                "title": "決戦スピリット",
+                "primary-type": "Single",
+                "secondary-types": [],
+                "artist-credit": target["artist-credit"],
+            },
+        }]
+        unrelated = self._recording(
+            "unrelated",
+            "Kessen",
+            score=100,
+            artist="Someone Else",
+        )
+
+        candidates = discovery._recording_release_group_candidates(
+            {"recordings": [unrelated, target]},
+            plan,
+        )
+
+        self.assertIn('release:"Kessen Spirit"', plan["query"])
+        self.assertIn('artist:"chico"', plan["query"])
+        self.assertEqual(
+            candidates[0]["id"],
+            "4a81a32b-c395-4e01-90db-52e80a270491",
+        )
+
+    def test_track_search_recovers_a_release_group_romanized_alias(self):
+        plan = discovery._track_search_plan(
+            "Sekai wa Koi ni Ochiteiru chico"
+        )
+        artist_mbid = "11111111-1111-4111-8111-111111111111"
+        interpretation = next(
+            item
+            for item in plan["interpretations"]
+            if item["artist"].casefold() == "chico"
+        )
+        plan = discovery._with_resolved_artist(
+            plan,
+            interpretation,
+            artist_mbid,
+        )
+        target = _release_group_fixture(
+            "bc465d63-9087-4707-ab43-c01bdad7dc0a",
+            "世界は恋に落ちている",
+            score=100,
+            date="2014-08-06",
+            artist="CHiCO with HoneyWorks",
+            primary_type="Single",
+        )
+        target["artist-credit"][0]["artist"]["id"] = artist_mbid
+        weak = _release_group_fixture(
+            "weak-alias-result",
+            "Unrelated",
+            score=70,
+            artist="CHiCO with HoneyWorks",
+            primary_type="Single",
+        )
+        weak["artist-credit"][0]["artist"]["id"] = artist_mbid
+
+        with patch.object(
+            discovery.musicbrainz,
+            "search",
+            return_value={"release-groups": [weak, target]},
+        ) as search:
+            results = discovery._track_release_group_alias_results(plan)
+
+        search_query = search.call_args.args[0]
+        self.assertIn('alias:"Sekai wa Koi ni Ochiteiru"', search_query)
+        self.assertIn(f"arid:{artist_mbid}", search_query)
+        self.assertIn("primarytype:single", search_query)
+        self.assertEqual(search.call_args.kwargs["limit"], 100)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(
+            results[0]["id"],
+            "bc465d63-9087-4707-ab43-c01bdad7dc0a",
+        )
+        self.assertEqual(results[0]["matchedTrack"], "Sekai wa Koi ni Ochiteiru")
+
+    @patch(
+        "backend.routes.discovery._recording_release_group_results",
+        return_value=[],
+    )
+    @patch("backend.routes.discovery.musicbrainz.search")
+    def test_track_route_uses_alias_fallback_only_after_a_recording_miss(
+        self,
+        search,
+        release_group_results,
+    ):
+        target = _release_group_fixture(
+            "bc465d63-9087-4707-ab43-c01bdad7dc0a",
+            "世界は恋に落ちている",
+            score=100,
+            date="2014-08-06",
+            artist="CHiCO with HoneyWorks",
+            primary_type="Single",
+        )
+        search.side_effect = [
+            {"recordings": []},
+            {"release-groups": [target]},
+        ]
+        app = Flask(__name__)
+        with app.test_request_context(
+            "/api/search?q=Sekai%20wa%20Koi%20ni%20Ochiteiru%20chico&type=track"
+        ):
+            response = discovery.search.__wrapped__()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json()["results"][0]["id"],
+            "bc465d63-9087-4707-ab43-c01bdad7dc0a",
+        )
+        self.assertEqual(search.call_count, 2)
+        self.assertEqual(search.call_args_list[0].args[1], "track")
+        self.assertEqual(search.call_args_list[1].args[1], "album")
+        release_group_results.assert_not_called()
+
     def test_track_version_intent_beats_a_generic_higher_score(self):
         plan = discovery._track_search_plan("Numb live")
         recordings = [
@@ -7139,10 +7271,15 @@ class ReleaseGroupRankingTests(unittest.TestCase):
             response = discovery.search.__wrapped__()
 
         self.assertEqual(response.status_code, 200)
-        search.assert_called_once()
+        self.assertEqual(search.call_count, 2)
         self.assertEqual(
-            search.call_args.kwargs,
+            search.call_args_list[0].kwargs,
             {"plain_search": False, "limit": 50},
+        )
+        self.assertEqual(search.call_args_list[1].args[1], "album")
+        self.assertEqual(
+            search.call_args_list[1].kwargs,
+            {"plain_search": False, "limit": 100},
         )
         plan = release_group_results.call_args.args[1]
         self.assertEqual(plan["artist"], "")
@@ -7498,6 +7635,7 @@ class LocalTrackSearchIndexTests(unittest.TestCase):
         ))
         search.side_effect = [
             {"recordings": []},
+            {"release-groups": []},
             {"artists": [self._artist(), self._artist(self.second_artist_mbid)]},
         ]
         app = Flask(__name__)
@@ -7508,7 +7646,9 @@ class LocalTrackSearchIndexTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertNotIn("arid:", search.call_args_list[0].args[0])
-        self.assertEqual(len(search.call_args_list), 2)
+        self.assertEqual(len(search.call_args_list), 3)
+        self.assertEqual(search.call_args_list[1].args[1], "album")
+        self.assertEqual(search.call_args_list[2].args[1], "artist")
         release_results.assert_called_once()
 
     @patch(
@@ -7530,9 +7670,11 @@ class LocalTrackSearchIndexTests(unittest.TestCase):
             response = discovery.search.__wrapped__()
 
         self.assertEqual(response.status_code, 200)
-        search.assert_called_once()
-        self.assertIn(f"arid:{self.artist_mbid}", search.call_args.args[0])
-        self.assertEqual(search.call_args.args[1], "track")
+        self.assertEqual(search.call_count, 2)
+        self.assertIn(f"arid:{self.artist_mbid}", search.call_args_list[0].args[0])
+        self.assertEqual(search.call_args_list[0].args[1], "track")
+        self.assertIn(f"arid:{self.artist_mbid}", search.call_args_list[1].args[0])
+        self.assertEqual(search.call_args_list[1].args[1], "album")
         release_results.assert_called_once()
 
     @patch(
@@ -7547,6 +7689,7 @@ class LocalTrackSearchIndexTests(unittest.TestCase):
     ):
         search.side_effect = [
             {"recordings": []},
+            {"release-groups": []},
             {"artists": [self._artist()]},
             {"recordings": []},
         ]
@@ -7556,8 +7699,9 @@ class LocalTrackSearchIndexTests(unittest.TestCase):
             first = discovery.search.__wrapped__()
 
         self.assertEqual(first.status_code, 200)
-        self.assertEqual(len(search.call_args_list), 3)
-        self.assertEqual(search.call_args_list[1].args[1], "artist")
+        self.assertEqual(len(search.call_args_list), 4)
+        self.assertEqual(search.call_args_list[1].args[1], "album")
+        self.assertEqual(search.call_args_list[2].args[1], "artist")
 
         search.reset_mock()
         search.side_effect = None
@@ -7566,8 +7710,9 @@ class LocalTrackSearchIndexTests(unittest.TestCase):
             second = discovery.search.__wrapped__()
 
         self.assertEqual(second.status_code, 200)
-        search.assert_called_once()
-        self.assertIn(f"arid:{self.artist_mbid}", search.call_args.args[0])
+        self.assertEqual(search.call_count, 2)
+        self.assertIn(f"arid:{self.artist_mbid}", search.call_args_list[0].args[0])
+        self.assertIn(f"arid:{self.artist_mbid}", search.call_args_list[1].args[0])
         release_results.assert_called()
 
 

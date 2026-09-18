@@ -275,7 +275,8 @@ def _track_search_plan(query):
     ]
     if artist_interpretations:
         artist_clauses = [
-            f"(recording:{_lucene_phrase(interpretation['title'])} AND "
+            f"((recording:{_lucene_phrase(interpretation['title'])} OR "
+            f"release:{_lucene_phrase(interpretation['title'])}) AND "
             f"(artist:{_lucene_phrase(interpretation['artist'])} OR "
             f"artistname:{_lucene_phrase(interpretation['artist'])}))"
             for interpretation in artist_interpretations
@@ -668,6 +669,26 @@ def _recording_title_quality(recording, title_query, versions=()):
     )
 
 
+def _release_title_quality(release, title_query, versions=()):
+    """Score a title against the specific release represented by this row."""
+    if not title_query:
+        return 0
+    base_query = _track_base_title(title_query, versions)
+    group = release.get("release-group") or {}
+    titles = [release.get("title"), group.get("title")]
+    return max(
+        (
+            max(
+                _text_match_quality(title_query, title),
+                _text_match_quality(base_query, title),
+            )
+            for title in titles
+            if title
+        ),
+        default=0,
+    )
+
+
 def _strict_recording_title_match(recording, title_query):
     """Protect true literal titles without erasing meaningful punctuation."""
     query = " ".join(str(title_query or "").casefold().split())
@@ -694,21 +715,30 @@ def _recording_artist_quality(recording, artist_query):
     )
 
 
-def _recording_interpretation_quality(recording, plan):
+def _recording_interpretation_quality(recording, release, plan):
     """Choose the strongest validated title/artist interpretation."""
     literal_quality = _recording_title_quality(
         recording,
         plan["literalTitle"],
     )
-    best = (literal_quality, literal_quality, 0)
+    best = (literal_quality, literal_quality, literal_quality, 0)
     for interpretation in plan["interpretations"]:
         artist_query = interpretation["artist"]
         if not artist_query:
             continue
-        title_quality = _recording_title_quality(
+        versions = _track_version_intents(interpretation["title"])
+        recording_title_quality = _recording_title_quality(
             recording,
             interpretation["title"],
-            _track_version_intents(interpretation["title"]),
+            versions,
+        )
+        title_quality = max(
+            recording_title_quality,
+            _release_title_quality(
+                release,
+                interpretation["title"],
+                versions,
+            ),
         )
         resolved_mbid = _resolved_artist_mbid(plan, artist_query)
         artist_quality = (
@@ -720,7 +750,12 @@ def _recording_interpretation_quality(recording, plan):
             continue
         best = max(
             best,
-            (title_quality + artist_quality, title_quality, artist_quality),
+            (
+                title_quality + artist_quality,
+                recording_title_quality,
+                title_quality,
+                artist_quality,
+            ),
         )
     return (
         int(
@@ -746,10 +781,18 @@ def _track_release_artist_quality(recording, release, plan):
         artist_query = interpretation["artist"]
         if not artist_query:
             continue
-        title_quality = _recording_title_quality(
-            recording,
-            interpretation["title"],
-            _track_version_intents(interpretation["title"]),
+        versions = _track_version_intents(interpretation["title"])
+        title_quality = max(
+            _recording_title_quality(
+                recording,
+                interpretation["title"],
+                versions,
+            ),
+            _release_title_quality(
+                release,
+                interpretation["title"],
+                versions,
+            ),
         )
         recording_artist_quality = _recording_artist_quality(
             recording,
@@ -873,7 +916,8 @@ def _local_track_resolution(plan):
 def _artist_mbid_recording_query(title, artist_mbid):
     return (
         f"(recording:{_lucene_phrase(title)} OR "
-        f"recording:{_lucene_all_words(title)}) AND arid:{artist_mbid}"
+        f"recording:{_lucene_all_words(title)} OR "
+        f"release:{_lucene_phrase(title)}) AND arid:{artist_mbid}"
     )
 
 
@@ -882,10 +926,24 @@ def _has_strong_recording_match(response, plan):
         for interpretation in plan["interpretations"]:
             if not interpretation["artist"]:
                 continue
-            title_quality = _recording_title_quality(
-                recording,
-                interpretation["title"],
-                _track_version_intents(interpretation["title"]),
+            versions = _track_version_intents(interpretation["title"])
+            title_quality = max(
+                _recording_title_quality(
+                    recording,
+                    interpretation["title"],
+                    versions,
+                ),
+                max(
+                    (
+                        _release_title_quality(
+                            release,
+                            interpretation["title"],
+                            versions,
+                        )
+                        for release in recording.get("releases") or []
+                    ),
+                    default=0,
+                ),
             )
             artist_quality = _recording_artist_quality(
                 recording,
@@ -901,6 +959,135 @@ def _has_exact_literal_recording(response, plan):
         _strict_recording_title_match(recording, plan["literalTitle"])
         for recording in response.get("recordings") or []
     )
+
+
+def _romanized_release_group_title_quality(group, title_query):
+    """Match common spaced Hepburn input to compact local romanization."""
+    romanized = (
+        group.get("romanizedTitle")
+        or musicbrainz.romanized_release_group_title(group)
+    )
+    if not romanized:
+        return 0
+    query_tokens = _normalize_search_text(title_query).split()
+    value_tokens = _normalize_search_text(romanized).split()
+    if not query_tokens or not value_tokens:
+        return 0
+    query_forms = {
+        "".join(query_tokens),
+        "".join(
+            {"wa": "ha", "e": "he", "o": "wo"}.get(token, token)
+            for token in query_tokens
+        ),
+    }
+    value = "".join(value_tokens)
+    if value in query_forms:
+        return 4
+    if any(value.startswith(query) for query in query_forms):
+        return 3
+    if any(query in value for query in query_forms):
+        return 2
+    return 0
+
+
+def _track_release_group_alias_results(plan):
+    """Recover romanized single/EP titles absent from the recording index."""
+    interpretations = [
+        interpretation
+        for interpretation in plan["interpretations"]
+        if interpretation["artist"]
+    ]
+    if not interpretations:
+        return []
+    clauses = []
+    for interpretation in interpretations:
+        resolved_mbid = _resolved_artist_mbid(plan, interpretation["artist"])
+        artist_clause = (
+            f"arid:{resolved_mbid}"
+            if resolved_mbid
+            else (
+                f"(artist:{_lucene_phrase(interpretation['artist'])} OR "
+                f"artistname:{_lucene_phrase(interpretation['artist'])})"
+            )
+        )
+        clauses.append(
+            f"((alias:{_lucene_phrase(interpretation['title'])} AND "
+            f"{artist_clause}) OR ({artist_clause} AND "
+            f"(primarytype:single OR primarytype:ep)))"
+        )
+    response = musicbrainz.search(
+        " OR ".join(clauses),
+        "album",
+        plain_search=False,
+        limit=100,
+    )
+    results = []
+    for group in response.get("release-groups") or []:
+        primary_type = _normalize_search_text(group.get("primary-type"))
+        if primary_type not in {"single", "ep"}:
+            continue
+        validated = []
+        for interpretation in interpretations:
+            title_quality = max(
+                _release_group_title_quality(group, interpretation["title"]),
+                _romanized_release_group_title_quality(
+                    group,
+                    interpretation["title"],
+                ),
+            )
+            resolved_mbid = _resolved_artist_mbid(
+                plan,
+                interpretation["artist"],
+            )
+            artist_quality = (
+                4
+                if resolved_mbid and resolved_mbid in _artist_credit_ids(group)
+                else _release_group_artist_quality(
+                    group,
+                    interpretation["artist"],
+                )
+            )
+            if title_quality < 3 or artist_quality < 2:
+                continue
+            validated.append((
+                title_quality,
+                artist_quality,
+                len(_normalize_search_text(interpretation["title"])),
+                interpretation,
+            ))
+        if not validated:
+            continue
+        title_quality, artist_quality, _, interpretation = max(
+            validated,
+            key=lambda item: item[:3],
+        )
+        results.append({
+            "id": group["id"],
+            "name": group.get("title") or interpretation["title"],
+            "romanizedTitle": musicbrainz.romanized_release_group_title(group),
+            "artist": _artist_credit_name(group),
+            "date": group.get("first-release-date") or "",
+            "type": group.get("primary-type") or "Single",
+            "secondaryTypes": [
+                name for name in group.get("secondary-types") or [] if name
+            ],
+            "disambiguation": group.get("disambiguation") or "",
+            "score": _release_group_search_score(group),
+            "matchedTrack": interpretation["title"],
+            "matchedTrackArtist": _artist_credit_name(group),
+            "_rank": (
+                -title_quality,
+                -artist_quality,
+                -_release_group_search_score(group),
+                0 if primary_type == "single" else 1,
+                group.get("first-release-date") or "9999",
+                group["id"],
+            ),
+        })
+    results.sort(key=lambda result: result["_rank"])
+    for result in results:
+        result.pop("_rank", None)
+    return results[:_SEARCH_RESULT_LIMIT]
 
 
 def _alias_fallback_interpretation(plan):
@@ -1008,7 +1195,11 @@ def _track_release_rank(
     status = str(release.get("status") or "").casefold()
     status_rank = 0 if status == "official" else (1 if not status else 2)
     primary_type = str(group.get("primary-type") or "other").casefold()
-    interpretation_quality = _recording_interpretation_quality(recording, plan)
+    interpretation_quality = _recording_interpretation_quality(
+        recording,
+        release,
+        plan,
+    )
     return (
         *(-value for value in interpretation_quality),
         -_track_release_artist_quality(recording, release, plan),
@@ -1471,32 +1662,44 @@ def search():
 
     if (
         search_type == "track"
-        and not track_plan["resolvedArtists"]
         and not _has_strong_recording_match(response, track_plan)
         and not _has_exact_literal_recording(response, track_plan)
     ):
         try:
-            alias_resolution = _musicbrainz_alias_resolution(track_plan)
-            if alias_resolution:
-                interpretation, artist_mbid = alias_resolution
-                track_plan = _with_resolved_artist(
-                    track_plan,
-                    interpretation,
-                    artist_mbid,
-                )
-                response = musicbrainz.search(
-                    _artist_mbid_recording_query(
-                        interpretation["title"],
-                        artist_mbid,
-                    ),
-                    "track",
-                    plain_search=False,
-                    limit=50,
-                )
+            alias_results = _track_release_group_alias_results(track_plan)
+            if alias_results:
+                return jsonify({
+                    "results": alias_results,
+                    "type": search_type,
+                    "candidateCount": len(alias_results),
+                })
         except requests.RequestException:
-            # Alias resolution is an optional recovery path. Preserve the
-            # original recording results when either fallback request fails.
+            # Release-group aliases are an optional recovery path. Continue
+            # with the existing artist-alias resolution when it is unavailable.
             pass
+        if not track_plan["resolvedArtists"]:
+            try:
+                alias_resolution = _musicbrainz_alias_resolution(track_plan)
+                if alias_resolution:
+                    interpretation, artist_mbid = alias_resolution
+                    track_plan = _with_resolved_artist(
+                        track_plan,
+                        interpretation,
+                        artist_mbid,
+                    )
+                    response = musicbrainz.search(
+                        _artist_mbid_recording_query(
+                            interpretation["title"],
+                            artist_mbid,
+                        ),
+                        "track",
+                        plain_search=False,
+                        limit=50,
+                    )
+            except requests.RequestException:
+                # Alias resolution is an optional recovery path. Preserve the
+                # original recording results when either fallback request fails.
+                pass
 
     if search_type == "artist":
         plex_artists = _plex_search_artists()
