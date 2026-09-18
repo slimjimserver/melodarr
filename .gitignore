@@ -36,7 +36,9 @@ vapid-private.pem
 # Local tools
 .agents/
 .codex/
-docs/
+docs/*
+!docs/api.md
+!docs/openapi.yaml
 
 # Editors / OS
 .idea/

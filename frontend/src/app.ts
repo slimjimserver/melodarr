@@ -679,7 +679,22 @@ async function refreshSettings(loadLidarrOptions = true) {
   toggleApiKeyButton.setAttribute("aria-pressed", "false");
   toggleApiKeyButton.setAttribute("aria-label", "Show API key");
   toggleApiKeyButton.title = "Show API key";
-  $("#melodarr-version").textContent = `Version ${melodarr.version || "development"}`;
+  const version = String(melodarr.version || "development");
+  const versionBadge = $<HTMLAnchorElement>("#melodarr-version");
+  versionBadge.textContent = `Version ${version}`;
+  if (/^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(version)) {
+    versionBadge.href = `https://github.com/slimjimserver/melodarr/releases/tag/${encodeURIComponent(version)}`;
+    versionBadge.target = "_blank";
+    versionBadge.rel = "noopener noreferrer";
+    versionBadge.setAttribute("aria-label", `View Melodarr ${version} release notes`);
+    versionBadge.title = `View ${version} release notes`;
+  } else {
+    versionBadge.removeAttribute("href");
+    versionBadge.removeAttribute("target");
+    versionBadge.removeAttribute("rel");
+    versionBadge.removeAttribute("aria-label");
+    versionBadge.removeAttribute("title");
+  }
   applyApplicationIdentity(melodarr.applicationTitle);
   const regenerateButton = $<HTMLButtonElement>("#regenerate-melodarr-api-key");
   regenerateButton.disabled = Boolean(melodarr.apiKeyManagedByEnvironment);
@@ -688,7 +703,7 @@ async function refreshSettings(loadLidarrOptions = true) {
     : "";
   $("#melodarr-api-key-help").textContent = melodarr.apiKeyManagedByEnvironment
     ? "This key is supplied by MELODARR_AUTOMATION_API_KEY. Change that environment variable to rotate it."
-    : "Send this secret in X-Api-Key when calling the AnimeThemes resolver.";
+    : "Send this secret in X-Api-Key when calling authenticated API endpoints.";
 
   const musicbrainz = settings.musicbrainz || {};
   const musicbrainzForm = $<MusicBrainzSettingsForm>("#musicbrainz-settings");

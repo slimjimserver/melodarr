@@ -541,7 +541,9 @@ h1 em { font-style: normal; }
 .service-intro h2 { margin: 0 0 4px; font-size: 20px; letter-spacing: -.03em; }
 .service-intro p { margin: 0; color: var(--foreground-muted); font-size: 13px; line-height: 1.4; }
 .service-icon { display: block; width: 42px; height: 42px; padding: 7px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
-.service-state { display: inline-flex; min-height: 30px; align-items: center; gap: 7px; border: 1px solid var(--border); border-radius: var(--radius-pill); background: var(--surface); color: var(--foreground-subtle); padding: 6px 10px; font-size: 12px; white-space: nowrap; }
+.service-state { display: inline-flex; min-height: 30px; align-items: center; gap: 7px; border: 1px solid var(--border); border-radius: var(--radius-pill); background: var(--surface); color: var(--foreground-subtle); padding: 6px 10px; font-size: 12px; text-decoration: none; white-space: nowrap; }
+.service-state[href] { cursor: pointer; transition: border-color .2s var(--ease-out), color .2s var(--ease-out), background .2s var(--ease-out); }
+.service-state[href]:hover { border-color: var(--border-hover); background: var(--surface-hover); color: var(--foreground); }
 .service-state[data-state]::before { width: 7px; height: 7px; flex: none; border-radius: 50%; background: var(--foreground-muted); content: ""; }
 .service-state[data-state="ready"] { border-color: color-mix(in srgb, var(--success) 38%, transparent); color: var(--success); }
 .service-state[data-state="ready"]::before { background: currentColor; box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 14%, transparent); }

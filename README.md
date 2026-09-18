@@ -54,6 +54,8 @@ Authenticated clients can call `POST /api/v1/animethemes/resolve` with a MusicBr
 
 AnimeThemes does not assign every anime to a higher-level series. In that case, Melodarr returns the individual anime as an explicit fallback with `animeThemesSeriesId: null`, its `animeThemesAnimeId`, and `fallback: "anime"`; it never invents a series ID.
 
+See the [Melodarr API guide](docs/api.md) for authentication, request and response schemas, examples, errors, and the OpenAPI specification.
+
 ## Environment variables
 
 The included Docker Compose setup does not require any extra environment variables. By default, it keeps the main database and metadata cache under the persistent `/app/data` mount.

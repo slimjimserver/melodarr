@@ -218,7 +218,7 @@
 
       <div id="settings-services" class="settings-stack settings-panel" role="tabpanel" aria-labelledby="settings-tab-services" tabindex="0">
         <section class="settings-section melodarr-settings-section">
-          <div class="service-intro"><img class="service-icon" src="/icons/melodarr.svg" width="42" height="42" loading="lazy" decoding="async" alt="Melodarr"><div><h2>Melodarr</h2><p>Configure this instance and its AnimeThemes automation credential.</p></div><span id="melodarr-version" class="service-state">Loading…</span></div>
+          <div class="service-intro"><img class="service-icon" src="/icons/melodarr.svg" width="42" height="42" loading="lazy" decoding="async" alt="Melodarr"><div><h2>Melodarr</h2><p>Configure this instance and its API credentials.</p></div><a id="melodarr-version" class="service-state">Loading…</a></div>
           <form id="melodarr-settings" class="service-card">
             <div class="settings-fields">
               <label>Application title
@@ -230,7 +230,7 @@
                 <input name="applicationUrl" type="url" placeholder="https://music.example.com">
               </label>
               <label class="wide-field">API key
-                <small id="melodarr-api-key-help">Send this secret in <code>X-Api-Key</code> when calling the AnimeThemes resolver.</small>
+                <small id="melodarr-api-key-help">Send this secret in <code>X-Api-Key</code> when calling authenticated API endpoints.</small>
                 <span class="secret-field"><input name="apiKey" type="password" readonly autocomplete="off" aria-describedby="melodarr-api-key-help"><button id="toggle-melodarr-api-key" class="outline secret-toggle" type="button" aria-label="Show API key" title="Show API key"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path class="secret-eye" d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z"/><circle class="secret-eye" cx="12" cy="12" r="2.5"/><path class="secret-eye-slash" d="m3 3 18 18"/></svg></button><button id="copy-melodarr-api-key" class="outline" type="button">Copy</button></span>
               </label>
             </div>

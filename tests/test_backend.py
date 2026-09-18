@@ -1872,6 +1872,11 @@ class DeploymentConfigTests(unittest.TestCase):
         )
         self.assertIn("copyInputValue(form.apiKey)", typescript)
         self.assertIn('form.apiKey.type === "password"', typescript)
+        self.assertIn(
+            "https://github.com/slimjimserver/melodarr/releases/tag/",
+            typescript,
+        )
+        self.assertIn('versionBadge.removeAttribute("href")', typescript)
 
     def test_musicbrainz_service_settings_support_self_hosting_and_testing(self):
         project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

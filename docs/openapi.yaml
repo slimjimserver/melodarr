@@ -1,0 +1,153 @@
+openapi: 3.1.0
+info:
+  title: Melodarr Automation API
+  version: 1.0.0
+  description: API endpoints available to trusted external automation.
+servers:
+  - url: /
+paths:
+  /api/v1/animethemes/resolve:
+    post:
+      operationId: resolveAnimeThemesSeries
+      summary: Resolve MusicBrainz identifiers to AnimeThemes series
+      description: |
+        Returns every unique AnimeThemes series linked to the supplied music.
+        Release-group evidence takes priority over recording evidence for the
+        same series. The API key is currently scoped to this endpoint.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResolveRequest'
+            examples:
+              releaseGroup:
+                summary: Resolve a release group
+                value:
+                  releaseGroupId: d65f7448-6d69-48b9-bc11-fb8a0b6f6e5f
+              recording:
+                summary: Resolve a recording
+                value:
+                  recordingIds:
+                    - 2b31e1c4-561b-305a-a94c-0c47f6378447
+      responses:
+        '200':
+          description: Resolution completed. Unknown identifiers return an empty series array.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResolveResponse'
+        '400':
+          description: Invalid request body or MusicBrainz identifier.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          description: Missing or invalid API key.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '502':
+          description: An upstream AnimeThemes request failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Api-Key
+  schemas:
+    ResolveRequest:
+      type: object
+      properties:
+        releaseGroupId:
+          type: string
+          format: uuid
+          description: MusicBrainz release-group MBID.
+        recordingIds:
+          type: array
+          description: MusicBrainz recording MBIDs. Duplicate values are ignored.
+          items:
+            type: string
+            format: uuid
+      anyOf:
+        - required:
+            - releaseGroupId
+        - required:
+            - recordingIds
+          properties:
+            recordingIds:
+              minItems: 1
+    ResolveResponse:
+      type: object
+      required:
+        - series
+      properties:
+        series:
+          type: array
+          items:
+            oneOf:
+              - $ref: '#/components/schemas/SeriesMatch'
+              - $ref: '#/components/schemas/AnimeFallback'
+    SeriesMatch:
+      type: object
+      required:
+        - animeThemesSeriesId
+        - name
+        - slug
+        - matchedBy
+      properties:
+        animeThemesSeriesId:
+          type: integer
+          minimum: 1
+        name:
+          type: string
+        slug:
+          type: string
+        matchedBy:
+          $ref: '#/components/schemas/MatchType'
+    AnimeFallback:
+      type: object
+      required:
+        - animeThemesSeriesId
+        - animeThemesAnimeId
+        - name
+        - slug
+        - matchedBy
+        - fallback
+      properties:
+        animeThemesSeriesId:
+          type: 'null'
+        animeThemesAnimeId:
+          type:
+            - integer
+            - 'null'
+          minimum: 1
+        name:
+          type: string
+        slug:
+          type: string
+        matchedBy:
+          $ref: '#/components/schemas/MatchType'
+        fallback:
+          type: string
+          const: anime
+    MatchType:
+      type: string
+      enum:
+        - releaseGroup
+        - recording
+    Error:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
