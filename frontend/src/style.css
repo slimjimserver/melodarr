@@ -38,6 +38,7 @@
   --duration-fast: 160ms;
   --duration-standard: 220ms;
   --tab-bar-height: 0px;
+  --safe-top: env(safe-area-inset-top, 0px);
   --safe-bottom: env(safe-area-inset-bottom, 0px);
   --bottom-ui-offset: var(--safe-bottom);
 }
@@ -76,10 +77,10 @@ header {
   top: 0;
   z-index: 10;
   align-items: center;
-  height: 68px;
+  height: calc(68px + var(--safe-top));
   gap: 32px;
   padding: 0 clamp(20px, 6vw, 92px);
-  padding-top: env(safe-area-inset-top, 0px);
+  padding-top: var(--safe-top);
   border-bottom: 1px solid var(--border);
   background: rgba(255, 250, 243, .96);
   box-shadow: 0 1px 12px rgba(68, 50, 38, .05);
@@ -724,9 +725,9 @@ details summary { margin-bottom: 17px; color: var(--accent-bright); cursor: poin
 }
 
 @media (max-width: 700px) {
-  :root { --tab-bar-height: 72px; --bottom-ui-offset: var(--tab-bar-height); }
+  :root { --tab-bar-height: calc(56px + var(--safe-bottom)); --bottom-ui-offset: var(--tab-bar-height); }
   input, select, textarea { font-size: 16px; }
-  header { display: flex; gap: 12px; height: 62px; padding: 0 16px; padding-top: env(safe-area-inset-top, 0px); }
+  header { display: flex; gap: 12px; height: calc(62px + var(--safe-top)); padding: 0 16px; padding-top: var(--safe-top); }
   .header-nav { display: none; }
   .status { display: none; }
   .brand { min-width: 0; margin-right: auto; font-size: 20px; }
@@ -923,7 +924,7 @@ button,
 
 @media (max-width: 700px) {
   header {
-    height: 64px;
+    height: calc(64px + var(--safe-top));
     padding-right: 14px;
     padding-left: 14px;
   }

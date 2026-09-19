@@ -244,20 +244,27 @@ test("artist track search shows every cached release group containing the track"
   await expect(page.locator('[data-release-group-id="fixture-album"]')).toBeVisible();
 });
 
-test("mobile tab bar keeps a compact 48px target above its safe-area padding", async ({ page }) => {
+test("mobile tab bar keeps its controls clear of the safe areas", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/");
   await signIn(page, "ada");
-  await page.evaluate(() => document.documentElement.style.setProperty("--safe-bottom", "24px"));
+  await page.evaluate(() => {
+    document.documentElement.style.setProperty("--safe-top", "40px");
+    document.documentElement.style.setProperty("--safe-bottom", "24px");
+  });
 
   const metrics = await page.locator(".tab-bar").evaluate((tabBar) => {
     const bounds = tabBar.getBoundingClientRect();
     const styles = getComputedStyle(tabBar);
     const main = document.querySelector("main");
+    const header = document.querySelector("header");
     const toasts = document.querySelector("#toasts");
     return {
+      position: styles.position,
       bottom: bounds.bottom,
       height: bounds.height,
+      headerHeight: header?.getBoundingClientRect().height,
+      headerPaddingTop: header ? getComputedStyle(header).paddingTop : "",
       mainPaddingBottom: main ? getComputedStyle(main).paddingBottom : "",
       paddingBottom: styles.paddingBottom,
       toastBottom: toasts ? getComputedStyle(toasts).bottom : "",
@@ -265,12 +272,30 @@ test("mobile tab bar keeps a compact 48px target above its safe-area padding", a
   });
 
   expect(metrics).toEqual({
+    position: "fixed",
     bottom: 844,
-    height: 72,
-    mainPaddingBottom: "108px",
+    height: 80,
+    headerHeight: 104,
+    headerPaddingTop: "40px",
+    mainPaddingBottom: "116px",
     paddingBottom: "24px",
-    toastBottom: "90px",
+    toastBottom: "98px",
   });
+});
+
+test("installed PWA uses Seerr-style edge-to-edge viewport and status bar metadata", async ({ page }) => {
+  await page.goto("/");
+
+  await expect(page.locator('meta[name="viewport"]')).toHaveAttribute(
+    "content",
+    "width=device-width,initial-scale=1,viewport-fit=cover",
+  );
+  await expect(page.locator('meta[name="mobile-web-app-capable"]')).toHaveAttribute("content", "yes");
+  await expect(page.locator('meta[name="apple-mobile-web-app-capable"]')).toHaveAttribute("content", "yes");
+  await expect(page.locator('meta[name="apple-mobile-web-app-status-bar-style"]')).toHaveAttribute(
+    "content",
+    "black-translucent",
+  );
 });
 
 for (const viewport of [
