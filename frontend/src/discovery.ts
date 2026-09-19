@@ -4039,7 +4039,12 @@
     $("#detail-eyebrow").textContent = "RELEASE TRACKLIST";
     $("#detail-title").textContent = data.title;
     $("#detail-subtitle").textContent = [data.artist, data.date, data.country].filter(Boolean).join(" · ");
-    data.tracks.forEach((track: JsonObject) => results.append(createCard(`${track.number}. ${track.title}`, track.artist || "")));
+    data.tracks.forEach((track: JsonObject) => {
+      const title = String(track.title || "Untitled");
+      const romanizedTitle = String(track.romanizedTitle || "").trim();
+      const displayTitle = romanizedTitle ? `${title} (${romanizedTitle})` : title;
+      results.append(createCard(`${track.number}. ${displayTitle}`, track.artist || ""));
+    });
   }
 
   const searchTypeCopy = {

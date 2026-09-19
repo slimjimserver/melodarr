@@ -999,14 +999,24 @@ def _release_detail_payload(mbid, priority, *, cache_only=False):
             RELEASE_TRACK_INCLUDES,
         ),
     )
-    tracks = [
-        {
-            "number": track.get("number", ""), "title": track.get("title", "Untitled"),
-            "length": track.get("length"),
-            "artist": " · ".join(credit.get("name", "") for credit in track.get("artist-credit", [])),
-        }
-        for medium in data.get("media", []) for track in medium.get("tracks", [])
-    ]
+    tracks = []
+    for medium in data.get("media", []):
+        for track in medium.get("tracks", []):
+            title = (
+                track.get("title")
+                or (track.get("recording") or {}).get("title")
+                or "Untitled"
+            )
+            tracks.append({
+                "number": track.get("number", ""),
+                "title": title,
+                "romanizedTitle": musicbrainz.romanized_track_title(title),
+                "length": track.get("length"),
+                "artist": " · ".join(
+                    credit.get("name", "")
+                    for credit in track.get("artist-credit", [])
+                ),
+            })
     return {
         "id": data["id"], "title": data.get("title"),
         "artist": " · ".join(credit.get("name", "") for credit in data.get("artist-credit", [])),

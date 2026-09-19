@@ -573,6 +573,15 @@ def romanized_release_group_title(group):
     if alias:
         return alias
 
+    return romanized_track_title(canonical)
+
+
+def romanized_track_title(title):
+    """Romanize a track title locally without requesting or choosing aliases."""
+    canonical = str(title or "").strip()
+    if not canonical or _is_latin_name(canonical):
+        return ""
+
     romanized = "".join(
         item["hepburn"] for item in _romanizer.convert(canonical)
     ).strip().translate(str.maketrans({"、": ",", "。": "."}))

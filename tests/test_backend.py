@@ -6812,6 +6812,12 @@ class MusicBrainzClientTests(unittest.TestCase):
             "",
         )
 
+    def test_track_title_romanizes_locally_without_using_aliases(self):
+        self.assertEqual(musicbrainz.romanized_track_title("じゃあな"), "Jaana")
+        self.assertEqual(
+            musicbrainz.romanized_track_title("more than words"), ""
+        )
+
 
 class LastFmDiscoveryTests(DatabaseTestCase):
     @patch("backend.routes.discovery.recommendation_engine.lastfm_recommendations")
@@ -8786,6 +8792,41 @@ class DiscoveryRoutesTests(DatabaseTestCase):
 
 
 class MusicRoutesTests(DatabaseTestCase):
+    @patch("backend.routes.music.track_search_index.index_release")
+    @patch("backend.routes.music.musicbrainz.get")
+    def test_release_tracklist_includes_local_romanization_without_extra_lookup(
+        self, get, index_release
+    ):
+        get.return_value = {
+            "id": "release-with-japanese-tracks",
+            "title": "Example release",
+            "artist-credit": [{"name": "ReoNa"}],
+            "media": [{"tracks": [
+                {"number": "1", "title": "じゃあな"},
+                {"number": "2", "title": "more than words"},
+                {"number": "3", "recording": {"title": "幸せ。"}},
+            ]}],
+        }
+
+        response = self.client.get(
+            "/api/music/release/release-with-japanese-tracks",
+            headers={"X-CSRF-Token": self.register()},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            [(track["title"], track["romanizedTitle"])
+             for track in response.get_json()["tracks"]],
+            [("じゃあな", "Jaana"), ("more than words", ""),
+             ("幸せ。", "Shiawase.")],
+        )
+        get.assert_called_once()
+        self.assertEqual(
+            get.call_args.args[1],
+            "recordings+artist-credits+release-groups",
+        )
+        index_release.assert_called_once()
+
     @patch("backend.routes.music.track_search_index.cached_release_groups")
     @patch("backend.routes.music.track_search_index.search_artist_tracks")
     def test_artist_track_search_returns_cached_release_group_cards(
