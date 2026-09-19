@@ -377,6 +377,7 @@ def artist_track_search(mbid):
         return api_error("Enter at least two characters.")
     matches = track_search_index.search_artist_tracks(mbid, query)
     if not matches:
+        has_snapshot = track_search_index.artist_track_snapshot_info(mbid) is not None
         escaped_query = query.replace("\\", "\\\\").replace('"', '\\"')
         words = track_search_index.normalize_text(query).split()
         clauses = [f'recording:"{escaped_query}"']
@@ -396,7 +397,11 @@ def artist_track_search(mbid):
                 limit=50,
             )
             track_search_index.index_recording_search(response)
-            matches = track_search_index.search_artist_tracks(mbid, query)
+            matches = (
+                track_search_index.recording_search_matches(response, mbid, query)
+                if has_snapshot
+                else track_search_index.search_artist_tracks(mbid, query)
+            )
         except requests.RequestException:
             # Release-title filtering remains useful when MusicBrainz is busy.
             pass
@@ -731,6 +736,7 @@ def refresh_artist_detail(mbid):
     try:
         cache_key = ("artist", mbid.casefold())
         artist_metadata_worker.refresh_artist_metadata(mbid, "critical")
+        artist_metadata_worker.request_track_refresh(mbid)
         with detail_cache.build_lock(cache_key) as generation:
             assembled = detail_cache.cached_response(cache_key)
             if assembled is not None:

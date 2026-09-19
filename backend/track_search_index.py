@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import sqlite3
+import time
 import unicodedata
 
 from pykakasi import kakasi
@@ -24,7 +25,8 @@ logger = logging.getLogger(__name__)
 # replace and prune its compact index without discarding independently known
 # Lidarr, Plex, or MusicBrainz-search records.
 # Version 6 adds alternate track-title keys without changing canonical titles.
-SCHEMA_VERSION = "6"
+# Version 7 adds independently replaceable, complete artist track snapshots.
+SCHEMA_VERSION = "7"
 SOURCE_MUSICBRAINZ = 1
 SOURCE_LIDARR = 2
 SOURCE_PLEX = 4
@@ -124,6 +126,26 @@ def initialize():
             ON track_search_title_keys (artist_mbid, search_key)
         """)
         connection.execute("""
+            CREATE TABLE IF NOT EXISTS track_search_artist_snapshot_tracks (
+                artist_mbid TEXT NOT NULL,
+                search_key TEXT NOT NULL,
+                normalized_title TEXT NOT NULL,
+                recording_mbid TEXT NOT NULL,
+                release_group_mbid TEXT NOT NULL,
+                PRIMARY KEY (artist_mbid, search_key, normalized_title,
+                             recording_mbid, release_group_mbid)
+            ) WITHOUT ROWID
+        """)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS track_search_artist_snapshot_meta (
+                artist_mbid TEXT PRIMARY KEY,
+                indexed_at REAL NOT NULL,
+                release_count INTEGER NOT NULL,
+                recording_count INTEGER NOT NULL,
+                cache_keys TEXT NOT NULL
+            ) WITHOUT ROWID
+        """)
+        connection.execute("""
             CREATE TABLE IF NOT EXISTS track_search_release_group_refs (
                 release_group_mbid TEXT NOT NULL,
                 cache_key TEXT NOT NULL,
@@ -190,9 +212,10 @@ def initialize():
         row = connection.execute(
             "SELECT value FROM track_search_meta WHERE key = 'schema-version'"
         ).fetchone()
-    if row is not None and row["value"] == "5":
+    if row is not None and row["value"] in {"5", "6"}:
         with cache_db() as connection:
-            _backfill_title_keys(connection)
+            if row["value"] == "5":
+                _backfill_title_keys(connection)
             connection.execute(
                 "INSERT OR REPLACE INTO track_search_meta (key, value) "
                 "VALUES ('schema-version', ?)",
@@ -1196,6 +1219,113 @@ def index_recording_search(response):
         )
 
 
+def artist_track_snapshot_info(artist_mbid):
+    """Read the completion marker for an artist's bulk track snapshot."""
+    try:
+        initialize()
+        with cache_db() as connection:
+            row = connection.execute(
+                "SELECT indexed_at, release_count, recording_count, cache_keys "
+                "FROM track_search_artist_snapshot_meta WHERE artist_mbid = ?",
+                (str(artist_mbid or "").casefold(),),
+            ).fetchone()
+    except (OSError, sqlite3.Error) as exc:
+        logger.warning("Local artist track snapshot lookup failed: %s", exc)
+        return None
+    return dict(row) if row else None
+
+
+def recording_search_matches(response, artist_mbid, title):
+    """Read a fresh recording-search response without trusting old local rows."""
+    artist_mbid = str(artist_mbid or "").casefold()
+    normalized = normalize_text(title)
+    if not _valid_mbid(artist_mbid) or not normalized:
+        return []
+    matches = set()
+    for recording in (response or {}).get("recordings") or []:
+        if not isinstance(recording, dict):
+            continue
+        canonical = normalize_text(recording.get("title"))
+        keys = _title_keys(recording.get("title"))
+        for alias in recording.get("aliases") or []:
+            if isinstance(alias, dict):
+                keys.update(_title_keys(alias.get("name")))
+        if not canonical or not any(
+            f" {normalized}" in f" {key}" for key in keys
+        ):
+            continue
+        for release in recording.get("releases") or []:
+            if not isinstance(release, dict):
+                continue
+            credits = _credit_artists(recording) or _credit_artists(release)
+            if artist_mbid not in {
+                str(artist.get("id") or "").casefold() for artist in credits
+            }:
+                continue
+            group_id = str((release.get("release-group") or {}).get("id") or "").casefold()
+            if _valid_mbid(group_id):
+                matches.add((canonical, group_id))
+    return [
+        {"normalized_title": normalized, "release_group_mbid": group_id}
+        for normalized, group_id in sorted(matches)
+    ]
+
+
+def replace_artist_track_snapshot(
+    artist_mbid, releases, *, release_count, recording_count, cache_keys=(),
+):
+    """Atomically replace all track-to-group links for one artist."""
+    if not _index_writable():
+        raise sqlite3.OperationalError("The local track index is unavailable.")
+    artist_mbid = str(artist_mbid or "").casefold()
+    if not _valid_mbid(artist_mbid):
+        raise ValueError("Invalid MusicBrainz artist ID.")
+    rows = set()
+    for release in releases:
+        group_id = str((release.get("release-group") or {}).get("id") or "").casefold()
+        if not _valid_mbid(group_id):
+            raise ValueError("MusicBrainz release lacks a release group.")
+        for medium in release.get("media") or []:
+            for track in medium.get("tracks") or []:
+                recording = track.get("recording") or {}
+                title = normalize_text(track.get("title") or recording.get("title"))
+                if not title:
+                    continue
+                recording_id = str(recording.get("id") or "").casefold()
+                if not _valid_mbid(recording_id):
+                    recording_id = ""
+                keys = set()
+                for entity in (track, recording):
+                    keys.update(_title_keys(entity.get("title")))
+                    for alias in entity.get("aliases") or []:
+                        if isinstance(alias, dict):
+                            keys.update(_title_keys(alias.get("name")))
+                rows.update(
+                    (artist_mbid, key, title, recording_id, group_id)
+                    for key in keys
+                )
+    with cache_db() as connection:
+        connection.execute(
+            "DELETE FROM track_search_artist_snapshot_tracks WHERE artist_mbid = ?",
+            (artist_mbid,),
+        )
+        connection.executemany(
+            "INSERT INTO track_search_artist_snapshot_tracks "
+            "(artist_mbid, search_key, normalized_title, recording_mbid, "
+            "release_group_mbid) VALUES (?, ?, ?, ?, ?)",
+            sorted(rows),
+        )
+        connection.execute(
+            "INSERT OR REPLACE INTO track_search_artist_snapshot_meta "
+            "(artist_mbid, indexed_at, release_count, recording_count, cache_keys) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                artist_mbid, time.time(), int(release_count),
+                int(recording_count), json.dumps(list(cache_keys)),
+            ),
+        )
+
+
 def index_cached_release(cache_key):
     """Backfill one cached MusicBrainz release without a provider request."""
     if not _index_writable() or not cache_key:
@@ -1393,6 +1523,20 @@ def exact_track_matches(artist_mbid, title):
     if not normalized or not _valid_mbid(artist_mbid):
         return []
     with cache_db() as connection:
+        snapshot = connection.execute(
+            "SELECT 1 FROM track_search_artist_snapshot_meta WHERE artist_mbid = ?",
+            (artist_mbid.casefold(),),
+        ).fetchone()
+        if snapshot:
+            rows = connection.execute(
+                "SELECT DISTINCT normalized_title, recording_mbid, "
+                "release_group_mbid, ? AS source_mask "
+                "FROM track_search_artist_snapshot_tracks "
+                "WHERE artist_mbid = ? AND search_key = ? "
+                "ORDER BY release_group_mbid, recording_mbid",
+                (SOURCE_MUSICBRAINZ_DISCOGRAPHY, artist_mbid.casefold(), normalized),
+            ).fetchall()
+            return [dict(row) for row in rows]
         rows = connection.execute(
             """
             SELECT relations.normalized_title, relations.recording_mbid,
@@ -1422,16 +1566,22 @@ def search_artist_tracks(artist_mbid, title):
     artist_mbid = str(artist_mbid or "").casefold()
     if not normalized or not _valid_mbid(artist_mbid):
         return []
-    terms = normalized.split()
-    conditions = " AND ".join("search_key LIKE ?" for _term in terms)
-    parameters = [artist_mbid, *(f"%{term}%" for term in terms), normalized]
+    parameters = [artist_mbid, normalized, normalized]
     try:
         with cache_db() as connection:
+            snapshot = connection.execute(
+                "SELECT 1 FROM track_search_artist_snapshot_meta WHERE artist_mbid = ?",
+                (artist_mbid,),
+            ).fetchone()
+            table = (
+                "track_search_artist_snapshot_tracks"
+                if snapshot else "track_search_title_keys"
+            )
             rows = connection.execute(
                 f"""
                 SELECT normalized_title, release_group_mbid
-                FROM track_search_title_keys
-                WHERE artist_mbid = ? AND {conditions}
+                FROM {table}
+                WHERE artist_mbid = ? AND instr(' ' || search_key, ' ' || ?) > 0
                 GROUP BY normalized_title, release_group_mbid
                 ORDER BY MIN(CASE WHEN search_key = ? THEN 0 ELSE 1 END),
                          normalized_title, release_group_mbid

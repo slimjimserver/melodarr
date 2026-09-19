@@ -149,6 +149,7 @@ class DatabaseTestCase(unittest.TestCase):
         anime_metadata_worker.wake_requested.clear()
         with artist_metadata_worker.queue_lock:
             artist_metadata_worker.queued_artist_ids.clear()
+            artist_metadata_worker.forced_track_artist_ids.clear()
             artist_metadata_worker.active_artist_phases.clear()
             artist_metadata_worker.job_state.update(
                 running=False,
@@ -202,6 +203,8 @@ class DatabaseTestCase(unittest.TestCase):
         write_settings_file({})
         with cache_db() as connection:
             connection.execute("DELETE FROM api_cache")
+            connection.execute("DELETE FROM track_search_artist_snapshot_tracks")
+            connection.execute("DELETE FROM track_search_artist_snapshot_meta")
 
     def register(self):
         response = self.client.post(
@@ -871,21 +874,27 @@ class ArtistMetadataWorkerTests(DatabaseTestCase):
         )
         cached_page.assert_called_once_with(self.artist_id)
 
+    @patch("backend.workers.artist_metadata.track_search_index.artist_track_snapshot_info")
+    @patch("backend.workers.artist_metadata.musicbrainz.artist_entity_counts")
     @patch("backend.workers.artist_metadata.musicbrainz.get")
-    def test_equal_count_records_check_without_full_refresh(self, get):
-        get.side_effect = [
-            {"release-groups": [{"id": "cached"}], "release-group-count": 1},
-            {"release-groups": [{"id": "live"}], "release-group-count": 1},
-        ]
+    def test_equal_count_records_check_without_full_refresh(
+        self, get, counts, snapshot,
+    ):
+        get.return_value = {
+            "release-groups": [{"id": "cached"}], "release-group-count": 1,
+        }
+        counts.return_value = {
+            "releaseGroupCount": 1, "releaseCount": 2, "recordingCount": 3,
+        }
+        snapshot.return_value = {
+            "release_count": 2, "recording_count": 3,
+            "indexed_at": time.time(),
+        }
 
         artist_metadata_worker._process_artist(self.artist_id)
 
-        self.assertEqual(get.call_count, 2)
-        probe = get.call_args_list[1]
-        self.assertEqual(probe.args, ("/release-group", ""))
-        self.assertEqual(probe.kwargs["limit"], 1)
-        self.assertTrue(probe.kwargs["force_refresh"])
-        self.assertEqual(probe.kwargs["priority"], "background")
+        get.assert_called_once()
+        counts.assert_called_once_with(self.artist_id, priority="background")
         state = get_cache_document(
             artist_metadata_worker.STATE_NAMESPACE,
             self.artist_id,
@@ -901,6 +910,32 @@ class ArtistMetadataWorkerTests(DatabaseTestCase):
         self.assertEqual(result["status"], "unchanged")
         get.assert_not_called()
 
+    @patch("backend.workers.artist_metadata._refresh_artist_tracks")
+    @patch("backend.workers.artist_metadata.track_search_index.artist_track_snapshot_info")
+    @patch("backend.workers.artist_metadata.musicbrainz.artist_entity_counts")
+    @patch("backend.workers.artist_metadata.musicbrainz.get")
+    def test_recording_count_change_rebuilds_tracks_without_album_refresh(
+        self, get, counts, snapshot, refresh_tracks,
+    ):
+        get.return_value = {"release-groups": [], "release-group-count": 0}
+        counts.return_value = {
+            "releaseGroupCount": 0, "releaseCount": 1, "recordingCount": 2,
+        }
+        snapshot.return_value = {
+            "release_count": 1, "recording_count": 1,
+            "indexed_at": time.time(),
+        }
+
+        artist_metadata_worker._process_artist(self.artist_id)
+
+        refresh_tracks.assert_called_once_with(self.artist_id, counts.return_value)
+        get.assert_called_once()
+        self.assertEqual(
+            get_cache_document(
+                artist_metadata_worker.STATE_NAMESPACE, self.artist_id,
+            )["outcome"], "unchanged",
+        )
+
     def test_newly_cached_discography_does_not_trigger_redundant_probe(self):
         page = {"release-groups": [], "release-group-count": 0}
         commit_json_responses([musicbrainz.metadata_cache_record(
@@ -914,23 +949,39 @@ class ArtistMetadataWorkerTests(DatabaseTestCase):
 
         result = artist_metadata_worker.request_revalidation(self.artist_id)
 
-        self.assertFalse(result["polling"])
-        self.assertEqual(result["status"], "unchanged")
-        self.assertEqual(artist_metadata_worker.queued_artist_ids, set())
-        state = get_cache_document(
-            artist_metadata_worker.STATE_NAMESPACE,
-            self.artist_id,
+        self.assertTrue(result["polling"])
+        self.assertEqual(result["status"], "queued")
+        self.assertEqual(
+            artist_metadata_worker.forced_track_artist_ids, {self.artist_id},
         )
-        self.assertEqual(state["cachedCount"], 0)
+
+    @patch("backend.workers.artist_metadata._cached_discography_page")
+    def test_failed_initial_track_build_honors_retry_cooldown(self, cached_page):
+        cached_page.return_value = {
+            "release-groups": [], "release-group-count": 0,
+        }
+        artist_metadata_worker._record_failure(self.artist_id)
+
+        result = artist_metadata_worker.request_revalidation(self.artist_id)
+
+        self.assertFalse(result["polling"])
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(artist_metadata_worker.queued_artist_ids, set())
 
     @patch(
         "backend.workers.artist_metadata.track_search_index."
         "replace_musicbrainz_artist_discography"
     )
+    @patch("backend.workers.artist_metadata._refresh_artist_tracks")
+    @patch("backend.workers.artist_metadata.musicbrainz.artist_entity_counts")
     @patch("backend.workers.artist_metadata.musicbrainz.get")
     def test_changed_count_refreshes_pages_then_artist_and_removes_old_pages(
-        self, get, replace_discography
+        self, get, counts, refresh_tracks, replace_discography
     ):
+        counts.return_value = {
+            "releaseGroupCount": 102, "releaseCount": 120,
+            "recordingCount": 130,
+        }
         old_offset = 200
         old_key = musicbrainz.metadata_cache_key(
             "/release-group",
@@ -957,7 +1008,6 @@ class ArtistMetadataWorkerTests(DatabaseTestCase):
         ]
         get.side_effect = [
             {"release-groups": [], "release-group-count": 201},
-            {"release-groups": [], "release-group-count": 102},
             {
                 "release-groups": first_page_groups,
                 "release-group-count": 102,
@@ -981,18 +1031,18 @@ class ArtistMetadataWorkerTests(DatabaseTestCase):
             "/release-group",
             "/release-group",
             "/release-group",
-            "/release-group",
             f"/artist/{self.artist_id}",
         ])
-        staged_calls = get.call_args_list[2:]
+        staged_calls = get.call_args_list[1:]
         self.assertTrue(all(
             call.kwargs["priority"] == "background"
             and call.kwargs["force_refresh"]
             and not call.kwargs["cache_response"]
             for call in staged_calls
         ))
-        self.assertEqual(get.call_args_list[2].kwargs["offset"], 0)
-        self.assertEqual(get.call_args_list[3].kwargs["offset"], 100)
+        self.assertEqual(get.call_args_list[1].kwargs["offset"], 0)
+        self.assertEqual(get.call_args_list[2].kwargs["offset"], 100)
+        refresh_tracks.assert_called_once_with(self.artist_id, counts.return_value)
         self.assertIsNone(self._cache_value(old_key))
 
         artist_key = musicbrainz.metadata_cache_key(
@@ -1117,6 +1167,80 @@ class ArtistMetadataWorkerTests(DatabaseTestCase):
             state["nextCheckAt"],
             1_000
             + artist_metadata_worker.MUSICBRAINZ_ARTIST_REVALIDATION_RETRY_INTERVAL,
+        )
+
+    @patch("backend.workers.artist_metadata.musicbrainz.get")
+    def test_track_refresh_advances_by_actual_release_page_size(self, get):
+        group_id = "22222222-2222-4222-8222-222222222222"
+        releases = [
+            {
+                "id": f"44444444-4444-4444-8444-{number:012d}",
+                "release-group": {"id": group_id},
+                "media": [{"tracks": [{
+                    "title": "じゃあな",
+                    "recording": {
+                        "id": "33333333-3333-4333-8333-333333333333",
+                        "title": "じゃあな",
+                    },
+                }]}],
+            }
+            for number in range(2)
+        ]
+        get.side_effect = [
+            {"release-count": 2, "releases": releases[:1]},
+            {"release-count": 2, "releases": releases[1:]},
+        ]
+
+        artist_metadata_worker._refresh_artist_tracks(
+            self.artist_id, {"recordingCount": 1},
+        )
+
+        self.assertEqual(
+            [call.kwargs["offset"] for call in get.call_args_list], [0, 1],
+        )
+        self.assertEqual(
+            track_search_index.artist_track_snapshot_info(self.artist_id)[
+                "release_count"
+            ], 2,
+        )
+        self.assertEqual(
+            track_search_index.search_artist_tracks(self.artist_id, "jaana"),
+            [{
+                "normalized_title": track_search_index.normalize_text("じゃあな"),
+                "release_group_mbid": group_id,
+            }],
+        )
+
+    @patch("backend.workers.artist_metadata.musicbrainz.get")
+    def test_incomplete_track_refresh_keeps_previous_snapshot(self, get):
+        group_id = "22222222-2222-4222-8222-222222222222"
+        old_release = {
+            "id": "44444444-4444-4444-8444-444444444444",
+            "release-group": {"id": group_id},
+            "media": [{"tracks": [{"title": "Old song"}]}],
+        }
+        track_search_index.replace_artist_track_snapshot(
+            self.artist_id, [old_release],
+            release_count=1, recording_count=1,
+        )
+        get.side_effect = [
+            {"release-count": 2, "releases": [old_release]},
+            requests.Timeout("second page timed out"),
+        ]
+
+        with self.assertRaises(requests.Timeout):
+            artist_metadata_worker._refresh_artist_tracks(
+                self.artist_id, {"recordingCount": 2},
+            )
+
+        self.assertEqual(
+            track_search_index.search_artist_tracks(self.artist_id, "Old song"),
+            [{"normalized_title": "old song", "release_group_mbid": group_id}],
+        )
+        self.assertEqual(
+            track_search_index.artist_track_snapshot_info(self.artist_id)[
+                "recording_count"
+            ], 1,
         )
 
 
@@ -6447,6 +6571,38 @@ class MusicBrainzClientTests(unittest.TestCase):
         if hasattr(musicbrainz._session_state, "session"):
             del musicbrainz._session_state.session
 
+    @patch("backend.services.musicbrainz._wait_for_request_slot")
+    @patch("backend.services.musicbrainz._http_get")
+    @patch("backend.services.musicbrainz.configuration")
+    def test_artist_count_probe_uses_one_paced_xml_lookup(
+        self, configuration, http_get, wait_for_slot,
+    ):
+        mbid = "11111111-1111-4111-8111-111111111111"
+        configuration.return_value = {
+            "baseUrl": "https://musicbrainz.org/ws/2",
+            "userAgent": "Melodarr Test/1.0",
+            "requestIntervalMs": 1100,
+        }
+        http_get.return_value = Response(content=(
+            f'<metadata xmlns="http://musicbrainz.org/ns/mmd-2.0#">'
+            f'<artist id="{mbid}">'
+            '<release-group-list count="57"/>'
+            '<release-list count="181"/>'
+            '<recording-list count="357"/>'
+            '</artist></metadata>'
+        ).encode())
+
+        result = musicbrainz.artist_entity_counts(mbid)
+
+        self.assertEqual(result, {
+            "releaseGroupCount": 57,
+            "releaseCount": 181,
+            "recordingCount": 357,
+        })
+        wait_for_slot.assert_called_once_with("background", 1.1)
+        http_get.assert_called_once()
+        self.assertEqual(http_get.call_args.kwargs["params"]["fmt"], "xml")
+
     @patch("backend.services.musicbrainz.get_service")
     def test_configuration_normalizes_self_hosted_settings(self, get_service):
         get_service.return_value = {
@@ -7569,6 +7725,8 @@ class LocalTrackSearchIndexTests(unittest.TestCase):
         api_cache.init_cache_db()
         track_search_index.initialize()
         with api_cache.cache_db() as connection:
+            connection.execute("DELETE FROM track_search_artist_snapshot_tracks")
+            connection.execute("DELETE FROM track_search_artist_snapshot_meta")
             connection.execute("DELETE FROM track_search_artist_names")
             connection.execute("DELETE FROM track_search_relations")
             connection.execute("DELETE FROM track_search_title_keys")
@@ -7583,6 +7741,8 @@ class LocalTrackSearchIndexTests(unittest.TestCase):
 
     def tearDown(self):
         with api_cache.cache_db() as connection:
+            connection.execute("DELETE FROM track_search_artist_snapshot_tracks")
+            connection.execute("DELETE FROM track_search_artist_snapshot_meta")
             connection.execute("DELETE FROM track_search_artist_names")
             connection.execute("DELETE FROM track_search_relations")
             connection.execute("DELETE FROM track_search_title_keys")
@@ -7798,7 +7958,7 @@ class LocalTrackSearchIndexTests(unittest.TestCase):
 
         matches = track_search_index.search_artist_tracks(
             self.artist_mbid,
-            "more words",
+            "more than words",
         )
 
         self.assertEqual(
@@ -7806,11 +7966,86 @@ class LocalTrackSearchIndexTests(unittest.TestCase):
             {self.release_group_mbid, single_group_id},
         )
         self.assertEqual(
+            track_search_index.search_artist_tracks(self.artist_mbid, "more words"),
+            [],
+        )
+        self.assertEqual(
             track_search_index.search_artist_tracks(
                 self.second_artist_mbid,
-                "more words",
+                "more than words",
             ),
             [],
+        )
+
+    def test_artist_track_lookup_matches_contiguous_phrase_in_both_indexes(self):
+        releases = []
+        for number, title in enumerate(
+            ("Calling My Name", "SMALL TOWN FAME", "Call Me", "All Me"),
+            start=1,
+        ):
+            release = self._release()
+            release["id"] = f"44444444-4444-4444-8444-{number:012d}"
+            release["release-group"]["id"] = (
+                f"22222222-2222-4222-8222-{number:012d}"
+            )
+            release["title"] = f"Phrase regression {number}"
+            release["release-group"]["title"] = release["title"]
+            track = release["media"][0]["tracks"][0]
+            track["title"] = title
+            track["recording"]["title"] = title
+            track["recording"]["id"] = (
+                f"33333333-3333-4333-8333-{number:012d}"
+            )
+            releases.append(release)
+            track_search_index.index_release(
+                release, f"track-search-test:phrase:{number}",
+            )
+
+        expected_group = releases[-1]["release-group"]["id"]
+        for has_snapshot in (False, True):
+            with self.subTest(has_snapshot=has_snapshot):
+                if has_snapshot:
+                    track_search_index.replace_artist_track_snapshot(
+                        self.artist_mbid, releases,
+                        release_count=4, recording_count=4,
+                    )
+                for query in ("All me", "all m"):
+                    self.assertEqual(
+                        [match["release_group_mbid"] for match in
+                         track_search_index.search_artist_tracks(
+                             self.artist_mbid, query,
+                         )],
+                        [expected_group],
+                    )
+                self.assertEqual(
+                    track_search_index.search_artist_tracks(
+                        self.artist_mbid, "me all",
+                    ),
+                    [],
+                )
+
+    def test_artist_recording_fallback_requires_contiguous_phrase(self):
+        recordings = []
+        for number, title in enumerate(
+            ("Calling My Name", "SMALL TOWN FAME", "Call Me", "All Me"),
+            start=1,
+        ):
+            recordings.append({
+                "title": title,
+                "artist-credit": self._group()["artist-credit"],
+                "releases": [{"release-group": {
+                    "id": f"22222222-2222-4222-8222-{number:012d}",
+                }}],
+            })
+
+        self.assertEqual(
+            track_search_index.recording_search_matches(
+                {"recordings": recordings}, self.artist_mbid, "All me",
+            ),
+            [{
+                "normalized_title": "all me",
+                "release_group_mbid": "22222222-2222-4222-8222-000000000004",
+            }],
         )
 
     def test_recording_search_populates_track_release_group_relations(self):
@@ -8792,6 +9027,62 @@ class DiscoveryRoutesTests(DatabaseTestCase):
 
 
 class MusicRoutesTests(DatabaseTestCase):
+    @patch("backend.routes.music.musicbrainz.search")
+    def test_complete_artist_track_snapshot_still_searches_musicbrainz_on_miss(
+        self, search,
+    ):
+        artist_id = "11111111-1111-4111-8111-111111111111"
+        search.return_value = {"recordings": []}
+        track_search_index.replace_artist_track_snapshot(
+            artist_id, [], release_count=0, recording_count=0,
+        )
+
+        response = self.client.get(
+            f"/api/music/artist/{artist_id}/tracks?q=Unknown",
+            headers={"X-CSRF-Token": self.register()},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["candidateCount"], 0)
+        search.assert_called_once()
+
+    @patch("backend.routes.music.track_search_index.cached_release_groups")
+    @patch("backend.routes.music.musicbrainz.search")
+    def test_snapshot_miss_can_find_guest_release_from_fresh_response(
+        self, search, cached_groups,
+    ):
+        artist_id = "11111111-1111-4111-8111-111111111111"
+        group_id = "22222222-2222-4222-8222-222222222222"
+        track_search_index.replace_artist_track_snapshot(
+            artist_id, [], release_count=0, recording_count=1,
+        )
+        search.return_value = {"recordings": [{
+            "id": "33333333-3333-4333-8333-333333333333",
+            "title": "Guest song",
+            "artist-credit": [{
+                "name": "Artist", "artist": {"id": artist_id},
+            }],
+            "releases": [{
+                "id": "44444444-4444-4444-8444-444444444444",
+                "release-group": {"id": group_id, "title": "Compilation"},
+            }],
+        }]}
+        cached_groups.return_value = {
+            group_id: {
+                "id": group_id, "title": "Compilation",
+                "primary-type": "Album", "secondary-types": [],
+            },
+        }
+
+        response = self.client.get(
+            f"/api/music/artist/{artist_id}/tracks?q=Guest%20song",
+            headers={"X-CSRF-Token": self.register()},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["candidateCount"], 1)
+        self.assertEqual(response.get_json()["results"][0]["id"], group_id)
+
     @patch("backend.routes.music.track_search_index.index_release")
     @patch("backend.routes.music.musicbrainz.get")
     def test_release_tracklist_includes_local_romanization_without_extra_lookup(
