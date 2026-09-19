@@ -512,7 +512,7 @@ def _artist_detail_payload(
         if data is None:
             return None
         track_search_index.index_artist(data)
-        raw_groups, offset = [], 0
+        raw_groups, index_pages, offset = [], [], 0
         while True:
             page = musicbrainz.get(
                 "/release-group", "aliases", priority=priority,
@@ -522,7 +522,7 @@ def _artist_detail_payload(
             )
             if page is None:
                 return None
-            track_search_index.index_release_group_page(
+            index_pages.append((
                 page,
                 musicbrainz.metadata_cache_key(
                     "/release-group",
@@ -531,13 +531,17 @@ def _artist_detail_payload(
                     limit=100,
                     offset=offset,
                 ),
-            )
+            ))
             batch = page.get("release-groups", [])
             raw_groups.extend(batch)
             total = page.get("release-group-count", len(raw_groups))
             if offset + len(batch) >= total or not batch:
                 break
             offset += len(batch)
+        track_search_index.replace_musicbrainz_artist_discography(
+            mbid,
+            index_pages,
+        )
     plex_groups = _plex_release_group_inventory()
     lidarr_groups = lidarr.cached_library_availability()
     download_groups = _download_snapshot()

@@ -923,9 +923,13 @@ class ArtistMetadataWorkerTests(DatabaseTestCase):
         )
         self.assertEqual(state["cachedCount"], 0)
 
+    @patch(
+        "backend.workers.artist_metadata.track_search_index."
+        "replace_musicbrainz_artist_discography"
+    )
     @patch("backend.workers.artist_metadata.musicbrainz.get")
     def test_changed_count_refreshes_pages_then_artist_and_removes_old_pages(
-        self, get
+        self, get, replace_discography
     ):
         old_offset = 200
         old_key = musicbrainz.metadata_cache_key(
@@ -1006,6 +1010,42 @@ class ArtistMetadataWorkerTests(DatabaseTestCase):
         self.assertEqual(state["outcome"], "refreshed")
         self.assertEqual(state["cachedCount"], 102)
         self.assertEqual(state["observedCount"], 102)
+        replace_discography.assert_called_once()
+        self.assertEqual(replace_discography.call_args.args[0], self.artist_id)
+        self.assertEqual(len(replace_discography.call_args.args[1]), 2)
+        self.assertIn(
+            old_key,
+            replace_discography.call_args.kwargs["obsolete_cache_keys"],
+        )
+
+    @patch(
+        "backend.workers.artist_metadata.track_search_index."
+        "replace_musicbrainz_artist_discography",
+        side_effect=sqlite3.OperationalError("index is busy"),
+    )
+    @patch("backend.workers.artist_metadata.commit_json_responses")
+    @patch(
+        "backend.workers.artist_metadata._stage_artist_refresh",
+        return_value=([], set(), 2, []),
+    )
+    def test_index_reconciliation_failure_does_not_discard_completed_refresh(
+        self, stage_refresh, commit_responses, replace_discography
+    ):
+        result = artist_metadata_worker.refresh_artist_metadata(
+            self.artist_id,
+            "background",
+            cached_count=1,
+        )
+
+        self.assertEqual(result["count"], 2)
+        commit_responses.assert_called_once_with([], delete_keys=set())
+        replace_discography.assert_called_once()
+        state = get_cache_document(
+            artist_metadata_worker.STATE_NAMESPACE,
+            self.artist_id,
+        )
+        self.assertEqual(state["outcome"], "refreshed")
+        self.assertEqual(state["cachedCount"], 2)
 
     @patch("backend.workers.artist_metadata.musicbrainz.get")
     def test_failed_staged_refresh_preserves_previous_cache(self, get):
@@ -7948,12 +7988,14 @@ class LocalAlbumSearchIndexTests(unittest.TestCase):
         api_cache.init_cache_db()
         track_search_index.initialize()
         with api_cache.cache_db() as connection:
+            connection.execute("DELETE FROM track_search_artist_discography_groups")
             connection.execute("DELETE FROM track_search_release_group_artists")
             connection.execute("DELETE FROM track_search_release_groups")
             connection.execute("DELETE FROM track_search_artist_names")
 
     def tearDown(self):
         with api_cache.cache_db() as connection:
+            connection.execute("DELETE FROM track_search_artist_discography_groups")
             connection.execute("DELETE FROM track_search_release_group_artists")
             connection.execute("DELETE FROM track_search_release_groups")
             connection.execute("DELETE FROM track_search_artist_names")
@@ -7986,9 +8028,10 @@ class LocalAlbumSearchIndexTests(unittest.TestCase):
             "artist-credit": [{"name": artist["name"], "artist": artist}],
         }
 
-    def _search(self, query):
+    def _search(self, query, *, musicbrainz=False):
         app = Flask(__name__)
-        with app.test_request_context(f"/api/search?q={query}&type=album"):
+        direct = "&musicbrainz=1" if musicbrainz else ""
+        with app.test_request_context(f"/api/search?q={query}&type=album{direct}"):
             return discovery.search.__wrapped__()
 
     @patch("backend.routes.discovery.musicbrainz.search")
@@ -8000,7 +8043,10 @@ class LocalAlbumSearchIndexTests(unittest.TestCase):
             coldplay,
             date="2000-07-10",
         )
-        track_search_index.index_release_groups([group])
+        track_search_index.index_release_groups(
+            [group],
+            source_mask=track_search_index.SOURCE_LIDARR,
+        )
 
         response = self._search("Parachutes")
 
@@ -8008,14 +8054,51 @@ class LocalAlbumSearchIndexTests(unittest.TestCase):
         result = response.get_json()["results"][0]
         self.assertEqual(result["id"], group["id"])
         self.assertEqual(result["artist"], "Coldplay")
+        self.assertEqual(response.get_json()["source"], "local")
         self.assertEqual(
             result["coverArt"],
             f"/api/artwork/release-group/{group['id']}?size=thumb",
         )
         search.assert_not_called()
 
+    @patch("backend.routes.discovery.artist_metadata_worker.request_revalidation")
     @patch("backend.routes.discovery.musicbrainz.search")
-    def test_artist_qualified_and_romanized_album_searches_are_local(self, search):
+    def test_explicit_musicbrainz_search_bypasses_local_hit(
+        self, search, request_revalidation
+    ):
+        coldplay = self._artist(self.coldplay_mbid, "Coldplay")
+        other = self._artist(self.other_mbid, "Other Artist")
+        local = self._group(
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "Parachutes",
+            coldplay,
+        )
+        remote = self._group(
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "Parachutes",
+            other,
+        )
+        track_search_index.index_release_groups(
+            [local], source_mask=track_search_index.SOURCE_LIDARR
+        )
+        search.return_value = {"release-groups": [remote]}
+
+        initial = self._search("Parachutes%20Coldplay")
+        direct = self._search("Parachutes%20Coldplay", musicbrainz=True)
+
+        self.assertEqual(initial.get_json()["source"], "local")
+        self.assertEqual(direct.status_code, 200)
+        self.assertEqual(direct.get_json()["source"], "musicbrainz")
+        self.assertEqual(direct.get_json()["results"][0]["id"], remote["id"])
+        search.assert_called_once()
+        self.assertEqual(search.call_args.args[1], "album")
+        request_revalidation.assert_called_once_with(self.coldplay_mbid)
+
+    @patch("backend.routes.discovery.artist_metadata_worker.request_revalidation")
+    @patch("backend.routes.discovery.musicbrainz.search")
+    def test_artist_qualified_and_romanized_album_searches_are_local(
+        self, search, request_revalidation
+    ):
         hitsuji = self._artist(
             self.hitsuji_mbid,
             "羊文学",
@@ -8037,6 +8120,8 @@ class LocalAlbumSearchIndexTests(unittest.TestCase):
         self.assertEqual(spaced.get_json()["results"][0]["id"], group["id"])
         self.assertEqual(canonical.get_json()["results"][0]["id"], group["id"])
         search.assert_not_called()
+        self.assertEqual(request_revalidation.call_count, 2)
+        request_revalidation.assert_any_call(self.hitsuji_mbid)
 
     @patch("backend.routes.discovery.musicbrainz.search")
     def test_soundtrack_intent_requires_matching_local_metadata(self, search):
@@ -8062,7 +8147,10 @@ class LocalAlbumSearchIndexTests(unittest.TestCase):
         search.assert_called_once()
 
         search.reset_mock()
-        track_search_index.index_release_groups([soundtrack])
+        track_search_index.index_release_groups(
+            [soundtrack],
+            source_mask=track_search_index.SOURCE_LIDARR,
+        )
         local = self._search("The%20Odyssey%20soundtrack")
 
         self.assertEqual(local.get_json()["results"][0]["id"], soundtrack["id"])
@@ -8113,7 +8201,7 @@ class LocalAlbumSearchIndexTests(unittest.TestCase):
         search.assert_called_once()
 
     @patch("backend.routes.discovery.musicbrainz.search")
-    def test_remote_album_candidates_are_indexed_for_the_next_search(self, search):
+    def test_remote_album_candidates_enable_specific_local_followup(self, search):
         coldplay = self._artist(self.coldplay_mbid, "Coldplay")
         group = self._group(
             "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -8127,11 +8215,144 @@ class LocalAlbumSearchIndexTests(unittest.TestCase):
         search.assert_called_once()
 
         search.reset_mock()
-        second = self._search("A%20Rush%20of%20Blood%20to%20the%20Head")
+        second = self._search(
+            "A%20Rush%20of%20Blood%20to%20the%20Head%20Coldplay"
+        )
 
         self.assertEqual(second.get_json()["results"][0]["id"], group["id"])
         search.assert_not_called()
         self.assertEqual(track_search_index.stats()["releaseGroupRows"], 1)
+
+    @patch("backend.routes.discovery.musicbrainz.search")
+    def test_generic_title_does_not_short_circuit_from_local_rows(self, search):
+        artist = self._artist(self.coldplay_mbid, "Example Artist")
+        track_search_index.index_release_groups(
+            [self._group(
+                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                "Greatest Hits",
+                artist,
+            )],
+            source_mask=track_search_index.SOURCE_LIDARR,
+        )
+        search.return_value = {"release-groups": []}
+
+        response = self._search("Greatest%20Hits")
+
+        self.assertEqual(response.status_code, 200)
+        search.assert_called_once()
+
+    @patch(
+        "backend.routes.discovery.artist_metadata_worker.discography_is_fresh",
+        return_value=True,
+    )
+    @patch("backend.routes.discovery.musicbrainz.search")
+    def test_fresh_complete_discography_allows_distinctive_title_fast_path(
+        self, search, discography_is_fresh
+    ):
+        coldplay = self._artist(self.coldplay_mbid, "Coldplay")
+        group = self._group(
+            "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            "Parachutes",
+            coldplay,
+        )
+        track_search_index.replace_musicbrainz_artist_discography(
+            self.coldplay_mbid,
+            [({"release-groups": [group]}, "discography-page")],
+        )
+
+        response = self._search("Parachutes")
+
+        self.assertEqual(response.get_json()["results"][0]["id"], group["id"])
+        search.assert_not_called()
+        discography_is_fresh.assert_called_once_with(self.coldplay_mbid)
+
+    @patch(
+        "backend.routes.discovery.artist_metadata_worker.discography_is_fresh",
+        return_value=False,
+    )
+    @patch("backend.routes.discovery.musicbrainz.search")
+    def test_stale_discography_title_falls_back_to_musicbrainz(
+        self, search, discography_is_fresh
+    ):
+        coldplay = self._artist(self.coldplay_mbid, "Coldplay")
+        track_search_index.replace_musicbrainz_artist_discography(
+            self.coldplay_mbid,
+            [({"release-groups": [self._group(
+                "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+                "Parachutes",
+                coldplay,
+            )]}, "discography-page")],
+        )
+        search.return_value = {"release-groups": []}
+
+        response = self._search("Parachutes")
+
+        self.assertEqual(response.status_code, 200)
+        search.assert_called_once()
+        discography_is_fresh.assert_called_once_with(self.coldplay_mbid)
+
+    @patch("backend.routes.discovery.musicbrainz.search")
+    def test_album_query_length_is_bounded(self, search):
+        response, status = self._search("a" * 201)
+
+        self.assertEqual(status, 400)
+        self.assertIn("200 characters", response.get_json()["error"])
+        search.assert_not_called()
+
+    def test_artist_discography_replacement_prunes_only_musicbrainz_rows(self):
+        artist = self._artist(self.coldplay_mbid, "Coldplay")
+        retained = self._group(
+            "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+            "Retained",
+            artist,
+        )
+        removed = self._group(
+            "ffffffff-ffff-4fff-8fff-ffffffffffff",
+            "Removed",
+            artist,
+        )
+        replacement = self._group(
+            "12121212-1212-4212-8212-121212121212",
+            "Replacement",
+            artist,
+        )
+        track_search_index.replace_musicbrainz_artist_discography(
+            self.coldplay_mbid,
+            [({"release-groups": [retained, removed]}, "old-page")],
+        )
+        track_search_index.index_release_groups(
+            [removed],
+            source_mask=track_search_index.SOURCE_LIDARR,
+        )
+
+        track_search_index.replace_musicbrainz_artist_discography(
+            self.coldplay_mbid,
+            [({"release-groups": [retained, replacement]}, "new-page")],
+            obsolete_cache_keys={"old-page"},
+        )
+
+        self.assertEqual(
+            [group["id"] for group in track_search_index.search_release_groups(
+                "Retained"
+            )],
+            [retained["id"]],
+        )
+        self.assertEqual(
+            [group["id"] for group in track_search_index.search_release_groups(
+                "Replacement"
+            )],
+            [replacement["id"]],
+        )
+        preserved = track_search_index.search_release_groups("Removed")
+        self.assertEqual([group["id"] for group in preserved], [removed["id"]])
+        self.assertEqual(
+            preserved[0]["sourceMask"],
+            track_search_index.SOURCE_LIDARR,
+        )
+        self.assertEqual(
+            track_search_index.stats()["artistDiscographyRows"],
+            2,
+        )
 
     def test_compact_index_deduplicates_and_removes_stale_lidarr_groups(self):
         payload = {

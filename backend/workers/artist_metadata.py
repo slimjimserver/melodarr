@@ -9,11 +9,11 @@ from threading import Event, Lock
 import requests
 
 if __package__ == "backend.workers":
-    from .. import detail_cache
+    from .. import detail_cache, track_search_index
     from ..api_cache import (
         commit_json_responses,
-        get_cache_expiry,
         get_cache_document,
+        get_cache_expiry,
         set_cache_document,
     )
     from ..config import (
@@ -24,10 +24,11 @@ if __package__ == "backend.workers":
     from ..services import musicbrainz
 else:
     import detail_cache
+    import track_search_index
     from api_cache import (
         commit_json_responses,
-        get_cache_expiry,
         get_cache_document,
+        get_cache_expiry,
         set_cache_document,
     )
     from config import (
@@ -129,6 +130,27 @@ def status(mbid):
     return _public_status(mbid)
 
 
+def discography_is_fresh(mbid):
+    """Return whether a complete cached artist snapshot is within its check window."""
+    mbid = str(mbid or "").casefold()
+    now = time.time()
+    state = _read_state(mbid)
+    if (
+        state.get("outcome") in {"unchanged", "refreshed"}
+        and float(state.get("nextCheckAt") or 0) > now
+    ):
+        return True
+    if state:
+        return False
+    if _cached_discography_page(mbid) is None:
+        return False
+    expires_at = _discography_cache_expiry(mbid)
+    if expires_at is None:
+        return False
+    cached_at = expires_at - MUSICBRAINZ_METADATA_CACHE_TTL
+    return cached_at + MUSICBRAINZ_ARTIST_REVALIDATION_INTERVAL > now
+
+
 def request_revalidation(mbid):
     """Queue an eligible cached artist, coalescing duplicate click requests."""
     mbid = mbid.casefold()
@@ -223,6 +245,7 @@ def _artist_refresh_lock(mbid):
 
 def _stage_artist_refresh(mbid, priority, old_count):
     records = []
+    index_pages = []
     raw_group_ids = []
     expected_total = None
     offset = 0
@@ -255,13 +278,24 @@ def _stage_artist_refresh(mbid, priority, old_count):
                 raise requests.RequestException(
                     "MusicBrainz returned an invalid release-group page."
                 )
-            records.append(musicbrainz.metadata_cache_record(
+            record = musicbrainz.metadata_cache_record(
                 "/release-group",
                 "aliases",
                 page,
                 artist=mbid,
                 limit=100,
                 offset=offset,
+            )
+            records.append(record)
+            index_pages.append((
+                page,
+                musicbrainz.metadata_cache_key(
+                    "/release-group",
+                    "aliases",
+                    artist=mbid,
+                    limit=100,
+                    offset=offset,
+                ),
             ))
             raw_group_ids.extend(
                 group.get("id") for group in batch if group.get("id")
@@ -325,7 +359,7 @@ def _stage_artist_refresh(mbid, priority, old_count):
         )
         for page_offset in new_offsets
     }
-    return records, old_keys - new_keys, expected_total
+    return records, old_keys - new_keys, expected_total, index_pages
 
 
 def refresh_artist_metadata(mbid, priority, *, cached_count=None):
@@ -339,7 +373,7 @@ def refresh_artist_metadata(mbid, priority, *, cached_count=None):
                 if cached_page is not None
                 else 0
             )
-        records, obsolete_keys, total = _stage_artist_refresh(
+        records, obsolete_keys, total, index_pages = _stage_artist_refresh(
             mbid,
             priority,
             cached_count,
@@ -352,6 +386,19 @@ def refresh_artist_metadata(mbid, priority, *, cached_count=None):
                 raise requests.RequestException(
                     "Melodarr could not commit the refreshed metadata cache."
                 ) from exc
+            try:
+                track_search_index.replace_musicbrainz_artist_discography(
+                    mbid,
+                    index_pages,
+                    obsolete_cache_keys=obsolete_keys,
+                )
+            except (OSError, sqlite3.Error, ValueError) as exc:
+                logger.warning(
+                    "Refreshed MusicBrainz metadata for %s, but could not reconcile "
+                    "the local album-search index; it will retry on the next artist load: %s",
+                    mbid,
+                    exc,
+                )
             detail_cache.invalidate(cache_key)
         refreshed_at = time.time()
         _write_state(

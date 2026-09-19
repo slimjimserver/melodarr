@@ -17,13 +17,17 @@ else:  # Support the existing `python backend/app.py` entry point.
 
 logger = logging.getLogger(__name__)
 
-# Version 4 can attach legacy release payloads, which omitted `release-group`,
-# to one unambiguous cached group by artist and normalized release title.
-SCHEMA_VERSION = "4"
+# Version 5 tracks complete artist-discography membership separately from
+# opportunistic MusicBrainz search results. This lets a refreshed artist page
+# replace and prune its compact index without discarding independently known
+# Lidarr, Plex, or MusicBrainz-search records.
+SCHEMA_VERSION = "5"
 SOURCE_MUSICBRAINZ = 1
 SOURCE_LIDARR = 2
 SOURCE_PLEX = 4
 SOURCE_ALIAS_FALLBACK = 8
+SOURCE_MUSICBRAINZ_DISCOGRAPHY = 16
+SOURCE_MUSICBRAINZ_MASK = SOURCE_MUSICBRAINZ | SOURCE_MUSICBRAINZ_DISCOGRAPHY
 _initialized = False
 
 
@@ -135,6 +139,17 @@ def initialize():
             ON track_search_release_group_artists
                 (artist_mbid, release_group_mbid)
         """)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS track_search_artist_discography_groups (
+                artist_mbid TEXT NOT NULL,
+                release_group_mbid TEXT NOT NULL,
+                PRIMARY KEY (artist_mbid, release_group_mbid)
+            ) WITHOUT ROWID
+        """)
+        connection.execute("""
+            CREATE INDEX IF NOT EXISTS idx_track_search_discography_group
+            ON track_search_artist_discography_groups (release_group_mbid)
+        """)
         row = connection.execute(
             "SELECT value FROM track_search_meta WHERE key = 'schema-version'"
         ).fetchone()
@@ -223,7 +238,7 @@ def _romanized_title(group):
 
 
 def _metadata_quality(source_mask):
-    if source_mask & SOURCE_MUSICBRAINZ:
+    if source_mask & SOURCE_MUSICBRAINZ_MASK:
         return 3
     if source_mask & SOURCE_LIDARR:
         return 2
@@ -696,15 +711,15 @@ def _upsert_rows(
         VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(release_group_mbid, artist_mbid) DO UPDATE SET
             credit_name = CASE
-                WHEN excluded.source_mask & 1 != 0
+                WHEN excluded.source_mask & 17 != 0
                      AND excluded.credit_name != '' THEN excluded.credit_name
-                WHEN source_mask & 1 = 0 AND excluded.credit_name != ''
+                WHEN source_mask & 17 = 0 AND excluded.credit_name != ''
                 THEN excluded.credit_name ELSE credit_name END,
             normalized_credit_name = CASE
-                WHEN excluded.source_mask & 1 != 0
+                WHEN excluded.source_mask & 17 != 0
                      AND excluded.normalized_credit_name != ''
                 THEN excluded.normalized_credit_name
-                WHEN source_mask & 1 = 0
+                WHEN source_mask & 17 = 0
                      AND excluded.normalized_credit_name != ''
                 THEN excluded.normalized_credit_name ELSE normalized_credit_name END,
             source_mask = source_mask | excluded.source_mask
@@ -791,6 +806,7 @@ def rebuild_from_cache():
         connection.execute("DELETE FROM track_search_release_group_refs")
         connection.execute("DELETE FROM track_search_release_groups")
         connection.execute("DELETE FROM track_search_release_group_artists")
+        connection.execute("DELETE FROM track_search_artist_discography_groups")
         _upsert_rows(
             connection,
             artist_rows,
@@ -825,7 +841,11 @@ def index_artist(artist, source_mask=SOURCE_MUSICBRAINZ):
         _upsert_rows(connection, artist_rows, {}, set())
 
 
-def index_release_group_page(page, cache_key):
+def index_release_group_page(
+    page,
+    cache_key,
+    source_mask=SOURCE_MUSICBRAINZ,
+):
     if not _index_writable():
         return
     artist_rows = {}
@@ -839,7 +859,7 @@ def index_release_group_page(page, cache_key):
             artist_rows,
             group_refs,
             group,
-            SOURCE_MUSICBRAINZ,
+            source_mask,
             cache_key,
         )
     with cache_db() as connection:
@@ -853,9 +873,150 @@ def index_release_group_page(page, cache_key):
         )
 
 
-def index_release_groups(groups, cache_key=""):
+def index_release_groups(
+    groups,
+    cache_key="",
+    source_mask=SOURCE_MUSICBRAINZ,
+):
     """Index MusicBrainz release-group candidates already fetched elsewhere."""
-    index_release_group_page({"release-groups": list(groups or [])}, cache_key)
+    index_release_group_page(
+        {"release-groups": list(groups or [])},
+        cache_key,
+        source_mask=source_mask,
+    )
+
+
+def replace_musicbrainz_artist_discography(
+    mbid,
+    pages,
+    obsolete_cache_keys=(),
+):
+    """Replace one complete artist snapshot and prune obsolete MB-only rows."""
+    if not _index_writable():
+        return
+    artist_mbid = str(mbid or "").casefold()
+    if not _valid_mbid(artist_mbid):
+        return
+
+    artist_rows = {}
+    group_refs = set()
+    group_rows = {}
+    group_artist_rows = {}
+    cache_keys = set(obsolete_cache_keys)
+    for page, cache_key in pages:
+        if cache_key:
+            cache_keys.add(cache_key)
+        for group in (page or {}).get("release-groups") or []:
+            _add_release_group(
+                group_rows,
+                group_artist_rows,
+                artist_rows,
+                group_refs,
+                group,
+                SOURCE_MUSICBRAINZ_DISCOGRAPHY,
+                cache_key,
+            )
+    new_group_ids = set(group_rows)
+
+    with cache_db() as connection:
+        old_rows = connection.execute(
+            "SELECT release_group_mbid "
+            "FROM track_search_artist_discography_groups "
+            "WHERE artist_mbid = ?",
+            (artist_mbid,),
+        ).fetchall()
+        old_group_ids = {row["release_group_mbid"] for row in old_rows}
+        affected_group_ids = old_group_ids | new_group_ids
+        affected_artist_ids = set()
+        if affected_group_ids:
+            placeholders = ",".join("?" for _group_id in affected_group_ids)
+            affected_artist_ids = {
+                row["artist_mbid"]
+                for row in connection.execute(
+                    "SELECT DISTINCT artist_mbid "
+                    "FROM track_search_release_group_artists "
+                    f"WHERE release_group_mbid IN ({placeholders})",
+                    tuple(sorted(affected_group_ids)),
+                ).fetchall()
+            }
+
+        connection.execute(
+            "DELETE FROM track_search_artist_discography_groups "
+            "WHERE artist_mbid = ?",
+            (artist_mbid,),
+        )
+        connection.executemany(
+            "INSERT INTO track_search_artist_discography_groups "
+            "(artist_mbid, release_group_mbid) VALUES (?, ?)",
+            (
+                (artist_mbid, group_id)
+                for group_id in sorted(new_group_ids)
+            ),
+        )
+        if cache_keys:
+            connection.executemany(
+                "DELETE FROM track_search_release_group_refs "
+                "WHERE cache_key = ?",
+                ((cache_key,) for cache_key in sorted(cache_keys)),
+            )
+        _upsert_rows(
+            connection,
+            artist_rows,
+            {},
+            group_refs,
+            group_rows,
+            group_artist_rows,
+        )
+
+        stale_group_ids = old_group_ids - new_group_ids
+        for group_id in sorted(stale_group_ids):
+            retained = connection.execute(
+                "SELECT 1 FROM track_search_artist_discography_groups "
+                "WHERE release_group_mbid = ? LIMIT 1",
+                (group_id,),
+            ).fetchone()
+            if retained:
+                continue
+            connection.execute(
+                "UPDATE track_search_release_groups "
+                "SET source_mask = source_mask & ? "
+                "WHERE release_group_mbid = ?",
+                (~SOURCE_MUSICBRAINZ_DISCOGRAPHY, group_id),
+            )
+            connection.execute(
+                "DELETE FROM track_search_release_groups "
+                "WHERE release_group_mbid = ? AND source_mask = 0",
+                (group_id,),
+            )
+            connection.execute(
+                "UPDATE track_search_release_group_artists "
+                "SET source_mask = source_mask & ? "
+                "WHERE release_group_mbid = ?",
+                (~SOURCE_MUSICBRAINZ_DISCOGRAPHY, group_id),
+            )
+            connection.execute(
+                "DELETE FROM track_search_release_group_artists "
+                "WHERE release_group_mbid = ? AND source_mask = 0",
+                (group_id,),
+            )
+        for affected_artist_id in sorted(affected_artist_ids):
+            retained = connection.execute(
+                "SELECT 1 FROM track_search_release_group_artists "
+                "WHERE artist_mbid = ? AND source_mask & ? != 0 LIMIT 1",
+                (affected_artist_id, SOURCE_MUSICBRAINZ_DISCOGRAPHY),
+            ).fetchone()
+            if retained:
+                continue
+            connection.execute(
+                "UPDATE track_search_artist_names "
+                "SET source_mask = source_mask & ? WHERE artist_mbid = ?",
+                (~SOURCE_MUSICBRAINZ_DISCOGRAPHY, affected_artist_id),
+            )
+            connection.execute(
+                "DELETE FROM track_search_artist_names "
+                "WHERE artist_mbid = ? AND source_mask = 0",
+                (affected_artist_id,),
+            )
 
 
 def index_release(release, cache_key):
@@ -1224,10 +1385,18 @@ def search_release_groups(title, artist_mbid="", limit=250):
             ).fetchall()
             group_ids = [row["release_group_mbid"] for row in rows]
             artist_rows = []
+            discography_rows = []
             if group_ids:
                 placeholders = ",".join("?" for _group_id in group_ids)
                 artist_rows = connection.execute(
                     "SELECT * FROM track_search_release_group_artists "
+                    f"WHERE release_group_mbid IN ({placeholders}) "
+                    "ORDER BY release_group_mbid, artist_mbid",
+                    group_ids,
+                ).fetchall()
+                discography_rows = connection.execute(
+                    "SELECT artist_mbid, release_group_mbid "
+                    "FROM track_search_artist_discography_groups "
                     f"WHERE release_group_mbid IN ({placeholders}) "
                     "ORDER BY release_group_mbid, artist_mbid",
                     group_ids,
@@ -1244,6 +1413,12 @@ def search_release_groups(title, artist_mbid="", limit=250):
                 "name": row["credit_name"],
             },
         })
+    discography_artists_by_group = {}
+    for row in discography_rows:
+        discography_artists_by_group.setdefault(
+            row["release_group_mbid"],
+            [],
+        ).append(row["artist_mbid"])
     results = []
     for row in rows:
         aliases = []
@@ -1270,6 +1445,10 @@ def search_release_groups(title, artist_mbid="", limit=250):
             "disambiguation": row["disambiguation"],
             "romanizedTitle": row["romanized_title"],
             "sourceMask": row["source_mask"],
+            "discographyArtistIds": discography_artists_by_group.get(
+                row["release_group_mbid"],
+                [],
+            ),
         })
     return results
 
@@ -1395,6 +1574,9 @@ def stats():
         release_group_artist_rows = connection.execute(
             "SELECT COUNT(*) FROM track_search_release_group_artists"
         ).fetchone()[0]
+        artist_discography_rows = connection.execute(
+            "SELECT COUNT(*) FROM track_search_artist_discography_groups"
+        ).fetchone()[0]
         index_bytes = None
         try:
             index_bytes = connection.execute("""
@@ -1410,12 +1592,14 @@ def stats():
         "releaseGroupRefRows": ref_rows,
         "releaseGroupRows": release_group_rows,
         "releaseGroupArtistRows": release_group_artist_rows,
+        "artistDiscographyRows": artist_discography_rows,
         "indexRows": (
             artist_rows
             + relation_rows
             + ref_rows
             + release_group_rows
             + release_group_artist_rows
+            + artist_discography_rows
         ),
         "indexBytes": index_bytes,
         "databaseBytes": _database_bytes(),

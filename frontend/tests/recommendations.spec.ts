@@ -120,6 +120,50 @@ test("album search reveals cached candidates without another request", async ({ 
   expect(searchRequests).toBe(requestsBeforeShowMore);
 });
 
+test("a local album hit offers an explicit MusicBrainz search and keeps the hit on failure", async ({ page }) => {
+  const requests: string[] = [];
+  let failDirectSearch = true;
+  await fixture(page);
+  await page.route("**/api/search?*", async route => {
+    const url = new URL(route.request().url());
+    if (url.searchParams.get("type") !== "album") return route.fallback();
+    requests.push(url.searchParams.get("musicbrainz") || "local");
+    if (url.searchParams.get("musicbrainz") === "1") {
+      if (failDirectSearch) {
+        failDirectSearch = false;
+        return route.fulfill({ status: 502, json: { error: "MusicBrainz is unavailable." } });
+      }
+      return route.fulfill({ json: {
+        type: "album", source: "musicbrainz", candidateCount: 1,
+        results: [{ id: "other-album", name: "Parachutes", artist: "Other Artist", type: "Album" }],
+      } });
+    }
+    return route.fulfill({ json: {
+      type: "album", source: "local", candidateCount: 1,
+      results: [{ id: "local-album", name: "Parachutes", artist: "Coldplay", type: "Album" }],
+    } });
+  });
+  await page.goto("/");
+  await signIn(page);
+
+  await page.locator("#search-type").selectOption("album");
+  await page.locator("#search-input").fill("Parachutes");
+  await page.locator("#search-submit").click();
+  const directSearch = page.getByRole("button", { name: "Search MusicBrainz for more albums" });
+  await expect(page.locator("#results")).toContainText("Coldplay");
+  await expect(directSearch).toBeVisible();
+  await directSearch.click();
+  await expect(page.locator("#search-message")).toContainText("MusicBrainz is unavailable");
+  await expect(page.locator("#results")).toContainText("Coldplay");
+  await expect(directSearch).toBeEnabled();
+  await directSearch.click();
+  await expect(page.locator("#results")).toContainText("Other Artist");
+  await expect(page.locator("#results")).not.toContainText("Coldplay");
+  await expect(directSearch).toBeHidden();
+  expect(requests.filter(request => request === "local").length).toBeGreaterThanOrEqual(1);
+  expect(requests.slice(-2)).toEqual(["1", "1"]);
+});
+
 test("feedback persists through reload and dismissal can be undone", async ({ page }) => {
   const { events } = await fixture(page);
   await page.goto("/");

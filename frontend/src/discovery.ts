@@ -4056,6 +4056,7 @@
   const searchType = $<HTMLSelectElement>("#search-type");
   const searchInput = $<HTMLInputElement>("#search-input");
   const searchSubmit = $<HTMLButtonElement>("#search-submit");
+  const searchMusicBrainz = $<HTMLButtonElement>("#search-musicbrainz");
   let activeSearchType = searchType.value;
   let searchTypePointerActive = false;
 
@@ -4165,6 +4166,7 @@
     searchAbort?.abort();
     searchAbort = undefined;
     clearTimeout(searchDebounce);
+    searchMusicBrainz.hidden = true;
     applySearchMode(type);
     if (searchInput.value.trim().length >= 2) {
       runSearch();
@@ -4172,7 +4174,7 @@
     if (searchTypePointerActive) searchType.blur();
   });
 
-  async function runSearch() {
+  async function runSearch(forceMusicBrainz = false) {
     const requestVersion = ++searchRequestVersion;
     searchAbort?.abort();
     const query = searchInput.value.trim();
@@ -4185,25 +4187,30 @@
       $("#search-form").classList.remove("searching");
       results.replaceChildren();
       $("#search-message").textContent = "";
+      searchMusicBrainz.hidden = true;
       return;
     }
 
     const controller = new AbortController();
     searchAbort = controller;
+    const keepLocalResults = forceMusicBrainz && type === "album" && !searchMusicBrainz.hidden;
+    searchMusicBrainz.disabled = keepLocalResults;
+    if (!keepLocalResults) searchMusicBrainz.hidden = true;
     $("#search-message").textContent = type === "anime"
       ? "Looking through anime themes…"
       : "Looking through MusicBrainz…";
     $("#search-form").classList.add("searching");
     results.setAttribute("aria-busy", "true");
-    results.replaceChildren(skeletonBlock("skeleton-card", 5));
+    if (!keepLocalResults) results.replaceChildren(skeletonBlock("skeleton-card", 5));
     try {
       const data = await getJson(
-        `/api/search?q=${encodeURIComponent(query)}&type=${type}`,
+        `/api/search?q=${encodeURIComponent(query)}&type=${type}${forceMusicBrainz && type === "album" ? "&musicbrainz=1" : ""}`,
         30_000,
         controller.signal,
       );
       if (requestVersion !== searchRequestVersion) return;
       results.replaceChildren();
+      searchMusicBrainz.hidden = !(type === "album" && data.source === "local");
       const orderedResults = type === "anime"
         ? animeSearchResultsByFormat(data.results)
         : data.results as JsonObject[];
@@ -4231,13 +4238,14 @@
       appendNextPage();
     } catch (error) {
       if (requestVersion !== searchRequestVersion) return;
-      results.replaceChildren();
+      if (!keepLocalResults) results.replaceChildren();
       $("#search-message").textContent = error.name === "AbortError"
         ? `${type === "anime" ? "Anime theme search" : "MusicBrainz"} is taking a little longer than usual. Please try again in a moment.`
         : `We couldn’t finish that search. ${error.message}`;
     } finally {
       if (requestVersion === searchRequestVersion) {
         searchAbort = undefined;
+        searchMusicBrainz.disabled = false;
         $("#search-form").classList.remove("searching");
         results.removeAttribute("aria-busy");
       }
@@ -4249,9 +4257,12 @@
   const searchDebounceMilliseconds = 450;
   searchInput.addEventListener("input", () => {
     clearTimeout(searchDebounce);
+    searchMusicBrainz.hidden = true;
     updateSearchSubmitState();
     searchDebounce = setTimeout(runSearch, searchDebounceMilliseconds);
   });
+
+  searchMusicBrainz.addEventListener("click", () => runSearch(true));
 
   $("#search-form").addEventListener("submit", (event) => {
     event.preventDefault();
@@ -4448,6 +4459,8 @@
     invalidateAuthenticatedDetailState();
     $("#recommendation-results").replaceChildren();
     $("#results").replaceChildren();
+    searchMusicBrainz.hidden = true;
+    searchMusicBrainz.disabled = false;
     $("#results").removeAttribute("aria-busy");
     $("#results").setAttribute("aria-label", "Search results");
   });
@@ -4494,6 +4507,8 @@
     applySearchMode(activeSearchType);
     $("#search-message").textContent = "";
     $("#results").replaceChildren();
+    searchMusicBrainz.hidden = true;
+    searchMusicBrainz.disabled = false;
     $("#results").removeAttribute("aria-busy");
     $("#results").setAttribute("aria-label", "Search results");
     // Recommendation cards remain current through their own refresh events.

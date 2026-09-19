@@ -25,6 +25,7 @@ if __package__ == "backend.routes":
         get_recommendation_cache,
         get_service,
     )
+    from ..workers import artist_metadata as artist_metadata_worker
     from ..workers import recommendations as recommendation_worker
 else:  # Support the existing `python backend/app.py` entry point.
     import recommendation_activity
@@ -37,6 +38,7 @@ else:  # Support the existing `python backend/app.py` entry point.
     from security import current_user, login_required
     from services import animethemes, charts, lastfm, musicbrainz, plex
     from storage import get_lastfm_api_key, get_recommendation_cache, get_service
+    from workers import artist_metadata as artist_metadata_worker
     from workers import recommendations as recommendation_worker
 
 
@@ -46,6 +48,18 @@ logger = logging.getLogger(__name__)
 _SEARCH_RESULT_LIMIT = 25
 _DUPLICATE_TITLE_LIMIT = 2
 _INFERRED_ARTIST_QUERY_BOOST = 2
+_MAX_ALBUM_SEARCH_CHARACTERS = 200
+_MAX_ALBUM_QUERY_INTERPRETATIONS = 8
+_GENERIC_ALBUM_TITLES = {
+    "anthology",
+    "best of",
+    "collection",
+    "greatest hits",
+    "singles",
+    "the best of",
+    "the collection",
+    "the singles",
+}
 _PRIMARY_RELEASE_TYPE_RANK = {
     "single": 0,
     "album": 1,
@@ -87,12 +101,17 @@ def _normalize_search_text(value):
 
 
 def _album_query_interpretations(query):
-    """Return the literal title query plus conservative title/artist splits."""
+    """Return the literal query plus bounded, likely title/artist splits."""
     words = str(query or "").split()
     interpretations = [(str(query or "").strip(), "")]
     if len(words) < 2:
         return interpretations
-    for split_at in range(1, len(words)):
+    # Prefer short artist suffixes. They are the most common qualified-album
+    # shape and keep pasted or garbage input from producing quadratic URLs.
+    split_points = list(range(len(words) - 1, 0, -1))[
+        :_MAX_ALBUM_QUERY_INTERPRETATIONS - 1
+    ]
+    for split_at in split_points:
         interpretations.append((
             " ".join(words[:split_at]),
             " ".join(words[split_at:]),
@@ -458,10 +477,7 @@ def _local_album_interpretations(query):
         "intents": literal_intents,
         "source": "literal",
     }]
-    words = str(query or "").split()
-    for split_at in range(1, len(words)):
-        title = " ".join(words[:split_at])
-        artist = " ".join(words[split_at:])
+    for title, artist in _album_query_interpretations(query)[1:]:
         resolution = track_search_index.resolve_artist(artist)
         if resolution["status"] != "unique":
             continue
@@ -545,14 +561,15 @@ def _local_album_resolution(query):
                     "group": group,
                     "match": match,
                     "rank": rank,
+                    "interpretation": interpretation,
                 }
     ranked = sorted(candidates.values(), key=lambda candidate: candidate["rank"])
     if not ranked or not _confident_local_album_match(ranked[0]["match"]):
-        return []
+        return None
     groups = _diversify_release_group_titles([
         candidate["group"] for candidate in ranked
     ])[:100]
-    return [
+    results = [
         {
             "id": group["id"],
             "name": group.get("title", "Untitled release"),
@@ -572,6 +589,47 @@ def _local_album_resolution(query):
         }
         for group in groups
     ]
+    top = ranked[0]
+    return {
+        "results": results,
+        "matchCount": len(ranked),
+        "artistMbid": top["interpretation"]["artistMbid"],
+        "interpretedTitle": top["interpretation"]["baseTitle"],
+        "sourceMask": int(top["group"].get("sourceMask") or 0),
+        "discographyArtistIds": tuple(
+            top["group"].get("discographyArtistIds") or ()
+        ),
+    }
+
+
+def _generic_album_title(value):
+    return _normalize_search_text(value) in _GENERIC_ALBUM_TITLES
+
+
+def _local_album_can_short_circuit(resolution):
+    """Use local results only when the query or source establishes confidence."""
+    artist_mbid = resolution["artistMbid"]
+    if artist_mbid:
+        try:
+            artist_metadata_worker.request_revalidation(artist_mbid)
+        except (OSError, ValueError, requests.RequestException):
+            # Search remains useful when optional background freshness state is
+            # unavailable; the exact title/artist identity is already strong.
+            pass
+        return True
+    if (
+        resolution["matchCount"] != 1
+        or _generic_album_title(resolution["interpretedTitle"])
+    ):
+        return False
+    if resolution["sourceMask"] & (
+        track_search_index.SOURCE_LIDARR | track_search_index.SOURCE_PLEX
+    ):
+        return True
+    return any(
+        artist_metadata_worker.discography_is_fresh(artist_mbid)
+        for artist_mbid in resolution["discographyArtistIds"]
+    )
 
 
 def _plex_search_artists():
@@ -1610,17 +1668,30 @@ def search():
             return api_error(
                 "AnimeThemes could not be reached. Try again shortly.", 502
             )
+    if search_type == "album" and (
+        len(query) > _MAX_ALBUM_SEARCH_CHARACTERS
+        or len(_normalize_search_text(query)) > _MAX_ALBUM_SEARCH_CHARACTERS
+    ):
+        return api_error(
+            f"Album searches must be {_MAX_ALBUM_SEARCH_CHARACTERS} "
+            "characters or fewer."
+        )
     search_query = query
     plain_search = True
     track_plan = None
     if search_type == "album":
-        local_results = _local_album_resolution(query)
-        if local_results:
-            return jsonify({
-                "results": local_results,
-                "type": search_type,
-                "candidateCount": len(local_results),
-            })
+        if request.args.get("musicbrainz") != "1":
+            local_resolution = _local_album_resolution(query)
+            if (
+                local_resolution
+                and _local_album_can_short_circuit(local_resolution)
+            ):
+                return jsonify({
+                    "results": local_resolution["results"],
+                    "type": search_type,
+                    "candidateCount": len(local_resolution["results"]),
+                    "source": "local",
+                })
         search_query, plain_search = _album_musicbrainz_query(query)
     elif search_type == "track":
         track_plan = _track_search_plan(query)
@@ -1739,8 +1810,11 @@ def search():
         ]
     else:
         results = _recording_release_group_results(response, track_plan)
-    return jsonify({
+    payload = {
         "results": results,
         "type": search_type,
         "candidateCount": len(results),
-    })
+    }
+    if search_type == "album":
+        payload["source"] = "musicbrainz"
+    return jsonify(payload)
