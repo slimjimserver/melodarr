@@ -7565,6 +7565,7 @@ class LocalTrackSearchIndexTests(unittest.TestCase):
         with api_cache.cache_db() as connection:
             connection.execute("DELETE FROM track_search_artist_names")
             connection.execute("DELETE FROM track_search_relations")
+            connection.execute("DELETE FROM track_search_title_keys")
             connection.execute("DELETE FROM track_search_release_group_refs")
             connection.execute(
                 "DELETE FROM api_cache WHERE cache_key LIKE 'track-search-test:%'"
@@ -7578,6 +7579,7 @@ class LocalTrackSearchIndexTests(unittest.TestCase):
         with api_cache.cache_db() as connection:
             connection.execute("DELETE FROM track_search_artist_names")
             connection.execute("DELETE FROM track_search_relations")
+            connection.execute("DELETE FROM track_search_title_keys")
             connection.execute("DELETE FROM track_search_release_group_refs")
             connection.execute(
                 "DELETE FROM api_cache WHERE cache_key LIKE 'track-search-test:%'"
@@ -7823,6 +7825,60 @@ class LocalTrackSearchIndexTests(unittest.TestCase):
         matches = track_search_index.search_artist_tracks(
             self.artist_mbid,
             "more than words",
+        )
+        self.assertEqual(
+            [match["release_group_mbid"] for match in matches],
+            [self.release_group_mbid],
+        )
+
+    def test_romanized_track_and_recording_alias_find_canonical_title(self):
+        release = self._release()
+        track = release["media"][0]["tracks"][0]
+        track["title"] = "幸せ。"
+        track["recording"]["title"] = "幸せ。"
+        track["recording"]["aliases"] = [{"name": "Happiness"}]
+        track_search_index.index_release(release, "track-search-test:shiawase")
+
+        for query in ("幸せ", "shiawase", "Happiness"):
+            with self.subTest(query=query):
+                matches = track_search_index.search_artist_tracks(
+                    self.artist_mbid, query,
+                )
+                self.assertEqual(matches, [{
+                    "normalized_title": "幸せ",
+                    "release_group_mbid": self.release_group_mbid,
+                }])
+        self.assertEqual(
+            track_search_index.exact_track_matches(
+                self.artist_mbid, "shiawase",
+            )[0]["normalized_title"],
+            "幸せ",
+        )
+        self.assertEqual(
+            track_search_index.search_artist_tracks(
+                self.second_artist_mbid, "shiawase",
+            ),
+            [],
+        )
+
+    def test_version_five_migration_preserves_uncached_track_relations(self):
+        release = self._release()
+        track = release["media"][0]["tracks"][0]
+        track["title"] = "幸せ。"
+        track["recording"]["title"] = "幸せ。"
+        track_search_index.index_release(release, "")
+        with api_cache.cache_db() as connection:
+            connection.execute("DELETE FROM track_search_title_keys")
+            connection.execute(
+                "UPDATE track_search_meta SET value = '5' "
+                "WHERE key = 'schema-version'"
+            )
+
+        with patch.object(track_search_index, "_initialized", False):
+            track_search_index.initialize()
+
+        matches = track_search_index.search_artist_tracks(
+            self.artist_mbid, "shiawase",
         )
         self.assertEqual(
             [match["release_group_mbid"] for match in matches],
