@@ -4179,6 +4179,7 @@
     searchAbort?.abort();
     const query = searchInput.value.trim();
     const type = searchType.value;
+    const canSearchMusicBrainz = type === "album" || type === "track";
     const results = $("#results");
     results.setAttribute("aria-label", "Search results");
 
@@ -4193,7 +4194,7 @@
 
     const controller = new AbortController();
     searchAbort = controller;
-    const keepLocalResults = forceMusicBrainz && type === "album" && !searchMusicBrainz.hidden;
+    const keepLocalResults = forceMusicBrainz && canSearchMusicBrainz && !searchMusicBrainz.hidden;
     searchMusicBrainz.disabled = keepLocalResults;
     if (!keepLocalResults) searchMusicBrainz.hidden = true;
     $("#search-message").textContent = type === "anime"
@@ -4204,13 +4205,18 @@
     if (!keepLocalResults) results.replaceChildren(skeletonBlock("skeleton-card", 5));
     try {
       const data = await getJson(
-        `/api/search?q=${encodeURIComponent(query)}&type=${type}${forceMusicBrainz && type === "album" ? "&musicbrainz=1" : ""}`,
+        `/api/search?q=${encodeURIComponent(query)}&type=${type}${forceMusicBrainz && canSearchMusicBrainz ? "&musicbrainz=1" : ""}`,
         30_000,
         controller.signal,
       );
       if (requestVersion !== searchRequestVersion) return;
       results.replaceChildren();
-      searchMusicBrainz.hidden = !(type === "album" && data.source === "local");
+      searchMusicBrainz.hidden = !(canSearchMusicBrainz && data.source === "local");
+      if (!searchMusicBrainz.hidden) {
+        searchMusicBrainz.textContent = type === "track"
+          ? "Search MusicBrainz for more tracks"
+          : "Search MusicBrainz for more albums";
+      }
       const orderedResults = type === "anime"
         ? animeSearchResultsByFormat(data.results)
         : data.results as JsonObject[];

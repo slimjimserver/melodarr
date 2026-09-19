@@ -7292,6 +7292,7 @@ class ReleaseGroupRankingTests(unittest.TestCase):
             response.get_json()["results"][0]["id"],
             "bc465d63-9087-4707-ab43-c01bdad7dc0a",
         )
+        self.assertEqual(response.get_json()["source"], "musicbrainz")
         self.assertEqual(search.call_count, 2)
         self.assertEqual(search.call_args_list[0].args[1], "track")
         self.assertEqual(search.call_args_list[1].args[1], "album")
@@ -7879,9 +7880,54 @@ class LocalTrackSearchIndexTests(unittest.TestCase):
             responses[0]["results"][0]["name"],
             "12 hugs (like butterflies)",
         )
+        self.assertTrue(all(payload["source"] == "local" for payload in responses))
         search.assert_not_called()
         stats = track_search_index.stats()
         self.assertEqual(stats["trackRelationRows"], 1)
+
+    @patch("backend.routes.discovery._has_strong_recording_match", return_value=True)
+    @patch("backend.routes.discovery.musicbrainz.search")
+    def test_explicit_musicbrainz_track_search_bypasses_local_hit(
+        self, search, strong_match
+    ):
+        self._seed_complete_index()
+        remote_group = {
+            **self._group(),
+            "id": "55555555-5555-4555-8555-555555555555",
+            "title": "More Than Words (Live)",
+        }
+        remote_recording = {
+            "id": "66666666-6666-4666-8666-666666666666",
+            "title": "more than words",
+            "artist-credit": remote_group["artist-credit"],
+            "releases": [{
+                "id": "77777777-7777-4777-8777-777777777777",
+                "title": remote_group["title"],
+                "release-group": remote_group,
+                "artist-credit": remote_group["artist-credit"],
+            }],
+        }
+        search.side_effect = [
+            {"recordings": [remote_recording]},
+            {"release-groups": [remote_group]},
+        ]
+        app = Flask(__name__)
+        query = "more%20than%20words%20Hitsujibungaku"
+        with app.test_request_context(f"/api/search?q={query}&type=track"):
+            local = discovery.search.__wrapped__()
+        with app.test_request_context(
+            f"/api/search?q={query}&type=track&musicbrainz=1"
+        ):
+            direct = discovery.search.__wrapped__()
+
+        self.assertEqual(local.get_json()["source"], "local")
+        self.assertEqual(local.get_json()["results"][0]["id"], self.release_group_mbid)
+        self.assertEqual(direct.status_code, 200)
+        self.assertEqual(direct.get_json()["source"], "musicbrainz")
+        self.assertEqual(direct.get_json()["results"][0]["id"], remote_group["id"])
+        self.assertEqual([call.args[1] for call in search.call_args_list], ["track", "album"])
+        self.assertIn(f"arid:{self.artist_mbid}", search.call_args_list[0].args[0])
+        strong_match.assert_called_once()
 
     @patch(
         "backend.routes.discovery._recording_release_group_results",

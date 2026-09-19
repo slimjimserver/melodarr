@@ -164,6 +164,56 @@ test("a local album hit offers an explicit MusicBrainz search and keeps the hit 
   expect(requests.slice(-2)).toEqual(["1", "1"]);
 });
 
+test("a local track hit offers an explicit MusicBrainz search and keeps the hit on failure", async ({ page }) => {
+  const requests: string[] = [];
+  let failDirectSearch = true;
+  await fixture(page);
+  await page.route("**/api/search?*", async route => {
+    const url = new URL(route.request().url());
+    if (url.searchParams.get("type") !== "track") return route.fallback();
+    requests.push(url.searchParams.get("musicbrainz") || "local");
+    if (url.searchParams.get("musicbrainz") === "1") {
+      if (failDirectSearch) {
+        failDirectSearch = false;
+        return route.fulfill({ status: 502, json: { error: "MusicBrainz is unavailable." } });
+      }
+      return route.fulfill({ json: {
+        type: "track", source: "musicbrainz", candidateCount: 1,
+        results: [{
+          id: "other-track-group", name: "Yellow (Live)", artist: "Coldplay",
+          matchedTrack: "Yellow", type: "Single",
+        }],
+      } });
+    }
+    return route.fulfill({ json: {
+      type: "track", source: "local", candidateCount: 1,
+      results: [{
+        id: "local-track-group", name: "Parachutes", artist: "Coldplay",
+        matchedTrack: "Yellow", type: "Album",
+      }],
+    } });
+  });
+  await page.goto("/");
+  await signIn(page);
+
+  await page.locator("#search-type").selectOption("track");
+  await page.locator("#search-input").fill("Yellow Coldplay");
+  await page.locator("#search-submit").click();
+  const directSearch = page.getByRole("button", { name: "Search MusicBrainz for more tracks" });
+  await expect(page.locator("#results")).toContainText("Parachutes");
+  await expect(directSearch).toBeVisible();
+  await directSearch.click();
+  await expect(page.locator("#search-message")).toContainText("MusicBrainz is unavailable");
+  await expect(page.locator("#results")).toContainText("Parachutes");
+  await expect(directSearch).toBeEnabled();
+  await directSearch.click();
+  await expect(page.locator("#results")).toContainText("Yellow (Live)");
+  await expect(page.locator("#results")).not.toContainText("Parachutes");
+  await expect(directSearch).toBeHidden();
+  expect(requests.filter(request => request === "local").length).toBeGreaterThanOrEqual(1);
+  expect(requests.slice(-2)).toEqual(["1", "1"]);
+});
+
 test("feedback persists through reload and dismissal can be undone", async ({ page }) => {
   const { events } = await fixture(page);
   await page.goto("/");

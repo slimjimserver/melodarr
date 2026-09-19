@@ -1697,11 +1697,15 @@ def search():
         track_plan = _track_search_plan(query)
         local_resolution = _local_track_resolution(track_plan)
         track_plan = local_resolution["plan"]
-        if local_resolution["results"]:
+        if (
+            local_resolution["results"]
+            and request.args.get("musicbrainz") != "1"
+        ):
             return jsonify({
                 "results": local_resolution["results"],
                 "type": search_type,
                 "candidateCount": len(local_resolution["results"]),
+                "source": "local",
             })
         search_query = track_plan["query"]
         plain_search = track_plan["plainSearch"]
@@ -1743,6 +1747,7 @@ def search():
                     "results": alias_results,
                     "type": search_type,
                     "candidateCount": len(alias_results),
+                    "source": "musicbrainz",
                 })
         except requests.RequestException:
             # Release-group aliases are an optional recovery path. Continue
@@ -1815,6 +1820,6 @@ def search():
         "type": search_type,
         "candidateCount": len(results),
     }
-    if search_type == "album":
+    if search_type in {"album", "track"}:
         payload["source"] = "musicbrainz"
     return jsonify(payload)
