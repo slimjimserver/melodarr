@@ -24,7 +24,7 @@
     timer?: ReturnType<typeof setTimeout>;
   };
   type DetailAvailabilityWatcher = {
-    kind: "artist" | "release-group";
+    kind: "artist" | "release-group" | "anime";
     id: string;
     data: JsonObject;
     generation: number;
@@ -979,6 +979,27 @@
     );
   }
 
+  function animeReleaseGroups(data: JsonObject) {
+    const groups = new Map<string, JsonObject[]>();
+    (data.themes || []).forEach((theme: JsonObject) => {
+      const mapping = theme.mapping || {};
+      const candidates = [
+        ...(mapping.releaseGroups || []),
+        ...(mapping.candidates || []),
+        ...(mapping.recordingCandidates || []).flatMap(
+          (recording: JsonObject) => recording.releaseGroups || [],
+        ),
+      ];
+      candidates.forEach((group: JsonObject) => {
+        if (!group?.id) return;
+        const id = String(group.id);
+        if (!groups.has(id)) groups.set(id, []);
+        groups.get(id)!.push(group);
+      });
+    });
+    return groups;
+  }
+
   function requestStatusLabel(data: JsonObject) {
     if (data.fullyAvailableInLidarr) return "Available";
     if (data.requestStatus === "downloading") {
@@ -1076,10 +1097,43 @@
       });
   }
 
+  function applyAnimeReleaseGroupAvailability(data: JsonObject, updates: JsonObject) {
+    const groups = animeReleaseGroups(data);
+    Object.entries(updates || {}).forEach(([id, status]: [string, JsonObject]) => {
+      (groups.get(id) || []).forEach((group) => {
+        group.availableInPlex = Boolean(group.availableInPlex || status.availableInPlex);
+        group.availableInLidarr = Boolean(group.availableInLidarr || status.availableInLidarr);
+        group.fullyAvailableInLidarr = Boolean(
+          group.fullyAvailableInLidarr || status.fullyAvailableInLidarr,
+        );
+        group.requestStatus = status.requestStatus;
+        group.downloadStatus = status.downloadStatus;
+        if (status.availableInLidarr) group.availabilityPending = false;
+        if (status.plexReleases?.length) group.plexReleases = status.plexReleases;
+      });
+    });
+    $("#detail-results").querySelectorAll<HTMLElement>(
+      ".anime-release-candidate[data-release-group-id]",
+    ).forEach((card) => {
+      const candidate = groups.get(String(card.dataset.releaseGroupId))?.[0];
+      const button = card.querySelector<HTMLButtonElement>(".release-group-request");
+      if (!candidate || !button) return;
+      updateAnimeCandidateAction(button, candidate);
+      const link = animeCandidatePlexLink(candidate);
+      const existing = card.querySelector<HTMLAnchorElement>(".anime-candidate-plex");
+      if (link && !existing) card.append(link);
+      else if (link && existing && link.href !== existing.href) existing.replaceWith(link);
+    });
+  }
+
   function applyDetailAvailability(
     watcher: DetailAvailabilityWatcher,
     availability: JsonObject,
   ) {
+    if (watcher.kind === "anime") {
+      applyAnimeReleaseGroupAvailability(watcher.data, availability.releaseGroups || {});
+      return;
+    }
     Object.assign(watcher.data, availability);
     updateDetailPlexLink(watcher.kind, watcher.data);
     const action = $("#detail-results")
@@ -1154,7 +1208,9 @@
 
     try {
       const availabilityUrl = new URL(
-        `/api/music/${watcher.kind}/${encodeURIComponent(watcher.id)}/availability`,
+        watcher.kind === "anime"
+          ? "/api/music/release-groups/availability"
+          : `/api/music/${watcher.kind}/${encodeURIComponent(watcher.id)}/availability`,
         window.location.origin,
       );
       if (watcher.kind === "artist") {
@@ -1167,11 +1223,27 @@
             );
           });
       }
-      const availability = await getJson(
-        `${availabilityUrl.pathname}${availabilityUrl.search}`,
-        30_000,
-        detailSessionAbort.signal,
-      );
+      const groupIds = watcher.kind === "anime"
+        ? [...animeReleaseGroups(watcher.data).keys()]
+        : [];
+      const urls: string[] = [];
+      if (watcher.kind === "anime") {
+        for (let index = 0; index < groupIds.length; index += 50) {
+          const url = new URL(availabilityUrl);
+          groupIds.slice(index, index + 50).forEach(
+            id => url.searchParams.append("releaseGroup", id),
+          );
+          urls.push(`${url.pathname}${url.search}`);
+        }
+      } else {
+        urls.push(`${availabilityUrl.pathname}${availabilityUrl.search}`);
+      }
+      const responses = await Promise.all(urls.map(url => getJson(
+        url, 30_000, detailSessionAbort.signal,
+      )));
+      const availability = watcher.kind === "anime"
+        ? { releaseGroups: Object.assign({}, ...responses.map(response => response.releaseGroups || {})) }
+        : responses[0];
       if (
         detailAvailabilityWatcher !== watcher
         || watcher.generation !== detailSessionGeneration
@@ -1180,7 +1252,7 @@
       ) return;
       applyDetailAvailability(watcher, availability);
       if (
-        availability.settled
+        watcher.kind !== "anime" && availability.settled
         && (
           watcher.kind !== "artist"
           || !incompleteArtistReleaseGroups(watcher.data).length
@@ -1206,10 +1278,10 @@
     delay = 5_000,
   ) {
     stopDetailAvailability();
-    if (kind !== "artist" && kind !== "release-group") return;
+    if (kind !== "artist" && kind !== "release-group" && kind !== "anime") return;
     const watcher: DetailAvailabilityWatcher = {
       kind,
-      id: String(data.id),
+      id: kind === "anime" ? String(data.slug || currentDetail?.id || "") : String(data.id),
       data,
       generation: detailSessionGeneration,
     };
@@ -1294,6 +1366,16 @@
           applyArtistReleaseGroupAvailability(currentDetailData, {});
           startDetailAvailability("artist", currentDetailData, 0);
         }
+      } else if (currentDetail?.kind === "anime" && currentDetailData) {
+        const groups = animeReleaseGroups(currentDetailData).get(releaseGroup.id) || [];
+        groups.forEach((group) => {
+          group.availableInLidarr = true;
+          group.availabilityPending = !result.alreadyExists;
+          group.fullyAvailableInLidarr = Boolean(result.alreadyExists);
+          group.requestStatus = result.pending ? "queued" : "requested";
+        });
+        applyAnimeReleaseGroupAvailability(currentDetailData, {});
+        startDetailAvailability("anime", currentDetailData, 0);
       }
     } catch (error) {
       if (!isCurrentDetailAction(action) || error.name === "AbortError") return;
@@ -2664,6 +2746,16 @@
     );
   }
 
+  function updateAnimeCandidateAction(button: HTMLButtonElement, candidate: JsonObject) {
+    button.disabled = Boolean(candidate.fullyAvailableInLidarr || candidate.availabilityPending)
+      || ["queued", "downloading"].includes(String(candidate.requestStatus || ""));
+    button.textContent = candidate.fullyAvailableInLidarr ? "Available"
+      : ["queued", "downloading"].includes(String(candidate.requestStatus || ""))
+        ? requestStatusLabel(candidate)
+        : candidate.availabilityPending ? "Requested"
+        : candidate.availableInLidarr ? "Search missing" : "Request";
+  }
+
   function createAnimeReleaseCandidate(
     candidate: JsonObject,
     theme: JsonObject,
@@ -2686,6 +2778,7 @@
       id,
     );
     card.classList.add("anime-release-candidate");
+    if (id) card.dataset.releaseGroupId = id;
     if (recommended) {
       const badge = document.createElement("span");
       badge.className = "anime-recommended";
@@ -2696,20 +2789,15 @@
       const requestButton = document.createElement("button");
       requestButton.className = "request release-group-request";
       requestButton.type = "button";
-      if (candidate.fullyAvailableInLidarr) {
-        requestButton.textContent = "Available";
-        requestButton.disabled = true;
-      } else {
-        requestButton.textContent = candidate.availableInLidarr ? "Search missing" : "Request";
-        requestButton.addEventListener("click", (event) => {
-          event.stopPropagation();
-          requestReleaseGroup({
-            id,
-            button: requestButton,
-            animeContext: animeRequestContext(theme),
-          });
+      updateAnimeCandidateAction(requestButton, candidate);
+      requestButton.addEventListener("click", (event) => {
+        event.stopPropagation();
+        requestReleaseGroup({
+          id,
+          button: requestButton,
+          animeContext: animeRequestContext(theme),
         });
-      }
+      });
       card.append(requestButton);
     }
     if (confirmMatch && id) {
@@ -3897,6 +3985,7 @@
     if (kind === "anime") {
       renderAnimeDetail(data);
       startAnimeResolution(data);
+      startDetailAvailability("anime", data);
       return;
     }
 

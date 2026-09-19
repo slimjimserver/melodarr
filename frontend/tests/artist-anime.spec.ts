@@ -188,6 +188,50 @@ test("matched artist themes support request, search missing, and live availabili
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 });
 
+test("anime release cards update download and availability without a page refresh", async ({ page }) => {
+  await page.clock.install();
+  let detailReads = 0;
+  let statusReads = 0;
+  await page.route("**/api/anime/switching-anime", route => {
+    detailReads += 1;
+    return route.fulfill({ json: {
+      id: 1, slug: "switching-anime", name: "Switching Anime", themes: [{
+        id: 10, type: "OP", sequence: 1,
+        song: { id: 100, title: "Opening", artists: [{ name: "Artist" }] },
+        mapping: { state: "resolved", releaseGroups: [{
+          id: "live-group", title: "Opening", availableInLidarr: true,
+        }] },
+      }],
+    } });
+  });
+  await page.route("**/api/music/release-groups/availability?*", route => {
+    statusReads += 1;
+    return route.fulfill({ json: { releaseGroups: { "live-group": statusReads === 1
+      ? { availableInLidarr: true, fullyAvailableInLidarr: false,
+          requestStatus: "downloading", downloadStatus: { progress: 42 },
+          availableInPlex: false, plexReleases: [] }
+      : { availableInLidarr: true, fullyAvailableInLidarr: true,
+          requestStatus: "available", downloadStatus: null, availableInPlex: true,
+          plexReleases: [{ url: "https://app.plex.tv/owned" }] },
+    } } });
+  });
+  await page.goto("/anime/switching-anime#theme-10");
+  await page.locator("#login-form").getByLabel("Username").fill("ada");
+  await page.locator("#login-form").getByLabel("Password").fill("fixture-password");
+  await page.getByRole("button", { name: "Sign in" }).click();
+  const card = page.locator("#theme-10 .anime-release-candidate[data-release-group-id='live-group']");
+  await expect(card.getByRole("button", { name: "Search missing" })).toBeVisible();
+  const detailReadsBeforePolling = detailReads;
+
+  await page.clock.runFor(5_000);
+  await expect(card.getByRole("button", { name: "Downloading 42%" })).toBeDisabled();
+  await page.clock.runFor(15_000);
+  await expect(card.getByRole("button", { name: "Available" })).toBeDisabled();
+  await expect(card.locator(".anime-candidate-plex")).toHaveAttribute("href", "https://app.plex.tv/owned");
+  expect(statusReads).toBe(2);
+  expect(detailReads).toBe(detailReadsBeforePolling);
+});
+
 test("multiple matched releases require a selection when no preferred target exists", async ({ page }) => {
   await page.route("**/api/music/artist/fixture-artist/anime", route => route.fulfill({ json: { anime: [{
     performances: [{ animeSlug: "switching-anime", animeName: "Anime", themeId: 10, songId: 1, themeLabel: "Opening", songTitle: "Choose song", releaseGroups: [

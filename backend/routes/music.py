@@ -314,13 +314,30 @@ def artist_availability(mbid):
     lidarr_artist = lidarr.cached_artist_availability().get(mbid)
     available_in_plex = bool(plex_artist)
     available_in_lidarr = bool(lidarr_artist)
-    release_group_ids = list(
-        dict.fromkeys(
-            value.strip()
-            for value in request.args.getlist("releaseGroup")
-            if value.strip()
-        )
-    )[:50]
+    release_group_ids = _requested_release_group_ids()
+    return _availability_response({
+        "id": mbid,
+        "availableInPlex": available_in_plex,
+        "availableInLidarr": available_in_lidarr,
+        "plexUrl": plex_artist.get("url", "") if plex_artist else "",
+        "plexampUrl": plex_artist.get("plexampUrl", "") if plex_artist else "",
+        "releaseGroups": _release_group_availability(release_group_ids),
+        "settled": _availability_settled(
+            available_in_lidarr=available_in_lidarr,
+            available_in_plex=available_in_plex,
+        ),
+    })
+
+
+def _requested_release_group_ids():
+    return list(dict.fromkeys(
+        value.strip()
+        for value in request.args.getlist("releaseGroup")
+        if value.strip()
+    ))[:50]
+
+
+def _release_group_availability(release_group_ids, *, include_plex_releases=False):
     plex_groups = (
         _plex_release_group_inventory() if release_group_ids else {}
     )
@@ -329,37 +346,38 @@ def artist_availability(mbid):
     )
     downloads = _download_snapshot() if release_group_ids else {}
     pending = pending_lidarr_search_mbids(release_group_ids)
+    result = {}
+    for release_group_id in release_group_ids:
+        key = release_group_id.casefold()
+        lidarr_group = lidarr_groups.get(key)
+        request_status, download_status = _release_group_lifecycle(
+            release_group_id, lidarr_group, downloads.get(key), key in pending,
+        )
+        status = {
+            "availableInPlex": release_group_id in plex_groups,
+            "availableInLidarr": key in lidarr_groups,
+            "fullyAvailableInLidarr": bool(
+                lidarr_group and lidarr_group.get("fullyAvailable")
+            ),
+            "requestStatus": request_status,
+            "downloadStatus": download_status,
+        }
+        if include_plex_releases:
+            status["plexReleases"] = [
+                _plex_release_summary(item)
+                for item in plex_groups.get(release_group_id, [])
+            ]
+        result[release_group_id] = status
+    return result
+
+
+@blueprint.get("/api/music/release-groups/availability")
+@login_required
+def release_groups_availability():
+    """Return cached live status for release cards on an anime page."""
     return _availability_response({
-        "id": mbid,
-        "availableInPlex": available_in_plex,
-        "availableInLidarr": available_in_lidarr,
-        "plexUrl": plex_artist.get("url", "") if plex_artist else "",
-        "plexampUrl": plex_artist.get("plexampUrl", "") if plex_artist else "",
-        "releaseGroups": {
-            release_group_id: {
-                "availableInPlex": release_group_id in plex_groups,
-                "availableInLidarr": release_group_id.casefold() in lidarr_groups,
-                "fullyAvailableInLidarr": bool(
-                    lidarr_groups.get(release_group_id.casefold(), {}).get(
-                        "fullyAvailable"
-                    )
-                ),
-                "requestStatus": _release_group_lifecycle(
-                    release_group_id, lidarr_groups.get(release_group_id.casefold()),
-                    downloads.get(release_group_id.casefold()),
-                    release_group_id.casefold() in pending,
-                )[0],
-                "downloadStatus": _release_group_lifecycle(
-                    release_group_id, lidarr_groups.get(release_group_id.casefold()),
-                    downloads.get(release_group_id.casefold()),
-                    release_group_id.casefold() in pending,
-                )[1],
-            }
-            for release_group_id in release_group_ids
-        },
-        "settled": _availability_settled(
-            available_in_lidarr=available_in_lidarr,
-            available_in_plex=available_in_plex,
+        "releaseGroups": _release_group_availability(
+            _requested_release_group_ids(), include_plex_releases=True,
         ),
     })
 

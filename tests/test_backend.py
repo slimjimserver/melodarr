@@ -9412,6 +9412,42 @@ class MusicRoutesTests(DatabaseTestCase):
             },
         })
 
+    def test_batch_release_group_availability_uses_live_cached_status(self):
+        with (
+            patch("backend.routes.music._plex_release_group_inventory") as plex_groups,
+            patch("backend.routes.music.lidarr.cached_library_availability") as albums,
+            patch("backend.routes.music._download_snapshot") as downloads,
+            patch("backend.routes.music.pending_lidarr_search_mbids") as pending,
+        ):
+            plex_groups.return_value = {
+                "owned": [{"name": "Owned", "url": "https://app.plex.tv/owned"}],
+            }
+            albums.return_value = {
+                "loading": {"fullyAvailable": False},
+                "owned": {"fullyAvailable": True},
+            }
+            downloads.return_value = {"loading": {
+                "progress": 42, "status": "downloading", "downloadId": 99,
+            }}
+            pending.return_value = {"loading"}
+            self.register()
+
+            response = self.client.get(
+                "/api/music/release-groups/availability"
+                "?releaseGroup=loading&releaseGroup=owned&releaseGroup=loading"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        groups = response.get_json()["releaseGroups"]
+        self.assertEqual(list(groups), ["loading", "owned"])
+        self.assertEqual(groups["loading"]["requestStatus"], "downloading")
+        self.assertEqual(groups["loading"]["downloadStatus"]["progress"], 42)
+        self.assertFalse(groups["loading"]["fullyAvailableInLidarr"])
+        self.assertEqual(groups["owned"]["requestStatus"], "available")
+        self.assertEqual(groups["owned"]["plexReleases"][0]["url"], "https://app.plex.tv/owned")
+        self.assertNotIn("downloadId", response.get_data(as_text=True))
+
     @patch("backend.routes.music.get_service")
     @patch("backend.routes.music.lidarr.cached_library_availability")
     @patch("backend.routes.music._plex_release_group_inventory")
