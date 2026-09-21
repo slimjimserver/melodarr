@@ -3,4 +3,4 @@ gunicorn==26.2.0
 pillow==12.3.0
 pykakasi==2.3.0
 requests==2.34.2
-pywebpush==2.3.0
+pywebpush==2.5.0
