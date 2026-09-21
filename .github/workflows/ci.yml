@@ -22,7 +22,7 @@ jobs:
         working-directory: frontend
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Node.js
         uses: actions/setup-node@v7
@@ -53,7 +53,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Python
         uses: actions/setup-python@v7
@@ -75,7 +75,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Build application image
         run: docker build --tag melodarr-ci .
