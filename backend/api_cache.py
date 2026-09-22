@@ -13,8 +13,10 @@ import requests
 
 if __package__:
     from .config import API_CACHE_CLEANUP_INTERVAL, CACHE_DATABASE, DATABASE
+    from .http_security import request_without_redirects
 else:  # Support the existing `python backend/app.py` entry point.
     from config import API_CACHE_CLEANUP_INTERVAL, CACHE_DATABASE, DATABASE
+    from http_security import request_without_redirects
 
 
 logger = logging.getLogger(__name__)
@@ -431,6 +433,7 @@ def cached_json_get(
     force_refresh=False,
     cache_only=False,
     cache_response=True,
+    reject_redirects=False,
     request_get=None,
     after_response=None,
 ):
@@ -467,6 +470,7 @@ def cached_json_get(
             request_timeout=request_timeout,
             force_refresh=force_refresh,
             cache_response=cache_response,
+            reject_redirects=reject_redirects,
             request_get=request_get,
             after_response=after_response,
         )
@@ -489,6 +493,7 @@ def _fetch_json_response(
     request_timeout,
     force_refresh,
     cache_response,
+    reject_redirects,
     request_get,
     after_response,
 ):
@@ -506,11 +511,15 @@ def _fetch_json_response(
                 if value is not None:
                     return (value, True) if include_cache_status else value
         try:
-            response = request_get(
-                url,
-                params=params,
-                headers=headers,
-                timeout=request_timeout,
+            request_kwargs = {
+                "params": params,
+                "headers": headers,
+                "timeout": request_timeout,
+            }
+            response = (
+                request_without_redirects(request_get, url, **request_kwargs)
+                if reject_redirects
+                else request_get(url, **request_kwargs)
             )
         except tuple(retry_exceptions) as exc:
             if attempt + 1 >= attempts:

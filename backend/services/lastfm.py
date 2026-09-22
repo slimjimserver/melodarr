@@ -97,6 +97,7 @@ def _get(method, api_key, *, username=None, **extra):
             params=params,
             headers={"User-Agent": USER_AGENT},
             namespace=namespace,
+            reject_redirects=True,
             ttl=LASTFM_CACHE_TTL,
         )
     if data.get("error"):

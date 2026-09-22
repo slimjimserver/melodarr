@@ -47,6 +47,7 @@ from backend.api_cache import (
 )
 from backend.application import MAX_REQUEST_BODY_BYTES, create_app
 from backend.config import ARTWORK_CACHE_DIRECTORY
+from backend.http_security import RedirectRejected
 from backend.routes import discovery
 from backend.services import (
     anime_theme_links,
@@ -4881,6 +4882,50 @@ class LastFmLinkingTests(DatabaseTestCase):
 
 
 class ApiCacheTests(DatabaseTestCase):
+    @patch("backend.api_cache.requests.get")
+    def test_redirects_never_forward_custom_credentials(self, get):
+        origin = "https://source.test/data"
+        secret = "sentinel-api-key"
+        destinations = {
+            "same-origin": "https://source.test/redirected",
+            "cross-origin": "https://other.test/credential-target",
+        }
+
+        for status_code in (301, 302, 307):
+            for destination_kind, destination in destinations.items():
+                with self.subTest(
+                    status_code=status_code,
+                    destination_kind=destination_kind,
+                ):
+                    get.reset_mock()
+                    get.return_value = Response(
+                        status_code,
+                        headers={"Location": destination},
+                    )
+
+                    with self.assertRaises(RedirectRejected):
+                        cached_json_get(
+                            origin,
+                            headers={"X-Api-Key": secret},
+                            namespace=(
+                                f"redirect-{status_code}-{destination_kind}"
+                            ),
+                            reject_redirects=True,
+                            ttl=60,
+                        )
+
+                    get.assert_called_once()
+                    self.assertEqual(get.call_args.args[0], origin)
+                    self.assertEqual(
+                        get.call_args.kwargs["headers"],
+                        {"X-Api-Key": secret},
+                    )
+                    self.assertFalse(get.call_args.kwargs["allow_redirects"])
+                    self.assertNotEqual(
+                        urlparse(get.call_args.args[0]).netloc,
+                        "other.test",
+                    )
+
     def test_expiry_cleanup_has_an_index(self):
         with cache_db() as connection:
             indexes = {
@@ -6487,8 +6532,27 @@ class LidarrClientTests(unittest.TestCase):
         })
 
     @patch("backend.services.lidarr.requests.request")
+    def test_authenticated_request_rejects_redirect(self, request):
+        request.return_value = Response(
+            302,
+            headers={"Location": "https://other.test/lidarr"},
+        )
+
+        with self.assertRaises(RedirectRejected):
+            lidarr.system_status(
+                {"url": "http://lidarr:8686", "apiKey": "private-key"}
+            )
+
+        request.assert_called_once()
+        self.assertFalse(request.call_args.kwargs["allow_redirects"])
+        self.assertEqual(
+            request.call_args.kwargs["headers"],
+            {"X-Api-Key": "private-key"},
+        )
+
+    @patch("backend.services.lidarr.requests.request")
     def test_artist_lookup_uses_authenticated_v1_endpoint(self, request):
-        response = Mock()
+        response = Response()
         request.return_value = response
         result = lidarr.lookup_artist(
             "artist-id",
@@ -6498,6 +6562,7 @@ class LidarrClientTests(unittest.TestCase):
         request.assert_called_once_with(
             "GET",
             "http://lidarr:8686/api/v1/artist/lookup",
+            allow_redirects=False,
             headers={"X-Api-Key": "key"},
             timeout=15,
             params={"term": "mbid:artist-id"},
@@ -6505,7 +6570,7 @@ class LidarrClientTests(unittest.TestCase):
 
     @patch("backend.services.lidarr.requests.request")
     def test_monitor_albums_uses_album_monitor_endpoint(self, request):
-        response = Mock()
+        response = Response()
         request.return_value = response
 
         result = lidarr.monitor_albums(
@@ -6517,6 +6582,7 @@ class LidarrClientTests(unittest.TestCase):
         request.assert_called_once_with(
             "PUT",
             "http://lidarr:8686/api/v1/album/monitor",
+            allow_redirects=False,
             headers={"X-Api-Key": "key"},
             timeout=15,
             json={"albumIds": [33], "monitored": True},
@@ -6544,6 +6610,7 @@ class LidarrClientTests(unittest.TestCase):
         request.assert_called_once_with(
             "GET",
             "http://lidarr:8686/api/v1/album",
+            allow_redirects=False,
             headers={"X-Api-Key": "key"},
             timeout=20,
             params={"artistId": 42},
@@ -10834,6 +10901,32 @@ class ArtworkCacheTests(DatabaseTestCase):
             self.assertEqual(result.headers["Cache-Control"], "no-store")
             self.assertEqual(os.listdir(directory), [])
 
+    @patch("backend.artwork_cache.requests.get")
+    def test_authenticated_artwork_rejects_provider_redirect(self, get):
+        get.return_value = Response(
+            307,
+            headers={"Location": "https://other.test/private-artwork"},
+        )
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(artwork_cache, "ARTWORK_CACHE_DIRECTORY", directory),
+            self.app.test_request_context(),
+        ):
+            result = self.app.make_response(artwork_cache.cached_artwork(
+                "plex-artist-redirect",
+                "http://plex:32400/thumbnail",
+                headers={"X-Plex-Token": "private-token"},
+            ))
+
+        self.assertEqual(result.status_code, 502)
+        self.assertNotIn("Location", result.headers)
+        get.assert_called_once()
+        self.assertFalse(get.call_args.kwargs["allow_redirects"])
+        self.assertEqual(
+            get.call_args.kwargs["headers"],
+            {"X-Plex-Token": "private-token"},
+        )
+
     def artwork_url(self, mbid):
         return f"/api/artwork/release-group/{mbid}"
 
@@ -11780,6 +11873,26 @@ class PlexHistoryClientTests(unittest.TestCase):
             "server-token",
         )
 
+    @patch("backend.services.plex_history.requests.get")
+    def test_accounts_reject_cross_origin_redirect(self, get):
+        get.return_value = Response(
+            302,
+            headers={"Location": "https://other.test/accounts"},
+        )
+
+        with self.assertRaises(RedirectRejected):
+            plex_history.accounts({
+                "url": "http://plex:32400",
+                "token": "server-token",
+            })
+
+        get.assert_called_once()
+        self.assertFalse(get.call_args.kwargs["allow_redirects"])
+        self.assertEqual(
+            get.call_args.kwargs["headers"]["X-Plex-Token"],
+            "server-token",
+        )
+
     @patch(
         "backend.services.plex_history.plex.cached_library_index",
         return_value={},
@@ -12244,6 +12357,23 @@ class PlexAuthenticationClientTests(unittest.TestCase):
         post.assert_called_once()
 
     @patch("backend.services.plex_auth.requests.get")
+    def test_authenticated_account_request_rejects_redirect(self, get):
+        get.return_value = Response(
+            301,
+            headers={"Location": "https://other.test/account"},
+        )
+
+        with self.assertRaises(RedirectRejected):
+            plex_auth.get_account("account-token", "client-id")
+
+        get.assert_called_once()
+        self.assertFalse(get.call_args.kwargs["allow_redirects"])
+        self.assertEqual(
+            get.call_args.kwargs["headers"]["X-Plex-Token"],
+            "account-token",
+        )
+
+    @patch("backend.services.plex_auth.requests.get")
     def test_poll_pin_treats_a_null_token_as_pending(self, get):
         get.return_value = Response(payload={"id": 42, "authToken": None})
 
@@ -12296,6 +12426,26 @@ class PlexClientTests(unittest.TestCase):
         )
         result = plex.machine_identifier({"url": "http://plex:32400", "token": "token"})
         self.assertEqual(result, "server-1")
+
+    @patch("backend.services.plex.requests.get")
+    def test_identity_rejects_same_origin_redirect(self, get):
+        get.return_value = Response(
+            307,
+            headers={"Location": "http://plex:32400/identity/"},
+        )
+
+        with self.assertRaises(RedirectRejected):
+            plex.machine_identifier({
+                "url": "http://plex:32400",
+                "token": "server-token",
+            })
+
+        get.assert_called_once()
+        self.assertFalse(get.call_args.kwargs["allow_redirects"])
+        self.assertEqual(
+            get.call_args.kwargs["headers"]["X-Plex-Token"],
+            "server-token",
+        )
 
     @patch("backend.services.plex.requests.get")
     def test_music_library_filters_sorts_and_builds_links(self, get):

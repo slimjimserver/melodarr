@@ -6,6 +6,11 @@ from urllib.parse import urlencode
 
 import requests
 
+if __package__ == "backend.services":
+    from ..http_security import request_without_redirects
+else:  # Support the existing `python backend/app.py` entry point.
+    from http_security import request_without_redirects
+
 
 PLEX_TV_URL = "https://plex.tv"
 PLEX_AUTH_URL = "https://app.plex.tv/auth/#!"
@@ -40,7 +45,8 @@ def _expires_at(value):
 
 def create_pin(client_identifier):
     """Create a short-lived Plex PIN and return its browser authorization URL."""
-    response = requests.post(
+    response = request_without_redirects(
+        requests.post,
         f"{PLEX_TV_URL}/api/v2/pins",
         params={"strong": "true"},
         headers=_headers(client_identifier),
@@ -73,7 +79,8 @@ def create_pin(client_identifier):
 
 def poll_pin(pin_id, client_identifier):
     """Return the Plex token for an authorized PIN, or an empty string."""
-    response = requests.get(
+    response = request_without_redirects(
+        requests.get,
         f"{PLEX_TV_URL}/api/v2/pins/{int(pin_id)}",
         headers=_headers(client_identifier),
         timeout=REQUEST_TIMEOUT,
@@ -85,7 +92,8 @@ def poll_pin(pin_id, client_identifier):
 
 def get_account(token, client_identifier):
     """Return the stable identity fields for the authenticated Plex account."""
-    response = requests.get(
+    response = request_without_redirects(
+        requests.get,
         f"{PLEX_TV_URL}/users/account.json",
         headers=_headers(client_identifier, token),
         timeout=REQUEST_TIMEOUT,
@@ -188,7 +196,8 @@ def _xml_resources(content):
 
 def get_resources(token, client_identifier):
     """Return Plex Media Server resources and their advertised connections."""
-    response = requests.get(
+    response = request_without_redirects(
+        requests.get,
         f"{PLEX_TV_URL}/api/resources",
         params={"includeHttps": "1"},
         headers=_headers(client_identifier, token),

@@ -23,6 +23,7 @@ if __package__ == "backend.services":
         USER_AGENT,
     )
     from ..detail_cache import invalidate_all as invalidate_detail_payloads
+    from ..http_security import request_without_redirects
     from ..storage import get_service
 else:  # Support the existing `python backend/app.py` entry point.
     import track_search_index
@@ -37,6 +38,7 @@ else:  # Support the existing `python backend/app.py` entry point.
         USER_AGENT,
     )
     from detail_cache import invalidate_all as invalidate_detail_payloads
+    from http_security import request_without_redirects
     from storage import get_service
 
 
@@ -85,7 +87,8 @@ def url(path, config=None):
 
 def _request(method, path, *, config=None, timeout=15, **kwargs):
     config = config or get_service("lidarr")
-    return requests.request(
+    return request_without_redirects(
+        requests.request,
         method,
         url(path, config),
         headers=headers(config),
@@ -109,6 +112,7 @@ def options(config=None):
             headers=request_headers,
             namespace="lidarr-options",
             ttl=LIDARR_OPTIONS_CACHE_TTL,
+            reject_redirects=True,
         )
 
     return {

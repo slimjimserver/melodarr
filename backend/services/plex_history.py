@@ -6,8 +6,10 @@ from urllib.parse import urlsplit
 import requests
 
 if __package__ == "backend.services":
+    from ..http_security import request_without_redirects
     from . import plex
 else:  # Support the existing `python backend/app.py` entry point.
+    from http_security import request_without_redirects
     from services import plex
 
 
@@ -86,7 +88,8 @@ def selected_music_section_ids(config):
 
 def accounts(config):
     """Return server-local Plex account IDs and their username-like aliases."""
-    response = requests.get(
+    response = request_without_redirects(
+        requests.get,
         f"{config['url']}/accounts",
         headers=_headers(config),
         timeout=12,
@@ -251,7 +254,8 @@ def _server_history(
             "sort": "viewedAt:desc",
             **pagination,
         }
-        response = requests.get(
+        response = request_without_redirects(
+            requests.get,
             f"{config['url']}{HISTORY_ENDPOINT}",
             params=params,
             headers=_headers(config, start=start, size=page_size),
