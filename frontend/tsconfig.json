@@ -2,7 +2,7 @@
   "compilerOptions": {
     "target": "ES2022",
     "lib": ["DOM", "DOM.Iterable", "ES2022"],
-    "module": "none",
+    "module": "ESNext",
     "strict": true,
     "useUnknownInCatchVariables": false,
     "noImplicitOverride": true,
