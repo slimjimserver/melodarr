@@ -7643,6 +7643,22 @@ class ReleaseGroupRankingTests(unittest.TestCase):
         self.assertEqual(isrc["query"], "isrc:USRC17607839")
         self.assertFalse(isrc["plainSearch"])
 
+    def test_explicit_track_artist_handles_repetitive_separator_input(self):
+        split = discovery._explicit_track_artist
+        self.assertEqual(split("Song - Artist"), ("Song", "Artist"))
+        self.assertEqual(split("Song – Artist"), ("Song", "Artist"))
+        self.assertEqual(split("Song — Artist"), ("Song", "Artist"))
+        self.assertEqual(split("Song by Artist Name"), ("Song", "Artist Name"))
+        self.assertEqual(split("Song by Artist - Remix"), ("Song by Artist", "Remix"))
+        self.assertEqual(split("Stand By Me"), ("Stand By Me", ""))
+
+        repeated = "a" * 6000 + " " * 6000
+        self.assertEqual(split(repeated + "- Artist"), ("a" * 6000, "Artist"))
+        self.assertEqual(
+            split(repeated + "by Artist Name"),
+            ("a" * 6000, "Artist Name"),
+        )
+
     def test_space_only_track_search_uses_the_strongest_valid_split(self):
         plan = discovery._track_search_plan("Blinding Lights The Weeknd")
         recordings = [

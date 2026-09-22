@@ -209,19 +209,29 @@ def _normalized_isrc(query):
 def _explicit_track_artist(query):
     """Split only unambiguous song/artist separators."""
     value = str(query or "").strip()
-    match = re.fullmatch(r"(.+?)\s+[-–—]\s+(.+?)", value)
-    if not match:
-        match = re.fullmatch(r"(.+?)\s+by\s+(.+?)", value, flags=re.IGNORECASE)
+    for index, character in enumerate(value):
         if (
-            match
-            and len(match.group(2).split()) < 2
-            and " by " not in value
+            character in "-–—"
+            and 0 < index < len(value) - 1
+            and value[index - 1].isspace()
+            and value[index + 1].isspace()
         ):
-            match = None
-    if not match:
-        return value, ""
-    title, artist = (part.strip() for part in match.groups())
-    return (title, artist) if title and artist else (value, "")
+            title, artist = value[:index].strip(), value[index + 1:].strip()
+            return (title, artist) if title and artist else (value, "")
+
+    for index in range(1, len(value) - 2):
+        if (
+            value[index:index + 2].lower() == "by"
+            and value[index - 1].isspace()
+            and value[index + 2].isspace()
+        ):
+            title, artist = value[:index].strip(), value[index + 2:].strip()
+            if not title or not artist:
+                return value, ""
+            if len(artist.split()) < 2 and " by " not in value:
+                return value, ""
+            return title, artist
+    return value, ""
 
 
 def _track_version_intents(query):
