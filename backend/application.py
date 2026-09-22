@@ -18,6 +18,7 @@ if __package__:
         load_session_secret,
     )
     from .instance_settings import ensure_instance_settings
+    from .responses import api_error
     from .routes.account import blueprint as account_blueprint
     from .routes.admin import blueprint as admin_blueprint
     from .routes.anime import blueprint as anime_blueprint
@@ -42,6 +43,7 @@ else:  # Support the existing `python backend/app.py` entry point.
         load_session_secret,
     )
     from instance_settings import ensure_instance_settings
+    from responses import api_error
     from routes.account import blueprint as account_blueprint
     from routes.admin import blueprint as admin_blueprint
     from routes.anime import blueprint as anime_blueprint
@@ -70,6 +72,7 @@ COMPRESSIBLE_MIMETYPES = frozenset({
     "text/plain",
 })
 COMPRESSION_MINIMUM_BYTES = 1024
+MAX_REQUEST_BODY_BYTES = 64 * 1024
 
 
 def compress_response(response):
@@ -172,6 +175,7 @@ def create_app(config=None):
     app.config.update(
         AUTOMATION_API_KEY_OVERRIDE=load_automation_api_key(),
         SECRET_KEY=load_session_secret(),
+        MAX_CONTENT_LENGTH=MAX_REQUEST_BODY_BYTES,
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
         SESSION_COOKIE_SECURE=os.getenv("MELODARR_COOKIE_SECURE", "false").lower() == "true",
@@ -180,6 +184,10 @@ def create_app(config=None):
     )
     if config:
         app.config.update(config)
+
+    @app.errorhandler(413)
+    def request_body_too_large(_error):
+        return api_error("Request body is too large.", 413)
 
     init_cache_db()
     migrate_legacy_cache()

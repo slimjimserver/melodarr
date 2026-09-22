@@ -45,7 +45,7 @@ from backend.api_cache import (
     migrate_legacy_cache,
     upsert_cache_documents,
 )
-from backend.application import create_app
+from backend.application import MAX_REQUEST_BODY_BYTES, create_app
 from backend.config import ARTWORK_CACHE_DIRECTORY
 from backend.routes import discovery
 from backend.services import (
@@ -264,6 +264,64 @@ class ApplicationFactoryTests(DatabaseTestCase):
     def test_factory_applies_test_configuration(self):
         self.assertTrue(self.app.config["TESTING"])
         self.assertEqual(self.app.config["SECRET_KEY"], "test-secret")
+        self.assertEqual(
+            self.app.config["MAX_CONTENT_LENGTH"],
+            MAX_REQUEST_BODY_BYTES,
+        )
+
+    def test_anonymous_json_body_at_limit_is_accepted(self):
+        prefix = b'{"username":"missing-user","password":"'
+        suffix = b'"}'
+        body = (
+            prefix
+            + (b"x" * (MAX_REQUEST_BODY_BYTES - len(prefix) - len(suffix)))
+            + suffix
+        )
+        self.assertEqual(len(body), MAX_REQUEST_BODY_BYTES)
+
+        response = self.client.post(
+            "/api/auth/login",
+            data=body,
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(
+            response.get_json(),
+            {"error": "Invalid username or password."},
+        )
+
+    def test_anonymous_oversized_json_body_returns_api_error(self):
+        response = self.client.post(
+            "/api/auth/login",
+            json={
+                "username": "missing-user",
+                "password": "x" * MAX_REQUEST_BODY_BYTES,
+            },
+        )
+
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(response.mimetype, "application/json")
+        self.assertEqual(
+            response.get_json(),
+            {"error": "Request body is too large."},
+        )
+
+    def test_authenticated_oversized_json_body_returns_api_error(self):
+        csrf_token = self.register()
+
+        response = self.client.post(
+            "/api/settings/melodarr",
+            json={"applicationTitle": "x" * MAX_REQUEST_BODY_BYTES},
+            headers={"X-CSRF-Token": csrf_token},
+        )
+
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(response.mimetype, "application/json")
+        self.assertEqual(
+            response.get_json(),
+            {"error": "Request body is too large."},
+        )
 
     def test_automation_api_key_uses_the_environment_configuration(self):
         with patch.dict(
