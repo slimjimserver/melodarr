@@ -4,6 +4,7 @@ import requests
 from flask import Blueprint, current_app, jsonify, request
 
 if __package__ == "backend.routes":
+    from ._safe_errors import public_exception_message
     from ..api_cache import cache_stats, clear_cache
     from ..artwork_cache import artwork_cache_stats, clear_artwork_cache
     from ..detail_cache import invalidate_all as invalidate_detail_payloads
@@ -30,6 +31,7 @@ if __package__ == "backend.routes":
     from ..workers import plex_metadata as plex_metadata_worker
     from ..workers import recommendations as recommendation_worker
 else:  # Support the existing `python backend/app.py` entry point.
+    from routes._safe_errors import public_exception_message
     from api_cache import cache_stats, clear_cache
     from artwork_cache import artwork_cache_stats, clear_artwork_cache
     from detail_cache import invalidate_all as invalidate_detail_payloads
@@ -58,6 +60,37 @@ else:  # Support the existing `python backend/app.py` entry point.
 
 
 blueprint = Blueprint("settings", __name__)
+
+_INSTANCE_VALIDATION_MESSAGES = (
+    "Request body must be a JSON object.",
+    "Melodarr settings contain unsupported fields.",
+    "Application title must be text.",
+    "Application title must be between 1 and 80 characters.",
+    "Application URL must be text.",
+    "Application URL must be an absolute HTTP(S) URL.",
+)
+_MUSICBRAINZ_CONFIG_MESSAGES = (
+    "MusicBrainz WS2 base URL must be text.",
+    "Enter a MusicBrainz WS2 base URL.",
+    "Enter a valid MusicBrainz WS2 base URL.",
+    "MusicBrainz WS2 base URL must use HTTP or HTTPS.",
+    "MusicBrainz WS2 base URL must not include credentials.",
+    "MusicBrainz WS2 base URL must not include a query or fragment.",
+    "MusicBrainz request interval must be a whole number from 0 to 60000.",
+    "MusicBrainz settings must be a JSON object.",
+    "MusicBrainz user agent must be text.",
+    "Enter a MusicBrainz user agent.",
+    "MusicBrainz user agent must be 512 characters or fewer.",
+)
+_MUSICBRAINZ_INCOMPATIBLE_MESSAGES = (
+    "MusicBrainz redirected the WS2 test request. Use the final WS2 base URL.",
+    "The server did not return valid MusicBrainz WS2 JSON.",
+    "The server responded, but it did not return a compatible MusicBrainz WS2 recording.",
+    "MusicBrainz redirected the WS2 search test request. Use the final WS2 base URL.",
+    "Direct MusicBrainz lookups work, but search is unavailable. If this is a self-hosted server, check that its search/Solr service is running and reachable from the MusicBrainz web service.",
+    "The server did not return valid MusicBrainz WS2 search JSON.",
+    "The server responded, but it did not return a compatible MusicBrainz WS2 artist search.",
+)
 
 CACHE_NAMES = {
     "musicbrainz-search": "MusicBrainz Search",
@@ -122,7 +155,10 @@ def configure_melodarr():
     try:
         save_instance_settings(request_json_object())
     except ValueError as exc:
-        return api_error(str(exc))
+        return api_error(public_exception_message(
+            exc, _INSTANCE_VALIDATION_MESSAGES, "Could not save Melodarr settings.",
+            context="Melodarr settings",
+        ))
     return jsonify({
         "message": "Melodarr settings saved.",
         "melodarr": public_instance_settings(
@@ -341,7 +377,10 @@ def configure_lidarr():
     try:
         connection = lidarr.connection(values, old)
     except ValueError as exc:
-        return api_error(str(exc))
+        return api_error(public_exception_message(
+            exc, ("Lidarr URL must not contain a username or password.",),
+            "Invalid Lidarr connection settings.", context="Lidarr settings",
+        ))
     config = {
         **connection,
         "externalUrl": str(values.get("externalUrl", "")).strip().rstrip("/"),
@@ -387,7 +426,10 @@ def configure_musicbrainz():
         old_config = musicbrainz.configuration()
         config = musicbrainz.configuration(values)
     except musicbrainz.ConfigurationError as exc:
-        return api_error(str(exc))
+        return api_error(public_exception_message(
+            exc, _MUSICBRAINZ_CONFIG_MESSAGES, "Invalid MusicBrainz settings.",
+            context="MusicBrainz settings",
+        ))
 
     save_service("musicbrainz", config)
     musicbrainz.reset_request_pacing()
@@ -415,9 +457,16 @@ def test_musicbrainz():
     try:
         return jsonify(musicbrainz.test_connection(values))
     except musicbrainz.ConfigurationError as exc:
-        return api_error(str(exc))
+        return api_error(public_exception_message(
+            exc, _MUSICBRAINZ_CONFIG_MESSAGES, "Invalid MusicBrainz settings.",
+            context="MusicBrainz connection test settings",
+        ))
     except musicbrainz.IncompatibleServerError as exc:
-        return api_error(str(exc), 502)
+        return api_error(public_exception_message(
+            exc, _MUSICBRAINZ_INCOMPATIBLE_MESSAGES,
+            "MusicBrainz did not provide a compatible WS2 response.",
+            context="MusicBrainz connection test",
+        ), 502)
     except requests.RequestException:
         return api_error(
             "Could not connect to MusicBrainz. Check the WS2 URL and port.",
@@ -449,7 +498,10 @@ def configure_lastfm():
                 cache_response=False,
             )
         except ValueError as exc:
-            return api_error(str(exc))
+            return api_error(public_exception_message(
+                exc, (), "Unable to validate the Last.fm API key.",
+                context="Last.fm API key validation",
+            ))
         except requests.RequestException:
             return api_error(
                 "Could not connect to Last.fm. Try again shortly.",
@@ -477,7 +529,10 @@ def test_lidarr():
     try:
         config = lidarr.connection(values)
     except ValueError as exc:
-        return api_error(str(exc))
+        return api_error(public_exception_message(
+            exc, ("Lidarr URL must not contain a username or password.",),
+            "Invalid Lidarr connection settings.", context="Lidarr connection test",
+        ))
     if not config["url"] or not config["apiKey"]:
         return api_error("Enter a hostname, port, and API key before testing.")
     try:

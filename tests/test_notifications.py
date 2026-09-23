@@ -758,6 +758,36 @@ class NotificationRouteTests(unittest.TestCase):
         self.assertEqual(saved["email"]["host"], "smtp.old")
         self.assertEqual(saved["webPush"]["contact"], "mailto:old@example.test")
 
+    def test_notification_settings_do_not_reflect_unexpected_validation_text(self):
+        self._login_as(self.admin_id)
+        with patch(
+            "backend.routes.notifications.notifications.save_email_config",
+            side_effect=ValueError("sentinel-secret-provider-detail"),
+        ):
+            with self.assertLogs(self.app.logger.name, level="WARNING") as logs:
+                response = self.client.put(
+                    "/api/settings/notifications/email",
+                    json={"enabled": True},
+                    headers={"X-CSRF-Token": "csrf"},
+                )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json(), {"error": "Invalid notification settings."})
+        self.assertNotIn("sentinel-secret-provider-detail", logs.output[0])
+
+    def test_push_metadata_does_not_reflect_unexpected_validation_text(self):
+        self._login_as(self.user_id)
+        with patch(
+            "backend.routes.notifications.notifications.safe_text",
+            side_effect=ValueError("sentinel-secret-provider-detail"),
+        ):
+            response = self.client.post(
+                "/api/account/notifications/subscriptions",
+                json={"deviceName": "Phone"},
+                headers={"X-CSRF-Token": "csrf"},
+            )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json(), {"error": "Push subscription is invalid."})
+
     def test_global_notification_route_saves_delay(self):
         self._login_as(self.admin_id)
         response = self.client.put(

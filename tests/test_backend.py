@@ -4441,6 +4441,23 @@ class SettingsMaintenanceTests(DatabaseTestCase):
             invalid.get_data(as_text=True),
         )
 
+    @patch("backend.routes.settings.lastfm.get")
+    def test_shared_lastfm_validation_does_not_reflect_provider_text(self, lastfm_get):
+        lastfm_get.side_effect = ValueError("sentinel-secret-provider-detail")
+        token = self.register()
+        with self.assertLogs(self.app.logger.name, level="WARNING") as logs:
+            response = self.client.post(
+                "/api/settings/lastfm",
+                json={"apiKey": "candidate-key"},
+                headers={"X-CSRF-Token": token},
+            )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.get_json(), {"error": "Unable to validate the Last.fm API key."}
+        )
+        self.assertNotIn("sentinel-secret-provider-detail", logs.output[0])
+        self.assertFalse(get_service("lastfm"))
+
     def test_only_administrators_can_manage_the_shared_lastfm_key(self):
         admin_token = self.register()
         with db() as connection:
@@ -5502,6 +5519,17 @@ class LidarrRequestTests(DatabaseTestCase):
             return connection.execute(
                 "SELECT kind, mbid, name FROM request_history ORDER BY id"
             ).fetchall()
+
+    @patch("backend.routes.requests._anime_request_context")
+    def test_anime_context_does_not_reflect_unexpected_exception(self, context):
+        context.side_effect = ValueError("sentinel-secret-provider-detail")
+        response = self.client.post(
+            "/api/request/release-group",
+            json={"mbid": self.album_mbid, "animeSlug": "anime"},
+            headers={"X-CSRF-Token": self.register()},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json(), {"error": "Invalid anime request context."})
 
     def test_already_queued_release_group_is_recorded_for_the_current_user(self):
         admin_csrf = self.register()
@@ -9001,6 +9029,18 @@ class DiscoveryRoutesTests(DatabaseTestCase):
             "type": "anime",
         })
         search.assert_called_once_with("naruto")
+
+    @patch("backend.routes.discovery.animethemes.search")
+    def test_anime_search_does_not_reflect_provider_exception(self, search):
+        search.side_effect = ValueError("sentinel-secret-provider-detail")
+        response = self.client.get(
+            "/api/search?q=naruto&type=anime",
+            headers={"X-CSRF-Token": self.register()},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.get_json(), {"error": "AnimeThemes search could not be completed."}
+        )
 
     @patch("backend.routes.discovery.plex.cached_library_index")
     @patch("backend.routes.discovery.get_service")

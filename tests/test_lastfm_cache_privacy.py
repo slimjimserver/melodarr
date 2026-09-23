@@ -186,7 +186,9 @@ class LastfmCachePrivacyTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.get_json()["error"], "Invalid API key")
+        self.assertEqual(
+            response.get_json()["error"], "Unable to validate the Last.fm API key."
+        )
         request_get.assert_called_once()
         self.assertEqual(request_get.call_args.kwargs["params"]["api_key"], "new-invalid-key")
         self.assertEqual(len(self.cache_rows()), 1)
