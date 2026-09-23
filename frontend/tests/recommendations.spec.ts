@@ -82,7 +82,7 @@ test("homepage explains album picks and separates global charts", async ({ page 
   await page.getByText("Your recommendation activity", { exact: true }).click();
   await expect(page.getByText(/Plex listening outcomes are not available yet/)).toBeVisible();
   await page.locator("#recommendations-title").scrollIntoViewIfNeeded();
-  await page.screenshot({ path: resolve(__dirname, "../../.venv-recommendations/homepage-desktop.jpg"), type: "jpeg", quality: 65 });
+  await page.screenshot({ path: resolve(__dirname, "../../data/test-artifacts/playwright/homepage-desktop.jpg"), type: "jpeg", quality: 65 });
 });
 
 test("album search reveals cached candidates without another request", async ({ page }) => {
@@ -241,7 +241,7 @@ test("offscreen carousel cards are not recorded as impressions", async ({ page }
   expect(events.some((event) => event.id === "familiar-5" && event.action === "impression")).toBeFalsy();
   const dimensions = await page.evaluate(() => ({ width: document.documentElement.clientWidth, scroll: document.documentElement.scrollWidth }));
   expect(dimensions.scroll).toBeLessThanOrEqual(dimensions.width);
-  await page.screenshot({ path: resolve(__dirname, "../../.venv-recommendations/homepage-mobile.jpg"), type: "jpeg", quality: 65 });
+  await page.screenshot({ path: resolve(__dirname, "../../data/test-artifacts/playwright/homepage-mobile.jpg"), type: "jpeg", quality: 65 });
 });
 
 test("album requests use the existing request flow and refresh queues work", async ({ page }) => {
@@ -316,7 +316,7 @@ test("popular albums keep chart ranks, filter recent releases, and request match
   const dimensions = await page.evaluate(() => ({ width: document.documentElement.clientWidth, scroll: document.documentElement.scrollWidth }));
   expect(dimensions.scroll).toBeLessThanOrEqual(dimensions.width);
   await page.getByRole("heading", { name: "Popular albums right now" }).scrollIntoViewIfNeeded();
-  await page.locator(".popular-albums").screenshot({ path: resolve(__dirname, "../../.venv-recommendations/popular-albums-mobile.jpg"), type: "jpeg", quality: 65 });
+  await page.locator(".popular-albums").screenshot({ path: resolve(__dirname, "../../data/test-artifacts/playwright/popular-albums-mobile.jpg"), type: "jpeg", quality: 65 });
   const request = page.waitForRequest("**/api/request/release-group");
   await page.locator('[data-item-id="new-chart"]').getByRole("button", { name: "Request album" }).click();
   expect((await request).postDataJSON().mbid).toBe("new-chart");
@@ -430,7 +430,7 @@ test("Japan selector switches chart ranks, preserves filters, and requests the J
   await expect(page.getByText("光", { exact: true })).toBeVisible();
   const dimensions = await page.evaluate(() => ({ width: document.documentElement.clientWidth, scroll: document.documentElement.scrollWidth }));
   expect(dimensions.scroll).toBeLessThanOrEqual(dimensions.width);
-  await page.locator(".popular-albums").screenshot({ path: resolve(__dirname, "../../.venv-recommendations/japan-chart-mobile.jpg"), type: "jpeg", quality: 65 });
+  await page.locator(".popular-albums").screenshot({ path: resolve(__dirname, "../../data/test-artifacts/playwright/japan-chart-mobile.jpg"), type: "jpeg", quality: 65 });
   const request = page.waitForRequest("**/api/request/release-group");
   await page.locator('[data-item-id="jp-new"]').getByRole("button", { name: "Request album" }).click();
   expect((await request).postDataJSON().mbid).toBe("jp-new");
@@ -484,7 +484,7 @@ test("taste controls save the mix and up to five favorite artists and survive re
   expect(dimensions.scroll).toBeLessThanOrEqual(dimensions.width);
   // Capture the entire expanded panel after checking the normal phone viewport.
   await page.setViewportSize({ width: 320, height: 1600 });
-  await page.locator(".taste-preferences").screenshot({ path: resolve(__dirname, "../../.venv-recommendations/taste-controls-mobile.jpg"), type: "jpeg", quality: 65 });
+  await page.locator(".taste-preferences").screenshot({ path: resolve(__dirname, "../../data/test-artifacts/playwright/taste-controls-mobile.jpg"), type: "jpeg", quality: 65 });
   await page.reload();
   await page.getByText("Shape Your Recommendations", { exact: true }).click();
   await expect(page.getByRole("radio", { name: "More discovery", exact: true })).toBeChecked();
@@ -574,7 +574,7 @@ test("request influence is editable only on your own history and persists after 
   await toggle.uncheck();
   await expect(page.getByText("Excluded from your taste profile.", { exact: false })).toBeVisible();
   await expect(page.getByText("Gift album", { exact: true })).toBeVisible();
-  await page.locator(".history-item").screenshot({ path: resolve(__dirname, "../../.venv-recommendations/request-taste-mobile.jpg"), type: "jpeg", quality: 65 });
+  await page.locator(".history-item").screenshot({ path: resolve(__dirname, "../../data/test-artifacts/playwright/request-taste-mobile.jpg"), type: "jpeg", quality: 65 });
   await page.reload();
   await expect(toggle).not.toBeChecked();
   await page.goto("/bea/requests");
@@ -624,9 +624,9 @@ test("mix preview explains row order and limits, supports keyboard selection, an
   await expect(panel.locator("summary")).toContainText("Familiar first");
   await expect(save).toBeDisabled();
   await expect(panel.locator(".taste-save-state")).toHaveText("All changes saved");
-  await panel.screenshot({ path: resolve(__dirname, "../../.venv-recommendations/taste-refined-desktop.jpg"), type: "jpeg", quality: 60 });
+  await panel.screenshot({ path: resolve(__dirname, "../../data/test-artifacts/playwright/taste-refined-desktop.jpg"), type: "jpeg", quality: 60 });
   await page.evaluate(() => document.documentElement.removeAttribute("data-theme"));
-  await panel.screenshot({ path: resolve(__dirname, "../../.venv-recommendations/taste-refined-light.jpg"), type: "jpeg", quality: 60 });
+  await panel.screenshot({ path: resolve(__dirname, "../../data/test-artifacts/playwright/taste-refined-light.jpg"), type: "jpeg", quality: 60 });
 });
 
 
@@ -671,6 +671,6 @@ for (const width of [1440, 320]) {
     const dimensions = await page.evaluate(() => ({ width: document.documentElement.clientWidth, scroll: document.documentElement.scrollWidth }));
     expect(dimensions.scroll).toBeLessThanOrEqual(dimensions.width);
     await first.scrollIntoViewIfNeeded();
-    await page.screenshot({ path: resolve(__dirname, `../../.venv-recommendations/requests-fixed-${width}.jpg`), type: "jpeg", quality: 65 });
+    await page.screenshot({ path: resolve(__dirname, `../../data/test-artifacts/playwright/requests-fixed-${width}.jpg`), type: "jpeg", quality: 65 });
   });
 }

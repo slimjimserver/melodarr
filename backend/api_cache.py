@@ -421,6 +421,7 @@ def cached_json_get(
     *,
     headers=None,
     params=None,
+    cache_params=None,
     namespace,
     ttl,
     include_cache_status=False,
@@ -437,8 +438,8 @@ def cached_json_get(
     request_get=None,
     after_response=None,
 ):
-    """Fetch JSON, optionally replacing rather than reading a fresh cached value."""
-    key = cache_key(namespace, url, params)
+    """Fetch JSON; cache_params can omit credentials sent in request params."""
+    key = cache_key(namespace, url, params if cache_params is None else cache_params)
     if not force_refresh:
         value = _fresh_cache_value(key)
         if value is not None:

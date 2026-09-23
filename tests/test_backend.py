@@ -2625,6 +2625,37 @@ class AuthenticationTests(DatabaseTestCase):
                     {"error": "Request body must be a JSON object."},
                 )
 
+    @patch("backend.routes.settings.lidarr.system_status")
+    def test_lidarr_settings_reject_embedded_url_credentials(self, system_status):
+        csrf = self.register()
+        for path in ("/api/settings/lidarr", "/api/settings/lidarr/test"):
+            with self.subTest(path=path):
+                response = self.client.post(
+                    path,
+                    json={"hostname": "http://user:password@lidarr:8686", "apiKey": "key"},
+                    headers={"X-CSRF-Token": csrf},
+                )
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(response.get_json(), {
+                    "error": "Lidarr URL must not contain a username or password.",
+                })
+        system_status.assert_not_called()
+
+    @patch("backend.routes.settings.lidarr.options", return_value={
+        "rootFolders": [], "qualityProfiles": [], "metadataProfiles": [], "tags": [],
+    })
+    @patch("backend.routes.settings.lidarr.system_status")
+    def test_lidarr_settings_accept_normal_url(self, system_status, options):
+        csrf = self.register()
+        system_status.return_value = Response(payload={"version": "1.0"})
+        response = self.client.post(
+            "/api/settings/lidarr",
+            json={"hostname": "http://lidarr:8686", "apiKey": "key"},
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(get_service("lidarr")["url"], "http://lidarr:8686")
+
     def test_plex_poll_stays_pending_until_the_pin_is_authorized(self):
         with (
             patch("backend.routes.auth.plex_auth.create_pin") as create_pin,
@@ -4333,6 +4364,8 @@ class SettingsMaintenanceTests(DatabaseTestCase):
             "melodarr",
             "first-shared-key",
             limit=1,
+            force_refresh=True,
+            cache_response=False,
         )
 
         configured = self.client.get("/api/settings")
@@ -6530,6 +6563,26 @@ class LidarrClientTests(unittest.TestCase):
             "url": "http://lidarr:8686",
             "apiKey": "saved-key",
         })
+
+    def test_connection_rejects_embedded_http_credentials(self):
+        for hostname in (
+            "http://user:password@lidarr:8686",
+            "https://user@lidarr:8686",
+            "user:password@lidarr:8686",
+        ):
+            with self.subTest(hostname=hostname):
+                with self.assertRaisesRegex(
+                    ValueError, "Lidarr URL must not contain a username or password"
+                ):
+                    lidarr.connection({"hostname": hostname, "apiKey": "key"})
+
+    def test_cached_options_reject_legacy_url_with_embedded_credentials(self):
+        with patch("backend.services.lidarr.cached_json_get") as cached_get:
+            with self.assertRaisesRegex(ValueError, "username or password"):
+                lidarr.options({
+                    "url": "http://user:password@lidarr:8686", "apiKey": "key",
+                })
+        cached_get.assert_not_called()
 
     @patch("backend.services.lidarr.requests.request")
     def test_authenticated_request_rejects_redirect(self, request):

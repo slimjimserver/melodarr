@@ -11,6 +11,7 @@ htmlcov/
 node_modules/
 .pnpm-store/
 *.tsbuildinfo
+frontend/test-results/
 
 # Generated frontend
 frontend/static/*.js

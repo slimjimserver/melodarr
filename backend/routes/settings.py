@@ -338,8 +338,12 @@ def configure_lidarr():
     if values is None:
         return api_error("Request body must be a JSON object.")
     old = get_service("lidarr") or {}
+    try:
+        connection = lidarr.connection(values, old)
+    except ValueError as exc:
+        return api_error(str(exc))
     config = {
-        **lidarr.connection(values, old),
+        **connection,
         "externalUrl": str(values.get("externalUrl", "")).strip().rstrip("/"),
         "defaults": {
             "rootFolderPath": values.get("rootFolderPath"),
@@ -441,6 +445,8 @@ def configure_lastfm():
                 "melodarr",
                 api_key,
                 limit=1,
+                force_refresh=True,
+                cache_response=False,
             )
         except ValueError as exc:
             return api_error(str(exc))
@@ -468,7 +474,10 @@ def test_lidarr():
     values = request_json_object()
     if values is None:
         return api_error("Request body must be a JSON object.")
-    config = lidarr.connection(values)
+    try:
+        config = lidarr.connection(values)
+    except ValueError as exc:
+        return api_error(str(exc))
     if not config["url"] or not config["apiKey"]:
         return api_error("Enter a hostname, port, and API key before testing.")
     try:

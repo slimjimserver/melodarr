@@ -5,7 +5,7 @@ import os
 import re
 from datetime import datetime, timezone
 from numbers import Real
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
@@ -55,14 +55,22 @@ TIME_LEFT_PATTERN = re.compile(
 )
 
 
+def _reject_embedded_credentials(base_url):
+    parsed = urlsplit(base_url)
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("Lidarr URL must not contain a username or password.")
+
+
 def connection(values, old=None):
     """Normalize Lidarr connection form values into stored configuration."""
     hostname = str(values.get("hostname", values.get("url", ""))).strip().rstrip("/")
+    _reject_embedded_credentials(hostname)
     if hostname and not hostname.startswith(("http://", "https://")):
         hostname = f"{'https' if values.get('useSsl') else 'http'}://{hostname}"
     port = str(values.get("port", "")).strip()
     if port and hostname.rsplit(":", 1)[-1] != port:
         hostname = f"{hostname}:{port}"
+    _reject_embedded_credentials(hostname)
     return {
         "url": hostname,
         "apiKey": str(values.get("apiKey", "")).strip() or (old or {}).get("apiKey", ""),
@@ -82,6 +90,7 @@ def url(path, config=None):
     config = config or get_service("lidarr")
     if not config or not config.get("url"):
         raise ValueError("Lidarr is not configured.")
+    _reject_embedded_credentials(config["url"])
     return f"{config['url'].rstrip('/')}/api/v1{path}"
 
 
