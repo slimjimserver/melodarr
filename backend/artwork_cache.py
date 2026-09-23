@@ -215,7 +215,13 @@ def _remove_artwork_miss(miss_file):
 
 def normalized_size(size):
     """Return a supported variant name, or None for the original image."""
-    return size if size in ARTWORK_SIZES else None
+    if size == "thumb":
+        return "thumb"
+    if size == "card":
+        return "card"
+    if size == "large":
+        return "large"
+    return None
 
 
 def base_cache_key(filename):
