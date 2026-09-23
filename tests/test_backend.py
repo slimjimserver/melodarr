@@ -11415,6 +11415,86 @@ class ArtworkVariantTests(DatabaseTestCase):
         url = f"/api/artwork/release-group/{mbid}"
         return f"{url}?size={size}" if size else url
 
+    def test_normalized_size_returns_application_owned_literals(self):
+        class RequestSize(str):
+            pass
+
+        for name in ("thumb", "card", "large"):
+            with self.subTest(size=name):
+                request_size = RequestSize(name)
+                result = artwork_cache.normalized_size(request_size)
+                self.assertEqual(result, name)
+                self.assertIs(type(result), str)
+                self.assertIsNot(result, request_size)
+
+        for value in (
+            None, "", "unknown", "../", "../../etc/passwd",
+            "thumb/../large", "thumb/card", "..\\..\\etc\\passwd",
+            "thumb\\..\\large",
+        ):
+            with self.subTest(size=value):
+                self.assertIsNone(artwork_cache.normalized_size(value))
+
+    @patch("backend.artwork_cache.requests.get")
+    def test_canonical_sizes_create_only_named_variants(self, get):
+        mbid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        cache_key = f"release-group-{mbid}"
+        original = encoded_image(1000)
+        os.makedirs(ARTWORK_CACHE_DIRECTORY, exist_ok=True)
+        with open(os.path.join(ARTWORK_CACHE_DIRECTORY, f"{cache_key}.jpg"), "wb") as file:
+            file.write(original)
+        self.register()
+
+        for size, edge in (("thumb", 128), ("card", 384), ("large", 640)):
+            with self.subTest(size=size):
+                response = self.client.get(self.artwork_url(mbid), query_string={"size": size})
+                self.assertEqual(response.status_code, 200)
+                with Image.open(io.BytesIO(response.data)) as image:
+                    self.assertEqual(image.format, "WEBP")
+                    self.assertEqual(max(image.size), edge)
+                self.assertTrue(os.path.isfile(os.path.join(
+                    ARTWORK_CACHE_DIRECTORY, f"{cache_key}@{size}.webp"
+                )))
+                response.close()
+
+        get.assert_not_called()
+
+    @patch("backend.artwork_cache.requests.get")
+    @patch("backend.artwork_cache.variant_cache_file")
+    def test_unsupported_sizes_never_reach_variant_filename(self, variant_file, get):
+        mbid = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        cache_key = f"release-group-{mbid}"
+        original = encoded_image(300)
+        os.makedirs(ARTWORK_CACHE_DIRECTORY, exist_ok=True)
+        with open(os.path.join(ARTWORK_CACHE_DIRECTORY, f"{cache_key}.jpg"), "wb") as file:
+            file.write(original)
+        self.register()
+        base_url = self.artwork_url(mbid)
+        original_files = set(os.listdir(ARTWORK_CACHE_DIRECTORY))
+
+        requests_to_check = [
+            (base_url, None),
+            *((base_url, {"size": size}) for size in (
+                "unknown", "../", "../../etc/passwd", "thumb/../large",
+                "thumb/card", "..\\..\\etc\\passwd", "thumb\\..\\large",
+            )),
+            (f"{base_url}?size=..%2F", None),
+            (f"{base_url}?size=..%2F..%2Fetc%2Fpasswd", None),
+            (f"{base_url}?size=thumb%2F..%2Flarge", None),
+            (f"{base_url}?size=..%5C..%5Cetc%5Cpasswd", None),
+            (f"{base_url}?size=..%252F..%252Fetc%252Fpasswd", None),
+        ]
+        for url, query in requests_to_check:
+            with self.subTest(url=url, query=query):
+                response = self.client.get(url, query_string=query)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.data, original)
+                response.close()
+
+        variant_file.assert_not_called()
+        get.assert_not_called()
+        self.assertEqual(set(os.listdir(ARTWORK_CACHE_DIRECTORY)), original_files)
+
     @patch("backend.artwork_cache.requests.get")
     def test_requested_size_is_downscaled_to_webp_once(self, get):
         mbid = "77777777-7777-7777-7777-777777777777"
