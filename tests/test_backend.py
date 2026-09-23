@@ -9290,6 +9290,30 @@ class DiscoveryRoutesTests(DatabaseTestCase):
 
 
 class MusicRoutesTests(DatabaseTestCase):
+    @staticmethod
+    def spotify_relation_cases(kind):
+        valid = f"https://open.spotify.com/{kind}/valid-id?si=example"
+        return (
+            ("valid", [valid], valid),
+            ("no relation", [], ""),
+            ("HTTP", [f"http://open.spotify.com/{kind}/valid-id"], ""),
+            ("JavaScript", ["javascript:alert('spotify.com')"], ""),
+            ("path spoof", ["https://attacker.example/path/spotify.com"], ""),
+            ("domain suffix", ["https://spotify.com.attacker.example/"], ""),
+            ("subdomain suffix", ["https://open.spotify.com.attacker.example/"], ""),
+            ("query spoof", ["https://attacker.example/?next=https://open.spotify.com"], ""),
+            ("username", [f"https://user@open.spotify.com/{kind}/valid-id"], ""),
+            ("password", [f"https://user:pass@open.spotify.com/{kind}/valid-id"], ""),
+            ("userinfo spoof", ["https://open.spotify.com@attacker.example/"], ""),
+            ("malformed host", ["https://[invalid/"], ""),
+            ("malformed port", [f"https://open.spotify.com:bad/{kind}/valid-id"], ""),
+            ("out-of-range port", [f"https://open.spotify.com:99999/{kind}/valid-id"], ""),
+            ("unexpected port", [f"https://open.spotify.com:444/{kind}/valid-id"], ""),
+            ("control character", [f"https://open.spotify.com/{kind}/bad\nlink"], ""),
+            ("non-string", [None], ""),
+            ("later valid relation", ["https://attacker.example/path/spotify.com", valid], valid),
+        )
+
     @patch("backend.routes.music.musicbrainz.search")
     def test_complete_artist_track_snapshot_still_searches_musicbrainz_on_miss(
         self, search,
@@ -9978,6 +10002,54 @@ class MusicRoutesTests(DatabaseTestCase):
         self.assertEqual(
             get.call_args_list[0].args[1], "aliases+artist-credits+url-rels"
         )
+
+    @patch("backend.routes.music.musicbrainz.get")
+    def test_artist_detail_only_returns_valid_spotify_relation(self, get):
+        csrf = self.register()
+        for index, (case, resources, expected) in enumerate(
+            self.spotify_relation_cases("artist")
+        ):
+            with self.subTest(case=case):
+                artist_id = f"spotify-artist-{index}"
+                get.side_effect = [
+                    {
+                        "id": artist_id,
+                        "name": "Spotify Artist",
+                        "relations": [{"url": {"resource": url}} for url in resources],
+                        "genres": [],
+                    },
+                    {"release-groups": [], "release-group-count": 0},
+                ]
+                response = self.client.get(
+                    f"/api/music/artist/{artist_id}",
+                    headers={"X-CSRF-Token": csrf},
+                )
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.get_json()["spotify"], expected)
+
+    @patch("backend.routes.music.musicbrainz.get")
+    def test_release_group_detail_only_returns_valid_spotify_relation(self, get):
+        csrf = self.register()
+        for index, (case, resources, expected) in enumerate(
+            self.spotify_relation_cases("album")
+        ):
+            with self.subTest(case=case):
+                group_id = f"spotify-group-{index}"
+                get.side_effect = [
+                    {
+                        "id": group_id,
+                        "title": "Spotify Album",
+                        "artist-credit": [],
+                        "relations": [{"url": {"resource": url}} for url in resources],
+                    },
+                    {"releases": [], "release-count": 0},
+                ]
+                response = self.client.get(
+                    f"/api/music/release-group/{group_id}",
+                    headers={"X-CSRF-Token": csrf},
+                )
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.get_json()["spotify"], expected)
 
     @patch("backend.routes.music.musicbrainz.get")
     @patch("backend.routes.music.lidarr.cached_artist_availability")

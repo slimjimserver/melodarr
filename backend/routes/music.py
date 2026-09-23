@@ -2,7 +2,7 @@
 
 import sqlite3
 from contextlib import nullcontext
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from uuid import UUID
 
 import requests
@@ -62,6 +62,34 @@ else:
 blueprint = Blueprint("music", __name__)
 RELEASE_TRACK_INCLUDES = "recordings+artist-credits+release-groups"
 LEGACY_RELEASE_TRACK_INCLUDES = "recordings+artist-credits"
+
+
+def _spotify_relation_url(relations):
+    """Select a Spotify web URL only after validating its parsed authority."""
+    for relation in relations or []:
+        if not isinstance(relation, dict):
+            continue
+        url = relation.get("url")
+        resource = url.get("resource") if isinstance(url, dict) else None
+        if not isinstance(resource, str) or any(
+            character.isspace() or ord(character) < 32 or ord(character) == 127
+            for character in resource
+        ):
+            continue
+        try:
+            parsed = urlsplit(resource)
+            port = parsed.port
+        except ValueError:
+            continue
+        if (
+            parsed.scheme == "https"
+            and parsed.hostname == "open.spotify.com"
+            and parsed.username is None
+            and parsed.password is None
+            and port in (None, 443)
+        ):
+            return resource
+    return ""
 
 
 def _prefetch_cache_miss():
@@ -609,11 +637,7 @@ def _artist_detail_payload(
     sections = {}
     for group in groups:
         sections.setdefault(" + ".join([group["type"], *group["secondaryTypes"]]), []).append(group)
-    spotify = next((
-        relation.get("url", {}).get("resource")
-        for relation in data.get("relations", [])
-        if "spotify.com" in relation.get("url", {}).get("resource", "")
-    ), "")
+    spotify = _spotify_relation_url(data.get("relations", []))
     plex_artist = _plex_artist(mbid)
     lidarr_artist = lidarr.cached_artist_availability().get(mbid)
     return {
@@ -856,11 +880,7 @@ def _release_group_detail_payload(mbid, priority, *, cache_only=False):
         for release in raw_releases
     ]
     releases.sort(key=lambda release: release["date"] or "9999")
-    spotify = next((
-        relation.get("url", {}).get("resource")
-        for relation in data.get("relations", [])
-        if "spotify.com" in relation.get("url", {}).get("resource", "")
-    ), "")
+    spotify = _spotify_relation_url(data.get("relations", []))
     artist_credit = data.get("artist-credit", [])
     primary_artist = artist_credit[0].get("artist", {}) if artist_credit else {}
     return {
