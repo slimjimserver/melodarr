@@ -4878,9 +4878,32 @@ class LastFmLinkingTests(DatabaseTestCase):
         )
 
         self.assertEqual(response.status_code, 503)
-        self.assertIn("administrator", response.get_json()["error"].lower())
+        self.assertEqual(
+            response.get_json(),
+            {"error": "Last.fm is not configured. Ask an administrator to add the API key."},
+        )
         self.assertIsNone(self.saved_lastfm_fields()["lastfm_username"])
         lastfm_get.assert_not_called()
+
+    @patch("backend.routes.account.lastfm.get")
+    def test_provider_error_is_not_reflected_when_linking(self, lastfm_get):
+        save_service("lastfm", {"apiKey": "admin-shared-key"})
+        lastfm_get.side_effect = ValueError("sentinel-secret-provider-detail")
+
+        with self.assertLogs(self.app.logger.name, level="WARNING") as logs:
+            response = self.client.post(
+                "/api/account/lastfm",
+                json={"username": "personal-listener"},
+                headers={"X-CSRF-Token": self.register()},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json(), {"error": "Unable to link Last.fm account."})
+        self.assertNotIn("sentinel-secret-provider-detail", response.get_data(as_text=True))
+        self.assertIsNone(self.saved_lastfm_fields()["lastfm_username"])
+        self.assertIn("Last.fm account linking failed", logs.output[0])
+        self.assertIn("ValueError", logs.output[0])
+        self.assertNotIn("sentinel-secret-provider-detail", logs.output[0])
 
     @patch("backend.routes.account.recommendation_worker.request_refresh")
     @patch("backend.routes.account.lastfm.get")

@@ -180,9 +180,34 @@ class AnimeThemesSeriesResolverTests(unittest.TestCase):
         self.assertEqual(response.get_json(), {"series": []})
 
     def test_missing_and_malformed_ids_are_validation_errors(self):
-        self.assertEqual(self.post({}).status_code, 400)
-        self.assertEqual(self.post({"releaseGroupId": "not-an-mbid"}).status_code, 400)
-        self.assertEqual(self.post({"recordingIds": "not-a-list"}).status_code, 400)
+        cases = (
+            ({}, "Provide releaseGroupId, at least one recordingIds entry, or both."),
+            ({"releaseGroupId": "not-an-mbid"}, "releaseGroupId must be a valid UUID."),
+            ({"recordingIds": "not-a-list"}, "recordingIds must be a list of UUIDs."),
+            ({"recordingIds": ["not-an-mbid"]}, "Each recording ID must be a valid UUID."),
+        )
+        for payload, message in cases:
+            with self.subTest(payload=payload):
+                response = self.post(payload)
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(response.get_json(), {"error": message})
+
+    @patch("backend.routes.anime.anime_theme_links.resolve_series")
+    def test_internal_resolver_error_is_not_reflected(self, resolve_series):
+        resolve_series.side_effect = ValueError("sentinel-secret-provider-detail")
+
+        with self.assertLogs(self.client.application.logger.name, level="WARNING") as logs:
+            response = self.post({"releaseGroupId": GROUP})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.get_json(),
+            {"error": "AnimeThemes could not resolve this music."},
+        )
+        self.assertNotIn("sentinel-secret-provider-detail", response.get_data(as_text=True))
+        self.assertIn("AnimeThemes series resolution failed", logs.output[0])
+        self.assertIn("ValueError", logs.output[0])
+        self.assertNotIn("sentinel-secret-provider-detail", logs.output[0])
 
     def test_endpoint_requires_authentication(self):
         self.clear_session()

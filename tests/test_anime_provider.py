@@ -1546,9 +1546,15 @@ class AnimeRouteTests(unittest.TestCase):
     @patch("backend.routes.anime.animethemes.detail")
     def test_detail_preserves_upstream_404(self, detail):
         upstream_response = Mock(status_code=404)
-        detail.side_effect = requests.HTTPError(response=upstream_response)
+        detail.side_effect = requests.HTTPError(
+            "sentinel-secret-provider-detail", response=upstream_response
+        )
         response = self._get("/api/anime/unknown")
         self.assertEqual(response.status_code, 404)
+        self.assertEqual(
+            response.get_json(),
+            {"error": "Anime was not found on AnimeThemes."},
+        )
 
     @patch("backend.routes.anime.animethemes.detail")
     def test_detail_returns_502_for_upstream_failure(self, detail):
@@ -1567,6 +1573,49 @@ class AnimeRouteTests(unittest.TestCase):
             response.get_json(),
             {"error": "Invalid AnimeThemes anime slug."},
         )
+
+    def test_detail_routes_do_not_reflect_unexpected_exception_text(self):
+        cases = (
+            ("/api/anime/naruto", "backend.routes.anime.animethemes.detail", "anime"),
+            ("/api/series/naruto", "backend.routes.anime.animethemes.series_detail", "series"),
+        )
+        for path, target, subject in cases:
+            for error, status in (
+                (ValueError("sentinel-secret-provider-detail"), 400),
+                (LookupError("sentinel-secret-provider-detail"), 404),
+            ):
+                with self.subTest(path=path, error=type(error).__name__):
+                    with patch(target, side_effect=error):
+                        with self.assertLogs(self.app.logger.name, level="WARNING") as logs:
+                            response = self._get(path)
+
+                    self.assertEqual(response.status_code, status)
+                    self.assertEqual(
+                        response.get_json(),
+                        {"error": f"AnimeThemes could not load this {subject}."},
+                    )
+                    self.assertNotIn(
+                        "sentinel-secret-provider-detail", response.get_data(as_text=True)
+                    )
+                    self.assertIn(type(error).__name__, logs.output[0])
+                    self.assertNotIn("sentinel-secret-provider-detail", logs.output[0])
+
+    @patch("backend.routes.anime._mapping_payload")
+    @patch("backend.routes.anime.animethemes.detail")
+    def test_detail_does_not_reflect_internal_mapping_error(self, detail, mapping):
+        detail.return_value = {"id": 2028, "slug": "naruto", "themes": []}
+        mapping.side_effect = ValueError("sentinel-secret-provider-detail")
+
+        with self.assertLogs(self.app.logger.name, level="WARNING") as logs:
+            response = self._get("/api/anime/naruto")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.get_json(),
+            {"error": "AnimeThemes could not load this anime."},
+        )
+        self.assertNotIn("sentinel-secret-provider-detail", response.get_data(as_text=True))
+        self.assertIn("ValueError", logs.output[0])
 
 
 if __name__ == "__main__":
