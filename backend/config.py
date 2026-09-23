@@ -25,11 +25,15 @@ LIDARR_METADATA_URL = "https://api.lidarr.audio/api/v0.4"
 LISTENBRAINZ_URL = "https://api.listenbrainz.org/1"
 LASTFM_URL = "https://ws.audioscrobbler.com/2.0/"
 USER_AGENT = "Melodarr/0.1 (https://github.com/slimjimserver/melodarr)"
+APPLICATION_VERSION = (
+    str(os.getenv("MELODARR_VERSION") or "development").strip() or "development"
+)
 
 MUSICBRAINZ_SEARCH_CACHE_TTL = 10 * 60
 MUSICBRAINZ_METADATA_CACHE_TTL = 90 * 24 * 60 * 60
 MUSICBRAINZ_ARTIST_REVALIDATION_INTERVAL = 24 * 60 * 60
 MUSICBRAINZ_ARTIST_REVALIDATION_RETRY_INTERVAL = 60 * 60
+MUSICBRAINZ_ARTIST_TRACK_SNAPSHOT_MAX_AGE = 30 * 24 * 60 * 60
 LIDARR_OPTIONS_CACHE_TTL = 5 * 60
 LIDARR_METADATA_CACHE_TTL = 30 * 24 * 60 * 60
 LIDARR_LIBRARY_SCAN_INTERVAL = 2 * 60
@@ -165,3 +169,13 @@ def load_session_secret():
         if os.path.exists(temporary_path):
             os.unlink(temporary_path)
     return secret
+
+
+def load_automation_api_key():
+    """Return the optional key used by trusted machine-to-machine callers."""
+    api_key = str(os.getenv("MELODARR_AUTOMATION_API_KEY") or "").strip()
+    if api_key and len(api_key) < 32:
+        raise RuntimeError(
+            "MELODARR_AUTOMATION_API_KEY must contain at least 32 characters."
+        )
+    return api_key

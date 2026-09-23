@@ -33,10 +33,10 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Build image
-        run: docker build --file Dockerfile --tag "$IMAGE_NAME:$GITHUB_SHA" .
+        run: docker build --build-arg "MELODARR_VERSION=$GITHUB_REF_NAME" --file Dockerfile --tag "$IMAGE_NAME:$GITHUB_SHA" .
 
       - name: Test image
         run: docker run --rm "$IMAGE_NAME:$GITHUB_SHA" python -m unittest discover -s tests -t . -v

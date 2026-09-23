@@ -1,5 +1,6 @@
 """Durable reverse associations from MusicBrainz releases to anime themes."""
 
+import json
 import time
 from uuid import UUID
 
@@ -8,11 +9,11 @@ import requests
 if __package__ == "backend.services":
     from .. import detail_cache
     from ..storage import db
-    from . import anime_artist_links, musicbrainz
+    from . import anime_artist_links, animethemes, musicbrainz
 else:  # Support the existing `python backend/app.py` entry point.
     import detail_cache
+    from services import anime_artist_links, animethemes, musicbrainz
     from storage import db
-    from services import anime_artist_links, musicbrainz
 
 
 _RESOLVED_STATES = frozenset({"confirmed", "matched", "mapped", "resolved"})
@@ -31,6 +32,57 @@ def _positive_integer(value):
     except (TypeError, ValueError):
         return None
     return normalized if normalized > 0 and str(value).strip() == str(normalized) else None
+
+
+def _series_snapshot(anime):
+    series_by_id = {}
+    for series in anime.get("series") or []:
+        if not isinstance(series, dict):
+            continue
+        series_id = _positive_integer(series.get("id"))
+        if series_id is None:
+            continue
+        series_by_id.setdefault(series_id, {
+            "id": series_id,
+            "name": _text(series.get("name"), "Untitled series"),
+            "slug": _text(series.get("slug")),
+        })
+    return json.dumps(
+        list(series_by_id.values()), separators=(",", ":"), sort_keys=True
+    )
+
+
+def _recording_ids(mapping):
+    values = []
+
+    def add(value):
+        if isinstance(value, str):
+            value = value.strip().casefold()
+            if value and value not in values:
+                values.append(value)
+
+    def add_document(document):
+        if not isinstance(document, dict):
+            return
+        add(document.get("recordingId") or document.get("recordingMbid"))
+        candidates = (
+            document.get("recordingIds")
+            or document.get("recordingMbids")
+            or document.get("recording_ids")
+            or document.get("recording_mbids")
+            or []
+        )
+        if isinstance(candidates, str):
+            candidates = [candidates]
+        if isinstance(candidates, (list, tuple)):
+            for candidate in candidates:
+                add(candidate)
+
+    add_document(mapping)
+    for field in ("releaseGroups", "release_groups", "targets", "recordingCandidates"):
+        for document in mapping.get(field) or []:
+            add_document(document)
+    return values
 
 
 def _release_group_ids(mapping):
@@ -74,7 +126,9 @@ def _theme_snapshot(anime, theme):
     sequence = _positive_integer(theme.get("sequence"))
     return {
         "anime_slug": anime_slug,
+        "anime_id": _positive_integer(anime.get("id")),
         "anime_name": _text(anime.get("name"), "Untitled anime"),
+        "anime_series_json": _series_snapshot(anime),
         "theme_id": theme_id,
         "theme_label": _text(theme.get("label"), "Theme"),
         "theme_type": _text(theme.get("type"), "Theme"),
@@ -99,6 +153,9 @@ def sync_anime_theme_mapping(anime, theme, mapping):
     if snapshot is None:
         return False
     release_group_ids = _release_group_ids(mapping)
+    snapshot["recording_mbids_json"] = json.dumps(
+        _recording_ids(mapping), separators=(",", ":")
+    )
     now = time.time()
     affected_groups = set(release_group_ids)
     changed = False
@@ -125,12 +182,15 @@ def sync_anime_theme_mapping(anime, theme, mapping):
             )
             changed = True
         comparable_fields = (
+            "anime_id",
             "anime_name",
+            "anime_series_json",
             "theme_label",
             "theme_type",
             "sequence",
             "song_id",
             "song_title",
+            "recording_mbids_json",
         )
         for mbid in release_group_ids:
             existing_row = existing_by_group.get(mbid)
@@ -143,18 +203,23 @@ def sync_anime_theme_mapping(anime, theme, mapping):
             created_at = existing_row["created_at"] if existing_row else now
             connection.execute(
                 "INSERT INTO anime_theme_release_group_links "
-                "(anime_slug, anime_name, theme_id, theme_label, theme_type, "
-                "sequence, song_id, song_title, release_group_mbid, "
-                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "(anime_slug, anime_id, anime_name, anime_series_json, theme_id, "
+                "theme_label, theme_type, sequence, song_id, song_title, "
+                "release_group_mbid, recording_mbids_json, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(anime_slug, theme_id, release_group_mbid) DO UPDATE SET "
-                "anime_name = excluded.anime_name, "
+                "anime_id = excluded.anime_id, anime_name = excluded.anime_name, "
+                "anime_series_json = excluded.anime_series_json, "
                 "theme_label = excluded.theme_label, "
                 "theme_type = excluded.theme_type, sequence = excluded.sequence, "
                 "song_id = excluded.song_id, song_title = excluded.song_title, "
+                "recording_mbids_json = excluded.recording_mbids_json, "
                 "updated_at = excluded.updated_at",
                 (
                     snapshot["anime_slug"],
+                    snapshot["anime_id"],
                     snapshot["anime_name"],
+                    snapshot["anime_series_json"],
                     snapshot["theme_id"],
                     snapshot["theme_label"],
                     snapshot["theme_type"],
@@ -162,6 +227,7 @@ def sync_anime_theme_mapping(anime, theme, mapping):
                     snapshot["song_id"],
                     snapshot["song_title"],
                     mbid,
+                    snapshot["recording_mbids_json"],
                     created_at,
                     now,
                 ),
@@ -194,6 +260,207 @@ def sync_anime_theme_mapping(anime, theme, mapping):
         _invalidate_release_groups(affected_groups)
         detail_cache.invalidate_kind("artist")
     return changed
+
+
+_RESOLVER_ROW_FIELDS = (
+    "anime_slug, anime_id, anime_name, anime_series_json, song_id, "
+    "recording_mbids_json"
+)
+_RESOLVER_LINK_FIELDS = (
+    "link.anime_slug AS anime_slug, link.anime_id AS anime_id, "
+    "link.anime_name AS anime_name, "
+    "link.anime_series_json AS anime_series_json, link.song_id AS song_id, "
+    "link.recording_mbids_json AS recording_mbids_json"
+)
+
+
+def _resolver_rows_for_release_group(mbid):
+    if not mbid:
+        return []
+    with db() as connection:
+        return [
+            dict(row)
+            for row in connection.execute(
+                f"SELECT DISTINCT {_RESOLVER_ROW_FIELDS} "
+                "FROM anime_theme_release_group_links "
+                "WHERE release_group_mbid = ?",
+                (mbid,),
+            ).fetchall()
+        ]
+
+
+def _json_string_list(value):
+    try:
+        values = json.loads(value or "[]")
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(values, list):
+        return []
+    return [item.casefold() for item in values if isinstance(item, str)]
+
+
+def _resolver_rows_for_recordings(recording_ids):
+    wanted = set(recording_ids)
+    if not wanted:
+        return []
+    rows_by_key = {}
+    song_ids = set()
+    with db() as connection:
+        direct_rows = connection.execute(
+            f"SELECT DISTINCT {_RESOLVER_ROW_FIELDS} "
+            "FROM anime_theme_release_group_links "
+            "WHERE recording_mbids_json != '[]'"
+        ).fetchall()
+        for row in direct_rows:
+            if wanted.intersection(_json_string_list(row["recording_mbids_json"])):
+                key = (row["anime_slug"], row["song_id"])
+                rows_by_key[key] = dict(row)
+
+        registered_rows = connection.execute(
+            f"SELECT DISTINCT {_RESOLVER_LINK_FIELDS}, "
+            "target.recording_mbids_json AS target_recording_mbids_json "
+            "FROM anime_theme_release_group_links AS link "
+            "JOIN anime_song_mappings AS mapping ON mapping.song_id = link.song_id "
+            "JOIN anime_song_mapping_targets AS target "
+            "ON target.song_id = mapping.song_id "
+            "WHERE mapping.status = 'confirmed' "
+            "AND target.recording_mbids_json != '[]'"
+        ).fetchall()
+        for row in registered_rows:
+            if wanted.intersection(
+                _json_string_list(row["target_recording_mbids_json"])
+            ):
+                key = (row["anime_slug"], row["song_id"])
+                rows_by_key[key] = {
+                    field: row[field]
+                    for field in (
+                        "anime_slug",
+                        "anime_id",
+                        "anime_name",
+                        "anime_series_json",
+                        "song_id",
+                        "recording_mbids_json",
+                    )
+                }
+
+        for row in connection.execute(
+            "SELECT payload FROM anime_automatic_matches"
+        ).fetchall():
+            try:
+                mapping = json.loads(row["payload"])
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(mapping, dict) or _text(
+                mapping.get("state")
+            ).casefold() not in _RESOLVED_STATES:
+                continue
+            if wanted.intersection(_recording_ids(mapping)):
+                song_id = _positive_integer(mapping.get("sourceSongId"))
+                if song_id is not None:
+                    song_ids.add(song_id)
+
+        for offset in range(0, len(song_ids), 400):
+            batch = sorted(song_ids)[offset:offset + 400]
+            placeholders = ",".join("?" for _ in batch)
+            for row in connection.execute(
+                f"SELECT DISTINCT {_RESOLVER_ROW_FIELDS} "
+                "FROM anime_theme_release_group_links "
+                f"WHERE song_id IN ({placeholders})",
+                batch,
+            ).fetchall():
+                key = (row["anime_slug"], row["song_id"])
+                rows_by_key[key] = dict(row)
+    return list(rows_by_key.values())
+
+
+def _hydrate_legacy_series(rows):
+    legacy_slugs = sorted({
+        row["anime_slug"] for row in rows if row["anime_id"] is None
+    })
+    if not legacy_slugs:
+        return rows
+    hydrated = {}
+    for slug in legacy_slugs:
+        anime = animethemes.detail(slug)
+        if not isinstance(anime, dict):
+            continue
+        hydrated[slug] = {
+            "anime_id": _positive_integer(anime.get("id")),
+            "anime_name": _text(anime.get("name"), "Untitled anime"),
+            "anime_series_json": _series_snapshot(anime),
+        }
+    if hydrated:
+        now = time.time()
+        with db() as connection:
+            for slug, snapshot in hydrated.items():
+                connection.execute(
+                    "UPDATE anime_theme_release_group_links "
+                    "SET anime_id = ?, anime_name = ?, anime_series_json = ?, "
+                    "updated_at = ? WHERE anime_slug = ?",
+                    (
+                        snapshot["anime_id"],
+                        snapshot["anime_name"],
+                        snapshot["anime_series_json"],
+                        now,
+                        slug,
+                    ),
+                )
+    return [{**row, **hydrated.get(row["anime_slug"], {})} for row in rows]
+
+
+def resolve_series(release_group_id=None, recording_ids=None):
+    """Resolve stored MusicBrainz evidence to unique AnimeThemes series."""
+    release_rows = _resolver_rows_for_release_group(release_group_id)
+    recording_rows = _resolver_rows_for_recordings(recording_ids or [])
+    rows = _hydrate_legacy_series([*release_rows, *recording_rows])
+    release_keys = {
+        (row["anime_slug"], row["song_id"]) for row in release_rows
+    }
+    results = {}
+    for row in rows:
+        matched_by = (
+            "releaseGroup"
+            if (row["anime_slug"], row["song_id"]) in release_keys
+            else "recording"
+        )
+        series_items = []
+        try:
+            candidate_series = json.loads(row["anime_series_json"] or "[]")
+            if isinstance(candidate_series, list):
+                series_items = candidate_series
+        except (TypeError, ValueError):
+            pass
+        for series in series_items:
+            if not isinstance(series, dict):
+                continue
+            series_id = _positive_integer(series.get("id"))
+            if series_id is None:
+                continue
+            results.setdefault(("series", series_id), {
+                "animeThemesSeriesId": series_id,
+                "name": _text(series.get("name"), "Untitled series"),
+                "slug": _text(series.get("slug")),
+                "matchedBy": matched_by,
+            })
+        if not series_items:
+            anime_id = row["anime_id"]
+            fallback_key = anime_id if anime_id is not None else row["anime_slug"]
+            results.setdefault(("anime", fallback_key), {
+                "animeThemesSeriesId": None,
+                "animeThemesAnimeId": anime_id,
+                "name": row["anime_name"],
+                "slug": row["anime_slug"],
+                "matchedBy": matched_by,
+                "fallback": "anime",
+            })
+    return sorted(
+        results.values(),
+        key=lambda item: (
+            item["name"].casefold(),
+            item.get("animeThemesSeriesId") or 0,
+            item.get("animeThemesAnimeId") or 0,
+        ),
+    )
 
 
 def links_for_release_group(mbid):

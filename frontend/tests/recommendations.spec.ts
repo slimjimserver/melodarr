@@ -82,7 +82,136 @@ test("homepage explains album picks and separates global charts", async ({ page 
   await page.getByText("Your recommendation activity", { exact: true }).click();
   await expect(page.getByText(/Plex listening outcomes are not available yet/)).toBeVisible();
   await page.locator("#recommendations-title").scrollIntoViewIfNeeded();
-  await page.screenshot({ path: resolve(__dirname, "../../.venv-recommendations/homepage-desktop.jpg"), type: "jpeg", quality: 65 });
+  await page.screenshot({ path: resolve(__dirname, "../../data/test-artifacts/playwright/homepage-desktop.jpg"), type: "jpeg", quality: 65 });
+});
+
+test("album search reveals cached candidates without another request", async ({ page }) => {
+  let searchRequests = 0;
+  await fixture(page);
+  await page.route("**/api/search?*", async route => {
+    const url = new URL(route.request().url());
+    if (url.searchParams.get("type") !== "album") return route.fallback();
+    searchRequests += 1;
+    await route.fulfill({ json: {
+      type: "album",
+      candidateCount: 30,
+      results: Array.from({ length: 30 }, (_, index) => ({
+        id: `album-${index + 1}`,
+        name: `The Odyssey ${index + 1}`,
+        artist: "Fixture Composer",
+        type: "Album",
+        date: "2026",
+      })),
+    } });
+  });
+  await page.goto("/");
+  await signIn(page);
+
+  await page.locator("#search-type").selectOption("album");
+  await page.locator("#search-input").fill("The Odyssey");
+  await page.locator("#search-submit").click();
+
+  await expect(page.locator("#results .artist-card")).toHaveCount(25);
+  await expect(page.locator("#search-message")).toHaveText("Showing 25 of 30 matches");
+  const requestsBeforeShowMore = searchRequests;
+  await page.getByRole("button", { name: "Show 5 more" }).click();
+  await expect(page.locator("#results .artist-card")).toHaveCount(30);
+  await expect(page.locator("#search-message")).toHaveText("30 albums found");
+  expect(searchRequests).toBe(requestsBeforeShowMore);
+});
+
+test("a local album hit offers an explicit MusicBrainz search and keeps the hit on failure", async ({ page }) => {
+  const requests: string[] = [];
+  let failDirectSearch = true;
+  await fixture(page);
+  await page.route("**/api/search?*", async route => {
+    const url = new URL(route.request().url());
+    if (url.searchParams.get("type") !== "album") return route.fallback();
+    requests.push(url.searchParams.get("musicbrainz") || "local");
+    if (url.searchParams.get("musicbrainz") === "1") {
+      if (failDirectSearch) {
+        failDirectSearch = false;
+        return route.fulfill({ status: 502, json: { error: "MusicBrainz is unavailable." } });
+      }
+      return route.fulfill({ json: {
+        type: "album", source: "musicbrainz", candidateCount: 1,
+        results: [{ id: "other-album", name: "Parachutes", artist: "Other Artist", type: "Album" }],
+      } });
+    }
+    return route.fulfill({ json: {
+      type: "album", source: "local", candidateCount: 1,
+      results: [{ id: "local-album", name: "Parachutes", artist: "Coldplay", type: "Album" }],
+    } });
+  });
+  await page.goto("/");
+  await signIn(page);
+
+  await page.locator("#search-type").selectOption("album");
+  await page.locator("#search-input").fill("Parachutes");
+  await page.locator("#search-submit").click();
+  const directSearch = page.getByRole("button", { name: "Search MusicBrainz for more albums" });
+  await expect(page.locator("#results")).toContainText("Coldplay");
+  await expect(directSearch).toBeVisible();
+  await directSearch.click();
+  await expect(page.locator("#search-message")).toContainText("MusicBrainz is unavailable");
+  await expect(page.locator("#results")).toContainText("Coldplay");
+  await expect(directSearch).toBeEnabled();
+  await directSearch.click();
+  await expect(page.locator("#results")).toContainText("Other Artist");
+  await expect(page.locator("#results")).not.toContainText("Coldplay");
+  await expect(directSearch).toBeHidden();
+  expect(requests.filter(request => request === "local").length).toBeGreaterThanOrEqual(1);
+  expect(requests.slice(-2)).toEqual(["1", "1"]);
+});
+
+test("a local track hit offers an explicit MusicBrainz search and keeps the hit on failure", async ({ page }) => {
+  const requests: string[] = [];
+  let failDirectSearch = true;
+  await fixture(page);
+  await page.route("**/api/search?*", async route => {
+    const url = new URL(route.request().url());
+    if (url.searchParams.get("type") !== "track") return route.fallback();
+    requests.push(url.searchParams.get("musicbrainz") || "local");
+    if (url.searchParams.get("musicbrainz") === "1") {
+      if (failDirectSearch) {
+        failDirectSearch = false;
+        return route.fulfill({ status: 502, json: { error: "MusicBrainz is unavailable." } });
+      }
+      return route.fulfill({ json: {
+        type: "track", source: "musicbrainz", candidateCount: 1,
+        results: [{
+          id: "other-track-group", name: "Yellow (Live)", artist: "Coldplay",
+          matchedTrack: "Yellow", type: "Single",
+        }],
+      } });
+    }
+    return route.fulfill({ json: {
+      type: "track", source: "local", candidateCount: 1,
+      results: [{
+        id: "local-track-group", name: "Parachutes", artist: "Coldplay",
+        matchedTrack: "Yellow", type: "Album",
+      }],
+    } });
+  });
+  await page.goto("/");
+  await signIn(page);
+
+  await page.locator("#search-type").selectOption("track");
+  await page.locator("#search-input").fill("Yellow Coldplay");
+  await page.locator("#search-submit").click();
+  const directSearch = page.getByRole("button", { name: "Search MusicBrainz for more tracks" });
+  await expect(page.locator("#results")).toContainText("Parachutes");
+  await expect(directSearch).toBeVisible();
+  await directSearch.click();
+  await expect(page.locator("#search-message")).toContainText("MusicBrainz is unavailable");
+  await expect(page.locator("#results")).toContainText("Parachutes");
+  await expect(directSearch).toBeEnabled();
+  await directSearch.click();
+  await expect(page.locator("#results")).toContainText("Yellow (Live)");
+  await expect(page.locator("#results")).not.toContainText("Parachutes");
+  await expect(directSearch).toBeHidden();
+  expect(requests.filter(request => request === "local").length).toBeGreaterThanOrEqual(1);
+  expect(requests.slice(-2)).toEqual(["1", "1"]);
 });
 
 test("feedback persists through reload and dismissal can be undone", async ({ page }) => {
@@ -112,7 +241,7 @@ test("offscreen carousel cards are not recorded as impressions", async ({ page }
   expect(events.some((event) => event.id === "familiar-5" && event.action === "impression")).toBeFalsy();
   const dimensions = await page.evaluate(() => ({ width: document.documentElement.clientWidth, scroll: document.documentElement.scrollWidth }));
   expect(dimensions.scroll).toBeLessThanOrEqual(dimensions.width);
-  await page.screenshot({ path: resolve(__dirname, "../../.venv-recommendations/homepage-mobile.jpg"), type: "jpeg", quality: 65 });
+  await page.screenshot({ path: resolve(__dirname, "../../data/test-artifacts/playwright/homepage-mobile.jpg"), type: "jpeg", quality: 65 });
 });
 
 test("album requests use the existing request flow and refresh queues work", async ({ page }) => {
@@ -187,7 +316,7 @@ test("popular albums keep chart ranks, filter recent releases, and request match
   const dimensions = await page.evaluate(() => ({ width: document.documentElement.clientWidth, scroll: document.documentElement.scrollWidth }));
   expect(dimensions.scroll).toBeLessThanOrEqual(dimensions.width);
   await page.getByRole("heading", { name: "Popular albums right now" }).scrollIntoViewIfNeeded();
-  await page.locator(".popular-albums").screenshot({ path: resolve(__dirname, "../../.venv-recommendations/popular-albums-mobile.jpg"), type: "jpeg", quality: 65 });
+  await page.locator(".popular-albums").screenshot({ path: resolve(__dirname, "../../data/test-artifacts/playwright/popular-albums-mobile.jpg"), type: "jpeg", quality: 65 });
   const request = page.waitForRequest("**/api/request/release-group");
   await page.locator('[data-item-id="new-chart"]').getByRole("button", { name: "Request album" }).click();
   expect((await request).postDataJSON().mbid).toBe("new-chart");
@@ -301,7 +430,7 @@ test("Japan selector switches chart ranks, preserves filters, and requests the J
   await expect(page.getByText("光", { exact: true })).toBeVisible();
   const dimensions = await page.evaluate(() => ({ width: document.documentElement.clientWidth, scroll: document.documentElement.scrollWidth }));
   expect(dimensions.scroll).toBeLessThanOrEqual(dimensions.width);
-  await page.locator(".popular-albums").screenshot({ path: resolve(__dirname, "../../.venv-recommendations/japan-chart-mobile.jpg"), type: "jpeg", quality: 65 });
+  await page.locator(".popular-albums").screenshot({ path: resolve(__dirname, "../../data/test-artifacts/playwright/japan-chart-mobile.jpg"), type: "jpeg", quality: 65 });
   const request = page.waitForRequest("**/api/request/release-group");
   await page.locator('[data-item-id="jp-new"]').getByRole("button", { name: "Request album" }).click();
   expect((await request).postDataJSON().mbid).toBe("jp-new");
@@ -355,7 +484,7 @@ test("taste controls save the mix and up to five favorite artists and survive re
   expect(dimensions.scroll).toBeLessThanOrEqual(dimensions.width);
   // Capture the entire expanded panel after checking the normal phone viewport.
   await page.setViewportSize({ width: 320, height: 1600 });
-  await page.locator(".taste-preferences").screenshot({ path: resolve(__dirname, "../../.venv-recommendations/taste-controls-mobile.jpg"), type: "jpeg", quality: 65 });
+  await page.locator(".taste-preferences").screenshot({ path: resolve(__dirname, "../../data/test-artifacts/playwright/taste-controls-mobile.jpg"), type: "jpeg", quality: 65 });
   await page.reload();
   await page.getByText("Shape Your Recommendations", { exact: true }).click();
   await expect(page.getByRole("radio", { name: "More discovery", exact: true })).toBeChecked();
@@ -445,7 +574,7 @@ test("request influence is editable only on your own history and persists after 
   await toggle.uncheck();
   await expect(page.getByText("Excluded from your taste profile.", { exact: false })).toBeVisible();
   await expect(page.getByText("Gift album", { exact: true })).toBeVisible();
-  await page.locator(".history-item").screenshot({ path: resolve(__dirname, "../../.venv-recommendations/request-taste-mobile.jpg"), type: "jpeg", quality: 65 });
+  await page.locator(".history-item").screenshot({ path: resolve(__dirname, "../../data/test-artifacts/playwright/request-taste-mobile.jpg"), type: "jpeg", quality: 65 });
   await page.reload();
   await expect(toggle).not.toBeChecked();
   await page.goto("/bea/requests");
@@ -495,9 +624,9 @@ test("mix preview explains row order and limits, supports keyboard selection, an
   await expect(panel.locator("summary")).toContainText("Familiar first");
   await expect(save).toBeDisabled();
   await expect(panel.locator(".taste-save-state")).toHaveText("All changes saved");
-  await panel.screenshot({ path: resolve(__dirname, "../../.venv-recommendations/taste-refined-desktop.jpg"), type: "jpeg", quality: 60 });
+  await panel.screenshot({ path: resolve(__dirname, "../../data/test-artifacts/playwright/taste-refined-desktop.jpg"), type: "jpeg", quality: 60 });
   await page.evaluate(() => document.documentElement.removeAttribute("data-theme"));
-  await panel.screenshot({ path: resolve(__dirname, "../../.venv-recommendations/taste-refined-light.jpg"), type: "jpeg", quality: 60 });
+  await panel.screenshot({ path: resolve(__dirname, "../../data/test-artifacts/playwright/taste-refined-light.jpg"), type: "jpeg", quality: 60 });
 });
 
 
@@ -542,6 +671,6 @@ for (const width of [1440, 320]) {
     const dimensions = await page.evaluate(() => ({ width: document.documentElement.clientWidth, scroll: document.documentElement.scrollWidth }));
     expect(dimensions.scroll).toBeLessThanOrEqual(dimensions.width);
     await first.scrollIntoViewIfNeeded();
-    await page.screenshot({ path: resolve(__dirname, `../../.venv-recommendations/requests-fixed-${width}.jpg`), type: "jpeg", quality: 65 });
+    await page.screenshot({ path: resolve(__dirname, `../../data/test-artifacts/playwright/requests-fixed-${width}.jpg`), type: "jpeg", quality: 65 });
   });
 }

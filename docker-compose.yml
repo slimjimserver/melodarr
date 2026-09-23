@@ -11,4 +11,5 @@ services:
       TZ: America/New_York
       MELODARR_DATABASE: /app/data/melodarr.db
       MELODARR_CACHE_DATABASE: /app/data/cache/metadata.db
+      MELODARR_AUTOMATION_API_KEY: ${MELODARR_AUTOMATION_API_KEY:-}
     restart: unless-stopped

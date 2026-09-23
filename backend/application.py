@@ -9,12 +9,16 @@ from flask import Flask, current_app, request, send_file
 from werkzeug.utils import safe_join
 
 if __package__:
+    from . import track_search_index
     from .api_cache import init_cache_db, migrate_legacy_cache
     from .config import (
         FRONTEND_ROOT,
         assert_test_storage_isolation,
+        load_automation_api_key,
         load_session_secret,
     )
+    from .instance_settings import ensure_instance_settings
+    from .responses import api_error
     from .routes.account import blueprint as account_blueprint
     from .routes.admin import blueprint as admin_blueprint
     from .routes.anime import blueprint as anime_blueprint
@@ -23,15 +27,23 @@ if __package__:
     from .routes.discovery import blueprint as discovery_blueprint
     from .routes.library import blueprint as library_blueprint
     from .routes.music import blueprint as music_blueprint
+    from .routes.notifications import blueprint as notifications_blueprint
     from .routes.pages import blueprint as pages_blueprint
     from .routes.requests import blueprint as requests_blueprint
     from .routes.settings import blueprint as settings_blueprint
-    from .routes.notifications import blueprint as notifications_blueprint
     from .security import verify_csrf_token
     from .storage import init_db
 else:  # Support the existing `python backend/app.py` entry point.
+    import track_search_index
     from api_cache import init_cache_db, migrate_legacy_cache
-    from config import FRONTEND_ROOT, assert_test_storage_isolation, load_session_secret
+    from config import (
+        FRONTEND_ROOT,
+        assert_test_storage_isolation,
+        load_automation_api_key,
+        load_session_secret,
+    )
+    from instance_settings import ensure_instance_settings
+    from responses import api_error
     from routes.account import blueprint as account_blueprint
     from routes.admin import blueprint as admin_blueprint
     from routes.anime import blueprint as anime_blueprint
@@ -40,10 +52,10 @@ else:  # Support the existing `python backend/app.py` entry point.
     from routes.discovery import blueprint as discovery_blueprint
     from routes.library import blueprint as library_blueprint
     from routes.music import blueprint as music_blueprint
+    from routes.notifications import blueprint as notifications_blueprint
     from routes.pages import blueprint as pages_blueprint
     from routes.requests import blueprint as requests_blueprint
     from routes.settings import blueprint as settings_blueprint
-    from routes.notifications import blueprint as notifications_blueprint
     from security import verify_csrf_token
     from storage import init_db
 
@@ -60,6 +72,7 @@ COMPRESSIBLE_MIMETYPES = frozenset({
     "text/plain",
 })
 COMPRESSION_MINIMUM_BYTES = 1024
+MAX_REQUEST_BODY_BYTES = 64 * 1024
 
 
 def compress_response(response):
@@ -160,7 +173,9 @@ def create_app(config=None):
         static_url_path="/static",
     )
     app.config.update(
+        AUTOMATION_API_KEY_OVERRIDE=load_automation_api_key(),
         SECRET_KEY=load_session_secret(),
+        MAX_CONTENT_LENGTH=MAX_REQUEST_BODY_BYTES,
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
         SESSION_COOKIE_SECURE=os.getenv("MELODARR_COOKIE_SECURE", "false").lower() == "true",
@@ -170,9 +185,25 @@ def create_app(config=None):
     if config:
         app.config.update(config)
 
+    @app.errorhandler(413)
+    def request_body_too_large(_error):
+        return api_error("Request body is too large.", 413)
+
     init_cache_db()
     migrate_legacy_cache()
+    track_search_index.initialize()
     init_db()
+    explicit_api_key = str(app.config.get("AUTOMATION_API_KEY") or "").strip()
+    api_key_override = str(
+        app.config.get("AUTOMATION_API_KEY_OVERRIDE") or ""
+    ).strip()
+    instance = ensure_instance_settings(api_key_override)
+    app.config["AUTOMATION_API_KEY"] = (
+        explicit_api_key or instance["apiKey"]
+    )
+    app.config["AUTOMATION_API_KEY_MANAGED_BY_ENVIRONMENT"] = bool(
+        api_key_override and not explicit_api_key
+    )
     app.before_request(verify_csrf_token)
     app.before_request(serve_precompressed_static)
     app.after_request(cache_static_assets)

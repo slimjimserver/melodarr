@@ -8,8 +8,8 @@
     "test:browser": "node ./node_modules/@playwright/test/cli.js test"
   },
   "devDependencies": {
-    "@playwright/test": "1.62.0",
-    "esbuild": "0.28.1",
-    "typescript": "5.9.3"
+    "@playwright/test": "1.63.0",
+    "esbuild": "0.28.2",
+    "typescript": "7.0.2"
   }
 }

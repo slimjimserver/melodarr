@@ -5,36 +5,40 @@ import os
 import re
 from datetime import datetime, timezone
 from numbers import Real
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 
 if __package__ == "backend.services":
+    from .. import track_search_index
     from ..api_cache import cached_json_get, get_cache_document, set_cache_document
     from ..cache_memo import invalidate_document, memoized_document
     from ..config import (
-        LIDARR_LIBRARY_CACHE_TTL,
         LIDARR_DOWNLOAD_CACHE_TTL,
+        LIDARR_LIBRARY_CACHE_TTL,
         LIDARR_METADATA_CACHE_TTL,
         LIDARR_METADATA_URL,
         LIDARR_OPTIONS_CACHE_TTL,
         USER_AGENT,
     )
     from ..detail_cache import invalidate_all as invalidate_detail_payloads
+    from ..http_security import request_without_redirects
     from ..storage import get_service
 else:  # Support the existing `python backend/app.py` entry point.
+    import track_search_index
     from api_cache import cached_json_get, get_cache_document, set_cache_document
     from cache_memo import invalidate_document, memoized_document
     from config import (
-        LIDARR_LIBRARY_CACHE_TTL,
         LIDARR_DOWNLOAD_CACHE_TTL,
+        LIDARR_LIBRARY_CACHE_TTL,
         LIDARR_METADATA_CACHE_TTL,
         LIDARR_METADATA_URL,
         LIDARR_OPTIONS_CACHE_TTL,
         USER_AGENT,
     )
     from detail_cache import invalidate_all as invalidate_detail_payloads
+    from http_security import request_without_redirects
     from storage import get_service
 
 
@@ -51,14 +55,22 @@ TIME_LEFT_PATTERN = re.compile(
 )
 
 
+def _reject_embedded_credentials(base_url):
+    parsed = urlsplit(base_url)
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("Lidarr URL must not contain a username or password.")
+
+
 def connection(values, old=None):
     """Normalize Lidarr connection form values into stored configuration."""
     hostname = str(values.get("hostname", values.get("url", ""))).strip().rstrip("/")
+    _reject_embedded_credentials(hostname)
     if hostname and not hostname.startswith(("http://", "https://")):
         hostname = f"{'https' if values.get('useSsl') else 'http'}://{hostname}"
     port = str(values.get("port", "")).strip()
     if port and hostname.rsplit(":", 1)[-1] != port:
         hostname = f"{hostname}:{port}"
+    _reject_embedded_credentials(hostname)
     return {
         "url": hostname,
         "apiKey": str(values.get("apiKey", "")).strip() or (old or {}).get("apiKey", ""),
@@ -78,12 +90,14 @@ def url(path, config=None):
     config = config or get_service("lidarr")
     if not config or not config.get("url"):
         raise ValueError("Lidarr is not configured.")
+    _reject_embedded_credentials(config["url"])
     return f"{config['url'].rstrip('/')}/api/v1{path}"
 
 
 def _request(method, path, *, config=None, timeout=15, **kwargs):
     config = config or get_service("lidarr")
-    return requests.request(
+    return request_without_redirects(
+        requests.request,
         method,
         url(path, config),
         headers=headers(config),
@@ -107,6 +121,7 @@ def options(config=None):
             headers=request_headers,
             namespace="lidarr-options",
             ttl=LIDARR_OPTIONS_CACHE_TTL,
+            reject_redirects=True,
         )
 
     return {
@@ -405,6 +420,8 @@ def album_availability(album):
         "monitored": bool(album.get("monitored")),
         "artistMbid": str(album.get("foreignArtistId") or (album.get("artist") or {}).get("foreignArtistId") or ""),
         "artistName": str(album.get("artistName") or (album.get("artist") or {}).get("artistName") or (album.get("artist") or {}).get("name") or ""),
+        "type": str(album.get("albumType") or ""),
+        "releaseDate": str(album.get("releaseDate") or "")[:10],
     }
 
 
@@ -430,6 +447,7 @@ def scan_library_availability(config=None):
             albums[str(release_group_id).casefold()] = normalized
     payload = {"artists": artists, "albums": albums}
     set_cache_document("lidarr-library", "albums", payload, LIDARR_LIBRARY_CACHE_TTL)
+    track_search_index.index_lidarr_library(payload)
     invalidate_document(LIBRARY_INDEX_KEY)
     invalidate_detail_payloads()
     # This receives only a complete successful scan; absent records remain unknown.

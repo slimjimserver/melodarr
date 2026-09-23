@@ -9,7 +9,7 @@ import requests
 from flask import Blueprint, jsonify, request
 
 if __package__ == "backend.routes":
-    from .. import detail_cache
+    from .. import detail_cache, track_search_index
     from ..media_urls import (
         artist_cover_art,
         artist_large_cover_art,
@@ -17,7 +17,14 @@ if __package__ == "backend.routes":
     )
     from ..responses import api_error
     from ..security import login_required
-    from ..services import anime_artist_links, anime_theme_links, lastfm, lidarr, musicbrainz, plex
+    from ..services import (
+        anime_artist_links,
+        anime_theme_links,
+        lastfm,
+        lidarr,
+        musicbrainz,
+        plex,
+    )
     from ..storage import (
         get_lastfm_api_key,
         get_service,
@@ -27,6 +34,7 @@ if __package__ == "backend.routes":
     from ..workers import similar_artists as similar_artist_worker
 else:
     import detail_cache
+    import track_search_index
     from media_urls import (
         artist_cover_art,
         artist_large_cover_art,
@@ -34,7 +42,14 @@ else:
     )
     from responses import api_error
     from security import login_required
-    from services import anime_artist_links, anime_theme_links, lastfm, lidarr, musicbrainz, plex
+    from services import (
+        anime_artist_links,
+        anime_theme_links,
+        lastfm,
+        lidarr,
+        musicbrainz,
+        plex,
+    )
     from storage import (
         get_lastfm_api_key,
         get_service,
@@ -45,6 +60,8 @@ else:
 
 
 blueprint = Blueprint("music", __name__)
+RELEASE_TRACK_INCLUDES = "recordings+artist-credits+release-groups"
+LEGACY_RELEASE_TRACK_INCLUDES = "recordings+artist-credits"
 
 
 def _prefetch_cache_miss():
@@ -297,13 +314,30 @@ def artist_availability(mbid):
     lidarr_artist = lidarr.cached_artist_availability().get(mbid)
     available_in_plex = bool(plex_artist)
     available_in_lidarr = bool(lidarr_artist)
-    release_group_ids = list(
-        dict.fromkeys(
-            value.strip()
-            for value in request.args.getlist("releaseGroup")
-            if value.strip()
-        )
-    )[:50]
+    release_group_ids = _requested_release_group_ids()
+    return _availability_response({
+        "id": mbid,
+        "availableInPlex": available_in_plex,
+        "availableInLidarr": available_in_lidarr,
+        "plexUrl": plex_artist.get("url", "") if plex_artist else "",
+        "plexampUrl": plex_artist.get("plexampUrl", "") if plex_artist else "",
+        "releaseGroups": _release_group_availability(release_group_ids),
+        "settled": _availability_settled(
+            available_in_lidarr=available_in_lidarr,
+            available_in_plex=available_in_plex,
+        ),
+    })
+
+
+def _requested_release_group_ids():
+    return list(dict.fromkeys(
+        value.strip()
+        for value in request.args.getlist("releaseGroup")
+        if value.strip()
+    ))[:50]
+
+
+def _release_group_availability(release_group_ids, *, include_plex_releases=False):
     plex_groups = (
         _plex_release_group_inventory() if release_group_ids else {}
     )
@@ -312,39 +346,141 @@ def artist_availability(mbid):
     )
     downloads = _download_snapshot() if release_group_ids else {}
     pending = pending_lidarr_search_mbids(release_group_ids)
+    result = {}
+    for release_group_id in release_group_ids:
+        key = release_group_id.casefold()
+        lidarr_group = lidarr_groups.get(key)
+        request_status, download_status = _release_group_lifecycle(
+            release_group_id, lidarr_group, downloads.get(key), key in pending,
+        )
+        status = {
+            "availableInPlex": release_group_id in plex_groups,
+            "availableInLidarr": key in lidarr_groups,
+            "fullyAvailableInLidarr": bool(
+                lidarr_group and lidarr_group.get("fullyAvailable")
+            ),
+            "requestStatus": request_status,
+            "downloadStatus": download_status,
+        }
+        if include_plex_releases:
+            status["plexReleases"] = [
+                _plex_release_summary(item)
+                for item in plex_groups.get(release_group_id, [])
+            ]
+        result[release_group_id] = status
+    return result
+
+
+@blueprint.get("/api/music/release-groups/availability")
+@login_required
+def release_groups_availability():
+    """Return cached live status for release cards on an anime page."""
     return _availability_response({
-        "id": mbid,
-        "availableInPlex": available_in_plex,
-        "availableInLidarr": available_in_lidarr,
-        "plexUrl": plex_artist.get("url", "") if plex_artist else "",
-        "plexampUrl": plex_artist.get("plexampUrl", "") if plex_artist else "",
-        "releaseGroups": {
-            release_group_id: {
-                "availableInPlex": release_group_id in plex_groups,
-                "availableInLidarr": release_group_id.casefold() in lidarr_groups,
-                "fullyAvailableInLidarr": bool(
-                    lidarr_groups.get(release_group_id.casefold(), {}).get(
-                        "fullyAvailable"
-                    )
-                ),
-                "requestStatus": _release_group_lifecycle(
-                    release_group_id, lidarr_groups.get(release_group_id.casefold()),
-                    downloads.get(release_group_id.casefold()),
-                    release_group_id.casefold() in pending,
-                )[0],
-                "downloadStatus": _release_group_lifecycle(
-                    release_group_id, lidarr_groups.get(release_group_id.casefold()),
-                    downloads.get(release_group_id.casefold()),
-                    release_group_id.casefold() in pending,
-                )[1],
-            }
-            for release_group_id in release_group_ids
-        },
-        "settled": _availability_settled(
-            available_in_lidarr=available_in_lidarr,
-            available_in_plex=available_in_plex,
+        "releaseGroups": _release_group_availability(
+            _requested_release_group_ids(), include_plex_releases=True,
         ),
     })
+
+
+@blueprint.get("/api/music/artist/<mbid>/tracks")
+@login_required
+def artist_track_search(mbid):
+    """Find cached release groups containing a matching track by this artist."""
+    try:
+        mbid = str(UUID(mbid))
+    except ValueError:
+        return api_error("Invalid MusicBrainz artist ID.")
+    query = request.args.get("q", "").strip()
+    if len(query) < 2:
+        return api_error("Enter at least two characters.")
+    matches = track_search_index.search_artist_tracks(mbid, query)
+    if not matches:
+        has_snapshot = track_search_index.artist_track_snapshot_info(mbid) is not None
+        escaped_query = query.replace("\\", "\\\\").replace('"', '\\"')
+        words = track_search_index.normalize_text(query).split()
+        clauses = [f'recording:"{escaped_query}"']
+        if words:
+            clauses.append("(" + " AND ".join(
+                f'recording:"{word}"' for word in words
+            ) + ")")
+        recording_query = (
+            f"({' OR '.join(clauses)}) AND arid:{mbid}"
+        )
+        try:
+            response = musicbrainz.search(
+                recording_query,
+                "track",
+                priority="interactive",
+                plain_search=False,
+                limit=50,
+            )
+            track_search_index.index_recording_search(response)
+            matches = (
+                track_search_index.recording_search_matches(response, mbid, query)
+                if has_snapshot
+                else track_search_index.search_artist_tracks(mbid, query)
+            )
+        except requests.RequestException:
+            # Release-title filtering remains useful when MusicBrainz is busy.
+            pass
+    group_ids = list(dict.fromkeys(
+        match["release_group_mbid"] for match in matches
+    ))
+    groups = track_search_index.cached_release_groups(group_ids)
+    matched_tracks = {}
+    for match in matches:
+        matched_tracks.setdefault(match["release_group_mbid"], []).append(
+            match["normalized_title"]
+        )
+
+    plex_groups = _plex_release_group_inventory() if group_ids else {}
+    lidarr_groups = lidarr.cached_library_availability() if group_ids else {}
+    download_groups = _download_snapshot() if group_ids else {}
+    pending_groups = pending_lidarr_search_mbids(group_ids)
+    anime_names = anime_theme_links.anime_names_for_release_groups(group_ids)
+    results = []
+    for group_id in group_ids:
+        group = groups.get(group_id)
+        if not group:
+            continue
+        lidarr_group = lidarr_groups.get(group_id.casefold())
+        request_status, download_status = _release_group_lifecycle(
+            group_id,
+            lidarr_group,
+            download_groups.get(group_id.casefold()),
+            group_id.casefold() in pending_groups,
+        )
+        results.append({
+            "id": group_id,
+            "title": group.get("title") or "Untitled",
+            "romanizedTitle": musicbrainz.romanized_release_group_title(group),
+            "date": group.get("first-release-date") or "",
+            "type": group.get("primary-type") or "Other",
+            "secondaryTypes": [
+                name for name in group.get("secondary-types") or [] if name
+            ],
+            "disambiguation": group.get("disambiguation") or "",
+            "coverArt": release_group_cover_art(group_id),
+            "animeNames": anime_names.get(group_id.casefold(), []),
+            "availableInPlex": group_id in plex_groups,
+            "availableInLidarr": bool(lidarr_group),
+            "fullyAvailableInLidarr": bool(
+                lidarr_group and lidarr_group.get("fullyAvailable")
+            ),
+            "requestStatus": request_status,
+            "downloadStatus": download_status,
+            "plexReleases": [
+                _plex_release_summary(item)
+                for item in plex_groups.get(group_id, [])
+            ],
+            "matchedTracks": list(dict.fromkeys(matched_tracks[group_id])),
+        })
+    response = jsonify({
+        "results": results,
+        "candidateCount": len(results),
+    })
+    response.headers["Cache-Control"] = "private, max-age=30"
+    return response
 
 
 @blueprint.get("/api/music/release-group/<mbid>/availability")
@@ -398,7 +534,8 @@ def _artist_detail_payload(
         )
         if data is None:
             return None
-        raw_groups, offset = [], 0
+        track_search_index.index_artist(data)
+        raw_groups, index_pages, offset = [], [], 0
         while True:
             page = musicbrainz.get(
                 "/release-group", "aliases", priority=priority,
@@ -408,12 +545,26 @@ def _artist_detail_payload(
             )
             if page is None:
                 return None
+            index_pages.append((
+                page,
+                musicbrainz.metadata_cache_key(
+                    "/release-group",
+                    "aliases",
+                    artist=mbid,
+                    limit=100,
+                    offset=offset,
+                ),
+            ))
             batch = page.get("release-groups", [])
             raw_groups.extend(batch)
             total = page.get("release-group-count", len(raw_groups))
             if offset + len(batch) >= total or not batch:
                 break
             offset += len(batch)
+        track_search_index.replace_musicbrainz_artist_discography(
+            mbid,
+            index_pages,
+        )
     plex_groups = _plex_release_group_inventory()
     lidarr_groups = lidarr.cached_library_availability()
     download_groups = _download_snapshot()
@@ -603,6 +754,7 @@ def refresh_artist_detail(mbid):
     try:
         cache_key = ("artist", mbid.casefold())
         artist_metadata_worker.refresh_artist_metadata(mbid, "critical")
+        artist_metadata_worker.request_track_refresh(mbid)
         with detail_cache.build_lock(cache_key) as generation:
             assembled = detail_cache.cached_response(cache_key)
             if assembled is not None:
@@ -658,6 +810,13 @@ def _release_group_detail_payload(mbid, priority, *, cache_only=False):
     )
     if data is None:
         return None
+    track_search_index.index_release_group_page(
+        {"release-groups": [data]},
+        musicbrainz.metadata_cache_key(
+            f"/release-group/{mbid}",
+            "aliases+artist-credits+url-rels",
+        ),
+    )
     raw_releases, offset = [], 0
     while True:
         page = musicbrainz.get(
@@ -851,25 +1010,58 @@ def release_group_detail(mbid):
 def _release_detail_payload(mbid, priority, *, cache_only=False):
     data = musicbrainz.get(
         f"/release/{quote(mbid)}",
-        "recordings+artist-credits",
+        RELEASE_TRACK_INCLUDES,
         priority=priority,
         cache_only=cache_only,
     )
     if data is None:
         return None
-    tracks = [
-        {
-            "number": track.get("number", ""), "title": track.get("title", "Untitled"),
-            "length": track.get("length"),
-            "artist": " · ".join(credit.get("name", "") for credit in track.get("artist-credit", [])),
-        }
-        for medium in data.get("media", []) for track in medium.get("tracks", [])
-    ]
+    track_search_index.index_release(
+        data,
+        musicbrainz.metadata_cache_key(
+            f"/release/{mbid}",
+            RELEASE_TRACK_INCLUDES,
+        ),
+    )
+    tracks = []
+    for medium in data.get("media", []):
+        for track in medium.get("tracks", []):
+            title = (
+                track.get("title")
+                or (track.get("recording") or {}).get("title")
+                or "Untitled"
+            )
+            tracks.append({
+                "number": track.get("number", ""),
+                "title": title,
+                "romanizedTitle": musicbrainz.romanized_track_title(title),
+                "length": track.get("length"),
+                "artist": " · ".join(
+                    credit.get("name", "")
+                    for credit in track.get("artist-credit", [])
+                ),
+            })
     return {
         "id": data["id"], "title": data.get("title"),
         "artist": " · ".join(credit.get("name", "") for credit in data.get("artist-credit", [])),
         "date": data.get("date", ""), "country": data.get("country", ""), "tracks": tracks,
     }
+
+
+def _index_cached_release_detail(mbid):
+    indexed = track_search_index.index_cached_release(
+        musicbrainz.metadata_cache_key(
+            f"/release/{mbid}",
+            RELEASE_TRACK_INCLUDES,
+        )
+    )
+    if not indexed:
+        track_search_index.index_cached_release(
+            musicbrainz.metadata_cache_key(
+                f"/release/{mbid}",
+                LEGACY_RELEASE_TRACK_INCLUDES,
+            )
+        )
 
 
 @blueprint.get("/api/music/release/<mbid>")
@@ -879,10 +1071,12 @@ def release_detail(mbid):
         cache_key = ("release", mbid.casefold())
         assembled = detail_cache.cached_response(cache_key)
         if assembled is not None:
+            _index_cached_release_detail(mbid)
             return assembled
         with detail_cache.build_lock(cache_key) as generation:
             assembled = detail_cache.cached_response(cache_key)
             if assembled is not None:
+                _index_cached_release_detail(mbid)
                 return assembled
             prefetch = request.args.get("prefetch") == "1"
             payload = _release_detail_payload(

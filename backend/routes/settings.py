@@ -1,12 +1,17 @@
 """Administrator service configuration and maintenance routes."""
 
 import requests
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, current_app, jsonify, request
 
 if __package__ == "backend.routes":
     from ..api_cache import cache_stats, clear_cache
     from ..artwork_cache import artwork_cache_stats, clear_artwork_cache
     from ..detail_cache import invalidate_all as invalidate_detail_payloads
+    from ..instance_settings import (
+        public_instance_settings,
+        rotate_api_key,
+        save_instance_settings,
+    )
     from ..responses import api_error, request_json_object
     from ..security import admin_required, login_required
     from ..services import lastfm, lidarr, musicbrainz
@@ -28,6 +33,11 @@ else:  # Support the existing `python backend/app.py` entry point.
     from api_cache import cache_stats, clear_cache
     from artwork_cache import artwork_cache_stats, clear_artwork_cache
     from detail_cache import invalidate_all as invalidate_detail_payloads
+    from instance_settings import (
+        public_instance_settings,
+        rotate_api_key,
+        save_instance_settings,
+    )
     from responses import api_error, request_json_object
     from security import admin_required, login_required
     from services import lastfm, lidarr, musicbrainz
@@ -77,6 +87,12 @@ def settings():
     lastfm_config = get_service("lastfm") or {}
     musicbrainz_config = musicbrainz.configuration()
     return jsonify({
+        "melodarr": public_instance_settings(
+            current_app.config.get("AUTOMATION_API_KEY", ""),
+            managed_by_environment=current_app.config.get(
+                "AUTOMATION_API_KEY_MANAGED_BY_ENVIRONMENT", False
+            ),
+        ),
         "lidarr": {
             "configured": bool(lidarr_config),
             "url": lidarr_config.get("url", "") if lidarr_config else "",
@@ -96,6 +112,44 @@ def settings():
             ),
         },
         "musicbrainz": musicbrainz_config,
+    })
+
+
+@blueprint.post("/api/settings/melodarr")
+@admin_required
+def configure_melodarr():
+    """Save instance identity while leaving its generated key untouched."""
+    try:
+        save_instance_settings(request_json_object())
+    except ValueError as exc:
+        return api_error(str(exc))
+    return jsonify({
+        "message": "Melodarr settings saved.",
+        "melodarr": public_instance_settings(
+            current_app.config.get("AUTOMATION_API_KEY", ""),
+            managed_by_environment=current_app.config.get(
+                "AUTOMATION_API_KEY_MANAGED_BY_ENVIRONMENT", False
+            ),
+        ),
+    })
+
+
+@blueprint.post("/api/settings/melodarr/api-key/regenerate")
+@admin_required
+def regenerate_melodarr_api_key():
+    """Rotate the machine credential unless an environment override owns it."""
+    if current_app.config.get("AUTOMATION_API_KEY_MANAGED_BY_ENVIRONMENT"):
+        return api_error(
+            "The API key is managed by MELODARR_AUTOMATION_API_KEY and cannot "
+            "be regenerated here.",
+            409,
+        )
+    current_app.config["AUTOMATION_API_KEY"] = rotate_api_key()
+    return jsonify({
+        "message": "API key regenerated. Existing integrations must use the new key.",
+        "melodarr": public_instance_settings(
+            current_app.config["AUTOMATION_API_KEY"]
+        ),
     })
 
 
@@ -284,8 +338,12 @@ def configure_lidarr():
     if values is None:
         return api_error("Request body must be a JSON object.")
     old = get_service("lidarr") or {}
+    try:
+        connection = lidarr.connection(values, old)
+    except ValueError as exc:
+        return api_error(str(exc))
     config = {
-        **lidarr.connection(values, old),
+        **connection,
         "externalUrl": str(values.get("externalUrl", "")).strip().rstrip("/"),
         "defaults": {
             "rootFolderPath": values.get("rootFolderPath"),
@@ -387,6 +445,8 @@ def configure_lastfm():
                 "melodarr",
                 api_key,
                 limit=1,
+                force_refresh=True,
+                cache_response=False,
             )
         except ValueError as exc:
             return api_error(str(exc))
@@ -414,7 +474,10 @@ def test_lidarr():
     values = request_json_object()
     if values is None:
         return api_error("Request body must be a JSON object.")
-    config = lidarr.connection(values)
+    try:
+        config = lidarr.connection(values)
+    except ValueError as exc:
+        return api_error(str(exc))
     if not config["url"] or not config["apiKey"]:
         return api_error("Enter a hostname, port, and API key before testing.")
     try:

@@ -133,6 +133,88 @@ class LastfmCachePrivacyTests(unittest.TestCase):
                 ),
             )
 
+    def test_api_key_is_sent_upstream_but_excluded_from_cache_key(self):
+        with (
+            patch("backend.api_cache.cache_key", wraps=cache_key) as make_key,
+            patch(
+                "backend.api_cache.requests.get",
+                return_value=Response({"marker": "first"}),
+            ) as request_get,
+        ):
+            first = lastfm.get_public("chart.gettopartists", "first-secret", limit=10)
+            second = lastfm.get_public("chart.gettopartists", "second-secret", limit=10)
+
+        self.assertEqual(first, second)
+        request_get.assert_called_once()
+        self.assertEqual(request_get.call_args.kwargs["params"]["api_key"], "first-secret")
+        self.assertEqual(make_key.call_count, 2)
+        cache_material = make_key.call_args.args[2]
+        self.assertEqual(cache_material, {
+            "method": "chart.gettopartists", "format": "json", "limit": 10,
+        })
+        self.assertNotIn("api_key", json.dumps(cache_material))
+        self.assertEqual(len(self.cache_rows()), 1)
+
+    def test_non_sensitive_lastfm_parameters_keep_distinct_cache_keys(self):
+        with patch(
+            "backend.api_cache.requests.get",
+            return_value=Response({"marker": "chart"}),
+        ) as request_get:
+            lastfm.get_public("chart.gettopartists", "shared-secret", limit=10)
+            lastfm.get_public("chart.gettopartists", "shared-secret", limit=20)
+
+        self.assertEqual(request_get.call_count, 2)
+        self.assertEqual(len({row["cache_key"] for row in self.cache_rows()}), 2)
+
+    def test_new_key_validation_ignores_old_cached_success(self):
+        admin = self.register_admin()
+        save_service("lastfm", {"apiKey": "old-key"})
+        with patch(
+            "backend.api_cache.requests.get",
+            return_value=Response({"topartists": {}}),
+        ):
+            lastfm.get("chart.gettopartists", "melodarr", "old-key", limit=1)
+
+        with patch(
+            "backend.api_cache.requests.get",
+            return_value=Response({"error": 10, "message": "Invalid API key"}),
+        ) as request_get:
+            response = self.client.post(
+                "/api/settings/lastfm",
+                headers={"X-CSRF-Token": admin["csrfToken"]},
+                json={"apiKey": "new-invalid-key"},
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()["error"], "Invalid API key")
+        request_get.assert_called_once()
+        self.assertEqual(request_get.call_args.kwargs["params"]["api_key"], "new-invalid-key")
+        self.assertEqual(len(self.cache_rows()), 1)
+
+    def test_key_change_still_invalidates_lastfm_cache(self):
+        admin = self.register_admin()
+        save_service("lastfm", {"apiKey": "old-key"})
+        self.seed_public_cache("old-public")
+        self.seed_user_cache("listener", "old-user")
+
+        with (
+            patch("backend.routes.settings.recommendation_worker.request_refresh"),
+            patch(
+                "backend.api_cache.requests.get",
+                return_value=Response({"topartists": {}}),
+            ) as request_get,
+        ):
+            response = self.client.post(
+                "/api/settings/lastfm",
+                headers={"X-CSRF-Token": admin["csrfToken"]},
+                json={"apiKey": "new-key"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        request_get.assert_called_once()
+        self.assertEqual(request_get.call_args.kwargs["params"]["api_key"], "new-key")
+        self.assertEqual(self.cache_rows(), [])
+
     def test_user_namespace_is_case_stable_and_does_not_store_the_handle(self):
         first = lastfm.user_cache_namespace("Private.Listener")
         second = lastfm.user_cache_namespace(" private.listener ")

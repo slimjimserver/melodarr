@@ -25,6 +25,7 @@ if __package__:
         ARTWORK_SIZES,
         ARTWORK_WEBP_QUALITY,
     )
+    from .http_security import request_without_redirects
 else:
     from config import (
         ARTWORK_BROWSER_CACHE_TTL,
@@ -38,6 +39,7 @@ else:
         ARTWORK_SIZES,
         ARTWORK_WEBP_QUALITY,
     )
+    from http_security import request_without_redirects
 
 
 _trim_lock = Lock()
@@ -448,8 +450,19 @@ def cached_artwork(cache_key, source_url, *, headers=None, size=None):
         temporary_path = None
         provider_response = None
         try:
-            provider_response = requests.get(
-                resolved_source_url, headers=headers, stream=True, timeout=20
+            request_kwargs = {
+                "headers": headers,
+                "stream": True,
+                "timeout": 20,
+            }
+            provider_response = (
+                request_without_redirects(
+                    requests.get,
+                    resolved_source_url,
+                    **request_kwargs,
+                )
+                if headers
+                else requests.get(resolved_source_url, **request_kwargs)
             )
             if provider_response.status_code == 404:
                 _record_artwork_miss(miss_file)

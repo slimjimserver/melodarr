@@ -38,6 +38,7 @@
   --duration-fast: 160ms;
   --duration-standard: 220ms;
   --tab-bar-height: 0px;
+  --safe-top: env(safe-area-inset-top, 0px);
   --safe-bottom: env(safe-area-inset-bottom, 0px);
   --bottom-ui-offset: var(--safe-bottom);
 }
@@ -76,10 +77,10 @@ header {
   top: 0;
   z-index: 10;
   align-items: center;
-  height: 68px;
+  height: calc(68px + var(--safe-top));
   gap: 32px;
   padding: 0 clamp(20px, 6vw, 92px);
-  padding-top: env(safe-area-inset-top, 0px);
+  padding-top: var(--safe-top);
   border-bottom: 1px solid var(--border);
   background: rgba(255, 250, 243, .96);
   box-shadow: 0 1px 12px rgba(68, 50, 38, .05);
@@ -200,6 +201,8 @@ h1 em { font-style: normal; }
 .search.searching { border-color: rgba(94, 106, 210, .45); }
 .message { min-height: 20px; margin: 22px 0 7px; color: var(--foreground-muted); font-size: 14px; }
 .results { display: grid; max-width: var(--content-narrow); gap: 10px; }
+.search-show-more { justify-self: start; margin-top: 8px; }
+.search-musicbrainz { margin-top: 12px; }
 .recommendations { width: min(1400px, calc(100vw - 56px)); max-width: none; margin-top: 56px; margin-left: 50%; border-top: 1px solid var(--border); padding-top: 28px; transform: translateX(-50%); }
 .recommendations-heading { display: flex; align-items: end; justify-content: space-between; gap: 20px; }
 .recommendations-heading .eyebrow { margin-bottom: 8px; }
@@ -448,6 +451,7 @@ h1 em { font-style: normal; }
 .settings-tabs a.active { border-bottom-color: var(--accent-bright); color: var(--foreground); background: rgba(168, 68, 45, .07); }
 .settings-panel[hidden] { display: none; }
 .settings-section { max-width: none; border-top: 1px solid var(--border); padding: 26px 0 32px; }
+.melodarr-settings-section { border-top: 0; padding-top: 0; }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; margin: -1px; clip: rect(0 0 0 0); white-space: nowrap; }
 .users-section:first-child { border-top: 0; padding-top: 0; }
 .users-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; margin-bottom: 20px; }
@@ -539,7 +543,9 @@ h1 em { font-style: normal; }
 .service-intro h2 { margin: 0 0 4px; font-size: 20px; letter-spacing: -.03em; }
 .service-intro p { margin: 0; color: var(--foreground-muted); font-size: 13px; line-height: 1.4; }
 .service-icon { display: block; width: 42px; height: 42px; padding: 7px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); }
-.service-state { display: inline-flex; min-height: 30px; align-items: center; gap: 7px; border: 1px solid var(--border); border-radius: var(--radius-pill); background: var(--surface); color: var(--foreground-subtle); padding: 6px 10px; font-size: 12px; white-space: nowrap; }
+.service-state { display: inline-flex; min-height: 30px; align-items: center; gap: 7px; border: 1px solid var(--border); border-radius: var(--radius-pill); background: var(--surface); color: var(--foreground-subtle); padding: 6px 10px; font-size: 12px; text-decoration: none; white-space: nowrap; }
+.service-state[href] { cursor: pointer; transition: border-color .2s var(--ease-out), color .2s var(--ease-out), background .2s var(--ease-out); }
+.service-state[href]:hover { border-color: var(--border-hover); background: var(--surface-hover); color: var(--foreground); }
 .service-state[data-state]::before { width: 7px; height: 7px; flex: none; border-radius: 50%; background: var(--foreground-muted); content: ""; }
 .service-state[data-state="ready"] { border-color: color-mix(in srgb, var(--success) 38%, transparent); color: var(--success); }
 .service-state[data-state="ready"]::before { background: currentColor; box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 14%, transparent); }
@@ -550,6 +556,13 @@ h1 em { font-style: normal; }
 .wide-field { grid-column: 1 / -1; }
 label { display: grid; gap: 7px; color: var(--foreground-subtle); font-size: 13px; font-weight: 600; letter-spacing: 0; }
 .service-card button { height: var(--control-height); padding: 0 16px; }
+.secret-field { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 9px; }
+.secret-field input { min-width: 0; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+.secret-field .secret-toggle { display: grid; width: var(--control-height); place-items: center; padding: 0; }
+.secret-toggle svg { width: 19px; height: 19px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.secret-toggle .secret-eye-slash { display: block; }
+.secret-toggle[aria-pressed="true"] .secret-eye-slash { display: none; }
+.melodarr-settings-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 9px; }
 .form-message { min-height: 16px; margin: 0; color: var(--foreground-muted); font-size: 12px; }
 .message.error:not(:empty), .form-message.error:not(:empty) { border-left: 2px solid var(--danger); border-radius: 0 var(--radius-control) var(--radius-control) 0; background: color-mix(in srgb, var(--danger) 8%, transparent); padding: 8px 10px; line-height: 1.45; }
 hr { width: 100%; border: 0; border-top: 1px solid var(--border); }
@@ -712,9 +725,9 @@ details summary { margin-bottom: 17px; color: var(--accent-bright); cursor: poin
 }
 
 @media (max-width: 700px) {
-  :root { --tab-bar-height: 72px; --bottom-ui-offset: var(--tab-bar-height); }
+  :root { --tab-bar-height: calc(56px + var(--safe-bottom)); --bottom-ui-offset: var(--tab-bar-height); }
   input, select, textarea { font-size: 16px; }
-  header { display: flex; gap: 12px; height: 62px; padding: 0 16px; padding-top: env(safe-area-inset-top, 0px); }
+  header { display: flex; gap: 12px; height: calc(62px + var(--safe-top)); padding: 0 16px; padding-top: var(--safe-top); }
   .header-nav { display: none; }
   .status { display: none; }
   .brand { min-width: 0; margin-right: auto; font-size: 20px; }
@@ -911,7 +924,7 @@ button,
 
 @media (max-width: 700px) {
   header {
-    height: 64px;
+    height: calc(64px + var(--safe-top));
     padding-right: 14px;
     padding-left: 14px;
   }

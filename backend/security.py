@@ -4,12 +4,14 @@ import os
 from functools import wraps
 from hmac import compare_digest
 
-from flask import g, has_request_context, jsonify, request, session
+from flask import current_app, g, has_request_context, jsonify, request, session
 
 if __package__:
+    from .instance_settings import application_identity
     from .responses import api_error
     from .storage import db, get_lastfm_api_key
 else:  # Support the existing `python backend/app.py` entry point.
+    from instance_settings import application_identity
     from responses import api_error
     from storage import db, get_lastfm_api_key
 
@@ -26,6 +28,7 @@ def get_user(user_id):
 
 _MISSING = object()
 _REQUEST_USER_KEY = "_melodarr_current_user"
+_API_KEY_ROUTE_ATTRIBUTE = "_melodarr_allows_api_key"
 
 
 def current_user():
@@ -111,6 +114,7 @@ def user_payload(user, include_csrf=False):
         "lastfmConfigured": bool(
             user["lastfm_username"] and get_lastfm_api_key()
         ),
+        **application_identity(),
     }
     if include_csrf:
         payload["csrfToken"] = session["csrf_token"]
@@ -135,6 +139,30 @@ def login_required(view):
     return wrapped
 
 
+def _valid_automation_api_key():
+    expected = current_app.config.get("AUTOMATION_API_KEY", "")
+    received = request.headers.get("X-Api-Key", "")
+    return bool(expected and received) and compare_digest(expected, received)
+
+
+def _request_allows_api_key():
+    view = current_app.view_functions.get(request.endpoint or "")
+    return bool(view and getattr(view, _API_KEY_ROUTE_ATTRIBUTE, False))
+
+
+def login_or_api_key_required(view):
+    """Allow a browser session or the configured machine API key."""
+
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not current_user() and not _valid_automation_api_key():
+            return api_error("Sign in or a valid API key is required.", 401)
+        return view(*args, **kwargs)
+
+    setattr(wrapped, _API_KEY_ROUTE_ATTRIBUTE, True)
+    return wrapped
+
+
 def admin_required(view):
     @wraps(view)
     def wrapped(*args, **kwargs):
@@ -155,6 +183,8 @@ def verify_csrf_token():
     if request.path in {"/api/auth/login", "/api/auth/register"} or request.path.startswith(
         "/api/auth/plex/"
     ):
+        return None
+    if _request_allows_api_key() and _valid_automation_api_key():
         return None
     expected_token = session.get("csrf_token", "")
     received_token = request.headers.get("X-CSRF-Token", "")

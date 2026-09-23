@@ -24,7 +24,7 @@
     timer?: ReturnType<typeof setTimeout>;
   };
   type DetailAvailabilityWatcher = {
-    kind: "artist" | "release-group";
+    kind: "artist" | "release-group" | "anime";
     id: string;
     data: JsonObject;
     generation: number;
@@ -964,7 +964,11 @@
 
   function artistReleaseGroups(data: JsonObject) {
     const groups = (Object.values(data.sections || {}) as JsonObject[][]).flat();
-    return [...new Map([...groups, ...(data.animeReleaseGroups || [])]
+    return [...new Map([
+      ...groups,
+      ...(data.animeReleaseGroups || []),
+      ...(data.trackSearchGroups || []),
+    ]
       .map((group: JsonObject) => [String(group.id), group])).values()];
   }
 
@@ -973,6 +977,27 @@
       (group) => (group.availableInLidarr && !group.fullyAvailableInLidarr)
         || ["queued", "downloading"].includes(String(group.requestStatus || "")),
     );
+  }
+
+  function animeReleaseGroups(data: JsonObject) {
+    const groups = new Map<string, JsonObject[]>();
+    (data.themes || []).forEach((theme: JsonObject) => {
+      const mapping = theme.mapping || {};
+      const candidates = [
+        ...(mapping.releaseGroups || []),
+        ...(mapping.candidates || []),
+        ...(mapping.recordingCandidates || []).flatMap(
+          (recording: JsonObject) => recording.releaseGroups || [],
+        ),
+      ];
+      candidates.forEach((group: JsonObject) => {
+        if (!group?.id) return;
+        const id = String(group.id);
+        if (!groups.has(id)) groups.set(id, []);
+        groups.get(id)!.push(group);
+      });
+    });
+    return groups;
   }
 
   function requestStatusLabel(data: JsonObject) {
@@ -1072,10 +1097,43 @@
       });
   }
 
+  function applyAnimeReleaseGroupAvailability(data: JsonObject, updates: JsonObject) {
+    const groups = animeReleaseGroups(data);
+    Object.entries(updates || {}).forEach(([id, status]: [string, JsonObject]) => {
+      (groups.get(id) || []).forEach((group) => {
+        group.availableInPlex = Boolean(group.availableInPlex || status.availableInPlex);
+        group.availableInLidarr = Boolean(group.availableInLidarr || status.availableInLidarr);
+        group.fullyAvailableInLidarr = Boolean(
+          group.fullyAvailableInLidarr || status.fullyAvailableInLidarr,
+        );
+        group.requestStatus = status.requestStatus;
+        group.downloadStatus = status.downloadStatus;
+        if (status.availableInLidarr) group.availabilityPending = false;
+        if (status.plexReleases?.length) group.plexReleases = status.plexReleases;
+      });
+    });
+    $("#detail-results").querySelectorAll<HTMLElement>(
+      ".anime-release-candidate[data-release-group-id]",
+    ).forEach((card) => {
+      const candidate = groups.get(String(card.dataset.releaseGroupId))?.[0];
+      const button = card.querySelector<HTMLButtonElement>(".release-group-request");
+      if (!candidate || !button) return;
+      updateAnimeCandidateAction(button, candidate);
+      const link = animeCandidatePlexLink(candidate);
+      const existing = card.querySelector<HTMLAnchorElement>(".anime-candidate-plex");
+      if (link && !existing) card.append(link);
+      else if (link && existing && link.href !== existing.href) existing.replaceWith(link);
+    });
+  }
+
   function applyDetailAvailability(
     watcher: DetailAvailabilityWatcher,
     availability: JsonObject,
   ) {
+    if (watcher.kind === "anime") {
+      applyAnimeReleaseGroupAvailability(watcher.data, availability.releaseGroups || {});
+      return;
+    }
     Object.assign(watcher.data, availability);
     updateDetailPlexLink(watcher.kind, watcher.data);
     const action = $("#detail-results")
@@ -1150,7 +1208,9 @@
 
     try {
       const availabilityUrl = new URL(
-        `/api/music/${watcher.kind}/${encodeURIComponent(watcher.id)}/availability`,
+        watcher.kind === "anime"
+          ? "/api/music/release-groups/availability"
+          : `/api/music/${watcher.kind}/${encodeURIComponent(watcher.id)}/availability`,
         window.location.origin,
       );
       if (watcher.kind === "artist") {
@@ -1163,11 +1223,27 @@
             );
           });
       }
-      const availability = await getJson(
-        `${availabilityUrl.pathname}${availabilityUrl.search}`,
-        30_000,
-        detailSessionAbort.signal,
-      );
+      const groupIds = watcher.kind === "anime"
+        ? [...animeReleaseGroups(watcher.data).keys()]
+        : [];
+      const urls: string[] = [];
+      if (watcher.kind === "anime") {
+        for (let index = 0; index < groupIds.length; index += 50) {
+          const url = new URL(availabilityUrl);
+          groupIds.slice(index, index + 50).forEach(
+            id => url.searchParams.append("releaseGroup", id),
+          );
+          urls.push(`${url.pathname}${url.search}`);
+        }
+      } else {
+        urls.push(`${availabilityUrl.pathname}${availabilityUrl.search}`);
+      }
+      const responses = await Promise.all(urls.map(url => getJson(
+        url, 30_000, detailSessionAbort.signal,
+      )));
+      const availability = watcher.kind === "anime"
+        ? { releaseGroups: Object.assign({}, ...responses.map(response => response.releaseGroups || {})) }
+        : responses[0];
       if (
         detailAvailabilityWatcher !== watcher
         || watcher.generation !== detailSessionGeneration
@@ -1176,7 +1252,7 @@
       ) return;
       applyDetailAvailability(watcher, availability);
       if (
-        availability.settled
+        watcher.kind !== "anime" && availability.settled
         && (
           watcher.kind !== "artist"
           || !incompleteArtistReleaseGroups(watcher.data).length
@@ -1202,10 +1278,10 @@
     delay = 5_000,
   ) {
     stopDetailAvailability();
-    if (kind !== "artist" && kind !== "release-group") return;
+    if (kind !== "artist" && kind !== "release-group" && kind !== "anime") return;
     const watcher: DetailAvailabilityWatcher = {
       kind,
-      id: String(data.id),
+      id: kind === "anime" ? String(data.slug || currentDetail?.id || "") : String(data.id),
       data,
       generation: detailSessionGeneration,
     };
@@ -1290,6 +1366,16 @@
           applyArtistReleaseGroupAvailability(currentDetailData, {});
           startDetailAvailability("artist", currentDetailData, 0);
         }
+      } else if (currentDetail?.kind === "anime" && currentDetailData) {
+        const groups = animeReleaseGroups(currentDetailData).get(releaseGroup.id) || [];
+        groups.forEach((group) => {
+          group.availableInLidarr = true;
+          group.availabilityPending = !result.alreadyExists;
+          group.fullyAvailableInLidarr = Boolean(result.alreadyExists);
+          group.requestStatus = result.pending ? "queued" : "requested";
+        });
+        applyAnimeReleaseGroupAvailability(currentDetailData, {});
+        startDetailAvailability("anime", currentDetailData, 0);
       }
     } catch (error) {
       if (!isCurrentDetailAction(action) || error.name === "AbortError") return;
@@ -2076,14 +2162,25 @@
     const byPrimary = new Map<string, JsonObject[]>(primaryOrder.map((name) => [name, []]));
     const secondaryCounts = new Map<string, number>();
     const searchText = new Map<JsonObject, string>();
+    const canonicalGroupIds = new Set<string>();
+    const trackMatches = new Map<string, JsonObject>();
     let releaseQuery = "";
     let wasSearching = false;
     let filterFrame: number | undefined;
+    let trackSearchTimer: ReturnType<typeof setTimeout> | undefined;
+    let trackSearchVersion = 0;
+    let trackSearchPending = false;
+    let trackSearchFailed = false;
+
+    const primaryType = (group: JsonObject) => (
+      primaryOrder.includes(String(group.type)) ? String(group.type) : "Other"
+    );
 
     (Object.values(data.sections || {}) as JsonObject[][]).forEach((groups) => {
       groups.forEach((group) => {
-        const primary = primaryOrder.includes(group.type) ? group.type : "Other";
+        const primary = primaryType(group);
         byPrimary.get(primary)!.push(group);
+        canonicalGroupIds.add(String(group.id));
         searchText.set(group, normalizeSearch(
           `${String(group.title || "")} ${String(group.romanizedTitle || "")} ${String(group.disambiguation || "")}`,
         ));
@@ -2102,7 +2199,9 @@
 
     const enabledSecondary = new Set<string>();
     const isVisible = (group: JsonObject) => (
-      (!releaseQuery || searchText.get(group)?.includes(releaseQuery))
+      (!releaseQuery
+        || searchText.get(group)?.includes(releaseQuery)
+        || trackMatches.has(String(group.id)))
       && (Boolean(releaseQuery) || (group.secondaryTypes || [])
         .every((secondary: string) => enabledSecondary.has(secondary)))
     );
@@ -2115,11 +2214,11 @@
     filter.className = "discography-filter";
     const filterLabel = document.createElement("label");
     filterLabel.htmlFor = "discography-search";
-    filterLabel.textContent = "Search releases";
+    filterLabel.textContent = "Search releases or tracks";
     const filterInput = document.createElement("input");
     filterInput.id = "discography-search";
     filterInput.type = "search";
-    filterInput.placeholder = "Search this artist's releases…";
+    filterInput.placeholder = "Search this artist's releases or tracks…";
     filterInput.autocomplete = "off";
     const filterCount = document.createElement("span");
     filterCount.setAttribute("aria-live", "polite");
@@ -2147,14 +2246,27 @@
       element: HTMLDetailsElement;
       summary: HTMLElement;
       link: HTMLAnchorElement;
+      primary: string;
       groups: JsonObject[];
       rendered: boolean;
       openBeforeSearch: boolean;
     }> = [];
 
+    function visibleSectionGroups(section: (typeof sections)[number]) {
+      const visible = section.groups.filter(isVisible);
+      if (!releaseQuery) return visible;
+      const supplemental = [...trackMatches.values()].filter((group) => (
+        !canonicalGroupIds.has(String(group.id))
+        && primaryType(group) === section.primary
+      ));
+      return [...visible, ...supplemental].sort(
+        (first, second) => (second.date || "").localeCompare(first.date || ""),
+      );
+    }
+
     function renderSection(
       section: (typeof sections)[number],
-      visible = section.groups.filter(isVisible),
+      visible = visibleSectionGroups(section),
     ) {
       section.summary.textContent = `${section.element.dataset.label} (${visible.length})`;
       section.element.hidden = visible.length === 0;
@@ -2185,6 +2297,7 @@
         element: section,
         summary,
         link,
+        primary,
         groups,
         rendered: false,
         openBeforeSearch: section.open,
@@ -2347,24 +2460,34 @@
     function refreshSections() {
       let visible = 0;
       sections.forEach((section) => {
-        const visibleGroups = section.groups.filter(isVisible);
+        const visibleGroups = visibleSectionGroups(section);
         visible += visibleGroups.length;
         if (releaseQuery && visibleGroups.length) section.element.open = true;
         renderSection(section, visibleGroups);
       });
       filterCount.textContent = releaseQuery
-        ? `${visible} of ${totalReleaseCount} releases`
+        ? `${visible} matching ${visible === 1 ? "release" : "releases"}`
         : `${totalReleaseCount} releases`;
-      filterMessage.textContent = releaseQuery && !visible
-        ? `No releases match “${filterInput.value.trim()}”.`
-        : "";
+      if (trackSearchPending) {
+        filterMessage.textContent = "Searching cached tracks…";
+      } else if (trackSearchFailed) {
+        filterMessage.textContent = "Track matches are unavailable; release-title matches are still shown.";
+      } else if (releaseQuery && !visible) {
+        filterMessage.textContent = `No releases or tracks match “${filterInput.value.trim()}”.`;
+      } else if (releaseQuery && trackMatches.size) {
+        const count = trackMatches.size;
+        filterMessage.textContent = `${count} release ${count === 1 ? "group contains" : "groups contain"} matching tracks.`;
+      } else {
+        filterMessage.textContent = "";
+      }
     }
 
     filterInput.addEventListener("input", () => {
       if (filterFrame !== undefined) return;
       filterFrame = window.requestAnimationFrame(() => {
         filterFrame = undefined;
-        const nextQuery = normalizeSearch(filterInput.value);
+        const rawQuery = filterInput.value.trim();
+        const nextQuery = normalizeSearch(rawQuery);
         const isSearching = Boolean(nextQuery);
         if (!wasSearching && isSearching) {
           sections.forEach((section) => {
@@ -2378,7 +2501,44 @@
           });
         }
         wasSearching = isSearching;
+        clearTimeout(trackSearchTimer);
+        const version = ++trackSearchVersion;
+        trackMatches.clear();
+        data.trackSearchGroups = [];
+        trackSearchFailed = false;
+        trackSearchPending = nextQuery.length >= 2;
         refreshSections();
+        if (!trackSearchPending) return;
+        trackSearchTimer = setTimeout(async () => {
+          try {
+            const payload = await getJson(
+              `/api/music/artist/${encodeURIComponent(data.id)}/tracks?q=${encodeURIComponent(rawQuery)}`,
+              30_000,
+              detailSessionAbort.signal,
+            );
+            if (
+              version !== trackSearchVersion
+              || !container.isConnected
+              || currentDetail?.kind !== "artist"
+              || currentDetail.id !== String(data.id)
+            ) return;
+            (payload.results || []).forEach((group: JsonObject) => {
+              trackMatches.set(String(group.id), group);
+            });
+            data.trackSearchGroups = [...trackMatches.values()];
+            trackSearchPending = false;
+            refreshSections();
+          } catch (error) {
+            if (
+              version !== trackSearchVersion
+              || !container.isConnected
+              || error.name === "AbortError"
+            ) return;
+            trackSearchPending = false;
+            trackSearchFailed = true;
+            refreshSections();
+          }
+        }, 250);
       });
     });
 
@@ -2586,6 +2746,16 @@
     );
   }
 
+  function updateAnimeCandidateAction(button: HTMLButtonElement, candidate: JsonObject) {
+    button.disabled = Boolean(candidate.fullyAvailableInLidarr || candidate.availabilityPending)
+      || ["queued", "downloading"].includes(String(candidate.requestStatus || ""));
+    button.textContent = candidate.fullyAvailableInLidarr ? "Available"
+      : ["queued", "downloading"].includes(String(candidate.requestStatus || ""))
+        ? requestStatusLabel(candidate)
+        : candidate.availabilityPending ? "Requested"
+        : candidate.availableInLidarr ? "Search missing" : "Request";
+  }
+
   function createAnimeReleaseCandidate(
     candidate: JsonObject,
     theme: JsonObject,
@@ -2608,6 +2778,7 @@
       id,
     );
     card.classList.add("anime-release-candidate");
+    if (id) card.dataset.releaseGroupId = id;
     if (recommended) {
       const badge = document.createElement("span");
       badge.className = "anime-recommended";
@@ -2618,20 +2789,15 @@
       const requestButton = document.createElement("button");
       requestButton.className = "request release-group-request";
       requestButton.type = "button";
-      if (candidate.fullyAvailableInLidarr) {
-        requestButton.textContent = "Available";
-        requestButton.disabled = true;
-      } else {
-        requestButton.textContent = candidate.availableInLidarr ? "Search missing" : "Request";
-        requestButton.addEventListener("click", (event) => {
-          event.stopPropagation();
-          requestReleaseGroup({
-            id,
-            button: requestButton,
-            animeContext: animeRequestContext(theme),
-          });
+      updateAnimeCandidateAction(requestButton, candidate);
+      requestButton.addEventListener("click", (event) => {
+        event.stopPropagation();
+        requestReleaseGroup({
+          id,
+          button: requestButton,
+          animeContext: animeRequestContext(theme),
         });
-      }
+      });
       card.append(requestButton);
     }
     if (confirmMatch && id) {
@@ -3819,6 +3985,7 @@
     if (kind === "anime") {
       renderAnimeDetail(data);
       startAnimeResolution(data);
+      startDetailAvailability("anime", data);
       return;
     }
 
@@ -3961,7 +4128,12 @@
     $("#detail-eyebrow").textContent = "RELEASE TRACKLIST";
     $("#detail-title").textContent = data.title;
     $("#detail-subtitle").textContent = [data.artist, data.date, data.country].filter(Boolean).join(" · ");
-    data.tracks.forEach((track: JsonObject) => results.append(createCard(`${track.number}. ${track.title}`, track.artist || "")));
+    data.tracks.forEach((track: JsonObject) => {
+      const title = String(track.title || "Untitled");
+      const romanizedTitle = String(track.romanizedTitle || "").trim();
+      const displayTitle = romanizedTitle ? `${title} (${romanizedTitle})` : title;
+      results.append(createCard(`${track.number}. ${displayTitle}`, track.artist || ""));
+    });
   }
 
   const searchTypeCopy = {
@@ -3978,6 +4150,7 @@
   const searchType = $<HTMLSelectElement>("#search-type");
   const searchInput = $<HTMLInputElement>("#search-input");
   const searchSubmit = $<HTMLButtonElement>("#search-submit");
+  const searchMusicBrainz = $<HTMLButtonElement>("#search-musicbrainz");
   let activeSearchType = searchType.value;
   let searchTypePointerActive = false;
 
@@ -3998,10 +4171,57 @@
 
   applySearchMode(activeSearchType);
 
-  function searchResultMessage(type: string, count: number) {
+  const searchResultPageSize = 25;
+
+  function searchResultMessage(type: string, shown: number, total = shown) {
+    if (shown < total) return `Showing ${shown} of ${total} matches`;
     const noun = copyForSearchType(type).noun;
-    const summary = `${count} ${noun}${count === 1 ? "" : "s"} found`;
+    const summary = `${total} ${noun}${total === 1 ? "" : "s"} found`;
     return type === "track" ? `${summary} for matching tracks` : summary;
+  }
+
+  function appendSearchResult(
+    container: HTMLElement,
+    result: JsonObject,
+    type: string,
+  ) {
+    const description = type === "anime"
+      ? [result.format, result.season, result.year].filter(Boolean).join(" · ")
+      : type === "artist"
+      ? [result.type, result.country, result.disambiguation].filter(Boolean).join(" · ")
+      : [
+        result.artist,
+        result.type,
+        ...(result.secondaryTypes || []),
+        result.date,
+        result.disambiguation,
+        type === "track" && result.matchedTrack
+          ? `Matched track: ${result.matchedTrack}`
+          : "",
+      ].filter(Boolean).join(" · ");
+    if (type === "anime") {
+      container.append(createCard(
+        String(result.name || "Anime"),
+        description,
+        () => showDetail("anime", String(result.slug || result.id)),
+        result.coverArt,
+        "anime",
+        String(result.slug || result.id),
+      ));
+      return;
+    }
+    container.append(type === "artist"
+      ? (result.plex
+        ? createPlexArtistCard(result, description, result.plex)
+        : createSearchArtistCard(result, description))
+      : createCard(
+        releaseGroupDisplayTitle(result),
+        description,
+        () => showDetail("release-group", result.id),
+        result.coverArt,
+        "release-group",
+        result.id,
+      ));
   }
 
   function animeSearchResultsByFormat(results: JsonObject[]) {
@@ -4040,6 +4260,7 @@
     searchAbort?.abort();
     searchAbort = undefined;
     clearTimeout(searchDebounce);
+    searchMusicBrainz.hidden = true;
     applySearchMode(type);
     if (searchInput.value.trim().length >= 2) {
       runSearch();
@@ -4047,11 +4268,12 @@
     if (searchTypePointerActive) searchType.blur();
   });
 
-  async function runSearch() {
+  async function runSearch(forceMusicBrainz = false) {
     const requestVersion = ++searchRequestVersion;
     searchAbort?.abort();
     const query = searchInput.value.trim();
     const type = searchType.value;
+    const canSearchMusicBrainz = type === "album" || type === "track";
     const results = $("#results");
     results.setAttribute("aria-label", "Search results");
 
@@ -4060,77 +4282,70 @@
       $("#search-form").classList.remove("searching");
       results.replaceChildren();
       $("#search-message").textContent = "";
+      searchMusicBrainz.hidden = true;
       return;
     }
 
     const controller = new AbortController();
     searchAbort = controller;
+    const keepLocalResults = forceMusicBrainz && canSearchMusicBrainz && !searchMusicBrainz.hidden;
+    searchMusicBrainz.disabled = keepLocalResults;
+    if (!keepLocalResults) searchMusicBrainz.hidden = true;
     $("#search-message").textContent = type === "anime"
       ? "Looking through anime themes…"
       : "Looking through MusicBrainz…";
     $("#search-form").classList.add("searching");
     results.setAttribute("aria-busy", "true");
-    results.replaceChildren(skeletonBlock("skeleton-card", 5));
+    if (!keepLocalResults) results.replaceChildren(skeletonBlock("skeleton-card", 5));
     try {
       const data = await getJson(
-        `/api/search?q=${encodeURIComponent(query)}&type=${type}`,
+        `/api/search?q=${encodeURIComponent(query)}&type=${type}${forceMusicBrainz && canSearchMusicBrainz ? "&musicbrainz=1" : ""}`,
         30_000,
         controller.signal,
       );
       if (requestVersion !== searchRequestVersion) return;
       results.replaceChildren();
-      $("#search-message").textContent = data.results.length
-        ? searchResultMessage(type, data.results.length)
-        : "We couldn’t find a match. Try a different spelling or search type.";
+      searchMusicBrainz.hidden = !(canSearchMusicBrainz && data.source === "local");
+      if (!searchMusicBrainz.hidden) {
+        searchMusicBrainz.textContent = type === "track"
+          ? "Search MusicBrainz for more tracks"
+          : "Search MusicBrainz for more albums";
+      }
       const orderedResults = type === "anime"
         ? animeSearchResultsByFormat(data.results)
-        : data.results;
-      orderedResults.forEach((result: JsonObject) => {
-        const description = type === "anime"
-          ? [result.format, result.season, result.year].filter(Boolean).join(" · ")
-          : type === "artist"
-          ? [result.type, result.country, result.disambiguation].filter(Boolean).join(" · ")
-          : [
-            result.artist,
-            result.type,
-            ...(result.secondaryTypes || []),
-            result.date,
-            result.disambiguation,
-            type === "track" && result.matchedTrack
-              ? `Matched track: ${result.matchedTrack}`
-              : "",
-          ].filter(Boolean).join(" · ");
-        if (type === "anime") {
-          results.append(createCard(
-            String(result.name || "Anime"),
-            description,
-            () => showDetail("anime", String(result.slug || result.id)),
-            result.coverArt,
-            "anime",
-            String(result.slug || result.id),
-          ));
-        } else {
-          results.append(type === "artist"
-            ? (result.plex ? createPlexArtistCard(result, description, result.plex) : createSearchArtistCard(result, description))
-            : createCard(
-                releaseGroupDisplayTitle(result),
-                description,
-                () => showDetail("release-group", result.id),
-                result.coverArt,
-                "release-group",
-                result.id,
-              ));
+        : data.results as JsonObject[];
+      let shown = 0;
+      const appendNextPage = () => {
+        results.querySelector(".search-show-more")?.remove();
+        const next = orderedResults.slice(shown, shown + searchResultPageSize);
+        next.forEach((result: JsonObject) => appendSearchResult(results, result, type));
+        shown += next.length;
+        $("#search-message").textContent = orderedResults.length
+          ? searchResultMessage(type, shown, orderedResults.length)
+          : "We couldn’t find a match. Try a different spelling or search type.";
+        if (shown < orderedResults.length) {
+          const showMore = document.createElement("button");
+          showMore.type = "button";
+          showMore.className = "outline search-show-more";
+          showMore.textContent = `Show ${Math.min(
+            searchResultPageSize,
+            orderedResults.length - shown,
+          )} more`;
+          showMore.addEventListener("click", appendNextPage);
+          results.append(showMore);
         }
-      });
+      };
+      appendNextPage();
     } catch (error) {
       if (requestVersion !== searchRequestVersion) return;
-      results.replaceChildren();
+      if (!keepLocalResults) results.replaceChildren();
       $("#search-message").textContent = error.name === "AbortError"
         ? `${type === "anime" ? "Anime theme search" : "MusicBrainz"} is taking a little longer than usual. Please try again in a moment.`
         : `We couldn’t finish that search. ${error.message}`;
     } finally {
       if (requestVersion === searchRequestVersion) {
         searchAbort = undefined;
+        searchMusicBrainz.disabled = false;
         $("#search-form").classList.remove("searching");
         results.removeAttribute("aria-busy");
       }
@@ -4142,9 +4357,12 @@
   const searchDebounceMilliseconds = 450;
   searchInput.addEventListener("input", () => {
     clearTimeout(searchDebounce);
+    searchMusicBrainz.hidden = true;
     updateSearchSubmitState();
     searchDebounce = setTimeout(runSearch, searchDebounceMilliseconds);
   });
+
+  searchMusicBrainz.addEventListener("click", () => runSearch(true));
 
   $("#search-form").addEventListener("submit", (event) => {
     event.preventDefault();
@@ -4341,6 +4559,8 @@
     invalidateAuthenticatedDetailState();
     $("#recommendation-results").replaceChildren();
     $("#results").replaceChildren();
+    searchMusicBrainz.hidden = true;
+    searchMusicBrainz.disabled = false;
     $("#results").removeAttribute("aria-busy");
     $("#results").setAttribute("aria-label", "Search results");
   });
@@ -4387,6 +4607,8 @@
     applySearchMode(activeSearchType);
     $("#search-message").textContent = "";
     $("#results").replaceChildren();
+    searchMusicBrainz.hidden = true;
+    searchMusicBrainz.disabled = false;
     $("#results").removeAttribute("aria-busy");
     $("#results").setAttribute("aria-label", "Search results");
     // Recommendation cards remain current through their own refresh events.

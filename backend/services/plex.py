@@ -9,6 +9,7 @@ from uuid import UUID
 import requests
 
 if __package__ == "backend.services":
+    from .. import track_search_index
     from ..api_cache import (
         get_cache_document,
         replace_cache_documents,
@@ -18,8 +19,10 @@ if __package__ == "backend.services":
     from ..cache_memo import invalidate_document, memoized_document
     from ..config import PLEX_LIBRARY_CACHE_TTL
     from ..detail_cache import invalidate_all as invalidate_detail_payloads
+    from ..http_security import request_without_redirects
     from ..media_urls import plex_artist_artwork
 else:  # Support the existing `python backend/app.py` entry point.
+    import track_search_index
     from api_cache import (
         get_cache_document,
         replace_cache_documents,
@@ -29,6 +32,7 @@ else:  # Support the existing `python backend/app.py` entry point.
     from cache_memo import invalidate_document, memoized_document
     from config import PLEX_LIBRARY_CACHE_TTL
     from detail_cache import invalidate_all as invalidate_detail_payloads
+    from http_security import request_without_redirects
     from media_urls import plex_artist_artwork
 
 
@@ -54,7 +58,8 @@ def _headers(config, accept_json=False):
 
 def machine_identifier(config):
     """Validate a Plex connection and return its server identifier."""
-    response = requests.get(
+    response = request_without_redirects(
+        requests.get,
         f"{config['url']}/identity",
         headers=_headers(config),
         timeout=12,
@@ -71,7 +76,8 @@ def music_sections(config):
     """Return the selectable music-library sections on a Plex server."""
     base = config["url"]
     headers = _headers(config, accept_json=True)
-    sections_response = requests.get(
+    sections_response = request_without_redirects(
+        requests.get,
         f"{base}/library/sections",
         headers=headers,
         timeout=12,
@@ -282,7 +288,8 @@ def _parent_artist(config, section, release_group, headers):
     key = release_group.get("artistKey") or ""
     if key:
         try:
-            response = requests.get(
+            response = request_without_redirects(
+                requests.get,
                 f"{config['url']}{key.removesuffix('/children')}",
                 params={"includeGuids": 1},
                 headers=headers,
@@ -330,7 +337,8 @@ def _scan_sections(config, sections, *, recently_added=False):
             (8, "artist", "artists", _normalize_artist),
             (9, "album", "releaseGroups", _normalize_release_group),
         ):
-            response = requests.get(
+            response = request_without_redirects(
+                requests.get,
                 f"{base}/library/sections/{section['id']}/{endpoint}",
                 params={"type": media_type, "includeGuids": 1},
                 headers=headers,
@@ -438,6 +446,7 @@ def _save_snapshot(
     set_cache_document(
         "plex-library", _snapshot_id(config), payload, PLEX_LIBRARY_CACHE_TTL
     )
+    track_search_index.index_plex_library(payload)
     invalidate_document(_index_key(_snapshot_id(config)))
     invalidate_detail_payloads()
     documents = _guid_documents(config, guid_inventory or payload)
@@ -723,6 +732,7 @@ def apply_release_group_mappings(config, mappings, *, artist_mappings=None):
         set_cache_document(
             "plex-library", _snapshot_id(config), payload, PLEX_LIBRARY_CACHE_TTL
         )
+        track_search_index.index_plex_library(payload)
         invalidate_document(_index_key(_snapshot_id(config)))
         invalidate_detail_payloads()
         documents = _guid_documents(config, {

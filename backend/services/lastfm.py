@@ -78,16 +78,19 @@ def _request_lock(namespace, method, api_key, extra):
                 del _request_locks[key]
 
 
-def _get(method, api_key, *, username=None, **extra):
+def _get(
+    method, api_key, *, username=None, force_refresh=False, cache_response=True, **extra
+):
     """Call one cached Last.fm API method and normalize API-level errors."""
-    params = {
+    cache_params = {
         "method": method,
-        "api_key": api_key,
         "format": "json",
         **extra,
     }
+    cache_params.pop("api_key", None)
     if username:
-        params["user"] = username
+        cache_params["user"] = username
+    params = {**cache_params, "api_key": api_key}
     namespace = (
         user_cache_namespace(username) if username else LASTFM_PUBLIC_CACHE_NAMESPACE
     )
@@ -95,18 +98,27 @@ def _get(method, api_key, *, username=None, **extra):
         data = cached_json_get(
             LASTFM_URL,
             params=params,
+            cache_params=cache_params,
             headers={"User-Agent": USER_AGENT},
             namespace=namespace,
+            reject_redirects=True,
             ttl=LASTFM_CACHE_TTL,
+            force_refresh=force_refresh,
+            cache_response=cache_response,
         )
     if data.get("error"):
         raise ValueError(data.get("message", "Last.fm rejected the request."))
     return data
 
 
-def get(method, username, api_key, **extra):
+def get(
+    method, username, api_key, *, force_refresh=False, cache_response=True, **extra
+):
     """Call a cached Last.fm method associated with one linked username."""
-    return _get(method, api_key, username=username, **extra)
+    return _get(
+        method, api_key, username=username, force_refresh=force_refresh,
+        cache_response=cache_response, **extra
+    )
 
 
 def get_public(method, api_key, **extra):

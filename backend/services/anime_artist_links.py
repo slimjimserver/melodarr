@@ -1,8 +1,10 @@
 """Artist identity evidence learned from resolved anime song mappings."""
 
-from uuid import UUID
-import unicodedata
 import json
+import unicodedata
+from uuid import UUID
+
+import requests
 
 if __package__ == "backend.services":
     from ..storage import db
@@ -17,6 +19,56 @@ _VARIOUS_ARTISTS = "89ad4ac3-39f7-470e-963a-56509c546377"
 
 def _name(value):
     return " ".join(unicodedata.normalize("NFKC", str(value or "")).casefold().split())
+
+
+def _resolve_conflicting_identities(artist_ids):
+    """Demote a false positive when only one MusicBrainz identity matches the credit.
+
+    A single-artist release can credit a group (for example Girls Dead
+    Monster) while AnimeThemes credits its singer. That release is valid, but
+    its group MBID must not claim the singer's AnimeThemes artist identity.
+    """
+    if not artist_ids:
+        return
+    placeholders = ",".join("?" for _ in artist_ids)
+    with db() as connection:
+        rows = connection.execute(
+            "SELECT animethemes_artist_id, artist_mbid, artist_name, credited_as "
+            "FROM anime_artist_links WHERE verified = 1 "
+            f"AND animethemes_artist_id IN ({placeholders})",
+            tuple(sorted(artist_ids)),
+        ).fetchall()
+    by_artist = {}
+    for row in rows:
+        by_artist.setdefault(row["animethemes_artist_id"], {}).setdefault(
+            row["artist_mbid"], []
+        ).append(row)
+    for artist_id, candidates in by_artist.items():
+        if len(candidates) < 2:
+            continue
+        matching_mbids = []
+        complete = True
+        for mbid, evidence in candidates.items():
+            try:
+                artist = musicbrainz.get(f"/artist/{mbid}", "aliases")
+            except requests.RequestException:
+                complete = False
+                break
+            names = {_name(artist.get("name")), _name(artist.get("sort-name"))}
+            names.update(_name(alias.get("name")) for alias in artist.get("aliases") or [])
+            credited_names = {
+                _name(value) for row in evidence
+                for value in (row["artist_name"], row["credited_as"])
+            }
+            if (names - {""}).intersection(credited_names):
+                matching_mbids.append(mbid)
+        if complete and len(matching_mbids) == 1:
+            with db() as connection:
+                connection.execute(
+                    "UPDATE anime_artist_links SET verified = 0 "
+                    "WHERE animethemes_artist_id = ? AND artist_mbid != ?",
+                    (artist_id, matching_mbids[0]),
+                )
 
 
 def sync(connection, anime, theme, mapping, resolved):
@@ -79,6 +131,11 @@ def appearances(mbid):
         ).fetchall()
     if not candidates:
         return {"anime": [], "artistLinks": []}
+    _resolve_conflicting_identities({row["animethemes_artist_id"] for row in candidates})
+    with db() as connection:
+        candidates = connection.execute(
+            "SELECT * FROM anime_artist_links WHERE artist_mbid = ?", (mbid,),
+        ).fetchall()
     if any(not row["verified"] for row in candidates):
         artist = musicbrainz.get(f"/artist/{mbid}", "aliases")
         names = {_name(artist.get("name")), _name(artist.get("sort-name"))}
@@ -158,7 +215,6 @@ def _backfill(mbid):
                 anime_theme_links.sync_anime_theme_mapping(anime, theme, mapping)
 
 
-
 def musicbrainz_links(artists):
     """Return unambiguous, verified identities for AnimeThemes artist credits."""
     ids = {
@@ -168,6 +224,7 @@ def musicbrainz_links(artists):
     }
     if not ids:
         return {}
+    _resolve_conflicting_identities(ids)
     placeholders = ",".join("?" for _ in ids)
     with db() as connection:
         rows = connection.execute(

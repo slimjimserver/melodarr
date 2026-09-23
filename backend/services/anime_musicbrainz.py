@@ -8,8 +8,8 @@ features the same song.
 
 import json
 import re
-import unicodedata
 import time
+import unicodedata
 from uuid import UUID
 
 import requests
@@ -22,8 +22,8 @@ if __package__ == "backend.services":
 else:  # Support the existing ``python backend/app.py`` entry point.
     from api_cache import get_cache_document, set_cache_document
     from media_urls import release_group_cover_art
-    from storage import db
     from services import anime_mapping_registry, musicbrainz
+    from storage import db
 
 
 CACHE_SCHEMA_VERSION = 2
@@ -434,6 +434,22 @@ def _mapping_from_registry(theme, document):
         recording_ids = [recording_ids]
     elif not isinstance(recording_ids, (list, tuple)):
         recording_ids = []
+    all_recording_ids = set()
+    for target in target_documents:
+        target_recording_ids = _document_value(
+            target,
+            "recordingIds",
+            "recordingMbids",
+            "recording_ids",
+            "recording_mbids",
+            default=[],
+        )
+        if isinstance(target_recording_ids, str):
+            target_recording_ids = [target_recording_ids]
+        if isinstance(target_recording_ids, (list, tuple)):
+            all_recording_ids.update(
+                str(value) for value in target_recording_ids if value
+            )
     artist_ids = _document_value(
         preferred,
         "artistIds",
@@ -451,6 +467,7 @@ def _mapping_from_registry(theme, document):
         state,
         reason,
         recordingId=(str(recording_ids[0]) if len(recording_ids) == 1 else ""),
+        recordingIds=sorted(all_recording_ids),
         recordingTitle=source_title,
         artistIds=sorted({str(value) for value in artist_ids if value}),
         confidence=100 if state == "resolved" else 0,

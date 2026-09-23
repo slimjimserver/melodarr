@@ -11,6 +11,7 @@ htmlcov/
 node_modules/
 .pnpm-store/
 *.tsbuildinfo
+frontend/test-results/
 
 # Generated frontend
 frontend/static/*.js
@@ -36,7 +37,9 @@ vapid-private.pem
 # Local tools
 .agents/
 .codex/
-docs/
+docs/*
+!docs/api.md
+!docs/openapi.yaml
 
 # Editors / OS
 .idea/

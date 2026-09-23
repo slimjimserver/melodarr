@@ -7,6 +7,7 @@ import unicodedata
 from contextlib import contextmanager
 from threading import Lock, local
 from urllib.parse import quote, urlsplit, urlunsplit
+from xml.etree import ElementTree
 
 import requests
 from pykakasi import kakasi
@@ -338,6 +339,7 @@ def search(
     include_cache_status=False,
     priority="interactive",
     plain_search=False,
+    limit=None,
 ):
     """Search a supported MusicBrainz entity using Melodarr's search names."""
     resources = {
@@ -350,7 +352,9 @@ def search(
     resource = resources.get(search_type)
     if resource is None:
         raise ValueError(f"Unsupported MusicBrainz search type: {search_type}")
-    params = {"query": query, "fmt": "json", "limit": 25}
+    if limit is None:
+        limit = 100 if resource == "release-group" else 25
+    params = {"query": query, "fmt": "json", "limit": limit}
     if plain_search:
         params["dismax"] = "true"
     config = configuration()
@@ -395,6 +399,76 @@ def get(
         cache_only=cache_only,
         cache_response=cache_response,
     )
+
+
+def artist_entity_counts(mbid, priority="background"):
+    """Fetch release-group, release and recording totals in one paced lookup.
+
+    MusicBrainz omits these linked-list totals from its JSON artist lookup, so
+    this narrow probe uses the XML representation instead.
+    """
+    config = configuration()
+    url = f"{config['baseUrl']}/artist/{mbid}"
+    retry_statuses = {429, 500, 502, 503, 504}
+    attempts = 5 if priority == "critical" else 3
+    for attempt in range(attempts):
+        if priority == "background":
+            _wait_for_background_circuit()
+        _wait_for_request_slot(priority, config["requestIntervalMs"] / 1000)
+        try:
+            response = _http_get(
+                url,
+                params={
+                    "inc": "release-groups+releases+recordings",
+                    "fmt": "xml",
+                },
+                headers={"User-Agent": config["userAgent"]},
+                timeout=20 if priority == "critical" else 15,
+            )
+            if response.status_code in retry_statuses and attempt + 1 < attempts:
+                retry_after = response.headers.get("Retry-After", "")
+                try:
+                    delay = max(0.0, float(retry_after))
+                except (TypeError, ValueError):
+                    delay = 2 ** attempt
+                time.sleep(delay)
+                continue
+            response.raise_for_status()
+            root = ElementTree.fromstring(response.content)
+            artist = root.find("{*}artist")
+            if artist is None or artist.get("id", "").casefold() != mbid.casefold():
+                raise requests.RequestException("MusicBrainz returned the wrong artist.")
+            counts = {}
+            for name, key in (
+                ("release-group-list", "releaseGroupCount"),
+                ("release-list", "releaseCount"),
+                ("recording-list", "recordingCount"),
+            ):
+                linked = artist.find(f"{{*}}{name}")
+                try:
+                    count = int(linked.get("count")) if linked is not None else -1
+                except (TypeError, ValueError) as exc:
+                    raise requests.RequestException(
+                        f"MusicBrainz returned an invalid {name} count."
+                    ) from exc
+                if count < 0:
+                    raise requests.RequestException(
+                        f"MusicBrainz omitted the {name} count."
+                    )
+                counts[key] = count
+            if priority == "background":
+                _record_background_success()
+            return counts
+        except (requests.Timeout, requests.ConnectionError) as exc:
+            if attempt + 1 >= attempts:
+                if priority == "background":
+                    _record_background_failure(exc)
+                raise
+            time.sleep(2 ** attempt)
+        except ElementTree.ParseError as exc:
+            raise requests.RequestException(
+                "MusicBrainz returned invalid artist count XML."
+            ) from exc
 
 
 def metadata_cache_record(path, inc, value, **extra):
@@ -569,6 +643,15 @@ def romanized_release_group_title(group):
     alias = _latin_alias(group, canonical)
     if alias:
         return alias
+
+    return romanized_track_title(canonical)
+
+
+def romanized_track_title(title):
+    """Romanize a track title locally without requesting or choosing aliases."""
+    canonical = str(title or "").strip()
+    if not canonical or _is_latin_name(canonical):
+        return ""
 
     romanized = "".join(
         item["hepburn"] for item in _romanizer.convert(canonical)

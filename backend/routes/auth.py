@@ -15,6 +15,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 if __package__ == "backend.routes":
     from ..api_cache import clear_cache
     from ..detail_cache import invalidate_all as invalidate_detail_payloads
+    from ..instance_settings import application_identity
     from ..responses import api_error, request_json_object
     from ..security import (
         current_user,
@@ -30,6 +31,7 @@ if __package__ == "backend.routes":
 else:  # Support the existing `python backend/app.py` entry point.
     from api_cache import clear_cache
     from detail_cache import invalidate_all as invalidate_detail_payloads
+    from instance_settings import application_identity
     from responses import api_error, request_json_object
     from security import (
         current_user,
@@ -339,6 +341,7 @@ def auth_status():
         "firstAccount": user_count == 0,
         "invitationValid": invitation_valid,
         "plexConfigured": bool(get_service("plex")),
+        **application_identity(),
     })
 
 

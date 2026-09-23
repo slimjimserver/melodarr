@@ -64,9 +64,10 @@ class ArtistLinksTests(unittest.TestCase):
         anime_theme_links.sync_anime_theme_mapping(ANIME, theme(), mapping())
         second = {**theme(), "id": 13057}
         anime_theme_links.sync_anime_theme_mapping(ANIME, second, mapping())
-        anime_theme_links.sync_anime_theme_mapping(ANIME, theme(), mapping([OTHER]))
-        self.assertEqual(len(self.rows()), 2)
-        with patch.object(animethemes, "artist_detail") as provider:
+        with patch.object(links.musicbrainz, "get", return_value={"name": "ALI", "aliases": []}), \
+             patch.object(animethemes, "artist_detail") as provider:
+            anime_theme_links.sync_anime_theme_mapping(ANIME, theme(), mapping([OTHER]))
+            self.assertEqual(len(self.rows()), 2)
             self.assertEqual(links.appearances(ALI)["artistLinks"], [])
             provider.assert_not_called()
         anime_theme_links.sync_anime_theme_mapping(ANIME, theme(), mapping(state="unmatched"))
@@ -138,11 +139,33 @@ class ArtistLinksTests(unittest.TestCase):
         self.assertEqual(links.musicbrainz_links([
             {"id": 916}, {"id": 999}, "Legacy name",
         ]), {"916": ALI})
-        anime_theme_links.sync_anime_theme_mapping(other_anime, source, mapping([OTHER]))
-        self.assertEqual(links.musicbrainz_links(source["song"]["artists"]), {})
+        # Two homonymous MusicBrainz identities remain ambiguous.
+        with patch.object(links.musicbrainz, "get", return_value={"name": "ALI", "aliases": []}):
+            anime_theme_links.sync_anime_theme_mapping(other_anime, source, mapping([OTHER]))
+            self.assertEqual(links.musicbrainz_links(source["song"]["artists"]), {})
         anime_theme_links.sync_anime_theme_mapping(other_anime, source, mapping(state="unmatched"))
         anime_theme_links.sync_anime_theme_mapping(ANIME, source, mapping(state="unmatched"))
         self.assertEqual(links.musicbrainz_links(source["song"]["artists"]), {})
+
+    def test_group_credit_does_not_hide_verified_singer_appearances(self):
+        source = theme()
+        anime_theme_links.sync_anime_theme_mapping(ANIME, source, mapping())
+        group_anime = {"slug": "angel_beats", "name": "Angel Beats!"}
+
+        def artist_detail(path, _include):
+            return {"name": "ALI" if path == f"/artist/{ALI}" else "Girls Dead Monster",
+                    "aliases": []}
+
+        with patch.object(links.musicbrainz, "get", side_effect=artist_detail), \
+             patch.object(animethemes, "artist_detail", return_value={
+                 "id": 916, "slug": "ali", "name": "ALI", "anime": []}):
+            anime_theme_links.sync_anime_theme_mapping(group_anime, source, mapping([OTHER]))
+            self.assertEqual(links.musicbrainz_links(source["song"]["artists"]), {"916": ALI})
+            self.assertEqual(links.appearances(ALI)["artistLinks"][0]["id"], 916)
+            self.assertEqual(links.appearances(OTHER), {"anime": [], "artistLinks": []})
+            anime_theme_links.sync_anime_theme_mapping(group_anime, source, mapping([OTHER]))
+        self.assertEqual([row["verified"] for row in self.rows()
+                          if row["artist_mbid"] == OTHER], [0])
     def test_release_card_anime_names_are_deduplicated_and_removed(self):
         first = theme()
         anime_theme_links.sync_anime_theme_mapping(ANIME, first, mapping())

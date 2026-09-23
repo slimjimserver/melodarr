@@ -89,7 +89,12 @@ def _snapshot_text(value, maximum=500):
 
 def notification_config():
     config = get_service("notifications") or {}
-    return config if isinstance(config, dict) else {}
+    config = dict(config) if isinstance(config, dict) else {}
+    instance = get_service("melodarr") or {}
+    instance_url = str(instance.get("applicationUrl") or "")
+    if instance_url or not config.get("applicationUrl"):
+        config["applicationUrl"] = instance_url
+    return config
 
 
 def _public_key():

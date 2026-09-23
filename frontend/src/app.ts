@@ -7,6 +7,11 @@ type AppForm = HTMLFormElement & {
   lastfmUsername: HTMLInputElement;
   invitationLink: HTMLInputElement;
 };
+type MelodarrSettingsForm = HTMLFormElement & {
+  applicationTitle: HTMLInputElement;
+  applicationUrl: HTMLInputElement;
+  apiKey: HTMLInputElement;
+};
 interface AppElement extends HTMLElement {
   value: string;
   placeholder: string;
@@ -46,6 +51,8 @@ interface CurrentUser {
   listenbrainzUsername?: string;
   lastfmUsername?: string;
   lastfmConfigured?: boolean;
+  applicationTitle?: string;
+  version?: string;
 }
 
 interface AdminUserIdentity {
@@ -446,6 +453,18 @@ function setServiceState(element: HTMLElement, text: string, state: "ready" | "i
   element.dataset.state = state;
 }
 
+function applyApplicationIdentity(title?: string) {
+  const applicationTitle = String(title || "Melodarr").trim() || "Melodarr";
+  document.title = `${applicationTitle} — Music requests`;
+  document.querySelectorAll<HTMLElement>(".brand span, .setup-brand span").forEach((element) => {
+    element.textContent = applicationTitle;
+  });
+  document.querySelector<HTMLAnchorElement>(".brand")?.setAttribute(
+    "aria-label",
+    `${applicationTitle} home`,
+  );
+}
+
 async function api<T = JsonObject>(url: string, options: RequestInit = {}): Promise<T> {
   const requestOptions = { ...options };
   const method = (requestOptions.method || "GET").toUpperCase();
@@ -650,6 +669,42 @@ async function refreshSettings(loadLidarrOptions = true) {
   const { lidarr, plex } = settings;
   lidarrDefaults = lidarr.defaults || {};
 
+  const melodarr = settings.melodarr || {};
+  const melodarrForm = $<MelodarrSettingsForm>("#melodarr-settings");
+  melodarrForm.applicationTitle.value = melodarr.applicationTitle || "Melodarr";
+  melodarrForm.applicationUrl.value = melodarr.applicationUrl || "";
+  melodarrForm.apiKey.value = melodarr.apiKey || "";
+  melodarrForm.apiKey.type = "password";
+  const toggleApiKeyButton = $<HTMLButtonElement>("#toggle-melodarr-api-key");
+  toggleApiKeyButton.setAttribute("aria-pressed", "false");
+  toggleApiKeyButton.setAttribute("aria-label", "Show API key");
+  toggleApiKeyButton.title = "Show API key";
+  const version = String(melodarr.version || "development");
+  const versionBadge = $<HTMLAnchorElement>("#melodarr-version");
+  versionBadge.textContent = `Version ${version}`;
+  if (/^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(version)) {
+    versionBadge.href = `https://github.com/slimjimserver/melodarr/releases/tag/${encodeURIComponent(version)}`;
+    versionBadge.target = "_blank";
+    versionBadge.rel = "noopener noreferrer";
+    versionBadge.setAttribute("aria-label", `View Melodarr ${version} release notes`);
+    versionBadge.title = `View ${version} release notes`;
+  } else {
+    versionBadge.removeAttribute("href");
+    versionBadge.removeAttribute("target");
+    versionBadge.removeAttribute("rel");
+    versionBadge.removeAttribute("aria-label");
+    versionBadge.removeAttribute("title");
+  }
+  applyApplicationIdentity(melodarr.applicationTitle);
+  const regenerateButton = $<HTMLButtonElement>("#regenerate-melodarr-api-key");
+  regenerateButton.disabled = Boolean(melodarr.apiKeyManagedByEnvironment);
+  regenerateButton.title = melodarr.apiKeyManagedByEnvironment
+    ? "Remove MELODARR_AUTOMATION_API_KEY to manage this key in Melodarr."
+    : "";
+  $("#melodarr-api-key-help").textContent = melodarr.apiKeyManagedByEnvironment
+    ? "This key is supplied by MELODARR_AUTOMATION_API_KEY. Change that environment variable to rotate it."
+    : "Send this secret in X-Api-Key when calling authenticated API endpoints.";
+
   const musicbrainz = settings.musicbrainz || {};
   const musicbrainzForm = $<MusicBrainzSettingsForm>("#musicbrainz-settings");
   musicbrainzForm.baseUrl.value = musicbrainz.baseUrl || "";
@@ -771,7 +826,6 @@ async function refreshNotificationSettings() {
     setServiceState(state, config.enabled ? "Enabled" : "Disabled", config.enabled ? "ready" : "idle");
     const input = (form: HTMLFormElement, name: string) => requiredDescendant<HTMLInputElement | HTMLSelectElement>(form, `[name="${name}"]`);
     (input(globalForm, "enabled") as HTMLInputElement).checked = Boolean(config.enabled);
-    (input(globalForm, "applicationUrl") as HTMLInputElement).value = config.applicationUrl || "";
     (input(globalForm, "delaySeconds") as HTMLInputElement).value = String(config.delaySeconds || 0);
     (input(emailForm, "host") as HTMLInputElement).value = config.email?.host || "";
     (input(emailForm, "port") as HTMLInputElement).value = String(config.email?.port || 587);
@@ -793,7 +847,7 @@ async function refreshNotificationSettings() {
         catch (error) { setMessage(message, error.message, true); }
       });
     };
-    bindSave(globalForm, "/api/settings/notifications/global", () => ({ enabled: (input(globalForm, "enabled") as HTMLInputElement).checked, applicationUrl: (input(globalForm, "applicationUrl") as HTMLInputElement).value, delaySeconds: (input(globalForm, "delaySeconds") as HTMLInputElement).value }), "Global notification settings saved.");
+    bindSave(globalForm, "/api/settings/notifications/global", () => ({ enabled: (input(globalForm, "enabled") as HTMLInputElement).checked, delaySeconds: (input(globalForm, "delaySeconds") as HTMLInputElement).value }), "Global notification settings saved.");
     bindSave(emailForm, "/api/settings/notifications/email", () => ({ enabled: (input(emailForm, "emailEnabled") as HTMLInputElement).checked, host: (input(emailForm, "host") as HTMLInputElement).value, port: (input(emailForm, "port") as HTMLInputElement).value, encryption: (input(emailForm, "encryption") as HTMLSelectElement).value, username: (input(emailForm, "username") as HTMLInputElement).value, senderName: (input(emailForm, "senderName") as HTMLInputElement).value, sender: (input(emailForm, "sender") as HTMLInputElement).value, password: (input(emailForm, "password") as HTMLInputElement).value }), "Email notification settings saved.");
     bindSave(pushForm, "/api/settings/notifications/web-push", () => ({ enabled: (input(pushForm, "webPushEnabled") as HTMLInputElement).checked, contact: (input(pushForm, "contact") as HTMLInputElement).value }), "Web Push notification settings saved.");
     const tests: Array<[HTMLFormElement, string]> = [[emailForm, "/api/settings/notifications/email/test"], [pushForm, "/api/settings/notifications/web-push/test"]];
@@ -1850,6 +1904,7 @@ function setupNavigation() {
 async function applyCurrentUser(user: CurrentUser) {
   sessionExpiryHandled = false;
   currentUser = user;
+  applyApplicationIdentity(user.applicationTitle);
   document.body.classList.add("authenticated");
   updateSessionChrome();
   if (pathNeedsDiscovery()) {
@@ -2432,6 +2487,7 @@ async function showAuth({ resetPath = false } = {}) {
   try {
     const query = invitationToken ? `?invite=${encodeURIComponent(invitationToken)}` : "";
     const status = await api(`/api/auth/status${query}`);
+    applyApplicationIdentity(status.applicationTitle);
     if (status.firstAccount) {
       invitationToken = "";
       window.history.replaceState({ setup: true }, "", "/setup");
@@ -2646,6 +2702,78 @@ async function signOut() {
       void showAuth({ resetPath: true });
     }
   }
+}
+
+function setupMelodarrSettings() {
+  const form = $<MelodarrSettingsForm>("#melodarr-settings");
+  const saveButton = requiredDescendant<HTMLButtonElement>(form, 'button[type="submit"]');
+  const copyButton = $<HTMLButtonElement>("#copy-melodarr-api-key");
+  const toggleButton = $<HTMLButtonElement>("#toggle-melodarr-api-key");
+  const regenerateButton = $<HTMLButtonElement>("#regenerate-melodarr-api-key");
+  const message = requiredDescendant<HTMLElement>(form, ".form-message");
+
+  toggleButton.addEventListener("click", () => {
+    const reveal = form.apiKey.type === "password";
+    form.apiKey.type = reveal ? "text" : "password";
+    toggleButton.setAttribute("aria-pressed", String(reveal));
+    toggleButton.setAttribute("aria-label", reveal ? "Hide API key" : "Show API key");
+    toggleButton.title = reveal ? "Hide API key" : "Show API key";
+  });
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!form.reportValidity()) return;
+    saveButton.disabled = true;
+    setMessage(message, "Saving Melodarr settings…");
+    try {
+      const result = await api("/api/settings/melodarr", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          applicationTitle: form.applicationTitle.value,
+          applicationUrl: form.applicationUrl.value,
+        }),
+      });
+      applyApplicationIdentity(result.melodarr?.applicationTitle);
+      setMessage(message, result.message || "Melodarr settings saved.");
+    } catch (error) {
+      setMessage(message, error.message, true);
+    } finally {
+      saveButton.disabled = false;
+    }
+  });
+
+  copyButton.addEventListener("click", async () => {
+    const copied = await copyInputValue(form.apiKey);
+    setMessage(
+      message,
+      copied ? "API key copied." : "Copy the selected API key.",
+      !copied,
+    );
+  });
+
+  regenerateButton.addEventListener("click", async () => {
+    if (!window.confirm(
+      "Regenerate the API key? Existing AnimeThemes integrations will stop working until they use the new key.",
+    )) return;
+    regenerateButton.disabled = true;
+    setMessage(message, "Regenerating API key…");
+    try {
+      const result = await api("/api/settings/melodarr/api-key/regenerate", {
+        method: "POST",
+      });
+      form.apiKey.value = result.melodarr.apiKey;
+      form.apiKey.type = "password";
+      toggleButton.setAttribute("aria-pressed", "false");
+      toggleButton.setAttribute("aria-label", "Show API key");
+      toggleButton.title = "Show API key";
+      setMessage(message, result.message);
+    } catch (error) {
+      setMessage(message, error.message, true);
+    } finally {
+      regenerateButton.disabled = false;
+    }
+  });
 }
 
 function setupLidarrSettings() {
@@ -3200,6 +3328,7 @@ setupNavigation();
 setupAdminRequests();
 setupAdminUsers();
 setupStandalonePullToRefresh();
+setupMelodarrSettings();
 setupMusicBrainzSettings();
 setupLidarrSettings();
 setupLastfmSettings();
