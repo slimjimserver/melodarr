@@ -1,10 +1,11 @@
 """Anime discovery detail routes."""
 
+from traceback import extract_tb
 from urllib.parse import urlparse
 from uuid import UUID
 
 import requests
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, current_app, jsonify, request
 
 if __package__ == "backend.routes":
     from ..responses import api_error
@@ -53,17 +54,33 @@ class AutomaticMatchUnavailable(Exception):
     """The displayed automatic result can no longer be safely confirmed."""
 
 
+class _InvalidAnimeThemesSlug(ValueError):
+    """A route slug failed Melodarr's local AnimeThemes validation."""
+
+
+class _AnimeThemesNotFound(LookupError):
+    """An AnimeThemes detail lookup returned no result."""
+
+
 def _load_anime(slug):
+    try:
+        animethemes._validate_slug(slug)
+    except ValueError as exc:
+        raise _InvalidAnimeThemesSlug("Invalid AnimeThemes anime slug.") from exc
     anime = animethemes.detail(slug)
     if anime is None:
-        raise LookupError("Anime was not found on AnimeThemes.")
+        raise _AnimeThemesNotFound("Anime was not found on AnimeThemes.")
     return anime
 
 
 def _load_series(slug):
+    try:
+        animethemes._validate_series_slug(slug)
+    except ValueError as exc:
+        raise _InvalidAnimeThemesSlug("Invalid AnimeThemes series slug.") from exc
     series = animethemes.series_detail(slug)
     if series is None:
-        raise LookupError("Series was not found on AnimeThemes.")
+        raise _AnimeThemesNotFound("Series was not found on AnimeThemes.")
     return series
 
 
@@ -460,11 +477,29 @@ def _mapping_payload(anime, aggregate=None):
     return mappings_by_theme_id
 
 
+def _log_unexpected_error(context, exc):
+    frames = extract_tb(exc.__traceback__)
+    origin = frames[-1] if frames else None
+    current_app.logger.warning(
+        "%s failed (%s at %s:%s)",
+        context,
+        type(exc).__name__,
+        origin.name if origin else "unknown",
+        origin.lineno if origin else "unknown",
+    )
+
+
 def _provider_error(exc, subject="Anime"):
+    if isinstance(exc, _InvalidAnimeThemesSlug):
+        return api_error(f"Invalid AnimeThemes {subject.casefold()} slug.")
+    if isinstance(exc, _AnimeThemesNotFound):
+        return api_error(f"{subject} was not found on AnimeThemes.", 404)
     if isinstance(exc, ValueError):
-        return api_error(str(exc))
+        _log_unexpected_error(f"AnimeThemes {subject.casefold()} detail", exc)
+        return api_error(f"AnimeThemes could not load this {subject.casefold()}.")
     if isinstance(exc, LookupError):
-        return api_error(str(exc), 404)
+        _log_unexpected_error(f"AnimeThemes {subject.casefold()} detail", exc)
+        return api_error(f"AnimeThemes could not load this {subject.casefold()}.", 404)
     if isinstance(exc, requests.HTTPError):
         status = getattr(exc.response, "status_code", None)
         if status == 404:
@@ -479,32 +514,39 @@ def resolve_animethemes_series():
     body = request.get_json(silent=True)
     if not isinstance(body, dict):
         return api_error("Request body must be a JSON object.")
-    try:
-        release_group_id = None
-        if "releaseGroupId" in body and body["releaseGroupId"] is not None:
+    release_group_id = None
+    if "releaseGroupId" in body and body["releaseGroupId"] is not None:
+        try:
             release_group_id = _request_mbid(
                 body["releaseGroupId"], "releaseGroupId"
             )
-        raw_recording_ids = body.get("recordingIds", [])
-        if raw_recording_ids is None:
-            raw_recording_ids = []
-        if not isinstance(raw_recording_ids, list):
-            return api_error("recordingIds must be a list of UUIDs.")
-        recording_ids = []
-        for value in raw_recording_ids:
+        except ValueError:
+            return api_error("releaseGroupId must be a valid UUID.")
+    raw_recording_ids = body.get("recordingIds", [])
+    if raw_recording_ids is None:
+        raw_recording_ids = []
+    if not isinstance(raw_recording_ids, list):
+        return api_error("recordingIds must be a list of UUIDs.")
+    recording_ids = []
+    for value in raw_recording_ids:
+        try:
             recording_id = _request_mbid(value, "Each recording ID")
-            if recording_id not in recording_ids:
-                recording_ids.append(recording_id)
-        if release_group_id is None and not recording_ids:
-            return api_error(
-                "Provide releaseGroupId, at least one recordingIds entry, or both."
-            )
+        except ValueError:
+            return api_error("Each recording ID must be a valid UUID.")
+        if recording_id not in recording_ids:
+            recording_ids.append(recording_id)
+    if release_group_id is None and not recording_ids:
+        return api_error(
+            "Provide releaseGroupId, at least one recordingIds entry, or both."
+        )
+    try:
         series = anime_theme_links.resolve_series(
             release_group_id=release_group_id,
             recording_ids=recording_ids,
         )
     except ValueError as exc:
-        return api_error(str(exc))
+        _log_unexpected_error("AnimeThemes series resolution", exc)
+        return api_error("AnimeThemes could not resolve this music.")
     except requests.RequestException:
         return api_error("AnimeThemes could not resolve this music.", 502)
     return jsonify({"series": series})

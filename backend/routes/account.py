@@ -5,6 +5,7 @@ import re
 import secrets
 import sqlite3
 import time
+from traceback import extract_tb
 from urllib.parse import quote
 
 import requests
@@ -463,6 +464,15 @@ def configure_lastfm():
         _recommendation_inputs_changed(user["id"])
         return jsonify({"message": "Last.fm account saved."})
     except ValueError as exc:
-        return api_error(str(exc), 400)
+        frames = extract_tb(exc.__traceback__)
+        origin = frames[-1] if frames else None
+        current_app.logger.warning(
+            "Last.fm account linking failed for user id %s (%s at %s:%s)",
+            user["id"],
+            type(exc).__name__,
+            origin.name if origin else "unknown",
+            origin.lineno if origin else "unknown",
+        )
+        return api_error("Unable to link Last.fm account.", 400)
     except requests.RequestException:
         return api_error("Could not connect to Last.fm. Try again shortly.", 502)
