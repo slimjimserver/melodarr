@@ -5339,19 +5339,21 @@ class ApiCacheTests(DatabaseTestCase):
         api_key = "sentinel-lastfm-api-key"
         username = "sentinel-linked-username"
         private_scope = "lastfm:user:sentinel-pseudonymous-handle-hash"
+        cache_url = "https://example.test/private"
         secret_url = (
-            "https://example.test/private?"
-            f"api_key={api_key}&user={username}"
+            f"{cache_url}?api_key={api_key}&user={username}"
         )
+        request_error = requests.ConnectionError(f"failed request for {secret_url}")
+        request_error.request = requests.Request("GET", secret_url).prepare()
         get.side_effect = [
-            requests.ConnectionError(f"failed request for {secret_url}"),
+            request_error,
             Response(503),
             Response(200, {"result": "recovered"}),
         ]
 
         with self.assertLogs("backend.api_cache", level="WARNING") as logs:
             result = cached_json_get(
-                secret_url,
+                cache_url,
                 namespace=private_scope,
                 ttl=60,
                 retry_statuses={503},
