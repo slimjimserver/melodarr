@@ -8,6 +8,7 @@ import requests
 from flask import Blueprint, current_app, jsonify, request
 
 if __package__ == "backend.routes":
+    from ._safe_errors import public_exception_message
     from ..responses import api_error
     from ..security import (
         admin_required,
@@ -27,6 +28,7 @@ if __package__ == "backend.routes":
     from ..storage import get_service
     from ..workers import anime_metadata as anime_metadata_worker
 else:  # Support the existing `python backend/app.py` entry point.
+    from routes._safe_errors import public_exception_message
     from responses import api_error
     from security import (
         admin_required,
@@ -60,6 +62,32 @@ class _InvalidAnimeThemesSlug(ValueError):
 
 class _AnimeThemesNotFound(LookupError):
     """An AnimeThemes detail lookup returned no result."""
+
+
+_MAPPING_INPUT_MESSAGES = (
+    "Invalid AnimeThemes anime slug.",
+    "This theme does not have a usable AnimeThemes song ID.",
+    "Enter a MusicBrainz release-group URL or MBID.",
+    "Enter a valid MusicBrainz release-group URL or MBID.",
+    "MusicBrainz release-group URLs must use HTTPS.",
+    "The URL must point to musicbrainz.org.",
+    "Use a MusicBrainz release-group URL, not an individual release URL.",
+    "MusicBrainz release-group MBID must be a valid UUID.",
+)
+_MAPPING_NOT_FOUND_MESSAGES = (
+    "Anime was not found on AnimeThemes.",
+    "Anime theme was not found on AnimeThemes.",
+    "MusicBrainz release group was not found.",
+)
+_AUTOMATIC_MATCH_MESSAGES = (
+    "The automatic match is no longer available. Run matching again before confirming it.",
+    "That release group is not part of the current automatic candidates.",
+    "Choose an automatic release-group candidate before confirming.",
+)
+_PROPOSAL_CONFLICT_MESSAGES = (
+    "Rejected mapping proposals cannot be approved.",
+    "Approved mapping proposals cannot be rejected.",
+)
 
 
 def _load_anime(slug):
@@ -622,11 +650,20 @@ def link_anime_theme_mapping(slug, theme_id):
         )
         anime_theme_links.sync_anime_theme_mapping(anime, theme, public_mapping)
     except ValueError as exc:
-        return api_error(str(exc))
+        return api_error(public_exception_message(
+            exc, _MAPPING_INPUT_MESSAGES, "Could not save the anime theme mapping.",
+            context="Anime theme mapping",
+        ))
     except AutomaticMatchUnavailable as exc:
-        return api_error(str(exc), 409)
+        return api_error(public_exception_message(
+            exc, _AUTOMATIC_MATCH_MESSAGES, "Automatic match could not be confirmed.",
+            context="Automatic anime match confirmation",
+        ), 409)
     except LookupError as exc:
-        return api_error(str(exc), 404)
+        return api_error(public_exception_message(
+            exc, _MAPPING_NOT_FOUND_MESSAGES, "Anime theme mapping was not found.",
+            context="Anime theme mapping lookup",
+        ), 404)
     except requests.RequestException:
         return api_error("MusicBrainz could not verify that release group.", 502)
     return jsonify({
@@ -671,9 +708,15 @@ def unlink_anime_theme_mapping(slug, theme_id):
         )
         anime_theme_links.sync_anime_theme_mapping(anime, theme, mapping)
     except ValueError as exc:
-        return api_error(str(exc))
+        return api_error(public_exception_message(
+            exc, _MAPPING_INPUT_MESSAGES, "Could not remove the anime theme mapping.",
+            context="Anime theme mapping removal",
+        ))
     except LookupError as exc:
-        return api_error(str(exc), 404)
+        return api_error(public_exception_message(
+            exc, _MAPPING_NOT_FOUND_MESSAGES, "Anime theme mapping was not found.",
+            context="Anime theme mapping removal lookup",
+        ), 404)
     except requests.RequestException as exc:
         return _provider_error(exc)
     return jsonify({
@@ -767,9 +810,15 @@ def propose_anime_theme_mapping(slug, theme_id):
             target=_registry_target(group),
         )
     except ValueError as exc:
-        return api_error(str(exc))
+        return api_error(public_exception_message(
+            exc, _MAPPING_INPUT_MESSAGES, "Could not submit the mapping proposal.",
+            context="Anime mapping proposal submission",
+        ))
     except LookupError as exc:
-        return api_error(str(exc), 404)
+        return api_error(public_exception_message(
+            exc, _MAPPING_NOT_FOUND_MESSAGES, "Anime theme mapping was not found.",
+            context="Anime mapping proposal lookup",
+        ), 404)
     except requests.RequestException:
         return api_error("MusicBrainz could not verify that release group.", 502)
     return jsonify({
@@ -837,9 +886,15 @@ def approve_anime_theme_mapping_proposal(slug, theme_id, proposal_id):
             current_user()["id"],
         )
     except ValueError as exc:
-        return api_error(str(exc), 409)
+        return api_error(public_exception_message(
+            exc, _PROPOSAL_CONFLICT_MESSAGES, "Could not approve the mapping proposal.",
+            context="Anime mapping proposal approval",
+        ), 409)
     except LookupError as exc:
-        return api_error(str(exc), 404)
+        return api_error(public_exception_message(
+            exc, ("Mapping proposal was not found.",), "Mapping proposal was not found.",
+            context="Anime mapping proposal approval lookup",
+        ), 404)
     mapping = _admin_proposal_state(
         slug,
         theme_id,
@@ -882,9 +937,15 @@ def reject_anime_theme_mapping_proposal(slug, theme_id, proposal_id):
             current_user()["id"],
         )
     except ValueError as exc:
-        return api_error(str(exc), 409)
+        return api_error(public_exception_message(
+            exc, _PROPOSAL_CONFLICT_MESSAGES, "Could not reject the mapping proposal.",
+            context="Anime mapping proposal rejection",
+        ), 409)
     except LookupError as exc:
-        return api_error(str(exc), 404)
+        return api_error(public_exception_message(
+            exc, ("Mapping proposal was not found.",), "Mapping proposal was not found.",
+            context="Anime mapping proposal rejection lookup",
+        ), 404)
     theme = _proposal_theme(source_proposal)
     mapping = _admin_proposal_state(
         slug,

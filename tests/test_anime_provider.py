@@ -1617,6 +1617,37 @@ class AnimeRouteTests(unittest.TestCase):
         self.assertNotIn("sentinel-secret-provider-detail", response.get_data(as_text=True))
         self.assertIn("ValueError", logs.output[0])
 
+    def test_mapping_routes_do_not_reflect_unexpected_exception_text(self):
+        cases = (
+            ("PUT", "/api/anime/naruto/themes/1/mapping", "Could not save the anime theme mapping."),
+            ("DELETE", "/api/anime/naruto/themes/1/mapping", "Could not remove the anime theme mapping."),
+            ("POST", "/api/anime/naruto/themes/1/mapping-proposals", "Could not submit the mapping proposal."),
+        )
+        for method, path, message in cases:
+            with self.subTest(method=method, path=path):
+                with patch(
+                    "backend.routes.anime.animethemes.detail",
+                    side_effect=ValueError("sentinel-secret-provider-detail"),
+                ):
+                    with self.assertLogs(self.app.logger.name, level="WARNING") as logs:
+                        response = self._admin_request(method, path, json={})
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(response.get_json(), {"error": message})
+                self.assertNotIn("sentinel-secret-provider-detail", logs.output[0])
+
+    def test_mapping_lookup_does_not_reflect_unexpected_exception_text(self):
+        with patch(
+            "backend.routes.anime.animethemes.detail",
+            side_effect=LookupError("sentinel-secret-provider-detail"),
+        ):
+            response = self._admin_request(
+                "DELETE", "/api/anime/naruto/themes/1/mapping"
+            )
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(
+            response.get_json(), {"error": "Anime theme mapping was not found."}
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

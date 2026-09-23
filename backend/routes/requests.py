@@ -6,6 +6,7 @@ import requests
 from flask import Blueprint, jsonify
 
 if __package__ == "backend.routes":
+    from ._safe_errors import public_exception_message
     from .. import notifications
     from ..responses import api_error, request_json_object
     from ..security import current_user, login_required
@@ -19,6 +20,7 @@ if __package__ == "backend.routes":
     from ..workers import lidarr_searches as lidarr_search_worker
     from ..workers import lidarr_library as lidarr_library_worker
 else:  # Support the existing `python backend/app.py` entry point.
+    from routes._safe_errors import public_exception_message
     import notifications
     from responses import api_error, request_json_object
     from security import current_user, login_required
@@ -36,6 +38,21 @@ else:  # Support the existing `python backend/app.py` entry point.
 blueprint = Blueprint("requests", __name__)
 
 _ANIME_SLUG_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,199}")
+_ANIME_CONTEXT_MESSAGES = (
+    "Anime slug is invalid.",
+    "Anime slug is required.",
+    "Anime slug must be 200 characters or fewer.",
+    "Anime name is required.",
+    *(f"{label} must be text." for label in (
+        "Anime slug", "Anime name", "Theme label", "Song title"
+    )),
+    *(f"{label} must be 500 characters or fewer." for label in (
+        "Anime name", "Theme label", "Song title"
+    )),
+    "Theme label is required.",
+    "AnimeThemes theme ID must be a positive integer.",
+    "AnimeThemes song ID must be a positive integer.",
+)
 
 
 def _context_text(body, name, label, *, maximum=500, required=False):
@@ -209,7 +226,10 @@ def request_release_group():
     try:
         anime_context = _anime_request_context(body)
     except ValueError as exc:
-        return api_error(str(exc))
+        return api_error(public_exception_message(
+            exc, _ANIME_CONTEXT_MESSAGES, "Invalid anime request context.",
+            context="Anime release-group request context",
+        ))
     pending = pending_lidarr_search(mbid)
     if pending:
         record_request(

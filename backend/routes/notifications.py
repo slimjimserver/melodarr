@@ -6,11 +6,13 @@ from urllib.parse import urlparse
 from flask import Blueprint, jsonify
 
 if __package__ == "backend.routes":
+    from ._safe_errors import public_exception_message
     from .. import notifications
     from ..responses import api_error, request_json_object
     from ..security import admin_required, current_user, login_required
     from ..storage import db
 else:
+    from routes._safe_errors import public_exception_message
     import notifications
     from responses import api_error, request_json_object
     from security import admin_required, current_user, login_required
@@ -21,6 +23,37 @@ blueprint = Blueprint("notifications", __name__)
 PUSH_HOSTS = (
     "fcm.googleapis.com", "push.services.mozilla.com", "web.push.apple.com",
     "notify.windows.com",
+)
+_NOTIFICATION_VALIDATION_MESSAGES = (
+    "Request body must be a JSON object.",
+    "This notification settings section contains unsupported fields.",
+    "email and webPush must be objects.",
+    "Application URL must be an absolute HTTP(S) URL.",
+    "SMTP sender name must be text.",
+    "SMTP sender name is invalid.",
+    "SMTP port must be a valid TCP port.",
+    "SMTP host is invalid.",
+    "SMTP username or sender is too long.",
+    "SMTP port or encryption is invalid.",
+    "SMTP sender must be a valid email address.",
+    "SMTP password must be text.",
+    "Web Push contact must be text.",
+    "Web Push contact must be a mailto: address or HTTPS URL.",
+    "Web Push contact is required when Web Push is enabled.",
+    "Notification email must be valid.",
+    f"Notification delay must be a whole number of seconds between 0 and {notifications.MAX_NOTIFICATION_DELAY_SECONDS}.",
+    *(f"SMTP {key} must be text." for key in (
+        "host", "username", "sender", "password", "senderName"
+    )),
+    *(f"{key} must be true or false." for key in (
+        "enabled", "emailEnabled", "webPushEnabled", "requestedAvailable",
+        "allNewMusic", "adminRequestNotifications"
+    )),
+)
+_DEVICE_METADATA_MESSAGES = tuple(
+    f"{label} {suffix}."
+    for label in ("Device name", "Operating system", "Browser", "Engine")
+    for suffix in ("must be text", "is invalid")
 )
 
 
@@ -63,7 +96,10 @@ def put_global_notifications():
     try:
         return jsonify(notifications.save_config(values))
     except ValueError as exc:
-        return api_error(str(exc))
+        return api_error(public_exception_message(
+            exc, _NOTIFICATION_VALIDATION_MESSAGES, "Invalid notification settings.",
+            context="Global notification settings",
+        ))
 
 
 @blueprint.put("/api/settings/notifications/global")
@@ -73,7 +109,10 @@ def put_notification_global_section():
         return jsonify(notifications.save_global_config(_section_payload(
             request_json_object(), {"enabled", "applicationUrl", "delaySeconds"})))
     except ValueError as exc:
-        return api_error(str(exc))
+        return api_error(public_exception_message(
+            exc, _NOTIFICATION_VALIDATION_MESSAGES, "Invalid notification settings.",
+            context="Notification delivery settings",
+        ))
 
 
 @blueprint.put("/api/settings/notifications/email")
@@ -83,7 +122,10 @@ def put_notification_email_section():
         return jsonify(notifications.save_email_config(_section_payload(
             request_json_object(), {"enabled", "host", "port", "encryption", "username", "senderName", "sender", "password", "clearPassword"})))
     except ValueError as exc:
-        return api_error(str(exc))
+        return api_error(public_exception_message(
+            exc, _NOTIFICATION_VALIDATION_MESSAGES, "Invalid notification settings.",
+            context="Notification email settings",
+        ))
 
 
 @blueprint.put("/api/settings/notifications/web-push")
@@ -93,7 +135,10 @@ def put_notification_web_push_section():
         return jsonify(notifications.save_web_push_config(_section_payload(
             request_json_object(), {"enabled", "contact"})))
     except ValueError as exc:
-        return api_error(str(exc))
+        return api_error(public_exception_message(
+            exc, _NOTIFICATION_VALIDATION_MESSAGES, "Invalid notification settings.",
+            context="Notification Web Push settings",
+        ))
 
 
 def _test_delivery(user, *, email_target=None, subscription=None):
@@ -175,7 +220,10 @@ def put_notifications():
     try:
         return jsonify(notifications.save_user_preferences(current_user(), request_json_object()))
     except ValueError as exc:
-        return api_error(str(exc))
+        return api_error(public_exception_message(
+            exc, _NOTIFICATION_VALIDATION_MESSAGES, "Invalid notification preferences.",
+            context="Account notification preferences",
+        ))
 
 
 @blueprint.post("/api/account/notifications/subscriptions")
@@ -194,7 +242,10 @@ def create_subscription():
         try:
             metadata[key] = notifications.safe_text(values[key], field=label) if key in values else ""
         except ValueError as exc:
-            return api_error(str(exc))
+            return api_error(public_exception_message(
+                exc, _DEVICE_METADATA_MESSAGES, "Push subscription is invalid.",
+                context="Push subscription metadata",
+            ))
     if (not _supported_push_endpoint(endpoint) or not isinstance(p256dh, str)
             or not isinstance(auth, str) or not p256dh or not auth
             or len(p256dh) > notifications.MAX_PUSH_KEY or len(auth) > notifications.MAX_PUSH_KEY):

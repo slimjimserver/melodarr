@@ -9,6 +9,7 @@ import requests
 from flask import Blueprint, jsonify, request
 
 if __package__ == "backend.routes":
+    from ._safe_errors import public_exception_message
     from .. import (
         recommendation_activity,
         recommendation_feed,
@@ -28,6 +29,7 @@ if __package__ == "backend.routes":
     from ..workers import artist_metadata as artist_metadata_worker
     from ..workers import recommendations as recommendation_worker
 else:  # Support the existing `python backend/app.py` entry point.
+    from routes._safe_errors import public_exception_message
     import recommendation_activity
     import recommendation_feed
     import recommendation_preferences
@@ -50,6 +52,19 @@ _DUPLICATE_TITLE_LIMIT = 2
 _INFERRED_ARTIST_QUERY_BOOST = 2
 _MAX_ALBUM_SEARCH_CHARACTERS = 200
 _MAX_ALBUM_QUERY_INTERPRETATIONS = 8
+_TASTE_VALIDATION_MESSAGES = (
+    "Choose familiar, balanced, or discovery recommendations.",
+    "Choose up to five favorite artists.",
+    "Choose an artist from the search results.",
+    "Choose up to five different artists from the search results.",
+)
+_ANIME_SEARCH_VALIDATION_MESSAGES = (
+    "Anime search query must be text.",
+    "Enter at least two characters.",
+    "Anime search query must be 200 characters or fewer.",
+    "Anime search limit must be a whole number.",
+    "Anime search limit must be between 1 and 50.",
+)
 _GENERIC_ALBUM_TITLES = {
     "anthology",
     "best of",
@@ -1435,7 +1450,8 @@ def lastfm_recommendations():
             "albums": albums,
         })
     except ValueError as exc:
-        return api_error(str(exc), 502)
+        logger.warning("Last.fm recommendations failed (%s)", type(exc).__name__)
+        return api_error("Last.fm recommendations could not be loaded. Try again shortly.", 502)
     except requests.RequestException:
         return api_error(
             "Last.fm recommendations could not be loaded. Try again shortly.",
@@ -1593,7 +1609,10 @@ def save_discover_preferences():
         result = recommendation_preferences.save_preferences(current_user()["id"], request.get_json(silent=True))
         return jsonify({**result, "message": "Taste preferences saved. Your picks are being refreshed."})
     except ValueError as exc:
-        return api_error(str(exc))
+        return api_error(public_exception_message(
+            exc, _TASTE_VALIDATION_MESSAGES, "Could not save taste preferences.",
+            context="Discovery taste preferences",
+        ))
 
 
 @blueprint.post("/api/discover/request-influence")
@@ -1606,7 +1625,12 @@ def request_influence():
         found = recommendation_preferences.set_request_influence(
             current_user()["id"], body.get("requestId"), body.get("useForRecommendations"))
     except ValueError as exc:
-        return api_error(str(exc))
+        return api_error(public_exception_message(
+            exc,
+            ("A request ID and a boolean recommendation preference are required.",),
+            "Could not save request preference.",
+            context="Discovery request preference",
+        ))
     if not found:
         return api_error("Request not found.", 404)
     return jsonify({"message": "Request preference saved. Your picks are being refreshed."})
@@ -1673,7 +1697,11 @@ def search():
         try:
             return jsonify({"results": animethemes.search(query), "type": search_type})
         except ValueError as exc:
-            return api_error(str(exc))
+            return api_error(public_exception_message(
+                exc, _ANIME_SEARCH_VALIDATION_MESSAGES,
+                "AnimeThemes search could not be completed.",
+                context="AnimeThemes search",
+            ))
         except requests.RequestException:
             return api_error(
                 "AnimeThemes could not be reached. Try again shortly.", 502
