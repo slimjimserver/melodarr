@@ -286,7 +286,7 @@ def build_personal_feed(user, payload, shared_exclusions=None):
     return payload
 
 
-def current_feed(user_id, payload):
+def current_feed(user_id, payload, *, chart_trace=None):
     """Apply feedback and current cached availability without upstream HTTP calls."""
     feedback = feedback_for(user_id)
     hidden = {(row["kind"], row["mbid"]) for row in feedback if row["action"] == "dismiss"}
@@ -305,6 +305,27 @@ def current_feed(user_id, payload):
     result = []
     for item in candidates:
         key = (item["kind"], item["id"])
+        if chart_trace is not None and item.get("lane") == "popular":
+            mbid = item["id"]
+            status = albums.get(mbid.casefold(), {})
+            reasons = []
+            if key in hidden:
+                reasons.append("dismissed")
+            if key in history:
+                reasons.append("requested")
+            if status.get("fullyAvailable"):
+                reasons.append("lidarr_available")
+            if mbid.casefold() in pending:
+                reasons.append("lidarr_search_pending")
+            if mbid.casefold() in downloads:
+                reasons.append("download_pending")
+            if mbid in plex_albums:
+                reasons.append("plex_mbid")
+            if (item.get("artist", "").casefold(), item["name"].casefold()) in plex_names:
+                reasons.append("plex_name")
+            chart_trace[(item.get("chartCountry", "us"), item.get("chartRank"))] = {
+                "exclusions": reasons, "disposition": reasons[0] if reasons else "candidate",
+            }
         if key in hidden or key in history:
             continue
         if item["kind"] == "artist" and (item["id"] in artists or item["id"] in plex_index.get("artistsByMbid", {})):
@@ -323,6 +344,16 @@ def current_feed(user_id, payload):
     featured = {(item["kind"], item["id"]) for section in sections for item in section["items"]}
     popular = [item for item in result if item.get("lane") == "popular"
                and (item["kind"], item["id"]) not in featured]
+    if chart_trace is not None:
+        for item in result:
+            if item.get("lane") != "popular":
+                continue
+            outcome = chart_trace[(item.get("chartCountry", "us"), item.get("chartRank"))]
+            if (item["kind"], item["id"]) in featured:
+                outcome["exclusions"].append("featured_elsewhere")
+                outcome["disposition"] = "featured_elsewhere"
+            else:
+                outcome["disposition"] = "final_requestable"
     return {**{key: value for key, value in payload.items() if key not in {"candidates", "popularCandidates"}},
             "sections": sections,
             "popularAlbums": [item for item in popular if item.get("chartCountry", "us") == "us"],

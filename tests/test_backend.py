@@ -7099,6 +7099,22 @@ class MusicBrainzClientTests(unittest.TestCase):
         self.assertEqual(kwargs["params"]["limit"], 100)
 
     @patch("backend.services.musicbrainz.cached_json_get")
+    def test_chart_evidence_uses_batched_cached_urls_and_release_search(self, cached_get):
+        cached_get.return_value = {"urls": []}
+        resources = ["https://music.apple.com/us/album/123",
+                     "https://music.apple.com/us/album/456"]
+        musicbrainz.lookup_urls(resources, include_cache_status=True)
+        self.assertTrue(cached_get.call_args.args[0].endswith("/url"))
+        self.assertEqual(cached_get.call_args.kwargs["params"][:2],
+                         [("resource", resource) for resource in resources])
+        self.assertEqual(cached_get.call_args.kwargs["namespace"], "musicbrainz-url")
+        self.assertTrue(cached_get.call_args.kwargs["include_cache_status"])
+        musicbrainz.search("reid:release-id", "release", priority="background")
+        self.assertTrue(cached_get.call_args.args[0].endswith("/release/"))
+        with self.assertRaises(ValueError):
+            musicbrainz.lookup_urls(resources * 21)
+
+    @patch("backend.services.musicbrainz.cached_json_get")
     def test_artist_search_keeps_the_default_candidate_limit(self, cached_get):
         cached_get.return_value = {"artists": []}
 
