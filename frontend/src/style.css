@@ -625,6 +625,11 @@ dialog::backdrop { background: rgba(48, 39, 32, .52); }
 .account-content { min-width: 0; }
 .account-section + .account-section { margin-top: 34px; }
 .account-section h2, .account-form h2 { margin: 0 0 14px; font-size: 20px; letter-spacing: -.03em; }
+.request-history-section { border: 0; padding: 0; }
+.request-history-section > summary { min-height: 44px; margin: 0; border-radius: 7px; padding: 8px; color: var(--foreground); cursor: pointer; }
+.request-history-section > summary::marker { color: var(--foreground-muted); }
+.request-history-section > summary h2 { display: inline; margin: 0; }
+.request-history-section[open] > summary { margin-bottom: 14px; }
 .profile-summary { display: flex; align-items: center; gap: 15px; border: 1px solid var(--border); border-radius: 14px; background: rgba(255, 250, 243, .7); padding: 18px; }
 .profile-summary h2 { margin-bottom: 4px; }
 .profile-summary p { margin: 0; color: var(--foreground-muted); font-size: 12px; }

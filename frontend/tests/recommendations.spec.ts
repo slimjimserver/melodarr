@@ -552,6 +552,127 @@ test("charts and optional taste setup are available while the first personal fee
   await expect(page.getByLabel("Find a favorite artist")).toBeVisible();
 });
 
+for (const theme of ["midnight", "warm"]) {
+  for (const width of [1440, 320]) {
+    test(`request history sections toggle independently in ${theme} at ${width}px`, async ({ page }, testInfo) => {
+      await page.setViewportSize({ width, height: 1200 });
+      await page.addInitScript(theme => localStorage.setItem("melodarr-theme", theme), theme);
+      await fixture(page);
+      const influenceUpdates: { requestId: number; useForRecommendations: boolean }[] = [];
+      await page.route("**/api/account/profile?*", route => {
+        const currentPage = Number(new URL(route.request().url()).searchParams.get("page"));
+        return route.fulfill({ json: {
+          requests: {
+            artist: [
+              { id: 1, mbid: "fixture-artist", name: "Fixture Artist", created_at: 1789171200, use_for_recommendations: true },
+              { id: 2, mbid: "second-artist", name: "Second Artist", created_at: 1788652800, use_for_recommendations: true },
+            ],
+            "release-group": [{ id: 41, mbid: "fixture-album", name: "Fixture Album", artist_name: "Fixture Artist",
+              release_type: "Album", release_date: "2026-09-01", created_at: 1789171200, requestStatus: "available",
+              availableInPlex: true, plexUrl: "https://app.plex.tv/desktop/#!/server/fixture/details?key=album",
+              use_for_recommendations: true }],
+          },
+          pagination: { page: currentPage, pageSize: 100, total: 103, totalPages: 2 },
+        } });
+      });
+      await page.route("**/api/discover/request-influence", async route => {
+        influenceUpdates.push(route.request().postDataJSON());
+        await route.fulfill({ json: { ok: true } });
+      });
+      await page.goto("/");
+      await signIn(page);
+      await page.goto("/ada/requests");
+      const artists = page.locator(".request-history-section").filter({ has: page.getByRole("heading", { name: "Artists", exact: true }) });
+      const releases = page.locator(".request-history-section").filter({ has: page.getByRole("heading", { name: "Release groups", exact: true }) });
+      const artistHeader = artists.locator("summary");
+      const releaseHeader = releases.locator("summary");
+      await expect(page.locator(".request-history-section")).toHaveCount(2);
+      await expect(artistHeader).toBeVisible();
+      await expect(releaseHeader).toBeVisible();
+      await expect(artists).not.toHaveAttribute("open");
+      await expect(releases).toHaveAttribute("open");
+      await expect(artists.locator(".history-item").first()).toBeHidden();
+      await expect(releases.locator(".history-item")).toBeVisible();
+      await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
+      const headerBox = (await artistHeader.boundingBox())!;
+      expect(Math.round(headerBox.height)).toBeGreaterThanOrEqual(44);
+      expect(headerBox.width).toBeGreaterThanOrEqual(200);
+      await page.screenshot({ path: testInfo.outputPath("requests-initial.png") });
+
+      // The far edge of the header is clickable, beyond the heading text.
+      await artistHeader.click({ position: { x: headerBox.width - 8, y: headerBox.height / 2 } });
+      await expect(artists).toHaveAttribute("open");
+      await expect(releases).toHaveAttribute("open");
+      await expect(artists.locator(".history-title")).toHaveText(["Fixture Artist", "Second Artist"]);
+      await expect(artists.locator("time").first()).toHaveAttribute("datetime", "2026-09-12T00:00:00.000Z");
+      await expect(releases.locator(".history-meta")).toHaveText("Fixture Artist · Album · 2026-09-01");
+      await expect(releases.locator(".request-lifecycle")).toHaveText("Available");
+      await expect(releases.locator(".history-plex")).toHaveAttribute("href", /app\.plex\.tv/);
+      await page.screenshot({ path: testInfo.outputPath("requests-expanded.png") });
+
+      const artistToggle = artists.getByLabel("Use for recommendations", { exact: true }).first();
+      await artistToggle.uncheck();
+      await expect(artists.getByText("Excluded from your taste profile.", { exact: false })).toBeVisible();
+      await releaseHeader.focus();
+      await page.keyboard.press("Space");
+      await expect(releases).not.toHaveAttribute("open");
+      await expect(artists).toHaveAttribute("open");
+      await artistHeader.focus();
+      await page.keyboard.press("Enter");
+      await expect(artists).not.toHaveAttribute("open");
+      await expect(releases).not.toHaveAttribute("open");
+      await expect(artists.locator(".history-item").first()).toBeHidden();
+      await expect(releases.locator(".history-item")).toBeHidden();
+      await page.keyboard.press("Enter");
+      await expect(artists).toHaveAttribute("open");
+      await expect(releases).not.toHaveAttribute("open");
+      await expect(artistToggle).not.toBeChecked();
+      await page.keyboard.press("Tab");
+      await expect(artists.getByRole("link", { name: "Fixture Artist", exact: true })).toBeFocused();
+      await artistToggle.check();
+      await expect(artists.getByText("This request shapes your picks.", { exact: true })).toBeVisible();
+      await releaseHeader.click();
+      await expect(releases).toHaveAttribute("open");
+      await expect(artists).toHaveAttribute("open");
+      await releases.getByLabel("Use for recommendations", { exact: true }).uncheck();
+      await expect(releases.getByText("Excluded from your taste profile.", { exact: false })).toBeVisible();
+      expect(influenceUpdates).toEqual([
+        { requestId: 1, useForRecommendations: false },
+        { requestId: 1, useForRecommendations: true },
+        { requestId: 41, useForRecommendations: false },
+      ]);
+      const dimensions = await page.evaluate(() => ({ width: document.documentElement.clientWidth, scroll: document.documentElement.scrollWidth }));
+      expect(dimensions.scroll).toBeLessThanOrEqual(dimensions.width);
+
+      const pagination = page.getByRole("navigation", { name: "Request history pages" });
+      await pagination.getByRole("button", { name: "Next", exact: true }).click();
+      await expect(page).toHaveURL(/\/ada\/requests\?page=2$/);
+      await expect(pagination).toContainText("Page 2 of 2");
+      await pagination.getByRole("button", { name: "Previous", exact: true }).click();
+      await expect(page).toHaveURL(/\/ada\/requests$/);
+      await artistHeader.click();
+      await artists.getByRole("link", { name: "Fixture Artist", exact: true }).click();
+      await expect(page).toHaveURL(/\/artists\/fixture-artist$/);
+      await page.goBack();
+      await releases.getByRole("link", { name: "Fixture Album", exact: true }).click();
+      await expect(page).toHaveURL(/\/albums\/fixture-album$/);
+    });
+  }
+}
+
+test("empty request history sections remain expandable", async ({ page }) => {
+  await fixture(page);
+  await page.goto("/");
+  await signIn(page);
+  await page.goto("/ada/requests");
+  const groups = page.locator(".request-history-section");
+  await expect(groups).toHaveCount(2);
+  await expect(groups.first().getByText("No requests yet.")).toBeHidden();
+  await expect(groups.last().getByText("No requests yet.")).toBeVisible();
+  await groups.first().locator("summary").click();
+  await expect(groups.first().getByText("No requests yet.")).toBeVisible();
+});
+
 test("request influence is editable only on your own history and persists after reload", async ({ page }) => {
   await page.setViewportSize({ width: 320, height: 844 });
   await fixture(page);
@@ -651,6 +772,7 @@ for (const width of [1440, 320]) {
     await signIn(page);
     await page.goto("/ada/requests");
     await expect(page.locator(".history-item")).toHaveCount(4);
+    await page.locator(".request-history-section > summary").filter({ hasText: "Artists" }).click();
     await page.evaluate(() => document.documentElement.removeAttribute("data-theme"));
     const first = page.locator(".history-item").first();
     const geometry = await first.evaluate(card => {

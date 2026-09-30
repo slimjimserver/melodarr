@@ -1391,13 +1391,16 @@ function setupNavigation() {
           ["Release groups", data.requests?.["release-group"] || [], "albums"],
         ];
         requestGroups.forEach(([title, requests, route]) => {
-          const section = document.createElement("section");
-          section.className = "account-section";
+          const section = document.createElement("details");
+          section.className = "account-section request-history-section";
+          section.open = route === "albums";
+          const summary = document.createElement("summary");
           const heading = document.createElement("h2"); heading.textContent = title;
+          summary.append(heading);
           const list = document.createElement("div"); list.className = "results";
           if (!requests.length) { const empty = document.createElement("p"); empty.className = "message"; empty.textContent = "No requests yet."; list.append(empty); }
           requests.forEach((item: JsonObject) => list.append(createHistoryItem(item, route, isOwnAccount)));
-          section.append(heading, list); content.append(section);
+          section.append(summary, list); content.append(section);
         });
 
         const pagination = data.pagination || {
