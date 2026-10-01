@@ -1,13 +1,20 @@
 import { expect, test, type Page } from "@playwright/test";
 
+test.afterEach(async ({ page }) => { await page.unrouteAll({ behavior: "ignoreErrors" }); });
+
 test.beforeEach(async ({ request, page }) => {
   await request.post("/__reset");
   await request.post("/api/auth/login", { data: { username: "ada", password: "fixture-password" } });
   await page.route("**/api/discover", route => route.fulfill({ json: { sections: [] } }));
-  await page.route("**/api/account/profile?*", route => route.fulfill({ json: {
-    requests: { artist: [], "release-group": [] }, matchCounts: { artist: 0, "release-group": 0 },
-    pagination: { page: Number(new URL(route.request().url()).searchParams.get("page") || 1), pageSize: 100, total: 0, totalPages: 0 },
-  } }));
+  await page.route("**/api/account/profile?*", async route => {
+    const params = new URL(route.request().url()).searchParams;
+    const response = await page.request.post("/__request-history", { data: {
+      items: Array.from({ length: 201 }, (_, i) => ({ id: i + 1, kind: "artist", mbid: `nav-${i}`, name: "Reo Another", created_at: i + 1, use_for_recommendations: true, availableInPlex: i % 2 === 0 })),
+      username: params.get("username"), query: params.get("q") || "", status: params.get("status") || "all", page: params.get("page") || "1",
+    } });
+    const result = await response.json();
+    if (!route.request().failure()) await route.fulfill({ status: result.status, json: result.body });
+  });
 });
 
 async function expectRequestsActive(page: Page) {

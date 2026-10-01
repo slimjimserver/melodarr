@@ -222,7 +222,7 @@ let showAccountPage: ((
   page?: AccountPage,
   updateHistory?: boolean,
   username?: string,
-  requestPage?: number,
+  requestPage?: number | string,
   requestQuery?: string,
   requestStatus?: string,
 ) => void) | undefined;
@@ -468,6 +468,7 @@ function applyApplicationIdentity(title?: string) {
 }
 
 async function api<T = JsonObject>(url: string, options: RequestInit = {}): Promise<T> {
+  const requestUser = currentUser;
   const requestOptions = { ...options };
   const method = (requestOptions.method || "GET").toUpperCase();
   const headers = new Headers(requestOptions.headers || {});
@@ -476,7 +477,7 @@ async function api<T = JsonObject>(url: string, options: RequestInit = {}): Prom
   }
   requestOptions.headers = headers;
   const response = await fetch(url, requestOptions);
-  handleAuthenticationFailure(response);
+  if (requestUser === currentUser) handleAuthenticationFailure(response);
   const responseText = await response.text();
   let body: T & { error?: string };
   try {
@@ -1055,16 +1056,20 @@ function createAnimeHistoryLinks(item: JsonObject) {
 
 function setupNavigation() {
   let activeAccountUsername = "";
-  let activeAccountRequestPage = 1;
+  let activeAccountRequestPage: number | string = 1;
   let activeAccountRequestQuery = "";
   let activeAccountRequestStatus = "all";
+  const tasteMutations = new Map<string, {
+    owner: CurrentUser; included: boolean; previous: boolean; pending: boolean; message: string;
+  }>();
+  window.addEventListener("melodarr-signed-out", () => tasteMutations.clear());
 
   function setActiveAccountRoute(page: AccountPage | null) {
     document.querySelectorAll<HTMLAnchorElement>("[data-account-route]").forEach((link) => {
       const route = link.dataset.accountRoute as AccountPage;
       const username = activeAccountUsername || currentUser?.username;
       if (username) {
-        link.href = accountPath(route, username, route === "requests" ? activeAccountRequestPage : 1);
+        link.href = accountPath(route, username, 1, false);
       }
       const isCurrent = page !== null && link.dataset.accountRoute === page;
       link.classList.toggle("active", isCurrent);
@@ -1143,7 +1148,7 @@ function setupNavigation() {
     if (page === "profile") return `/${encodedUsername}`;
     if (page === "requests") {
       const query = new URLSearchParams();
-      if (requestPage > 1) query.set("page", String(requestPage));
+      if (Number(requestPage) > 1) query.set("page", String(requestPage));
       if (includeRequestFilters && activeAccountRequestQuery) query.set("q", activeAccountRequestQuery);
       if (includeRequestFilters && activeAccountRequestStatus !== "all") query.set("status", activeAccountRequestStatus);
       return `/${encodedUsername}/requests${query.size ? `?${query}` : ""}`;
@@ -1195,6 +1200,14 @@ function setupNavigation() {
     main.append(detailLink);
     appendRequestLifecycle(copy, item);
     if (editableTaste && item.id !== undefined) {
+      const owner = currentUser!;
+      const requestId = String(item.id);
+      const remembered = tasteMutations.get(requestId);
+      if (remembered && (remembered.owner !== owner || (!remembered.pending && remembered.included === (item.use_for_recommendations !== 0 && item.use_for_recommendations !== false)))) {
+        // Once a fresh read acknowledges a save, use server state again.
+        tasteMutations.delete(requestId);
+      }
+      row.dataset.tasteRequestId = requestId;
       const label = document.createElement("label");
       label.className = "request-taste-toggle";
       const toggle = document.createElement("input");
@@ -1209,27 +1222,42 @@ function setupNavigation() {
       controls.className = "request-taste-controls";
       controls.append(label, status);
       row.append(controls);
+      const sync = () => {
+        const mutation = tasteMutations.get(requestId);
+        if (mutation?.owner !== owner) return;
+        toggle.checked = mutation.included;
+        toggle.disabled = mutation.pending;
+        status.textContent = mutation.message;
+      };
+      // A pending save belongs to the request, not to a particular card node.
+      row.addEventListener("request-taste-updated", sync);
+      sync();
       toggle.addEventListener("change", async () => {
         const included = toggle.checked;
-        const generation = accountRenderGeneration;
-        const ownerId = currentUser?.id;
-        toggle.disabled = true;
+        const existing = tasteMutations.get(requestId);
+        if (existing?.owner === owner && existing.pending) return;
+        const mutation = { owner, included, previous: !included, pending: true, message: "Saving…" };
+        tasteMutations.set(requestId, mutation);
+        const updateVisibleCards = () => {
+          if (currentUser !== owner || tasteMutations.get(requestId) !== mutation) return;
+          document.querySelectorAll<HTMLElement>("#account-content [data-taste-request-id]").forEach(card => {
+            if (card.dataset.tasteRequestId === requestId) card.dispatchEvent(new Event("request-taste-updated"));
+          });
+        };
+        updateVisibleCards();
         try {
           await api("/api/discover/request-influence", {
             method: "POST", headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ requestId: item.id, useForRecommendations: included }),
-            signal: accountRenderAbort?.signal,
           });
-          if (generation !== accountRenderGeneration || ownerId !== currentUser?.id || !row.isConnected) return;
-          item.use_for_recommendations = included;
-          status.textContent = included ? "This request shapes your picks." : "Excluded from your taste profile. Your request is unchanged.";
-          window.dispatchEvent(new Event("melodarr-recommendations-changed"));
+          mutation.message = included ? "This request shapes your picks." : "Excluded from your taste profile. Your request is unchanged.";
+          if (currentUser === owner) window.dispatchEvent(new Event("melodarr-recommendations-changed"));
         } catch (error) {
-          if (generation !== accountRenderGeneration || ownerId !== currentUser?.id || !row.isConnected) return;
-          toggle.checked = !included;
-          status.textContent = `Couldn’t save this preference. ${error.message}`;
+          mutation.included = mutation.previous;
+          mutation.message = "Couldn’t save this preference. Please try again.";
         } finally {
-          toggle.disabled = false;
+          mutation.pending = false;
+          updateVisibleCards();
         }
       });
     }
@@ -1441,6 +1469,10 @@ function setupNavigation() {
         let searchTimer: number | undefined;
         let searchGeneration = 0;
         let searchAbort: AbortController | undefined;
+        let composing = false;
+        const disablePagination = () => {
+          results.querySelectorAll<HTMLButtonElement>(".request-pagination button").forEach(button => { button.disabled = true; });
+        };
         controller.signal.addEventListener("abort", () => {
           window.clearTimeout(searchTimer);
           searchAbort?.abort();
@@ -1511,23 +1543,37 @@ function setupNavigation() {
           results.append(paginationControls);
         };
 
-        const loadResults = async (query: string, requestPage: number, requestStatus: string) => {
+        const loadResults = async (query: string, requestPage: number | string, requestStatus: string) => {
           searchAbort?.abort();
           const generation = ++searchGeneration;
           const fetchController = new AbortController();
           searchAbort = fetchController;
+          disablePagination();
           results.setAttribute("aria-busy", "true");
           setMessage(searchStatus, query ? "Searching…" : "Loading…");
           try {
+            const rawPage = String(requestPage);
+            if (rawPage !== rawPage.trim() || !/^[1-9][0-9]*$/.test(rawPage) || rawPage.length > 17 || BigInt(rawPage) > ((2n ** 63n - 1n) / 100n) + 1n) {
+              throw new Error("Page must be a positive integer.");
+            }
             const params = new URLSearchParams({ username: targetUsername, page: String(requestPage) });
             if (query) params.set("q", query);
             params.set("status", requestStatus);
-            const data = await api(`/api/account/profile?${params}`, { signal: fetchController.signal });
+            let data = await api(`/api/account/profile?${params}`, { signal: fetchController.signal });
+            if (!isCurrentRender() || generation !== searchGeneration) return;
+            if (Number(requestPage) > Math.max(1, data.pagination?.totalPages ?? 1)) {
+              activeAccountRequestPage = 1;
+              window.history.replaceState({ account: "requests", username: targetUsername, page: 1 }, "", accountPath("requests", targetUsername, 1));
+              params.set("page", "1");
+              data = await api(`/api/account/profile?${params}`, { signal: fetchController.signal });
+            }
             if (!isCurrentRender() || generation !== searchGeneration) return;
             renderResults(data, query, requestStatus);
           } catch (error) {
             if (error.name !== "AbortError" && isCurrentRender() && generation === searchGeneration) {
-              setMessage(searchStatus, error.message, true);
+              results.replaceChildren();
+              const validation = ["Page must be a positive integer.", "Search must be 500 characters or fewer.", "Status must be all, requested, or available."];
+              setMessage(searchStatus, validation.includes(error.message) ? error.message : "Requests could not be loaded. Please try again.", true);
             }
           } finally {
             if (generation === searchGeneration) results.removeAttribute("aria-busy");
@@ -1535,7 +1581,7 @@ function setupNavigation() {
         };
         const applySearch = () => {
           window.clearTimeout(searchTimer);
-          if (!isCurrentRender()) return;
+          if (!isCurrentRender() || composing) return;
           activeAccountRequestQuery = searchInput.value.trim();
           activeAccountRequestStatus = statusSelect.value;
           activeAccountRequestPage = 1;
@@ -1544,16 +1590,21 @@ function setupNavigation() {
           );
           void loadResults(activeAccountRequestQuery, 1, activeAccountRequestStatus);
         };
-        searchInput.addEventListener("input", () => {
+        const scheduleSearch = () => {
           clear.hidden = !searchInput.value;
           window.clearTimeout(searchTimer);
           searchAbort?.abort();
           searchGeneration += 1;
-          searchTimer = window.setTimeout(applySearch, 250);
-        });
+          disablePagination();
+          if (!composing) searchTimer = window.setTimeout(applySearch, 250);
+        };
+        searchInput.addEventListener("compositionstart", () => { composing = true; scheduleSearch(); });
+        searchInput.addEventListener("compositionend", () => { composing = false; scheduleSearch(); });
+        searchInput.addEventListener("input", scheduleSearch);
         searchForm.addEventListener("submit", event => { event.preventDefault(); applySearch(); });
         statusSelect.addEventListener("change", applySearch);
         clear.addEventListener("click", () => {
+          composing = false;
           searchInput.value = "";
           clear.hidden = true;
           searchInput.focus();
@@ -1910,8 +1961,8 @@ function setupNavigation() {
     if (currentUser.role === "admin") allowedPages.push("invitations");
     page = allowedPages.includes(page) ? page : "profile";
     activeAccountUsername = username;
-    activeAccountRequestPage = page === "requests" ? Math.max(1, requestPage) : 1;
-    activeAccountRequestQuery = page === "requests" ? requestQuery : "";
+    activeAccountRequestPage = page === "requests" ? requestPage : 1;
+    activeAccountRequestQuery = page === "requests" ? requestQuery.trim() : "";
     activeAccountRequestStatus = page === "requests" ? requestStatus : "all";
     showView("account", false, page);
     if (updateHistory) {
@@ -1920,6 +1971,11 @@ function setupNavigation() {
         "",
         accountPath(page, username, activeAccountRequestPage),
       );
+    } else if (page === "requests" && requestQuery !== activeAccountRequestQuery) {
+      const url = new URL(window.location.href);
+      if (activeAccountRequestQuery) url.searchParams.set("q", activeAccountRequestQuery);
+      else url.searchParams.delete("q");
+      window.history.replaceState(window.history.state, "", url);
     }
     renderAccount(page);
   };
@@ -1987,7 +2043,7 @@ function setupNavigation() {
     if (accountMatch && canViewAccount) {
       const accountPage = (accountMatch[2] || accountMatch[3] || "profile") as AccountPage;
       const requestPage = accountPage === "requests"
-        ? Math.max(1, Number.parseInt(new URLSearchParams(window.location.search).get("page") || "1", 10) || 1)
+        ? new URLSearchParams(window.location.search).get("page") ?? "1"
         : 1;
       const requestQuery = accountPage === "requests" ? new URLSearchParams(window.location.search).get("q") || "" : "";
       const requestStatus = accountPage === "requests" ? new URLSearchParams(window.location.search).get("status") || "all" : "all";

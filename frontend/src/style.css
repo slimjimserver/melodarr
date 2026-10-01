@@ -1288,6 +1288,10 @@ button,
   header { gap: 8px; padding-right: 8px; padding-left: 8px; }
 }
 
+@media (max-width: 319px) {
+  header { gap: 6px; }
+}
+
 /* Personal recommendations give the reason and decision controls room to breathe. */
 .recommendation-card[data-personal-recommendation] { flex-basis: 210px; align-content: start; cursor: default; }
 .recommendation-card[data-personal-recommendation] .recommendation-art { width: 100%; }

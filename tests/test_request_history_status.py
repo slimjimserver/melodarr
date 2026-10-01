@@ -6,6 +6,7 @@ else:
     from _test_environment import TEST_ROOT
 
 from unittest.mock import patch
+from backend import request_history_search
 
 if __package__:
     from .test_backend import DatabaseTestCase
@@ -15,6 +16,64 @@ from backend.storage import db, enqueue_lidarr_search, record_request, save_serv
 
 
 class RequestHistoryStatusTests(DatabaseTestCase):
+    def test_mixed_history_boundary_matrix_and_stable_page_partitions(self):
+        for size in (0, 1, 100, 101, 205):
+            with db() as connection:
+                connection.execute("DELETE FROM request_history")
+                connection.executemany(
+                    "INSERT INTO request_history (user_id, kind, mbid, name, created_at) VALUES (?, ?, ?, 'Same Name Café', 1)",
+                    [(self.user_id, "artist" if i % 2 else "release-group", f"boundary-{size}-{i}") for i in range(size)],
+                )
+                ordered = list(connection.execute("SELECT id, kind, mbid FROM request_history ORDER BY created_at DESC, id DESC"))
+            for regime in ("none", "all", "mixed"):
+                available = {row["mbid"] for i, row in enumerate(ordered) if regime == "all" or (regime == "mixed" and i % 3 == 0)}
+                self.plex["artistsByMbid"] = {row["mbid"]: {"url": "local"} for row in ordered if row["kind"] == "artist" and row["mbid"] in available}
+                self.albums.clear()
+                self.albums.update({row["mbid"]: {"fullyAvailable": True} for row in ordered if row["kind"] == "release-group" and row["mbid"] in available})
+                for query in ("", "cafe", "Same Name", "Absent"):
+                    for status in ("all", "requested", "available"):
+                        with self.subTest(size=size, regime=regime, query=query, status=status):
+                            expected = [row for row in ordered if query != "Absent" and (status == "all" or (row["mbid"] in available) == (status == "available"))]
+                            pages = (len(expected) + 99) // 100
+                            seen = []
+                            for page in range(1, max(1, pages) + 2):
+                                body = self.history(status, q=query, page=page)
+                                self.assertEqual(body["pagination"], {"page": page, "pageSize": 100, "total": len(expected), "totalPages": pages})
+                                selected = expected[(page - 1) * 100:page * 100]
+                                for kind in ("artist", "release-group"):
+                                    self.assertEqual([row["id"] for row in body["requests"][kind]], [row["id"] for row in selected if row["kind"] == kind])
+                                if query or status != "all":
+                                    self.assertEqual(body["matchCounts"], {kind: sum(row["kind"] == kind for row in expected) for kind in ("artist", "release-group")})
+                                seen.extend(row["id"] for group in body["requests"].values() for row in group)
+                            self.assertEqual(len(seen), len(set(seen)))
+                            self.assertEqual(set(seen), {row["id"] for row in expected})
+
+    def test_multiple_anime_associations_and_overlapping_aliases_do_not_duplicate_rows(self):
+        record_request(self.user_id, "release-group", "multi-anime", "Album")
+        with db() as connection:
+            for theme, slug in enumerate(("anime-one", "anime-two"), 1):
+                connection.execute(
+                    "INSERT INTO anime_theme_release_group_links (anime_slug, anime_name, theme_id, theme_label, theme_type, song_title, release_group_mbid, created_at, updated_at) "
+                    "VALUES (?, 'Shared Anime', ?, 'Opening', 'OP', 'Song', 'multi-anime', 0, 0)", (slug, theme),
+                )
+                request_history_search.save_names(connection, "anime", slug, ["Shared Alias", f"Alias {theme}"], catalog=True)
+        for status in ("requested", "available"):
+            if status == "available":
+                self.albums["multi-anime"] = {"fullyAvailable": True}
+            for query in ("Shared Anime", "Shared Alias", "Alias 1", "Alias 2"):
+                body = self.history(status, q=query)
+                self.assertEqual(body["pagination"]["total"], 1)
+                self.assertEqual(body["matchCounts"], {"artist": 0, "release-group": 1})
+                self.assertEqual(len(body["requests"]["release-group"]), 1)
+
+    def test_legacy_row_without_alias_sources_remains_searchable_and_local(self):
+        with db() as connection:
+            connection.execute(
+                "INSERT INTO request_history (user_id, kind, mbid, name, anime_name, created_at) VALUES (?, 'release-group', 'legacy-missing', '雫', 'Row Snapshot', 1)", (self.user_id,),
+            )
+        for query in ("雫", "Row Snapshot"):
+            self.assertEqual(self.history("requested", q=query)["pagination"]["total"], 1)
+        self.assertEqual(self.history("requested", q="Shizuku")["pagination"]["total"], 0)
     def setUp(self):
         super().setUp()
         self.csrf = self.register()

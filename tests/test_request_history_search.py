@@ -381,6 +381,21 @@ class RequestHistorySearchTests(DatabaseTestCase):
         self.assertEqual(self.search("   ")["pagination"]["total"], 1)
         self.assertEqual(self.client.get("/api/account/profile", query_string={"q": "a" * 501}).status_code, 400)
 
+    def test_normalization_and_unicode_character_length_contract(self):
+        record_request(self.user_id, "artist", self.artist_id, "Café & O'Neil / A-B_🎵 日本語", search_metadata=({"aliases": ["Romaji Nihongo"]},))
+        for query in ("cafe", "Café", "Cafe\u0301", "O'Neil", "o neil", "Café & O'Neil", "A-B", "A_B", "A/B", "a b", "日本語", "Romaji Nihongo", "  cafe   o neil  ", "cafe%", "cafe_", "🎵cafe"):
+            with self.subTest(query=query):
+                self.assertEqual(self.search(query)["pagination"]["total"], 1)
+        for query in ("%", "_", "🎵", "///", "&&&", "---"):
+            self.assertEqual(self.search(query)["pagination"]["total"], 0)
+        # Python validates Unicode code points, including astral emoji; the
+        # browser's native maxlength separately measures UTF-16 code units.
+        for character in ("a", "日", "🎵"):
+            self.assertEqual(self.client.get("/api/account/profile", query_string={"q": character * 500}).status_code, 200)
+            response = self.client.get("/api/account/profile", query_string={"q": character * 501})
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(response.get_json()["error"], "Search must be 500 characters or fewer.")
+
     def test_search_uses_only_local_availability_even_with_services_configured(self):
         self.add_album()
         save_service("plex", {"url": "http://unavailable", "token": "token", "librarySectionIds": [1]})

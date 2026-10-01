@@ -1,6 +1,8 @@
 import { createReadStream, existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
+import { spawn } from "node:child_process";
+import { createInterface } from "node:readline";
 import { extname, join, normalize } from "node:path";
 
 const root = process.cwd();
@@ -10,6 +12,26 @@ let signedInAs = "";
 let settingsReads = 0;
 let delayedProposalResponse;
 let delayedProposalAborted = false;
+let historyWorker;
+const historyResponses = [];
+
+function historyResponse(payload) {
+  if (!historyWorker) {
+    const localPython = join(root, "..", ".venv", process.platform === "win32" ? "Scripts/python.exe" : "bin/python");
+    const python = process.env.MELODARR_TEST_PYTHON || (existsSync(localPython) ? localPython : "python");
+    historyWorker = spawn(python, [join(root, "tests/request-history-api-fixture.py")], { windowsHide: true, stdio: ["pipe", "pipe", "inherit"] });
+    createInterface({ input: historyWorker.stdout }).on("line", line => historyResponses.shift()?.resolve(JSON.parse(line)));
+    const fail = () => { while (historyResponses.length) historyResponses.shift().reject(new Error("History fixture stopped")); };
+    historyWorker.on("error", fail);
+    historyWorker.on("exit", fail);
+  }
+  return new Promise((resolve, reject) => {
+    historyResponses.push({ resolve, reject });
+    historyWorker.stdin.write(`${JSON.stringify(payload)}\n`);
+  });
+}
+process.on("exit", () => historyWorker?.kill());
+process.on("SIGTERM", () => { historyWorker?.kill(); process.exit(0); });
 
 const users = {
   ada: { id: 1, username: "ada", role: "admin", csrfToken: "csrf-ada", plexUsername: "target-user" },
@@ -140,6 +162,14 @@ function staticPath(url) {
 const server = createServer(async (request, response) => {
   const url = new URL(request.url || "/", "http://127.0.0.1:4173");
   if (url.pathname === "/health") return send(response, 200, { ok: true });
+  if (url.pathname === "/__request-history" && request.method === "POST") {
+    let body = "";
+    request.on("data", chunk => { body += chunk; });
+    return request.on("end", async () => {
+      try { send(response, 200, await historyResponse(JSON.parse(body))); }
+      catch { send(response, 500, { error: "History fixture stopped" }); }
+    });
+  }
   if (url.pathname === "/__reset" && request.method === "POST") {
     signedInAs = "";
     settingsReads = 0;
