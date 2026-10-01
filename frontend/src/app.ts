@@ -224,6 +224,7 @@ let showAccountPage: ((
   username?: string,
   requestPage?: number,
   requestQuery?: string,
+  requestStatus?: string,
 ) => void) | undefined;
 let invitationToken = "";
 let setupPlexFlowToken = "";
@@ -1056,6 +1057,7 @@ function setupNavigation() {
   let activeAccountUsername = "";
   let activeAccountRequestPage = 1;
   let activeAccountRequestQuery = "";
+  let activeAccountRequestStatus = "all";
 
   function setActiveAccountRoute(page: AccountPage | null) {
     document.querySelectorAll<HTMLAnchorElement>("[data-account-route]").forEach((link) => {
@@ -1131,6 +1133,7 @@ function setupNavigation() {
       const query = new URLSearchParams();
       if (requestPage > 1) query.set("page", String(requestPage));
       if (activeAccountRequestQuery) query.set("q", activeAccountRequestQuery);
+      if (activeAccountRequestStatus !== "all") query.set("status", activeAccountRequestStatus);
       return `/${encodedUsername}/requests${query.size ? `?${query}` : ""}`;
     }
     return `/${encodedUsername}/settings/${page}`;
@@ -1400,12 +1403,28 @@ function setupNavigation() {
         clear.textContent = "Clear";
         clear.setAttribute("aria-label", "Clear request search");
         clear.hidden = !searchInput.value;
+        const statusLabel = document.createElement("label");
+        statusLabel.className = "request-history-status";
+        const statusName = document.createElement("span");
+        statusName.textContent = "Request status";
+        const statusSelect = document.createElement("select");
+        for (const [value, label] of [["all", "All"], ["requested", "Requested"], ["available", "Available"]]) {
+          const option = document.createElement("option");
+          option.value = value;
+          option.textContent = label;
+          statusSelect.append(option);
+        }
+        statusSelect.value = activeAccountRequestStatus;
+        statusLabel.append(statusName, statusSelect);
+        const searchField = document.createElement("div");
+        searchField.className = "request-history-search-field";
         const searchStatus = document.createElement("p");
         searchStatus.className = "request-search-status field-help";
         searchStatus.setAttribute("role", "status");
         const results = document.createElement("div");
         results.className = "request-history-results";
-        searchForm.append(searchInput, clear);
+        searchField.append(searchInput, clear);
+        searchForm.append(searchField, statusLabel);
         content.append(searchForm, searchStatus, results);
         let searchTimer: number | undefined;
         let searchGeneration = 0;
@@ -1415,8 +1434,12 @@ function setupNavigation() {
           searchAbort?.abort();
         });
 
-        const renderResults = (data: JsonObject, query: string) => {
+        const renderResults = (data: JsonObject, query: string, requestStatus: string) => {
           results.replaceChildren();
+          const filtered = Boolean(query) || requestStatus !== "all";
+          const emptyMessage = query ? "No matching requests."
+            : requestStatus === "requested" ? "No requested items found."
+            : requestStatus === "available" ? "No available items found." : "No requests yet.";
           const requestGroups: [string, JsonObject[], string][] = [
             ["Artists", data.requests?.artist || [], "artists"],
             ["Release groups", data.requests?.["release-group"] || [], "albums"],
@@ -1427,16 +1450,14 @@ function setupNavigation() {
             const summary = document.createElement("summary");
             const heading = document.createElement("h2");
             const count = data.matchCounts?.[route === "artists" ? "artist" : "release-group"] ?? requests.length;
-            section.open = query ? count > 0 : route === "albums";
-            heading.textContent = query ? `${title} (${count.toLocaleString()})` : title;
+            section.open = filtered ? count > 0 : route === "albums";
+            heading.textContent = filtered ? `${title} (${count.toLocaleString()})` : title;
             summary.append(heading);
             const list = document.createElement("div"); list.className = "results";
             if (!requests.length) {
               const empty = document.createElement("p");
               empty.className = "message";
-              empty.textContent = query
-                ? count > 0 ? "No matching requests on this page." : "No matching requests."
-                : "No requests yet.";
+              empty.textContent = filtered && count > 0 ? "No matching requests on this page." : emptyMessage;
               list.append(empty);
             }
             requests.forEach((item: JsonObject) => list.append(createHistoryItem(item, route, isOwnAccount)));
@@ -1461,8 +1482,8 @@ function setupNavigation() {
           status.textContent = pagination.total
             ? `Page ${pagination.page.toLocaleString()} of ${pagination.totalPages.toLocaleString()} · ${pagination.total.toLocaleString()} requests`
             : "No requests";
-          setMessage(searchStatus, query
-            ? pagination.total ? `${pagination.total.toLocaleString()} matching requests.` : "No matching requests."
+          setMessage(searchStatus, filtered
+            ? pagination.total ? `${pagination.total.toLocaleString()} matching requests.` : emptyMessage
             : "");
           const next = document.createElement("button");
           next.type = "button";
@@ -1470,7 +1491,7 @@ function setupNavigation() {
           next.textContent = "Next";
           next.disabled = pagination.totalPages === 0 || pagination.page >= pagination.totalPages;
           const showRequestPage = (nextPage: number) => {
-            showAccountPage?.("requests", true, targetUsername, nextPage, query);
+            showAccountPage?.("requests", true, targetUsername, nextPage, query, requestStatus);
           };
           previous.addEventListener("click", () => showRequestPage(pagination.page - 1));
           next.addEventListener("click", () => showRequestPage(pagination.page + 1));
@@ -1478,7 +1499,7 @@ function setupNavigation() {
           results.append(paginationControls);
         };
 
-        const loadResults = async (query: string, requestPage: number) => {
+        const loadResults = async (query: string, requestPage: number, requestStatus: string) => {
           searchAbort?.abort();
           const generation = ++searchGeneration;
           const fetchController = new AbortController();
@@ -1488,9 +1509,10 @@ function setupNavigation() {
           try {
             const params = new URLSearchParams({ username: targetUsername, page: String(requestPage) });
             if (query) params.set("q", query);
+            params.set("status", requestStatus);
             const data = await api(`/api/account/profile?${params}`, { signal: fetchController.signal });
             if (!isCurrentRender() || generation !== searchGeneration) return;
-            renderResults(data, query);
+            renderResults(data, query, requestStatus);
           } catch (error) {
             if (error.name !== "AbortError" && isCurrentRender() && generation === searchGeneration) {
               setMessage(searchStatus, error.message, true);
@@ -1503,11 +1525,12 @@ function setupNavigation() {
           window.clearTimeout(searchTimer);
           if (!isCurrentRender()) return;
           activeAccountRequestQuery = searchInput.value.trim();
+          activeAccountRequestStatus = statusSelect.value;
           activeAccountRequestPage = 1;
           window.history.replaceState(
             { account: "requests", username: targetUsername, page: 1 }, "", accountPath("requests", targetUsername, 1),
           );
-          void loadResults(activeAccountRequestQuery, 1);
+          void loadResults(activeAccountRequestQuery, 1, activeAccountRequestStatus);
         };
         searchInput.addEventListener("input", () => {
           clear.hidden = !searchInput.value;
@@ -1517,13 +1540,14 @@ function setupNavigation() {
           searchTimer = window.setTimeout(applySearch, 250);
         });
         searchForm.addEventListener("submit", event => { event.preventDefault(); applySearch(); });
+        statusSelect.addEventListener("change", applySearch);
         clear.addEventListener("click", () => {
           searchInput.value = "";
           clear.hidden = true;
           searchInput.focus();
           applySearch();
         });
-        await loadResults(activeAccountRequestQuery, targetRequestPage);
+        await loadResults(activeAccountRequestQuery, targetRequestPage, activeAccountRequestStatus);
       } else if (page === "general") {
         const accountSettings = await api(accountApiPath("/api/account/settings"), {
           signal: controller.signal,
@@ -1857,6 +1881,7 @@ function setupNavigation() {
     username = activeAccountUsername || currentUser?.username,
     requestPage = 1,
     requestQuery = "",
+    requestStatus = "all",
   ) => {
     if (!currentUser || !username) return;
     const isOwnAccount = isOwnAccountUsername(username);
@@ -1874,6 +1899,7 @@ function setupNavigation() {
     activeAccountUsername = username;
     activeAccountRequestPage = page === "requests" ? Math.max(1, requestPage) : 1;
     activeAccountRequestQuery = page === "requests" ? requestQuery : "";
+    activeAccountRequestStatus = page === "requests" ? requestStatus : "all";
     showView("account", false);
     if (updateHistory) {
       window.history.pushState(
@@ -1947,7 +1973,8 @@ function setupNavigation() {
         ? Math.max(1, Number.parseInt(new URLSearchParams(window.location.search).get("page") || "1", 10) || 1)
         : 1;
       const requestQuery = accountPage === "requests" ? new URLSearchParams(window.location.search).get("q") || "" : "";
-      showAccountPage?.(accountPage, false, accountUsername, requestPage, requestQuery);
+      const requestStatus = accountPage === "requests" ? new URLSearchParams(window.location.search).get("status") || "all" : "all";
+      showAccountPage?.(accountPage, false, accountUsername, requestPage, requestQuery, requestStatus);
       return;
     }
     const view = window.location.pathname.slice(1) || "discover";

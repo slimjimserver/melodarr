@@ -17,17 +17,19 @@ test.beforeEach(async ({ request }) => { await request.post("/__reset"); });
 
 async function fixture(page: Page, extra: HistoryItem[] = []) {
   const items = [{ ...artist }, { ...album }, ...extra].sort((a, b) => b.created_at - a.created_at);
-  const reads: { query: string; page: number; username: string }[] = [];
+  const reads: { query: string; page: number; username: string; status?: string }[] = [];
   const updates: unknown[] = [];
   await page.route("**/api/discover", route => route.fulfill({ json: { sections: [] } }));
   await page.route("**/api/account/profile?*", route => {
     const params = new URL(route.request().url()).searchParams;
     const query = params.get("q") || "";
     const currentPage = Number(params.get("page") || 1);
-    reads.push({ query, page: currentPage, username: params.get("username") || "" });
+    const status = params.get("status") || "all";
+    reads.push({ query, page: currentPage, username: params.get("username") || "", ...(status !== "all" ? { status } : {}) });
     const key = (value: string) => value.toLocaleLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
-    const matches = items.filter(item => !query || [item.name, item.artist_name, item.anime_name, item.anime_slug, item.song_title, item.theme_label, ...(item.aliases || [])]
-      .some(value => value && key(value).includes(key(query))));
+    const matches = items.filter(item => (!query || [item.name, item.artist_name, item.anime_name, item.anime_slug, item.song_title, item.theme_label, ...(item.aliases || [])]
+      .some(value => value && key(value).includes(key(query)))) &&
+      (status === "all" || (item.kind === "artist" ? item.availableInPlex === true : item.requestStatus === "available") === (status === "available")));
     const visible = matches.slice((currentPage - 1) * 100, currentPage * 100);
     return route.fulfill({ json: {
       requests: { artist: visible.filter(item => item.kind === "artist"), "release-group": visible.filter(item => item.kind === "release-group") },
@@ -201,4 +203,143 @@ test("search category counts include matches on later pages", async ({ page }) =
   await expect(releases.getByText("No matching requests on this page.")).toBeVisible();
   await page.getByRole("navigation", { name: "Request history pages" }).getByRole("button", { name: "Next", exact: true }).click();
   await expect(releases.getByRole("link", { name: "So Wrong, It's Right", exact: true })).toBeVisible();
+});
+
+for (const theme of ["midnight", "warm"]) {
+  for (const width of [1440, 320]) {
+    test(`status filter composes with search and preserves controls in ${theme} at ${width}px`, async ({ page }, testInfo) => {
+      await page.setViewportSize({ width, height: 1200 });
+      await page.addInitScript(theme => localStorage.setItem("melodarr-theme", theme), theme);
+      const { reads, updates } = await fixture(page, [
+        { ...artist, id: 3, mbid: "ready-artist", created_at: 3, availableInPlex: true, plexUrl: "https://app.plex.tv/artist" },
+        ...["requested", "queued", "downloading"].map((requestStatus, i) => ({
+          id: 4 + i, kind: "release-group", mbid: requestStatus, name: `${requestStatus} album`, artist_name: "All Time Low",
+          requestStatus, created_at: 4 + i, use_for_recommendations: true,
+        })),
+      ]);
+      const search = page.getByRole("searchbox", { name: "Search request history" });
+      const select = page.getByRole("combobox", { name: "Request status" });
+      const groups = page.locator(".request-history-section");
+      const message = page.locator(".request-search-status");
+      await expect(select).toHaveValue("all");
+      expect(await select.locator("option").allTextContents()).toEqual(["All", "Requested", "Available"]);
+      await expect(groups.first()).not.toHaveAttribute("open");
+      await expect(groups.last()).toHaveAttribute("open");
+      const searchBox = (await search.boundingBox())!;
+      const filterBox = (await select.boundingBox())!;
+      if (width === 1440) expect(Math.abs(searchBox.y - filterBox.y)).toBeLessThan(5);
+      else expect(filterBox.y).toBeGreaterThanOrEqual(searchBox.y + searchBox.height);
+
+      await select.focus();
+      await page.keyboard.press("ArrowDown");
+      await page.keyboard.press("Enter");
+      await expect(select).toHaveValue("requested");
+      await expect(message).toHaveText("4 matching requests.");
+      await expect(groups.first().getByRole("heading")).toHaveText("Artists (1)");
+      await expect(groups.last().getByRole("heading")).toHaveText("Release groups (3)");
+      await expect(groups.first()).toHaveAttribute("open");
+      await expect(groups.last()).toHaveAttribute("open");
+      for (const lifecycle of ["Requested", "Queued", "Downloading"]) {
+        await expect(groups.last().locator(".request-lifecycle").filter({ hasText: lifecycle })).toHaveCount(1);
+      }
+      await expect(page).toHaveURL(/status=requested/);
+      await groups.first().locator("summary").click();
+      await expect(groups.first()).not.toHaveAttribute("open");
+      await expect(groups.last()).toHaveAttribute("open");
+      await groups.first().locator("summary").click();
+      await groups.first().getByLabel("Use for recommendations", { exact: true }).uncheck();
+      expect(updates).toEqual([{ requestId: 1, useForRecommendations: false }]);
+
+      await search.fill("All Time Low");
+      await search.press("Enter");
+      await expect(message).toHaveText("4 matching requests.");
+      await select.selectOption("available");
+      await expect(message).toHaveText("2 matching requests.");
+      expect(reads.at(-1)).toEqual({ query: "All Time Low", page: 1, username: "ada", status: "available" });
+      await expect(groups.last().locator(".history-title")).toHaveAttribute("href", "/albums/fixture-album");
+      await expect(groups.last().locator("time")).toHaveAttribute("datetime", "1970-01-01T00:00:02.000Z");
+      await expect(groups.last().locator(".history-plex")).toHaveAttribute("href", "https://app.plex.tv/album");
+      await groups.last().getByLabel("Use for recommendations", { exact: true }).uncheck();
+      expect(updates.at(-1)).toEqual({ requestId: 2, useForRecommendations: false });
+      await search.fill("again");
+      await search.press("Enter");
+      await expect(message).toHaveText("1 matching requests.");
+      await expect(select).toHaveValue("available");
+      await expect(groups.first()).not.toHaveAttribute("open");
+      await expect(groups.last()).toHaveAttribute("open");
+      await page.getByRole("button", { name: "Clear request search" }).click();
+      await expect(message).toHaveText("2 matching requests.");
+      await expect(select).toHaveValue("available");
+      await expect(page).toHaveURL(/\/ada\/requests\?status=available$/);
+      const dimensions = await page.evaluate(() => ({ width: document.documentElement.clientWidth, scroll: document.documentElement.scrollWidth }));
+      expect(dimensions.scroll).toBeLessThanOrEqual(dimensions.width);
+      await page.screenshot({ path: testInfo.outputPath("history-status.png") });
+      await page.reload();
+      await expect(page.getByRole("combobox", { name: "Request status" })).toHaveValue("available");
+      await expect(message).toHaveText("2 matching requests.");
+      await page.getByRole("combobox", { name: "Request status" }).selectOption("all");
+      await expect(message).toBeEmpty();
+      await expect(groups.first()).not.toHaveAttribute("open");
+      await expect(groups.last()).toHaveAttribute("open");
+      await expect(page).toHaveURL(/\/ada\/requests$/);
+    });
+  }
+}
+
+test("status pagination preserves query and restores both from back navigation", async ({ page }) => {
+  const { reads } = await fixture(page, Array.from({ length: 205 }, (_, i) => ({
+    id: 100 + i, mbid: `bulk-${i}`, kind: "artist", name: "Bulk match", created_at: 100 + i, use_for_recommendations: true,
+  })));
+  const search = page.getByRole("searchbox", { name: "Search request history" });
+  const select = page.getByRole("combobox", { name: "Request status" });
+  const pagination = page.getByRole("navigation", { name: "Request history pages" });
+  await select.selectOption("requested");
+  await search.fill("bulk");
+  await search.press("Enter");
+  await expect(pagination).toContainText("Page 1 of 3 · 205 requests");
+  await pagination.getByRole("button", { name: "Next", exact: true }).click();
+  await expect(pagination).toContainText("Page 2 of 3 · 205 requests");
+  await expect(select).toHaveValue("requested");
+  await expect(search).toHaveValue("bulk");
+  expect(reads.at(-1)).toEqual({ query: "bulk", page: 2, username: "ada", status: "requested" });
+  await select.selectOption("available");
+  await expect(page.locator(".request-search-status")).toHaveText("No matching requests.");
+  expect(reads.at(-1)?.page).toBe(1);
+  await expect(search).toHaveValue("bulk");
+  await expect(page).not.toHaveURL(/page=2/);
+  await page.goBack();
+  await expect(select).toHaveValue("requested");
+  await expect(search).toHaveValue("bulk");
+  await expect(pagination).toContainText("Page 1 of 3 · 205 requests");
+  await page.getByRole("button", { name: "Clear request search" }).click();
+  await expect(select).toHaveValue("requested");
+  await expect(pagination).toContainText("Page 1 of 3 · 206 requests");
+  await select.selectOption("available");
+  await expect(page.getByRole("link", { name: "So Wrong, It's Right", exact: true })).toBeVisible();
+  await expect(pagination).toContainText("Page 1 of 1 · 1 requests");
+});
+
+test("status-only empty results identify the selected filter and cancel pending search debounce", async ({ page }) => {
+  await fixture(page);
+  const select = page.getByRole("combobox", { name: "Request status" });
+  const search = page.getByRole("searchbox", { name: "Search request history" });
+  const message = page.locator(".request-search-status");
+  await page.clock.install({ time: new Date("2026-09-30T12:00:00Z") });
+  await page.clock.pauseAt(new Date("2026-09-30T12:01:00Z"));
+  await search.fill("nothing");
+  await select.selectOption("available");
+  await expect(message).toHaveText("No matching requests.");
+  await page.clock.fastForward(500);
+  await expect(select).toHaveValue("available");
+  await expect(message).toHaveText("No matching requests.");
+  // Empty histories return the same API shape as real filtered histories.
+  await page.route("**/api/account/profile?*", route => route.fulfill({ json: {
+    requests: { artist: [], "release-group": [] }, matchCounts: { artist: 0, "release-group": 0 },
+    pagination: { page: 1, pageSize: 100, total: 0, totalPages: 0 },
+  } }));
+  await page.getByRole("button", { name: "Clear request search" }).click();
+  await expect(message).toHaveText("No available items found.");
+  await expect(page.locator(".request-history-section[open]")).toHaveCount(0);
+  await select.selectOption("requested");
+  await expect(message).toHaveText("No requested items found.");
 });
