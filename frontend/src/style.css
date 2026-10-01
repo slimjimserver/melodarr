@@ -1290,6 +1290,11 @@ button,
 
 @media (max-width: 360px) {
   header { gap: 8px; padding-right: 8px; padding-left: 8px; }
+  /* System font metrics vary by platform. Let the wordmark yield space while
+     keeping the logo and all three header controls at their existing sizes. */
+  .brand { flex-shrink: 1; gap: 6px; }
+  .brand img { flex: none; }
+  .brand > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 }
 
 @media (max-width: 319px) {

@@ -666,6 +666,31 @@ test("Japanese composition waits for committed input and preserves focus", async
 });
 
 for (const theme of ["midnight", "warm"]) {
+  test(`mobile header accommodates wider wordmark metrics in ${theme}`, async ({ page }) => {
+    await page.setViewportSize({ width: 280, height: 900 });
+    await page.addInitScript(theme => localStorage.setItem("melodarr-theme", theme), theme);
+    await fixture(page);
+    // Exercise wider system-font metrics on every OS, including Windows where
+    // the default wordmark is narrower than Chromium's Linux fallback font.
+    await page.addStyleTag({ content: ".brand > span { letter-spacing: .12em; }" });
+    await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(280);
+    const brand = await page.locator("header .brand").boundingBox();
+    let previousRight = brand!.x + brand!.width;
+    for (const selector of ["#theme-toggle", "#account-menu", "#logout"]) {
+      const control = page.locator(selector);
+      const bounds = await control.boundingBox();
+      expect(bounds!.width).toBeGreaterThanOrEqual(44);
+      expect(bounds!.height).toBeGreaterThanOrEqual(44);
+      expect(bounds!.x).toBeGreaterThanOrEqual(previousRight);
+      expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(272);
+      await control.focus();
+      await expect(control).toBeFocused();
+      previousRight = bounds!.x + bounds!.width;
+    }
+    await expect(page.getByRole("link", { name: "Melodarr home" })).toBeVisible();
+    expect((await page.locator("header .brand img").boundingBox())!.width).toBe(36);
+  });
+
   test(`header and Requests controls fit at 280px in ${theme} with a bottom safe area`, async ({ page }) => {
     await page.setViewportSize({ width: 280, height: 900 });
     await page.addInitScript(theme => localStorage.setItem("melodarr-theme", theme), theme);
