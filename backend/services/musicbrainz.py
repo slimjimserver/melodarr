@@ -346,6 +346,7 @@ def search(
         "artist": "artist",
         "album": "release-group",
         "release-group": "release-group",
+        "release": "release",
         "track": "recording",
         "recording": "recording",
     }
@@ -366,6 +367,23 @@ def search(
         ttl=MUSICBRAINZ_SEARCH_CACHE_TTL,
         include_cache_status=include_cache_status,
         priority=priority,
+        request_interval_seconds=config["requestIntervalMs"] / 1000,
+    )
+
+
+def lookup_urls(resources, *, priority="background", include_cache_status=False):
+    """Look up up to 40 exact URL resources in one paced, cached request."""
+    resources = list(resources)
+    if not 1 <= len(resources) <= 40:
+        raise ValueError("URL lookup requires between 1 and 40 resources")
+    config = configuration()
+    params = [("resource", resource) for resource in resources]
+    params.extend((("inc", "release-rels+release-group-rels"), ("fmt", "json")))
+    return _cached_get(
+        f"{config['baseUrl']}/url", params=params,
+        headers={"User-Agent": config["userAgent"]},
+        namespace="musicbrainz-url", ttl=MUSICBRAINZ_SEARCH_CACHE_TTL,
+        include_cache_status=include_cache_status, priority=priority,
         request_interval_seconds=config["requestIntervalMs"] / 1000,
     )
 

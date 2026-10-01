@@ -222,7 +222,9 @@ let showAccountPage: ((
   page?: AccountPage,
   updateHistory?: boolean,
   username?: string,
-  requestPage?: number,
+  requestPage?: number | string,
+  requestQuery?: string,
+  requestStatus?: string,
 ) => void) | undefined;
 let invitationToken = "";
 let setupPlexFlowToken = "";
@@ -466,6 +468,7 @@ function applyApplicationIdentity(title?: string) {
 }
 
 async function api<T = JsonObject>(url: string, options: RequestInit = {}): Promise<T> {
+  const requestUser = currentUser;
   const requestOptions = { ...options };
   const method = (requestOptions.method || "GET").toUpperCase();
   const headers = new Headers(requestOptions.headers || {});
@@ -474,7 +477,7 @@ async function api<T = JsonObject>(url: string, options: RequestInit = {}): Prom
   }
   requestOptions.headers = headers;
   const response = await fetch(url, requestOptions);
-  handleAuthenticationFailure(response);
+  if (requestUser === currentUser) handleAuthenticationFailure(response);
   const responseText = await response.text();
   let body: T & { error?: string };
   try {
@@ -1053,14 +1056,20 @@ function createAnimeHistoryLinks(item: JsonObject) {
 
 function setupNavigation() {
   let activeAccountUsername = "";
-  let activeAccountRequestPage = 1;
+  let activeAccountRequestPage: number | string = 1;
+  let activeAccountRequestQuery = "";
+  let activeAccountRequestStatus = "all";
+  const tasteMutations = new Map<string, {
+    owner: CurrentUser; included: boolean; previous: boolean; pending: boolean; message: string;
+  }>();
+  window.addEventListener("melodarr-signed-out", () => tasteMutations.clear());
 
   function setActiveAccountRoute(page: AccountPage | null) {
     document.querySelectorAll<HTMLAnchorElement>("[data-account-route]").forEach((link) => {
       const route = link.dataset.accountRoute as AccountPage;
       const username = activeAccountUsername || currentUser?.username;
       if (username) {
-        link.href = accountPath(route, username, route === "requests" ? activeAccountRequestPage : 1);
+        link.href = accountPath(route, username, 1, false);
       }
       const isCurrent = page !== null && link.dataset.accountRoute === page;
       link.classList.toggle("active", isCurrent);
@@ -1080,7 +1089,15 @@ function setupNavigation() {
       .some((candidate) => candidate!.toLocaleLowerCase() === normalizedUsername);
   }
 
-  function showView(view: AppView, updateHistory = true) {
+  function updatePrimaryRequestsLinks() {
+    if (!currentUser) return;
+    const username = currentUser.username;
+    document.querySelectorAll<HTMLAnchorElement>('[data-primary-account="requests"]').forEach((link) => {
+      link.href = accountPath("requests", username, 1, false);
+    });
+  }
+
+  function showView(view: AppView, updateHistory = true, accountPage: AccountPage | null = null) {
     if (!currentUser || (currentUser.role !== "admin" && !VIEWS_FOR_EVERY_USER.includes(view))) view = "discover";
     if (view !== "account") {
       accountRenderGeneration += 1;
@@ -1088,10 +1105,13 @@ function setupNavigation() {
       accountRenderAbort = undefined;
     }
     document.querySelectorAll(".nav-link, .view").forEach((element) => element.classList.remove("active"));
-    // Account and detail are application views without a matching navigation link,
-    // and the header and bottom tab bar both carry a link per view.
+    updatePrimaryRequestsLinks();
+    // Both primary navigation bars share active state, with Requests mapped
+    // to its existing account page rather than a separate application view.
     document.querySelectorAll<HTMLElement>("[data-view]").forEach((button) => {
-      const isCurrent = button.dataset.view === view;
+      const isCurrent = button.dataset.primaryAccount === "requests"
+        ? view === "account" && accountPage === "requests"
+        : button.dataset.view === view;
       button.classList.toggle("active", isCurrent);
       if (isCurrent) button.setAttribute("aria-current", "page");
       else button.removeAttribute("aria-current");
@@ -1121,13 +1141,17 @@ function setupNavigation() {
     page: AccountPage,
     username = activeAccountUsername || currentUser?.username || "",
     requestPage = activeAccountRequestPage,
+    includeRequestFilters = true,
   ) {
     if (!currentUser) throw new Error("Account navigation requires an authenticated user.");
     const encodedUsername = encodeURIComponent(username);
     if (page === "profile") return `/${encodedUsername}`;
     if (page === "requests") {
-      const query = requestPage > 1 ? `?page=${requestPage}` : "";
-      return `/${encodedUsername}/requests${query}`;
+      const query = new URLSearchParams();
+      if (Number(requestPage) > 1) query.set("page", String(requestPage));
+      if (includeRequestFilters && activeAccountRequestQuery) query.set("q", activeAccountRequestQuery);
+      if (includeRequestFilters && activeAccountRequestStatus !== "all") query.set("status", activeAccountRequestStatus);
+      return `/${encodedUsername}/requests${query.size ? `?${query}` : ""}`;
     }
     return `/${encodedUsername}/settings/${page}`;
   }
@@ -1176,6 +1200,14 @@ function setupNavigation() {
     main.append(detailLink);
     appendRequestLifecycle(copy, item);
     if (editableTaste && item.id !== undefined) {
+      const owner = currentUser!;
+      const requestId = String(item.id);
+      const remembered = tasteMutations.get(requestId);
+      if (remembered && (remembered.owner !== owner || (!remembered.pending && remembered.included === (item.use_for_recommendations !== 0 && item.use_for_recommendations !== false)))) {
+        // Once a fresh read acknowledges a save, use server state again.
+        tasteMutations.delete(requestId);
+      }
+      row.dataset.tasteRequestId = requestId;
       const label = document.createElement("label");
       label.className = "request-taste-toggle";
       const toggle = document.createElement("input");
@@ -1190,27 +1222,48 @@ function setupNavigation() {
       controls.className = "request-taste-controls";
       controls.append(label, status);
       row.append(controls);
+      const sync = () => {
+        const mutation = tasteMutations.get(requestId);
+        if (mutation?.owner !== owner) return;
+        toggle.checked = mutation.included;
+        // Keep keyboard focus during saving; the change guard below prevents
+        // further mutations while aria-disabled communicates the pending state.
+        if (mutation.pending) toggle.setAttribute("aria-disabled", "true");
+        else toggle.removeAttribute("aria-disabled");
+        status.textContent = mutation.message;
+      };
+      // A pending save belongs to the request, not to a particular card node.
+      row.addEventListener("request-taste-updated", sync);
+      sync();
       toggle.addEventListener("change", async () => {
         const included = toggle.checked;
-        const generation = accountRenderGeneration;
-        const ownerId = currentUser?.id;
-        toggle.disabled = true;
+        const existing = tasteMutations.get(requestId);
+        if (existing?.owner === owner && existing.pending) {
+          toggle.checked = existing.included;
+          return;
+        }
+        const mutation = { owner, included, previous: !included, pending: true, message: "Saving…" };
+        tasteMutations.set(requestId, mutation);
+        const updateVisibleCards = () => {
+          if (currentUser !== owner || tasteMutations.get(requestId) !== mutation) return;
+          document.querySelectorAll<HTMLElement>("#account-content [data-taste-request-id]").forEach(card => {
+            if (card.dataset.tasteRequestId === requestId) card.dispatchEvent(new Event("request-taste-updated"));
+          });
+        };
+        updateVisibleCards();
         try {
           await api("/api/discover/request-influence", {
             method: "POST", headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ requestId: item.id, useForRecommendations: included }),
-            signal: accountRenderAbort?.signal,
           });
-          if (generation !== accountRenderGeneration || ownerId !== currentUser?.id) return;
-          item.use_for_recommendations = included;
-          status.textContent = included ? "This request shapes your picks." : "Excluded from your taste profile. Your request is unchanged.";
-          window.dispatchEvent(new Event("melodarr-recommendations-changed"));
+          mutation.message = included ? "This request shapes your picks." : "Excluded from your taste profile. Your request is unchanged.";
+          if (currentUser === owner) window.dispatchEvent(new Event("melodarr-recommendations-changed"));
         } catch (error) {
-          if (generation !== accountRenderGeneration || ownerId !== currentUser?.id) return;
-          toggle.checked = !included;
-          status.textContent = `Couldn’t save this preference. ${error.message}`;
+          mutation.included = mutation.previous;
+          mutation.message = "Couldn’t save this preference. Please try again.";
         } finally {
-          toggle.disabled = false;
+          mutation.pending = false;
+          updateVisibleCards();
         }
       });
     }
@@ -1240,6 +1293,10 @@ function setupNavigation() {
       plexBadge.append(icon);
       main.append(plexBadge);
     }
+    row.querySelectorAll<HTMLElement>('a, input[type="checkbox"]').forEach(control => {
+      const identity = control instanceof HTMLAnchorElement ? `link:${control.getAttribute("href")}` : "recommendations";
+      control.dataset.requestFocusKey = JSON.stringify([route, item.id ?? item.mbid, identity]);
+    });
     return row;
   }
 
@@ -1373,11 +1430,6 @@ function setupNavigation() {
           content.append(roleForm);
         }
       } else if (page === "requests") {
-        const data = await api(
-          `/api/account/profile?username=${encodeURIComponent(targetUsername)}&page=${encodeURIComponent(targetRequestPage)}`,
-          { signal: controller.signal },
-        );
-        if (!isCurrentRender()) return;
         content.replaceChildren();
         if (isOwnAccount) {
           const tasteHelp = document.createElement("p");
@@ -1386,50 +1438,211 @@ function setupNavigation() {
           tasteHelp.textContent = "Requested something for someone else? Turn off Use for recommendations to keep it out of your taste profile.";
           content.append(tasteHelp);
         }
-        const requestGroups: [string, JsonObject[], string][] = [
-          ["Artists", data.requests?.artist || [], "artists"],
-          ["Release groups", data.requests?.["release-group"] || [], "albums"],
-        ];
-        requestGroups.forEach(([title, requests, route]) => {
-          const section = document.createElement("section");
-          section.className = "account-section";
-          const heading = document.createElement("h2"); heading.textContent = title;
-          const list = document.createElement("div"); list.className = "results";
-          if (!requests.length) { const empty = document.createElement("p"); empty.className = "message"; empty.textContent = "No requests yet."; list.append(empty); }
-          requests.forEach((item: JsonObject) => list.append(createHistoryItem(item, route, isOwnAccount)));
-          section.append(heading, list); content.append(section);
+        const searchForm = document.createElement("form");
+        searchForm.className = "request-history-search";
+        const searchInput = document.createElement("input");
+        searchInput.type = "search";
+        searchInput.placeholder = "Search artists, albums, or anime";
+        searchInput.setAttribute("aria-label", "Search request history");
+        searchInput.autocomplete = "off";
+        searchInput.maxLength = 500;
+        searchInput.value = activeAccountRequestQuery;
+        const clear = document.createElement("button");
+        clear.type = "button";
+        clear.className = "outline";
+        clear.textContent = "Clear";
+        clear.setAttribute("aria-label", "Clear request search");
+        clear.hidden = !searchInput.value;
+        const statusLabel = document.createElement("label");
+        statusLabel.className = "request-history-status";
+        const statusName = document.createElement("span");
+        statusName.textContent = "Request status";
+        const statusSelect = document.createElement("select");
+        for (const [value, label] of [["all", "All"], ["requested", "Requested"], ["available", "Available"]]) {
+          const option = document.createElement("option");
+          option.value = value;
+          option.textContent = label;
+          statusSelect.append(option);
+        }
+        statusSelect.value = activeAccountRequestStatus;
+        statusLabel.append(statusName, statusSelect);
+        const searchField = document.createElement("div");
+        searchField.className = "request-history-search-field";
+        const searchStatus = document.createElement("p");
+        searchStatus.className = "request-search-status field-help";
+        searchStatus.setAttribute("role", "status");
+        const results = document.createElement("div");
+        results.className = "request-history-results";
+        searchField.append(searchInput, clear);
+        searchForm.append(searchField, statusLabel);
+        content.append(searchForm, searchStatus, results);
+        let searchTimer: number | undefined;
+        let searchGeneration = 0;
+        let searchAbort: AbortController | undefined;
+        let composing = false;
+        const focusedResultKey = () => {
+          const focused = document.activeElement;
+          return focused instanceof HTMLElement && results.contains(focused)
+            ? focused.dataset.requestFocusKey || "" : null;
+        };
+        const restoreResultFocus = (key: string | null, fallback: HTMLElement) => {
+          if (key === null) return;
+          const replacement = Array.from(results.querySelectorAll<HTMLElement>("[data-request-focus-key]"))
+            .find(control => key && control.dataset.requestFocusKey === key);
+          if (replacement && !replacement.matches(":disabled")) {
+            const section = replacement.closest("details");
+            if (section && !replacement.matches("summary")) section.open = true;
+            replacement.focus();
+          } else fallback.focus();
+        };
+        const disablePagination = () => {
+          results.querySelectorAll<HTMLButtonElement>(".request-pagination button").forEach(button => { button.disabled = true; });
+        };
+        controller.signal.addEventListener("abort", () => {
+          window.clearTimeout(searchTimer);
+          searchAbort?.abort();
         });
 
-        const pagination = data.pagination || {
-          page: activeAccountRequestPage,
-          pageSize: 100,
-          total: requestGroups.reduce((total, [, requests]) => total + requests.length, 0),
-          totalPages: 1,
+        const renderResults = (data: JsonObject, query: string, requestStatus: string, focusFallback: HTMLElement) => {
+          // Read focus at replacement time, rather than when loading began:
+          // users can continue navigating while a response is pending.
+          const focusKey = focusedResultKey();
+          results.replaceChildren();
+          const filtered = Boolean(query) || requestStatus !== "all";
+          const emptyMessage = query ? "No matching requests."
+            : requestStatus === "requested" ? "No requested items found."
+            : requestStatus === "available" ? "No available items found." : "No requests yet.";
+          const requestGroups: [string, JsonObject[], string][] = [
+            ["Artists", data.requests?.artist || [], "artists"],
+            ["Release groups", data.requests?.["release-group"] || [], "albums"],
+          ];
+          requestGroups.forEach(([title, requests, route]) => {
+            const section = document.createElement("details");
+            section.className = "account-section request-history-section";
+            const summary = document.createElement("summary");
+            summary.dataset.requestFocusKey = `section:${route}`;
+            const heading = document.createElement("h2");
+            const count = data.matchCounts?.[route === "artists" ? "artist" : "release-group"] ?? requests.length;
+            section.open = filtered ? count > 0 : route === "albums";
+            heading.textContent = filtered ? `${title} (${count.toLocaleString()})` : title;
+            summary.append(heading);
+            const list = document.createElement("div"); list.className = "results";
+            if (!requests.length) {
+              const empty = document.createElement("p");
+              empty.className = "message";
+              empty.textContent = filtered && count > 0 ? "No matching requests on this page." : emptyMessage;
+              list.append(empty);
+            }
+            requests.forEach((item: JsonObject) => list.append(createHistoryItem(item, route, isOwnAccount)));
+            section.append(summary, list); results.append(section);
+          });
+
+          const pagination = data.pagination || {
+            page: activeAccountRequestPage,
+            pageSize: 100,
+            total: requestGroups.reduce((total, [, requests]) => total + requests.length, 0),
+            totalPages: 1,
+          };
+          const paginationControls = document.createElement("nav");
+          paginationControls.className = "request-pagination";
+          paginationControls.setAttribute("aria-label", "Request history pages");
+          const previous = document.createElement("button");
+          previous.type = "button";
+          previous.className = "outline";
+          previous.textContent = "Previous";
+          previous.disabled = pagination.page <= 1;
+          const status = document.createElement("span");
+          status.textContent = pagination.total
+            ? `Page ${pagination.page.toLocaleString()} of ${pagination.totalPages.toLocaleString()} · ${pagination.total.toLocaleString()} requests`
+            : "No requests";
+          setMessage(searchStatus, filtered
+            ? pagination.total ? `${pagination.total.toLocaleString()} matching requests.` : emptyMessage
+            : "");
+          const next = document.createElement("button");
+          next.type = "button";
+          next.className = "outline";
+          next.textContent = "Next";
+          next.disabled = pagination.totalPages === 0 || pagination.page >= pagination.totalPages;
+          const showRequestPage = (nextPage: number) => {
+            showAccountPage?.("requests", true, targetUsername, nextPage, query, requestStatus);
+          };
+          previous.addEventListener("click", () => showRequestPage(pagination.page - 1));
+          next.addEventListener("click", () => showRequestPage(pagination.page + 1));
+          paginationControls.append(previous, status, next);
+          results.append(paginationControls);
+          restoreResultFocus(focusKey, focusFallback);
         };
-        const paginationControls = document.createElement("nav");
-        paginationControls.className = "request-pagination";
-        paginationControls.setAttribute("aria-label", "Request history pages");
-        const previous = document.createElement("button");
-        previous.type = "button";
-        previous.className = "outline";
-        previous.textContent = "Previous";
-        previous.disabled = pagination.page <= 1;
-        const status = document.createElement("span");
-        status.textContent = pagination.total
-          ? `Page ${pagination.page.toLocaleString()} of ${pagination.totalPages.toLocaleString()} · ${pagination.total.toLocaleString()} requests`
-          : "No requests";
-        const next = document.createElement("button");
-        next.type = "button";
-        next.className = "outline";
-        next.textContent = "Next";
-        next.disabled = pagination.totalPages === 0 || pagination.page >= pagination.totalPages;
-        const showRequestPage = (nextPage: number) => {
-          showAccountPage?.("requests", true, targetUsername, nextPage);
+
+        const loadResults = async (query: string, requestPage: number | string, requestStatus: string, focusFallback: HTMLElement = searchInput) => {
+          searchAbort?.abort();
+          const generation = ++searchGeneration;
+          const fetchController = new AbortController();
+          searchAbort = fetchController;
+          disablePagination();
+          results.setAttribute("aria-busy", "true");
+          setMessage(searchStatus, query ? "Searching…" : "Loading…");
+          try {
+            const rawPage = String(requestPage);
+            if (rawPage !== rawPage.trim() || !/^[1-9][0-9]*$/.test(rawPage) || rawPage.length > 17 || BigInt(rawPage) > ((2n ** 63n - 1n) / 100n) + 1n) {
+              throw new Error("Page must be a positive integer.");
+            }
+            const params = new URLSearchParams({ username: targetUsername, page: String(requestPage) });
+            if (query) params.set("q", query);
+            params.set("status", requestStatus);
+            let data = await api(`/api/account/profile?${params}`, { signal: fetchController.signal });
+            if (!isCurrentRender() || generation !== searchGeneration) return;
+            if (Number(requestPage) > Math.max(1, data.pagination?.totalPages ?? 1)) {
+              activeAccountRequestPage = 1;
+              window.history.replaceState({ account: "requests", username: targetUsername, page: 1 }, "", accountPath("requests", targetUsername, 1));
+              params.set("page", "1");
+              data = await api(`/api/account/profile?${params}`, { signal: fetchController.signal });
+            }
+            if (!isCurrentRender() || generation !== searchGeneration) return;
+            renderResults(data, query, requestStatus, focusFallback);
+          } catch (error) {
+            if (error.name !== "AbortError" && isCurrentRender() && generation === searchGeneration) {
+              const focusKey = focusedResultKey();
+              results.replaceChildren();
+              const validation = ["Page must be a positive integer.", "Search must be 500 characters or fewer.", "Status must be all, requested, or available."];
+              setMessage(searchStatus, validation.includes(error.message) ? error.message : "Requests could not be loaded. Please try again.", true);
+              restoreResultFocus(focusKey, focusFallback);
+            }
+          } finally {
+            if (generation === searchGeneration) results.removeAttribute("aria-busy");
+          }
         };
-        previous.addEventListener("click", () => showRequestPage(pagination.page - 1));
-        next.addEventListener("click", () => showRequestPage(pagination.page + 1));
-        paginationControls.append(previous, status, next);
-        content.append(paginationControls);
+        const applySearch = (focusFallback: HTMLElement = searchInput) => {
+          window.clearTimeout(searchTimer);
+          if (!isCurrentRender() || composing) return;
+          activeAccountRequestQuery = searchInput.value.trim();
+          activeAccountRequestStatus = statusSelect.value;
+          activeAccountRequestPage = 1;
+          window.history.replaceState(
+            { account: "requests", username: targetUsername, page: 1 }, "", accountPath("requests", targetUsername, 1),
+          );
+          void loadResults(activeAccountRequestQuery, 1, activeAccountRequestStatus, focusFallback);
+        };
+        const scheduleSearch = () => {
+          clear.hidden = !searchInput.value;
+          window.clearTimeout(searchTimer);
+          searchAbort?.abort();
+          searchGeneration += 1;
+          disablePagination();
+          if (!composing) searchTimer = window.setTimeout(applySearch, 250);
+        };
+        searchInput.addEventListener("compositionstart", () => { composing = true; scheduleSearch(); });
+        searchInput.addEventListener("compositionend", () => { composing = false; scheduleSearch(); });
+        searchInput.addEventListener("input", scheduleSearch);
+        searchForm.addEventListener("submit", event => { event.preventDefault(); applySearch(); });
+        statusSelect.addEventListener("change", () => applySearch(statusSelect));
+        clear.addEventListener("click", () => {
+          composing = false;
+          searchInput.value = "";
+          clear.hidden = true;
+          searchInput.focus();
+          applySearch();
+        });
+        await loadResults(activeAccountRequestQuery, targetRequestPage, activeAccountRequestStatus);
       } else if (page === "general") {
         const accountSettings = await api(accountApiPath("/api/account/settings"), {
           signal: controller.signal,
@@ -1456,6 +1669,7 @@ function setupNavigation() {
               const accountMenu = $<HTMLAnchorElement>("#account-menu");
               accountMenu.textContent = result.username.slice(0, 1).toUpperCase();
               accountMenu.href = accountPath("profile");
+              updatePrimaryRequestsLinks();
             }
             formMessage.textContent = result.message;
             if (formStillActive) {
@@ -1753,7 +1967,7 @@ function setupNavigation() {
         setMessage(message, error.message, true);
       }
     } finally {
-      if (accountRenderAbort === controller) accountRenderAbort = undefined;
+      if (accountRenderAbort === controller && page !== "requests") accountRenderAbort = undefined;
     }
   }
 
@@ -1762,6 +1976,8 @@ function setupNavigation() {
     updateHistory = true,
     username = activeAccountUsername || currentUser?.username,
     requestPage = 1,
+    requestQuery = "",
+    requestStatus = "all",
   ) => {
     if (!currentUser || !username) return;
     const isOwnAccount = isOwnAccountUsername(username);
@@ -1777,14 +1993,21 @@ function setupNavigation() {
     if (currentUser.role === "admin") allowedPages.push("invitations");
     page = allowedPages.includes(page) ? page : "profile";
     activeAccountUsername = username;
-    activeAccountRequestPage = page === "requests" ? Math.max(1, requestPage) : 1;
-    showView("account", false);
+    activeAccountRequestPage = page === "requests" ? requestPage : 1;
+    activeAccountRequestQuery = page === "requests" ? requestQuery.trim() : "";
+    activeAccountRequestStatus = page === "requests" ? requestStatus : "all";
+    showView("account", false, page);
     if (updateHistory) {
       window.history.pushState(
         { account: page, username, page: activeAccountRequestPage },
         "",
         accountPath(page, username, activeAccountRequestPage),
       );
+    } else if (page === "requests" && requestQuery !== activeAccountRequestQuery) {
+      const url = new URL(window.location.href);
+      if (activeAccountRequestQuery) url.searchParams.set("q", activeAccountRequestQuery);
+      else url.searchParams.delete("q");
+      window.history.replaceState(window.history.state, "", url);
     }
     renderAccount(page);
   };
@@ -1793,6 +2016,10 @@ function setupNavigation() {
     link.addEventListener("click", (event) => {
       if (!isPlainPrimaryClick(event)) return;
       event.preventDefault();
+      if (link.dataset.primaryAccount === "requests") {
+        showAccountPage?.("requests", true, currentUser?.username);
+        return;
+      }
       showView(link.dataset.view as AppView);
       if (link.dataset.view === "discover") {
         window.dispatchEvent(new Event("melodarr-home"));
@@ -1848,9 +2075,11 @@ function setupNavigation() {
     if (accountMatch && canViewAccount) {
       const accountPage = (accountMatch[2] || accountMatch[3] || "profile") as AccountPage;
       const requestPage = accountPage === "requests"
-        ? Math.max(1, Number.parseInt(new URLSearchParams(window.location.search).get("page") || "1", 10) || 1)
+        ? new URLSearchParams(window.location.search).get("page") ?? "1"
         : 1;
-      showAccountPage?.(accountPage, false, accountUsername, requestPage);
+      const requestQuery = accountPage === "requests" ? new URLSearchParams(window.location.search).get("q") || "" : "";
+      const requestStatus = accountPage === "requests" ? new URLSearchParams(window.location.search).get("status") || "all" : "all";
+      showAccountPage?.(accountPage, false, accountUsername, requestPage, requestQuery, requestStatus);
       return;
     }
     const view = window.location.pathname.slice(1) || "discover";

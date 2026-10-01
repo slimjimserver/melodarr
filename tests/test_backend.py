@@ -2346,13 +2346,14 @@ class DeploymentConfigTests(unittest.TestCase):
             '<a data-account-route="requests" href="#">Requests</a>',
             frontend,
         )
-        self.assertIn('return `/${encodedUsername}/requests${query}`', typescript)
+        self.assertIn('return `/${encodedUsername}/requests${query.size ? `?${query}` : ""}`', typescript)
         self.assertIn('className = "request-pagination"', typescript)
         self.assertIn(
-            '/api/account/profile?username=${encodeURIComponent(targetUsername)}'
-            '&page=${encodeURIComponent(targetRequestPage)}',
+            'new URLSearchParams({ username: targetUsername, page: String(requestPage) })',
             typescript,
         )
+        self.assertIn('if (query) params.set("q", query)', typescript)
+        self.assertIn('api(`/api/account/profile?${params}`', typescript)
         # The header and the mobile tab bar both carry a button per view, and
         # detail/account views have none, so this must not use the strict
         # single-element helper that throws when a selector matches nothing.
@@ -5693,7 +5694,9 @@ class LidarrRequestTests(DatabaseTestCase):
         self.assertEqual((mbid, album_id, artist_id, title), (
             self.album_mbid, 33, 44, "Test Album",
         ))
-        self.assertEqual(enqueue_search.call_args.kwargs, {
+        search_metadata = enqueue_search.call_args.kwargs["search_metadata"]
+        self.assertTrue(any(item.get("title") == "Test Album" for item in search_metadata))
+        self.assertEqual({key: value for key, value in enqueue_search.call_args.kwargs.items() if key != "search_metadata"}, {
             "artist_name": "Test Artist",
             "release_type": "Album",
             "release_date": "2020-03-18",
@@ -5802,7 +5805,9 @@ class LidarrRequestTests(DatabaseTestCase):
         self.assertEqual(record_history.call_args.args[1:4], (
             "release-group", self.album_mbid, "Theme Single"
         ))
-        self.assertEqual(record_history.call_args.kwargs, {
+        search_metadata = record_history.call_args.kwargs["search_metadata"]
+        self.assertTrue(any(item.get("title") == "Theme Single" for item in search_metadata))
+        self.assertEqual({key: value for key, value in record_history.call_args.kwargs.items() if key != "search_metadata"}, {
             "artist_name": "Theme Artist",
             "release_type": "Single",
             "release_date": "2026-01-02",
@@ -6261,11 +6266,24 @@ class AccountProfileTests(DatabaseTestCase):
                 "releaseGroups": [{"id": self.release_group_mbid}],
             },
         )
-        musicbrainz_get.return_value = {
+        cached_metadata = {
             "artist-credit": [{"name": "Legacy Artist"}],
             "primary-type": "EP",
             "first-release-date": "2019-04-05",
         }
+        with cache_db() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO api_cache VALUES (?, ?, ?)",
+                (
+                    musicbrainz.metadata_cache_key(
+                        f"/release-group/{self.release_group_mbid}",
+                        "aliases+artist-credits+url-rels",
+                    ),
+                    json.dumps(cached_metadata),
+                    time.time() + 60,
+                ),
+            )
+        musicbrainz_get.side_effect = AssertionError("Profile enrichment must read local cache directly")
 
         response = self.client.get("/api/account/profile")
 
@@ -6277,7 +6295,7 @@ class AccountProfileTests(DatabaseTestCase):
         self.assertEqual(item["animePath"], "/anime/legacy-anime#theme-10")
         self.assertEqual(item["animeThemes"][0]["songTitle"], "Legacy Song")
         self.assertFalse(item["availableInPlex"])
-        self.assertTrue(musicbrainz_get.call_args.kwargs["cache_only"])
+        musicbrainz_get.assert_not_called()
 
     @patch("backend.routes.account.get_service", return_value=None)
     def test_profile_request_history_paginates_at_100_items(
@@ -6348,13 +6366,25 @@ class AccountProfileTests(DatabaseTestCase):
     def test_profile_request_history_rejects_invalid_pages(self):
         self.register()
 
-        for page in ("0", "-1", "nope", "1.5", str(2 ** 100)):
+        for page in ("", "0", "-1", "nope", "1.5", "+1", "01", "1_0", " 1 ", "1\n", "1.0", "1e2", "١", "１", str(2 ** 100)):
             with self.subTest(page=page):
                 response = self.client.get(
-                    f"/api/account/profile?page={page}"
+                    "/api/account/profile", query_string={"page": page},
                 )
                 self.assertEqual(response.status_code, 400)
                 self.assertIn("positive integer", response.get_json()["error"])
+
+    def test_profile_request_history_accepts_canonical_pages_with_bounded_offsets(self):
+        self.register()
+        largest_page = ((2 ** 63 - 1) // 100) + 1
+        for page in (1, 2, 10, 999, largest_page):
+            response = self.client.get("/api/account/profile", query_string={"page": str(page)})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.get_json()["pagination"]["page"], page)
+        for page in (str(largest_page + 1), "9" * 5000):
+            response = self.client.get("/api/account/profile", query_string={"page": page})
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(response.get_json(), {"error": "Page must be a positive integer."})
 
     @patch("backend.routes.account.get_service", return_value=None)
     def test_admin_can_view_another_profile_by_local_or_plex_username(
@@ -7097,6 +7127,22 @@ class MusicBrainzClientTests(unittest.TestCase):
         self.assertEqual(kwargs["namespace"], "musicbrainz-search")
         self.assertTrue(kwargs["include_cache_status"])
         self.assertEqual(kwargs["params"]["limit"], 100)
+
+    @patch("backend.services.musicbrainz.cached_json_get")
+    def test_chart_evidence_uses_batched_cached_urls_and_release_search(self, cached_get):
+        cached_get.return_value = {"urls": []}
+        resources = ["https://music.apple.com/us/album/123",
+                     "https://music.apple.com/us/album/456"]
+        musicbrainz.lookup_urls(resources, include_cache_status=True)
+        self.assertTrue(cached_get.call_args.args[0].endswith("/url"))
+        self.assertEqual(cached_get.call_args.kwargs["params"][:2],
+                         [("resource", resource) for resource in resources])
+        self.assertEqual(cached_get.call_args.kwargs["namespace"], "musicbrainz-url")
+        self.assertTrue(cached_get.call_args.kwargs["include_cache_status"])
+        musicbrainz.search("reid:release-id", "release", priority="background")
+        self.assertTrue(cached_get.call_args.args[0].endswith("/release/"))
+        with self.assertRaises(ValueError):
+            musicbrainz.lookup_urls(resources * 21)
 
     @patch("backend.services.musicbrainz.cached_json_get")
     def test_artist_search_keeps_the_default_candidate_limit(self, cached_get):

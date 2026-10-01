@@ -142,25 +142,63 @@ def update_service(service, updater):
         return deepcopy(updated)
 
 
-def get_request_history(user_id, limit=100, offset=0):
+def get_request_history(user_id, limit=100, offset=0, query="", *, status="all", availability=None):
     """Return the most recent private request-history rows for one user."""
     with db() as connection:
+        search, parameters = _request_history_filter(connection, query, status, availability)
         return connection.execute(
             "SELECT id, use_for_recommendations, kind, mbid, name, artist_name, release_type, release_date, "
             "anime_slug, anime_name, theme_id, theme_label, song_id, song_title, "
             "created_at FROM request_history "
-            "WHERE user_id = ? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
-            (user_id, limit, offset),
+            "WHERE user_id = ?" + search + " ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+            (user_id, *parameters, limit, offset),
         ).fetchall()
 
 
-def count_request_history(user_id):
+def count_request_history(user_id, query="", *, status="all", availability=None):
     """Return the number of private request-history rows for one user."""
     with db() as connection:
+        search, parameters = _request_history_filter(connection, query, status, availability)
         return connection.execute(
-            "SELECT COUNT(*) AS total FROM request_history WHERE user_id = ?",
-            (user_id,),
+            "SELECT COUNT(*) AS total FROM request_history WHERE user_id = ?" + search,
+            (user_id, *parameters),
         ).fetchone()["total"]
+
+
+def count_request_history_groups(user_id, query="", *, status="all", availability=None):
+    """Count both categories across all matching history, before pagination."""
+    with db() as connection:
+        search, parameters = _request_history_filter(connection, query, status, availability)
+        counts = {"artist": 0, "release-group": 0}
+        for row in connection.execute(
+            "SELECT kind, COUNT(*) AS total FROM request_history WHERE user_id = ?"
+            + search + " GROUP BY kind", (user_id, *parameters),
+        ):
+            counts[row["kind"]] = row["total"]
+        return counts
+
+
+def _request_history_filter(connection, query, status, availability):
+    """Combine local search with a fixed availability snapshot before pagination."""
+    if status not in {"all", "requested", "available"}:
+        raise ValueError("Status must be all, requested, or available.")
+    search, parameters = _request_search_module().predicate(connection, query)
+    if status != "all":
+        if availability is None:
+            raise ValueError("Status filtering requires a local availability snapshot.")
+        connection.create_function("request_history_available", 2, availability, deterministic=True)
+        search += " AND request_history_available(kind, mbid) = ?"
+        parameters += (int(status == "available"),)
+    return search, parameters
+
+
+def _request_search_module():
+    # Lazy import: the existing local name normalization/index depends on storage.
+    if __package__:
+        from . import request_history_search
+    else:
+        import request_history_search
+    return request_history_search
 
 
 def _wake_recommendations():
@@ -187,10 +225,11 @@ def record_request(
     theme_label="",
     song_id=None,
     song_title="",
+    search_metadata=(),
 ):
     """Record an artist or release-group request for one user."""
     with db() as connection:
-        connection.execute(
+        history_cursor = connection.execute(
             "INSERT INTO request_history "
             "(user_id, kind, mbid, name, artist_name, release_type, "
             "release_date, anime_slug, anime_name, theme_id, theme_label, "
@@ -213,6 +252,7 @@ def record_request(
                 time.time(),
             ),
         )
+        _request_search_module().capture(connection, history_cursor.lastrowid, metadata=search_metadata)
         if kind == "release-group":
             connection.execute(
                 "INSERT OR IGNORE INTO pending_lidarr_search_requesters "
@@ -240,6 +280,7 @@ def enqueue_lidarr_search(
     theme_label="",
     song_id=None,
     song_title="",
+    search_metadata=(),
 ):
     """Persist a refresh-then-search job and its user-visible request atomically."""
     now = time.time()
@@ -264,7 +305,7 @@ def enqueue_lidarr_search(
         # The queue is shared across users by release-group MBID, while
         # request history is private per user. Even when another request
         # already created the shared job, retain this user's action.
-        connection.execute(
+        history_cursor = connection.execute(
             "INSERT INTO request_history "
             "(user_id, kind, mbid, name, artist_name, release_type, "
             "release_date, anime_slug, anime_name, theme_id, theme_label, "
@@ -286,6 +327,7 @@ def enqueue_lidarr_search(
                 now,
             ),
         )
+        _request_search_module().capture(connection, history_cursor.lastrowid, metadata=search_metadata)
         inserted = bool(cursor.rowcount)
     _wake_recommendations()
     return inserted
@@ -1295,6 +1337,9 @@ def init_db():
             "WHERE refresh_type != 'album'"
         )
         _delete_legacy_orphans(connection)
+        request_search = _request_search_module()
+        if request_search.initialize(connection):
+            request_search.backfill(connection)
         has_legacy_settings = connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'settings'"
         ).fetchone()

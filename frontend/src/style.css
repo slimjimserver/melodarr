@@ -21,7 +21,7 @@
   --surface-subtle: rgba(255, 250, 243, .58);
   --surface-raised: rgba(255, 252, 247, .9);
   --border-strong: rgba(78, 61, 47, .34);
-  --focus-ring: rgba(168, 68, 45, .38);
+  --focus-ring: #a8442d;
   --shadow-control: 0 2px 7px rgba(68, 50, 38, .05);
   --shadow-card: 0 10px 30px rgba(68, 50, 38, .07);
   --shadow-artwork: 0 18px 44px rgba(68, 50, 38, .18);
@@ -45,7 +45,10 @@
 
 * { box-sizing: border-box; }
 
-html { background: var(--background-deep); }
+html {
+  background: var(--background-deep);
+  scroll-padding-block: calc(68px + var(--safe-top) + 8px) calc(var(--bottom-ui-offset) + 8px);
+}
 
 body {
   min-height: 100vh;
@@ -625,6 +628,25 @@ dialog::backdrop { background: rgba(48, 39, 32, .52); }
 .account-content { min-width: 0; }
 .account-section + .account-section { margin-top: 34px; }
 .account-section h2, .account-form h2 { margin: 0 0 14px; font-size: 20px; letter-spacing: -.03em; }
+.request-history-section { border: 0; padding: 0; }
+.request-history-section > summary { min-height: 44px; margin: 0; border-radius: 7px; padding: 8px; color: var(--foreground); cursor: pointer; }
+.request-history-section > summary::marker { color: var(--foreground-muted); }
+.request-history-section > summary h2 { display: inline; margin: 0; }
+.request-history-section[open] > summary { margin-bottom: 14px; }
+.request-history-search { display: flex; align-items: end; gap: 14px; margin: 0 0 8px; }
+.request-history-search-field { display: flex; align-items: center; flex: 1; min-width: 0; gap: 10px; }
+.request-history-search input { flex: 1; min-width: 0; }
+:root[data-theme] .request-history-search input::placeholder { color: var(--foreground-muted); }
+.request-history-search button { flex: none; min-height: 44px; }
+.request-history-status { display: grid; flex: 0 0 145px; gap: 6px; color: var(--foreground-muted); font-size: 12px; }
+.request-history-status select { min-height: 44px; }
+@media (max-width: 600px) {
+  .request-history-search { flex-direction: column; align-items: stretch; }
+  .request-history-status { flex-basis: auto; }
+}
+.request-search-status { margin: 0 0 18px; }
+.request-search-status:empty { display: none; }
+.request-history-results { min-width: 0; margin-top: 20px; }
 .profile-summary { display: flex; align-items: center; gap: 15px; border: 1px solid var(--border); border-radius: 14px; background: rgba(255, 250, 243, .7); padding: 18px; }
 .profile-summary h2 { margin-bottom: 4px; }
 .profile-summary p { margin: 0; color: var(--foreground-muted); font-size: 12px; }
@@ -691,8 +713,8 @@ details summary { margin-bottom: 17px; color: var(--accent-bright); cursor: poin
 .dialog-actions { display: flex; justify-content: flex-end; gap: 10px; margin: 22px -27px -27px; border-top: 1px solid var(--border); padding: 17px 27px; }
 .dialog-actions button { min-height: 44px; padding: 0 16px; }
 
-#back-to-top { position: fixed; right: 24px; bottom: calc(24px + var(--bottom-ui-offset)); z-index: 10; min-width: 44px; min-height: 44px; border: 1px solid var(--border-hover); border-radius: 999px; background: rgba(255, 250, 243, .96); color: var(--foreground); cursor: pointer; opacity: 0; padding: 12px 15px; pointer-events: none; transform: translateY(10px); box-shadow: 0 6px 18px rgba(68, 50, 38, .12); transition: .2s var(--ease-out); font-size: 13px; font-weight: 600; }
-#back-to-top.visible { opacity: 1; pointer-events: auto; transform: none; }
+#back-to-top { position: fixed; right: 24px; bottom: calc(24px + var(--bottom-ui-offset)); z-index: 10; min-width: 44px; min-height: 44px; border: 1px solid var(--border-hover); border-radius: 999px; background: rgba(255, 250, 243, .96); color: var(--foreground); cursor: pointer; visibility: hidden; opacity: 0; padding: 12px 15px; pointer-events: none; transform: translateY(10px); box-shadow: 0 6px 18px rgba(68, 50, 38, .12); transition: opacity .2s var(--ease-out), transform .2s var(--ease-out); font-size: 13px; font-weight: 600; }
+#back-to-top.visible { visibility: visible; opacity: 1; pointer-events: auto; transform: none; }
 
 /* Pointer affordances. Touch browsers keep :hover applied after a tap, which
    leaves cards lifted and navigation looking selected, so every hover-only
@@ -1040,7 +1062,7 @@ button,
   --surface-subtle: rgba(255, 255, 255, .025);
   --surface-raised: rgba(255, 255, 255, .052);
   --border-strong: rgba(255, 255, 255, .2);
-  --focus-ring: rgba(118, 129, 228, .58);
+  --focus-ring: #7681e4;
   --shadow-control: inset 0 1px rgba(255, 255, 255, .05);
   --shadow-card: 0 12px 32px rgba(0, 0, 0, .24), inset 0 1px rgba(255, 255, 255, .045);
   --shadow-artwork: 0 20px 52px rgba(0, 0, 0, .52);
@@ -1194,7 +1216,7 @@ button,
 :root[data-theme="midnight"] .dialog-actions { background: #08080a; }
 :root[data-theme="midnight"] .skip-link { background: var(--foreground); color: var(--background-deep); }
 :root[data-theme="midnight"] :where(button, a, input, select, summary, [role="link"]):focus-visible {
-  outline-color: rgba(118, 129, 228, .58);
+  outline-color: var(--focus-ring);
 }
 :root[data-theme="midnight"] ::selection { background: rgba(94, 106, 210, .32); color: #fff; }
 
@@ -1268,6 +1290,15 @@ button,
 
 @media (max-width: 360px) {
   header { gap: 8px; padding-right: 8px; padding-left: 8px; }
+  /* System font metrics vary by platform. Let the wordmark yield space while
+     keeping the logo and all three header controls at their existing sizes. */
+  .brand { flex-shrink: 1; gap: 6px; }
+  .brand img { flex: none; }
+  .brand > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+}
+
+@media (max-width: 319px) {
+  header { gap: 6px; }
 }
 
 /* Personal recommendations give the reason and decision controls room to breathe. */
@@ -1353,6 +1384,7 @@ button,
 }
 .request-taste-toggle { display: inline-flex; align-items: center; gap: 8px; width: fit-content; max-width: 100%; min-height: 44px; margin: 0; font-size: 12px; color: var(--foreground-muted); cursor: pointer; }
 .request-taste-toggle input { width: 16px; height: 16px; margin: 0; flex: none; accent-color: var(--accent-bright); }
+.request-taste-toggle input[aria-disabled="true"] { cursor: wait; }
 
 .request-taste-controls { min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 0 16px; padding: 0 15px; border-top: 1px solid var(--border); }
 .request-taste-controls .field-help { flex: 1 1 220px; margin: 0; padding: 4px 0 8px; font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }

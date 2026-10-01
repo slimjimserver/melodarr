@@ -13,6 +13,7 @@ from flask import Blueprint, current_app, jsonify, request
 from werkzeug.security import generate_password_hash
 
 if __package__ == "backend.routes":
+    from ..request_history_search import local_release_group_metadata, local_release_group_metadata_batch
     from ..responses import api_error, request_json_object
     from ..security import (
         admin_required,
@@ -24,6 +25,7 @@ if __package__ == "backend.routes":
     from ..storage import (
         db,
         count_request_history,
+        count_request_history_groups,
         delete_recommendation_cache,
         get_lastfm_api_key,
         get_request_history,
@@ -32,6 +34,7 @@ if __package__ == "backend.routes":
     )
     from ..workers import recommendations as recommendation_worker
 else:  # Support the existing `python backend/app.py` entry point.
+    from request_history_search import local_release_group_metadata, local_release_group_metadata_batch
     from responses import api_error, request_json_object
     from security import (
         admin_required,
@@ -43,6 +46,7 @@ else:  # Support the existing `python backend/app.py` entry point.
     from storage import (
         db,
         count_request_history,
+        count_request_history_groups,
         delete_recommendation_cache,
         get_lastfm_api_key,
         get_request_history,
@@ -66,6 +70,8 @@ def _safe_error_label(error):
 
 def _requested_page():
     raw_page = request.args.get("page", "1")
+    if not re.fullmatch(r"[1-9][0-9]*", raw_page):
+        return None
     try:
         page = int(raw_page)
     except (TypeError, ValueError):
@@ -135,7 +141,7 @@ def _explicit_anime_history_link(item):
     }
 
 
-def _profile_history_item(row, plex_index, anime_link_cache=None):
+def _profile_history_item(row, plex_index, anime_link_cache=None, *, local_only=False, metadata_cache=None):
     item = dict(row)
     explicit_anime_link = _explicit_anime_history_link(item)
     if explicit_anime_link:
@@ -166,7 +172,9 @@ def _profile_history_item(row, plex_index, anime_link_cache=None):
             item.get(field)
             for field in ("artist_name", "release_type", "release_date")
         ):
-            cached = _cached_release_group_metadata(item["mbid"])
+            cached = metadata_cache.get(item["mbid"], {}) if metadata_cache is not None else (
+                local_release_group_metadata(item["mbid"]) if local_only else _cached_release_group_metadata(item["mbid"])
+            )
             item["artist_name"] = (
                 item.get("artist_name")
                 or cached.get("artist_name")
@@ -192,25 +200,38 @@ def _profile_history_item(row, plex_index, anime_link_cache=None):
     return item
 
 
-def apply_release_group_lifecycle(items):
+def _release_group_snapshots():
+    """Read the local snapshots shared by lifecycle badges and history filters."""
+    try:
+        albums = lidarr.cached_library_availability()
+    except Exception:
+        # Request history remains available when the short-lived worker cache is not.
+        albums = {}
+    try:
+        downloads = lidarr.cached_download_availability()
+    except Exception:
+        downloads = {}
+    return albums, downloads
+
+
+def _release_group_available(mbid, albums):
+    album = albums.get(str(mbid).casefold())
+    return bool(album and album.get("fullyAvailable"))
+
+
+def apply_release_group_lifecycle(items, *, snapshots=None):
     """Decorate request rows from shared snapshots without per-row database reads."""
     release_ids = [item["mbid"] for item in items if item["kind"] == "release-group"]
     if not release_ids:
         return items
-    try:
-        albums = lidarr.cached_library_availability()
-        downloads = lidarr.cached_download_availability()
-    except Exception:
-        # Request history remains available when the short-lived worker cache is not.
-        albums, downloads = {}, {}
+    albums, downloads = snapshots if snapshots is not None else _release_group_snapshots()
     pending = pending_lidarr_search_mbids(release_ids)
     for item in items:
         if item["kind"] != "release-group":
             continue
         mbid = str(item["mbid"])
-        album = albums.get(mbid.casefold())
         download = lidarr.public_download_status(downloads.get(mbid.casefold()))
-        if album and album.get("fullyAvailable"):
+        if _release_group_available(mbid, albums):
             status, download = "available", None
         elif download:
             status = "downloading"
@@ -302,24 +323,49 @@ def account_profile():
     page = _requested_page()
     if page is None:
         return api_error("Page must be a positive integer.")
-    total = count_request_history(user["id"])
-    history = {"artist": [], "release-group": []}
+    query = request.args.get("q", "").strip()
+    if len(query) > 500:
+        return api_error("Search must be 500 characters or fewer.")
+    status = request.args.get("status", "all")
+    if status not in {"all", "requested", "available"}:
+        return api_error("Status must be all, requested, or available.")
     plex_index = _profile_plex_index()
-    anime_link_cache = {}
+    snapshots = _release_group_snapshots() if status != "all" else None
+
+    def available(kind, mbid):
+        if kind == "artist":
+            return bool(plex_index.get("artistsByMbid", {}).get(mbid))
+        return _release_group_available(mbid, snapshots[0])
+
+    group_counts = count_request_history_groups(
+        user["id"], query=query, status=status, availability=available,
+    ) if query or status != "all" else None
+    total = sum(group_counts.values()) if group_counts else count_request_history(user["id"])
+    history = {"artist": [], "release-group": []}
     rows = [dict(row) for row in get_request_history(
         user["id"],
         limit=REQUESTS_PAGE_SIZE,
         offset=(page - 1) * REQUESTS_PAGE_SIZE,
+        query=query,
+        status=status,
+        availability=available,
     )]
-    apply_release_group_lifecycle(rows)
+    apply_release_group_lifecycle(rows, snapshots=snapshots)
+    link_mbids = {row["mbid"] for row in rows if row["kind"] == "release-group" and not _explicit_anime_history_link(row)}
+    links = anime_theme_links.links_for_release_groups(link_mbids)
+    anime_link_cache = {mbid: links.get(str(mbid).casefold(), []) for mbid in link_mbids}
+    metadata_mbids = {row["mbid"] for row in rows if row["kind"] == "release-group" and not all(row.get(field) for field in ("artist_name", "release_type", "release_date"))}
+    local_only = bool(query) or "status" in request.args
+    metadata_cache = local_release_group_metadata_batch(metadata_mbids, allow_expired=local_only)
     for row in rows:
         history[row["kind"]].append(
-            _profile_history_item(row, plex_index, anime_link_cache)
+            _profile_history_item(row, plex_index, anime_link_cache, local_only=local_only, metadata_cache=metadata_cache)
         )
     return jsonify({
         "username": user["username"],
         "user": _profile_user_payload(user),
         "requests": history,
+        "matchCounts": group_counts,
         "pagination": {
             "page": page,
             "pageSize": REQUESTS_PAGE_SIZE,

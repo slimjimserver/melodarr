@@ -466,33 +466,43 @@ def resolve_series(release_group_id=None, recording_ids=None):
 def links_for_release_group(mbid):
     """Return all known anime-theme contexts for a release-group MBID."""
     mbid = _text(mbid).casefold()
-    if not mbid:
-        return []
+    return links_for_release_groups([mbid]).get(mbid, [])
+
+
+def links_for_release_groups(mbids):
+    """Batch contexts for selected cards, preserving each group's link order."""
+    mbids = sorted({_text(mbid).casefold() for mbid in mbids if _text(mbid)})
+    result = {mbid: [] for mbid in mbids}
+    if not mbids:
+        return result
     with db() as connection:
-        rows = connection.execute(
-            "SELECT anime_slug, anime_name, theme_id, theme_label, theme_type, "
-            "sequence, song_id, song_title "
-            "FROM anime_theme_release_group_links WHERE release_group_mbid = ? "
-            "ORDER BY anime_name COLLATE NOCASE, anime_slug, "
-            "CASE WHEN sequence IS NULL THEN 1 ELSE 0 END, sequence, theme_id",
-            (mbid,),
-        ).fetchall()
-    return [
-        {
-            "animeSlug": row["anime_slug"],
-            "animeName": row["anime_name"],
-            "animePath": (
-                f"/anime/{row['anime_slug']}#theme-{row['theme_id']}"
-            ),
-            "themeId": row["theme_id"],
-            "themeLabel": row["theme_label"],
-            "themeType": row["theme_type"],
-            "sequence": row["sequence"],
-            "songId": row["song_id"],
-            "songTitle": row["song_title"],
-        }
-        for row in rows
-    ]
+        for offset in range(0, len(mbids), 400):
+            batch = mbids[offset:offset + 400]
+            placeholders = ",".join("?" for _ in batch)
+            rows = connection.execute(
+                "SELECT release_group_mbid, anime_slug, anime_name, theme_id, theme_label, theme_type, "
+                "sequence, song_id, song_title "
+                f"FROM anime_theme_release_group_links WHERE release_group_mbid IN ({placeholders}) "
+                "ORDER BY release_group_mbid, anime_name COLLATE NOCASE, anime_slug, "
+                "CASE WHEN sequence IS NULL THEN 1 ELSE 0 END, sequence, theme_id", batch,
+            )
+            for row in rows:
+                result[row["release_group_mbid"]].append(_history_link(row))
+    return result
+
+
+def _history_link(row):
+    return {
+        "animeSlug": row["anime_slug"],
+        "animeName": row["anime_name"],
+        "animePath": f"/anime/{row['anime_slug']}#theme-{row['theme_id']}",
+        "themeId": row["theme_id"],
+        "themeLabel": row["theme_label"],
+        "themeType": row["theme_type"],
+        "sequence": row["sequence"],
+        "songId": row["song_id"],
+        "songTitle": row["song_title"],
+    }
 
 
 

@@ -40,6 +40,7 @@ vapid-private.pem
 docs/*
 !docs/api.md
 !docs/openapi.yaml
+!docs/request-history-search.md
 
 # Editors / OS
 .idea/

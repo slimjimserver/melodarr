@@ -29,6 +29,16 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Set up Python for Requests browser fixtures
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install Requests fixture dependencies
+        run: python -m pip install -r ../backend/requirements.txt
+
       - name: Enable pnpm
         run: corepack enable && corepack prepare pnpm@11.9.0 --activate
 
