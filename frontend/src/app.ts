@@ -1084,7 +1084,15 @@ function setupNavigation() {
       .some((candidate) => candidate!.toLocaleLowerCase() === normalizedUsername);
   }
 
-  function showView(view: AppView, updateHistory = true) {
+  function updatePrimaryRequestsLinks() {
+    if (!currentUser) return;
+    const username = currentUser.username;
+    document.querySelectorAll<HTMLAnchorElement>('[data-primary-account="requests"]').forEach((link) => {
+      link.href = accountPath("requests", username, 1, false);
+    });
+  }
+
+  function showView(view: AppView, updateHistory = true, accountPage: AccountPage | null = null) {
     if (!currentUser || (currentUser.role !== "admin" && !VIEWS_FOR_EVERY_USER.includes(view))) view = "discover";
     if (view !== "account") {
       accountRenderGeneration += 1;
@@ -1092,10 +1100,13 @@ function setupNavigation() {
       accountRenderAbort = undefined;
     }
     document.querySelectorAll(".nav-link, .view").forEach((element) => element.classList.remove("active"));
-    // Account and detail are application views without a matching navigation link,
-    // and the header and bottom tab bar both carry a link per view.
+    updatePrimaryRequestsLinks();
+    // Both primary navigation bars share active state, with Requests mapped
+    // to its existing account page rather than a separate application view.
     document.querySelectorAll<HTMLElement>("[data-view]").forEach((button) => {
-      const isCurrent = button.dataset.view === view;
+      const isCurrent = button.dataset.primaryAccount === "requests"
+        ? view === "account" && accountPage === "requests"
+        : button.dataset.view === view;
       button.classList.toggle("active", isCurrent);
       if (isCurrent) button.setAttribute("aria-current", "page");
       else button.removeAttribute("aria-current");
@@ -1125,6 +1136,7 @@ function setupNavigation() {
     page: AccountPage,
     username = activeAccountUsername || currentUser?.username || "",
     requestPage = activeAccountRequestPage,
+    includeRequestFilters = true,
   ) {
     if (!currentUser) throw new Error("Account navigation requires an authenticated user.");
     const encodedUsername = encodeURIComponent(username);
@@ -1132,8 +1144,8 @@ function setupNavigation() {
     if (page === "requests") {
       const query = new URLSearchParams();
       if (requestPage > 1) query.set("page", String(requestPage));
-      if (activeAccountRequestQuery) query.set("q", activeAccountRequestQuery);
-      if (activeAccountRequestStatus !== "all") query.set("status", activeAccountRequestStatus);
+      if (includeRequestFilters && activeAccountRequestQuery) query.set("q", activeAccountRequestQuery);
+      if (includeRequestFilters && activeAccountRequestStatus !== "all") query.set("status", activeAccountRequestStatus);
       return `/${encodedUsername}/requests${query.size ? `?${query}` : ""}`;
     }
     return `/${encodedUsername}/settings/${page}`;
@@ -1574,6 +1586,7 @@ function setupNavigation() {
               const accountMenu = $<HTMLAnchorElement>("#account-menu");
               accountMenu.textContent = result.username.slice(0, 1).toUpperCase();
               accountMenu.href = accountPath("profile");
+              updatePrimaryRequestsLinks();
             }
             formMessage.textContent = result.message;
             if (formStillActive) {
@@ -1900,7 +1913,7 @@ function setupNavigation() {
     activeAccountRequestPage = page === "requests" ? Math.max(1, requestPage) : 1;
     activeAccountRequestQuery = page === "requests" ? requestQuery : "";
     activeAccountRequestStatus = page === "requests" ? requestStatus : "all";
-    showView("account", false);
+    showView("account", false, page);
     if (updateHistory) {
       window.history.pushState(
         { account: page, username, page: activeAccountRequestPage },
@@ -1915,6 +1928,10 @@ function setupNavigation() {
     link.addEventListener("click", (event) => {
       if (!isPlainPrimaryClick(event)) return;
       event.preventDefault();
+      if (link.dataset.primaryAccount === "requests") {
+        showAccountPage?.("requests", true, currentUser?.username);
+        return;
+      }
       showView(link.dataset.view as AppView);
       if (link.dataset.view === "discover") {
         window.dispatchEvent(new Event("melodarr-home"));
