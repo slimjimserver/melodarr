@@ -70,6 +70,8 @@ def _safe_error_label(error):
 
 def _requested_page():
     raw_page = request.args.get("page", "1")
+    if not re.fullmatch(r"[1-9][0-9]*", raw_page):
+        return None
     try:
         page = int(raw_page)
     except (TypeError, ValueError):

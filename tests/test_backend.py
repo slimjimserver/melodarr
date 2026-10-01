@@ -6353,13 +6353,25 @@ class AccountProfileTests(DatabaseTestCase):
     def test_profile_request_history_rejects_invalid_pages(self):
         self.register()
 
-        for page in ("0", "-1", "nope", "1.5", str(2 ** 100)):
+        for page in ("", "0", "-1", "nope", "1.5", "+1", "01", "1_0", " 1 ", "1\n", "1.0", "1e2", "١", "１", str(2 ** 100)):
             with self.subTest(page=page):
                 response = self.client.get(
-                    f"/api/account/profile?page={page}"
+                    "/api/account/profile", query_string={"page": page},
                 )
                 self.assertEqual(response.status_code, 400)
                 self.assertIn("positive integer", response.get_json()["error"])
+
+    def test_profile_request_history_accepts_canonical_pages_with_bounded_offsets(self):
+        self.register()
+        largest_page = ((2 ** 63 - 1) // 100) + 1
+        for page in (1, 2, 10, 999, largest_page):
+            response = self.client.get("/api/account/profile", query_string={"page": str(page)})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.get_json()["pagination"]["page"], page)
+        for page in (str(largest_page + 1), "9" * 5000):
+            response = self.client.get("/api/account/profile", query_string={"page": page})
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(response.get_json(), {"error": "Page must be a positive integer."})
 
     @patch("backend.routes.account.get_service", return_value=None)
     def test_admin_can_view_another_profile_by_local_or_plex_username(

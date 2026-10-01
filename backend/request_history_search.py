@@ -45,6 +45,21 @@ def initialize(connection):
         CREATE INDEX IF NOT EXISTS request_history_search_alias_name
         ON request_history_search_aliases(entity_kind, search_key, entity_id)
     """)
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS request_history_search_migrations (
+            name TEXT PRIMARY KEY
+        ) WITHOUT ROWID
+    """)
+    migration = "catalog-only-anime-aliases-v1"
+    if not connection.execute(
+        "SELECT 1 FROM request_history_search_migrations WHERE name = ?", (migration,),
+    ).fetchone():
+        # Old anime aliases have no provenance. Discard them conservatively and
+        # reconstruct only what trusted local catalog data can establish. Names
+        # whose catalog/cache source is gone cannot safely be recovered.
+        connection.execute("DELETE FROM request_history_search_aliases WHERE entity_kind = 'anime'")
+        _backfill_catalog_anime_names(connection)
+        connection.execute("INSERT INTO request_history_search_migrations (name) VALUES (?)", (migration,))
     return not existed
 
 
@@ -73,7 +88,10 @@ def _names(document):
     return [name for name in names if isinstance(name, str) and name.strip()]
 
 
-def save_names(connection, kind, entity_id, names):
+def save_names(connection, kind, entity_id, names, *, catalog=False):
+    """Share entity aliases; anime names must come from a local catalog source."""
+    if kind == "anime" and not catalog:
+        raise ValueError("Shared anime aliases require trusted catalog metadata.")
     entity_id = str(entity_id or "").strip().casefold()
     if not entity_id:
         return
@@ -83,6 +101,25 @@ def save_names(connection, kind, entity_id, names):
         "(entity_kind, entity_id, search_key) VALUES (?, ?, ?)",
         ((kind, entity_id, key) for key in keys),
     )
+
+
+def _backfill_catalog_anime_names(connection):
+    """Rebuild reusable anime names without consulting request snapshots or HTTP."""
+    if __package__:
+        from .api_cache import cache_db
+    else:
+        from api_cache import cache_db
+    for row in connection.execute("SELECT DISTINCT anime_slug, anime_name FROM anime_theme_release_group_links"):
+        save_names(connection, "anime", row["anime_slug"], [row["anime_slug"], row["anime_name"]], catalog=True)
+    with cache_db() as cached:
+        for row in cached.execute("SELECT value FROM api_cache WHERE cache_key LIKE 'animethemes-detail:%'"):
+            try:
+                payload = json.loads(row[0])
+            except (TypeError, ValueError):
+                continue
+            anime = payload.get("anime") if isinstance(payload, dict) else None
+            if isinstance(anime, dict) and anime.get("slug"):
+                save_names(connection, "anime", anime["slug"], [anime["slug"], *_names(anime)], catalog=True)
 
 
 def remember_anime_names(anime):
@@ -98,7 +135,7 @@ def remember_anime_names(anime):
             if connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE name = 'request_history_search_aliases'"
             ).fetchone():
-                save_names(connection, "anime", anime["slug"], [anime["slug"], *_names(anime)])
+                save_names(connection, "anime", anime["slug"], [anime["slug"], *_names(anime)], catalog=True)
     except (OSError, sqlite3.Error):
         # Alias persistence must not make existing anime detail lookups fail.
         # Request creation can still snapshot the same already-cached names.
@@ -152,7 +189,9 @@ def capture(connection, request_id, *, metadata=()):
             entities.setdefault((kind, entity_id), []).extend(names)
 
     add(row["kind"], row["mbid"], [row["name"]])
-    add("anime", row.get("anime_slug"), [row.get("anime_name"), row.get("anime_slug")])
+    # A submitted slug may link this row to established catalog aliases, but its
+    # submitted name remains row-local and must never become a shared alias.
+    add("anime", row.get("anime_slug"))
     for document in metadata:
         if not isinstance(document, dict):
             continue
@@ -160,11 +199,26 @@ def capture(connection, request_id, *, metadata=()):
             add("artist", row["mbid"], _names(document))
         else:
             add("release-group", row["mbid"], _names(document))
+            artist_id = document.get("foreignArtistId") or document.get("artistMbid")
+            if isinstance(artist_id, str):
+                add("artist", artist_id, [document.get("artistName")])
             artist = document.get("artist") or {}
             if isinstance(artist, dict):
                 artist_id = artist.get("foreignArtistId") or artist.get("musicbrainzId") or artist.get("id")
                 if isinstance(artist_id, str):
                     add("artist", artist_id, _names(artist))
+            for credit in document.get("artist-credit") or []:
+                if isinstance(credit, dict) and isinstance(credit.get("artist"), dict):
+                    artist = credit["artist"]
+                    add("artist", artist.get("id"), [credit.get("name"), *_names(artist)])
+
+    explicit_artists = {
+        entity_id for kind, entity_id in entities if kind == "artist"
+    } if row["kind"] == "release-group" else set()
+
+    def add_credit(artist_id, names):
+        if not explicit_artists or str(artist_id or "").strip().casefold() in explicit_artists:
+            add("artist", artist_id, names)
 
     if row["kind"] == "release-group":
         for link in connection.execute(
@@ -191,19 +245,7 @@ def capture(connection, request_id, *, metadata=()):
                     "SELECT artist_mbid, credit_name FROM track_search_release_group_artists WHERE release_group_mbid = ?",
                     (row["mbid"].casefold(),),
                 ):
-                    add("artist", credit["artist_mbid"], [credit["credit_name"]])
-            if row["kind"] == "release-group" and row.get("artist_name"):
-                artist_ids = {item[0] for item in connection.execute(
-                    "SELECT entity_id FROM request_history_search_aliases "
-                    "WHERE entity_kind = 'artist' AND search_key = ?", (search_key(row["artist_name"]),),
-                )}
-                if "track_search_artist_names" in tables:
-                    artist_ids.update(item[0] for item in cached.execute(
-                        "SELECT artist_mbid FROM track_search_artist_names WHERE normalized_name IN (?, ?)",
-                        (normalize_text(row["artist_name"]), search_key(row["artist_name"])),
-                    ))
-                if len(artist_ids) == 1:
-                    add("artist", next(iter(artist_ids)), [row["artist_name"]])
+                    add_credit(credit["artist_mbid"], [credit["credit_name"]])
             if "api_cache" in tables:
                 cache_keys = set()
                 for kind, entity_id in list(entities):
@@ -255,8 +297,8 @@ def capture(connection, request_id, *, metadata=()):
                                         artist = credit.get("artist") or {}
                                         if not isinstance(artist, dict):
                                             continue
-                                        add("artist", artist.get("id"), [credit.get("name"), *_names(artist)])
-                                        if artist.get("id"):
+                                        add_credit(artist.get("id"), [credit.get("name"), *_names(artist)])
+                                        if ("artist", str(artist.get("id") or "").casefold()) in entities:
                                             cache_keys.update(
                                                 musicbrainz.metadata_cache_key(f"/artist/{quote(str(artist['id']))}", include)
                                                 for include in ("", "aliases", "aliases+url-rels+genres")
@@ -265,6 +307,33 @@ def capture(connection, request_id, *, metadata=()):
                                     add("artist", row["mbid"], [musicbrainz.romanized_artist_name(entity)])
                             elif ("artist", str(entity.get("id") or "").casefold()) in entities:
                                 add("artist", entity["id"], _names(entity))
+            # Only infer identity after all authoritative local credits have
+            # been read. A unique name in our partial catalog is not evidence
+            # that it supersedes an explicit artist identifier.
+            if (row["kind"] == "release-group" and row.get("artist_name")
+                    and not any(kind == "artist" for kind, _ in entities)):
+                artist_ids = {item[0] for item in connection.execute(
+                    "SELECT entity_id FROM request_history_search_aliases "
+                    "WHERE entity_kind = 'artist' AND search_key = ?", (search_key(row["artist_name"]),),
+                )}
+                if "track_search_artist_names" in tables:
+                    artist_ids.update(item[0] for item in cached.execute(
+                        "SELECT artist_mbid FROM track_search_artist_names WHERE normalized_name IN (?, ?)",
+                        (normalize_text(row["artist_name"]), search_key(row["artist_name"])),
+                    ))
+                if len(artist_ids) == 1:
+                    artist_id = next(iter(artist_ids))
+                    add("artist", artist_id, [row["artist_name"]])
+                    if "api_cache" in tables:
+                        for include in ("", "aliases", "aliases+url-rels+genres"):
+                            key = musicbrainz.metadata_cache_key(f"/artist/{quote(artist_id)}", include)
+                            document = cached.execute("SELECT value FROM api_cache WHERE cache_key = ?", (key,)).fetchone()
+                            try:
+                                artist = json.loads(document[0]) if document else {}
+                            except (TypeError, ValueError):
+                                continue
+                            if isinstance(artist, dict) and str(artist.get("id") or "").casefold() == artist_id:
+                                add("artist", artist_id, [*_names(artist), musicbrainz.romanized_artist_name(artist)])
             if "track_search_artist_names" in tables:
                 for kind, entity_id in list(entities):
                     if kind == "artist":
@@ -281,7 +350,7 @@ def capture(connection, request_id, *, metadata=()):
         ((request_id, kind, entity_id) for kind, entity_id in entities),
     )
     for (kind, entity_id), names in entities.items():
-        save_names(connection, kind, entity_id, names)
+        save_names(connection, kind, entity_id, names, catalog=kind == "anime")
 
 
 def predicate(connection, query):
