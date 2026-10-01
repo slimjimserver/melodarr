@@ -1339,8 +1339,7 @@ def init_db():
         _delete_legacy_orphans(connection)
         request_search = _request_search_module()
         if request_search.initialize(connection):
-            for row in connection.execute("SELECT id FROM request_history ORDER BY kind, id").fetchall():
-                request_search.capture(connection, row["id"])
+            request_search.backfill(connection)
         has_legacy_settings = connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'settings'"
         ).fetchone()

@@ -13,7 +13,7 @@ from flask import Blueprint, current_app, jsonify, request
 from werkzeug.security import generate_password_hash
 
 if __package__ == "backend.routes":
-    from ..request_history_search import local_release_group_metadata
+    from ..request_history_search import local_release_group_metadata, local_release_group_metadata_batch
     from ..responses import api_error, request_json_object
     from ..security import (
         admin_required,
@@ -34,7 +34,7 @@ if __package__ == "backend.routes":
     )
     from ..workers import recommendations as recommendation_worker
 else:  # Support the existing `python backend/app.py` entry point.
-    from request_history_search import local_release_group_metadata
+    from request_history_search import local_release_group_metadata, local_release_group_metadata_batch
     from responses import api_error, request_json_object
     from security import (
         admin_required,
@@ -141,7 +141,7 @@ def _explicit_anime_history_link(item):
     }
 
 
-def _profile_history_item(row, plex_index, anime_link_cache=None, *, local_only=False):
+def _profile_history_item(row, plex_index, anime_link_cache=None, *, local_only=False, metadata_cache=None):
     item = dict(row)
     explicit_anime_link = _explicit_anime_history_link(item)
     if explicit_anime_link:
@@ -172,7 +172,9 @@ def _profile_history_item(row, plex_index, anime_link_cache=None, *, local_only=
             item.get(field)
             for field in ("artist_name", "release_type", "release_date")
         ):
-            cached = local_release_group_metadata(item["mbid"]) if local_only else _cached_release_group_metadata(item["mbid"])
+            cached = metadata_cache.get(item["mbid"], {}) if metadata_cache is not None else (
+                local_release_group_metadata(item["mbid"]) if local_only else _cached_release_group_metadata(item["mbid"])
+            )
             item["artist_name"] = (
                 item.get("artist_name")
                 or cached.get("artist_name")
@@ -201,10 +203,15 @@ def _profile_history_item(row, plex_index, anime_link_cache=None, *, local_only=
 def _release_group_snapshots():
     """Read the local snapshots shared by lifecycle badges and history filters."""
     try:
-        return lidarr.cached_library_availability(), lidarr.cached_download_availability()
+        albums = lidarr.cached_library_availability()
     except Exception:
         # Request history remains available when the short-lived worker cache is not.
-        return {}, {}
+        albums = {}
+    try:
+        downloads = lidarr.cached_download_availability()
+    except Exception:
+        downloads = {}
+    return albums, downloads
 
 
 def _release_group_available(mbid, albums):
@@ -335,7 +342,6 @@ def account_profile():
     ) if query or status != "all" else None
     total = sum(group_counts.values()) if group_counts else count_request_history(user["id"])
     history = {"artist": [], "release-group": []}
-    anime_link_cache = {}
     rows = [dict(row) for row in get_request_history(
         user["id"],
         limit=REQUESTS_PAGE_SIZE,
@@ -345,9 +351,15 @@ def account_profile():
         availability=available,
     )]
     apply_release_group_lifecycle(rows, snapshots=snapshots)
+    link_mbids = {row["mbid"] for row in rows if row["kind"] == "release-group" and not _explicit_anime_history_link(row)}
+    links = anime_theme_links.links_for_release_groups(link_mbids)
+    anime_link_cache = {mbid: links.get(str(mbid).casefold(), []) for mbid in link_mbids}
+    metadata_mbids = {row["mbid"] for row in rows if row["kind"] == "release-group" and not all(row.get(field) for field in ("artist_name", "release_type", "release_date"))}
+    local_only = bool(query) or "status" in request.args
+    metadata_cache = local_release_group_metadata_batch(metadata_mbids, allow_expired=local_only)
     for row in rows:
         history[row["kind"]].append(
-            _profile_history_item(row, plex_index, anime_link_cache, local_only=bool(query) or "status" in request.args)
+            _profile_history_item(row, plex_index, anime_link_cache, local_only=local_only, metadata_cache=metadata_cache)
         )
     return jsonify({
         "username": user["username"],

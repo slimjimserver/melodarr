@@ -6266,11 +6266,24 @@ class AccountProfileTests(DatabaseTestCase):
                 "releaseGroups": [{"id": self.release_group_mbid}],
             },
         )
-        musicbrainz_get.return_value = {
+        cached_metadata = {
             "artist-credit": [{"name": "Legacy Artist"}],
             "primary-type": "EP",
             "first-release-date": "2019-04-05",
         }
+        with cache_db() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO api_cache VALUES (?, ?, ?)",
+                (
+                    musicbrainz.metadata_cache_key(
+                        f"/release-group/{self.release_group_mbid}",
+                        "aliases+artist-credits+url-rels",
+                    ),
+                    json.dumps(cached_metadata),
+                    time.time() + 60,
+                ),
+            )
+        musicbrainz_get.side_effect = AssertionError("Profile enrichment must read local cache directly")
 
         response = self.client.get("/api/account/profile")
 
@@ -6282,7 +6295,7 @@ class AccountProfileTests(DatabaseTestCase):
         self.assertEqual(item["animePath"], "/anime/legacy-anime#theme-10")
         self.assertEqual(item["animeThemes"][0]["songTitle"], "Legacy Song")
         self.assertFalse(item["availableInPlex"])
-        self.assertTrue(musicbrainz_get.call_args.kwargs["cache_only"])
+        musicbrainz_get.assert_not_called()
 
     @patch("backend.routes.account.get_service", return_value=None)
     def test_profile_request_history_paginates_at_100_items(

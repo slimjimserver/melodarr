@@ -2,6 +2,10 @@
 
 import json
 import sqlite3
+import time
+from collections import OrderedDict
+from contextlib import contextmanager, nullcontext
+from functools import lru_cache
 from urllib.parse import quote
 
 if __package__:
@@ -143,6 +147,10 @@ def remember_anime_names(anime):
 
 
 def local_release_group_metadata(mbid):
+    return local_release_group_metadata_batch([mbid]).get(mbid, {})
+
+
+def local_release_group_metadata_batch(mbids, *, allow_expired=True):
     """Preserve cached card metadata without invoking a MusicBrainz client."""
     if __package__:
         from .api_cache import cache_db
@@ -150,35 +158,115 @@ def local_release_group_metadata(mbid):
     else:
         from api_cache import cache_db
         from services import musicbrainz
-    key = musicbrainz.metadata_cache_key(f"/release-group/{quote(mbid)}", "aliases+artist-credits+url-rels")
+    result = {}
+    try:
+        keys = {musicbrainz.metadata_cache_key(f"/release-group/{quote(mbid)}", "aliases+artist-credits+url-rels"): mbid for mbid in set(mbids)}
+    except (KeyError, TypeError, ValueError):
+        return result
+    if not keys:
+        return result
     try:
         with cache_db() as connection:
-            row = connection.execute("SELECT value FROM api_cache WHERE cache_key = ?", (key,)).fetchone()
-        data = json.loads(row[0]) if row else {}
-    except (OSError, sqlite3.Error, TypeError, ValueError):
+            names = list(keys)
+            for offset in range(0, len(names), 400):
+                batch = names[offset:offset + 400]
+                placeholders = ",".join("?" for _ in batch)
+                expiry = "" if allow_expired else " AND expires_at > ?"
+                parameters = (*batch,) if allow_expired else (*batch, time.time())
+                for row in connection.execute(f"SELECT cache_key, value FROM api_cache WHERE cache_key IN ({placeholders})" + expiry, parameters):
+                    try:
+                        data = json.loads(row["value"])
+                    except (TypeError, ValueError):
+                        continue
+                    if isinstance(data, dict):
+                        artist_names = []
+                        for credit in data.get("artist-credit") or []:
+                            if not isinstance(credit, dict):
+                                continue
+                            name = credit.get("name")
+                            if allow_expired and isinstance(name, str):
+                                artist_names.append(name)
+                            elif not allow_expired and name:
+                                artist_names.append(str(name).strip())
+                        result[keys[row["cache_key"]]] = {
+                            "artist_name": " · ".join(artist_names),
+                            "release_type": data.get("primary-type") or "",
+                            "release_date": data.get("first-release-date") or "",
+                        }
+    except (OSError, sqlite3.Error):
         return {}
-    if not isinstance(data, dict):
-        return {}
-    return {
-        "artist_name": " · ".join(
-            credit["name"] for credit in data.get("artist-credit") or []
-            if isinstance(credit, dict) and isinstance(credit.get("name"), str)
-        ),
-        "release_type": data.get("primary-type") or "",
-        "release_date": data.get("first-release-date") or "",
-    }
+    return result
 
 
-def capture(connection, request_id, *, metadata=()):
+class _CaptureCache:
+    """Bounded, read-only catalog lookups shared for one backfill transaction."""
+
+    def __init__(self, connection):
+        if __package__:
+            from .services import musicbrainz
+        else:
+            from services import musicbrainz
+        self.tables = frozenset(row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'"))
+        self.rows = lru_cache(maxsize=256)(lambda sql, parameters: tuple(connection.execute(sql, parameters)))
+        self.document = lru_cache(maxsize=256)(self._document)
+        self.metadata_keys = lru_cache(maxsize=256)(lambda kind, entity_id, includes: tuple(
+            musicbrainz.metadata_cache_key(f"/{kind}/{quote(entity_id)}", include) for include in includes
+        ))
+        self._names = OrderedDict()
+
+    def _document(self, key):
+        rows = self.rows("SELECT value FROM api_cache WHERE cache_key = ?", (key,))
+        try:
+            return json.loads(rows[0][0]) if rows else None
+        except (TypeError, ValueError):
+            return None
+
+    def names(self, document, kind=""):
+        key = (id(document), kind)
+        if key not in self._names:
+            names = _names(document)
+            if kind:
+                if __package__:
+                    from .services import musicbrainz
+                else:
+                    from services import musicbrainz
+                names.append(musicbrainz.romanized_artist_name(document) if kind == "artist" else musicbrainz.romanized_release_group_title(document))
+            # Retain the document alongside its immutable names so object IDs
+            # cannot be reused while an entry is cached.
+            self._names[key] = (document, tuple(names))
+            if len(self._names) > 256:
+                self._names.popitem(last=False)
+        self._names.move_to_end(key)
+        return self._names[key][1]
+
+
+@contextmanager
+def _capture_cache():
+    if __package__:
+        from .api_cache import cache_db
+    else:
+        from api_cache import cache_db
+    with cache_db() as cached:
+        yield _CaptureCache(cached)
+
+
+def backfill(connection):
+    """Stream legacy rows atomically; any cache I/O failure must be retryable."""
+    with _capture_cache() as cached:
+        for row in connection.execute("SELECT * FROM request_history ORDER BY kind, id"):
+            capture(connection, row["id"], row=row, strict=True, cache_context=cached)
+
+
+def capture(connection, request_id, *, metadata=(), row=None, strict=False, cache_context=None):
     """Snapshot already-known names on creation or migration, with no HTTP calls."""
     if __package__:
-        from .api_cache import cache_db, cache_key
+        from .api_cache import cache_key
         from .services import animethemes, musicbrainz
     else:
-        from api_cache import cache_db, cache_key
+        from api_cache import cache_key
         from services import animethemes, musicbrainz
 
-    row = dict(connection.execute(
+    row = dict(row) if row is not None else dict(connection.execute(
         "SELECT * FROM request_history WHERE id = ?", (request_id,),
     ).fetchone())
     entities = {}
@@ -230,18 +318,19 @@ def capture(connection, request_id, *, metadata=()):
     # Read the existing local index and cached documents directly. Do not use
     # service get/detail methods: a cache miss must never become an HTTP lookup.
     try:
-        with cache_db() as cached:
-            tables = {item[0] for item in cached.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        with nullcontext(cache_context) if cache_context is not None else _capture_cache() as cached:
+            tables = cached.tables
             if row["kind"] == "release-group" and "track_search_release_groups" in tables:
-                group = cached.execute(
+                groups = cached.rows(
                     "SELECT title, romanized_title, artist_name "
                     "FROM track_search_release_groups WHERE release_group_mbid = ?",
                     (row["mbid"].casefold(),),
-                ).fetchone()
+                )
+                group = groups[0] if groups else None
                 if group:
                     add("release-group", row["mbid"], [group["title"], group["romanized_title"]])
                     row["artist_name"] = row.get("artist_name") or group["artist_name"]
-                for credit in cached.execute(
+                for credit in cached.rows(
                     "SELECT artist_mbid, credit_name FROM track_search_release_group_artists WHERE release_group_mbid = ?",
                     (row["mbid"].casefold(),),
                 ):
@@ -251,15 +340,14 @@ def capture(connection, request_id, *, metadata=()):
                 for kind, entity_id in list(entities):
                     if kind in {"artist", "release-group"}:
                         includes = ("", "aliases", "aliases+url-rels+genres", "aliases+artist-credits+url-rels")
-                        for include in includes:
-                            cache_keys.add(musicbrainz.metadata_cache_key(f"/{kind}/{quote(entity_id)}", include))
+                        cache_keys.update(cached.metadata_keys(kind, entity_id, includes))
                     else:
                         cache_keys.add(cache_key(
                             "animethemes-detail", f"{animethemes._ANIMETHEMES_URL}/anime/{quote(entity_id, safe='')}",
                             {"include": animethemes._DETAIL_INCLUDE},
                         ))
                 if "track_search_release_group_refs" in tables and row["kind"] == "release-group":
-                    cache_keys.update(item[0] for item in cached.execute(
+                    cache_keys.update(item[0] for item in cached.rows(
                         "SELECT cache_key FROM track_search_release_group_refs WHERE release_group_mbid = ?",
                         (row["mbid"].casefold(),),
                     ))
@@ -269,44 +357,32 @@ def capture(connection, request_id, *, metadata=()):
                     if key in read_keys:
                         continue
                     read_keys.add(key)
-                    document = cached.execute("SELECT value FROM api_cache WHERE cache_key = ?", (key,)).fetchone()
-                    if not document:
-                        continue
-                    try:
-                        payload = json.loads(document[0])
-                    except (TypeError, ValueError):
-                        continue
+                    payload = cached.document(key)
                     if not isinstance(payload, dict):
                         continue
                     if key.startswith("animethemes-detail:"):
                         anime = payload.get("anime") or {}
                         if isinstance(anime, dict):
-                            add("anime", anime.get("slug"), _names(anime))
+                            add("anime", anime.get("slug"), cached.names(anime))
                     else:
                         documents = [payload, *(payload.get("release-groups") or [])]
                         for entity in documents:
                             if not isinstance(entity, dict):
                                 continue
                             if str(entity.get("id") or "").casefold() == row["mbid"].casefold():
-                                add(row["kind"], row["mbid"], _names(entity))
+                                add(row["kind"], row["mbid"], cached.names(entity, row["kind"]))
                                 if row["kind"] == "release-group":
-                                    add("release-group", row["mbid"], [musicbrainz.romanized_release_group_title(entity)])
                                     for credit in entity.get("artist-credit") or []:
                                         if not isinstance(credit, dict):
                                             continue
                                         artist = credit.get("artist") or {}
                                         if not isinstance(artist, dict):
                                             continue
-                                        add_credit(artist.get("id"), [credit.get("name"), *_names(artist)])
+                                        add_credit(artist.get("id"), [credit.get("name"), *cached.names(artist)])
                                         if ("artist", str(artist.get("id") or "").casefold()) in entities:
-                                            cache_keys.update(
-                                                musicbrainz.metadata_cache_key(f"/artist/{quote(str(artist['id']))}", include)
-                                                for include in ("", "aliases", "aliases+url-rels+genres")
-                                            )
-                                else:
-                                    add("artist", row["mbid"], [musicbrainz.romanized_artist_name(entity)])
+                                            cache_keys.update(cached.metadata_keys("artist", str(artist["id"]), ("", "aliases", "aliases+url-rels+genres")))
                             elif ("artist", str(entity.get("id") or "").casefold()) in entities:
-                                add("artist", entity["id"], _names(entity))
+                                add("artist", entity["id"], cached.names(entity))
             # Only infer identity after all authoritative local credits have
             # been read. A unique name in our partial catalog is not evidence
             # that it supersedes an explicit artist identifier.
@@ -317,7 +393,7 @@ def capture(connection, request_id, *, metadata=()):
                     "WHERE entity_kind = 'artist' AND search_key = ?", (search_key(row["artist_name"]),),
                 )}
                 if "track_search_artist_names" in tables:
-                    artist_ids.update(item[0] for item in cached.execute(
+                    artist_ids.update(item[0] for item in cached.rows(
                         "SELECT artist_mbid FROM track_search_artist_names WHERE normalized_name IN (?, ?)",
                         (normalize_text(row["artist_name"]), search_key(row["artist_name"])),
                     ))
@@ -325,25 +401,21 @@ def capture(connection, request_id, *, metadata=()):
                     artist_id = next(iter(artist_ids))
                     add("artist", artist_id, [row["artist_name"]])
                     if "api_cache" in tables:
-                        for include in ("", "aliases", "aliases+url-rels+genres"):
-                            key = musicbrainz.metadata_cache_key(f"/artist/{quote(artist_id)}", include)
-                            document = cached.execute("SELECT value FROM api_cache WHERE cache_key = ?", (key,)).fetchone()
-                            try:
-                                artist = json.loads(document[0]) if document else {}
-                            except (TypeError, ValueError):
-                                continue
+                        for key in cached.metadata_keys("artist", artist_id, ("", "aliases", "aliases+url-rels+genres")):
+                            artist = cached.document(key)
                             if isinstance(artist, dict) and str(artist.get("id") or "").casefold() == artist_id:
-                                add("artist", artist_id, [*_names(artist), musicbrainz.romanized_artist_name(artist)])
+                                add("artist", artist_id, cached.names(artist, "artist"))
             if "track_search_artist_names" in tables:
                 for kind, entity_id in list(entities):
                     if kind == "artist":
-                        add(kind, entity_id, [name[0] for name in cached.execute(
+                        add(kind, entity_id, [name[0] for name in cached.rows(
                             "SELECT normalized_name FROM track_search_artist_names WHERE artist_mbid = ?", (entity_id,),
                         )])
     except (OSError, sqlite3.Error):
         # The disposable cache may be absent or busy. Canonical local fields
         # and previously captured durable aliases remain sufficient to search.
-        pass
+        if strict:
+            raise
 
     connection.executemany(
         "INSERT OR IGNORE INTO request_history_search_entities (request_id, entity_kind, entity_id) VALUES (?, ?, ?)",
