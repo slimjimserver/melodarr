@@ -630,6 +630,12 @@ dialog::backdrop { background: rgba(48, 39, 32, .52); }
 .request-history-section > summary::marker { color: var(--foreground-muted); }
 .request-history-section > summary h2 { display: inline; margin: 0; }
 .request-history-section[open] > summary { margin-bottom: 14px; }
+.request-history-search { display: flex; align-items: center; gap: 10px; margin: 0 0 8px; }
+.request-history-search input { flex: 1; min-width: 0; }
+.request-history-search button { flex: none; min-height: 44px; }
+.request-search-status { margin: 0 0 18px; }
+.request-search-status:empty { display: none; }
+.request-history-results { min-width: 0; margin-top: 20px; }
 .profile-summary { display: flex; align-items: center; gap: 15px; border: 1px solid var(--border); border-radius: 14px; background: rgba(255, 250, 243, .7); padding: 18px; }
 .profile-summary h2 { margin-bottom: 4px; }
 .profile-summary p { margin: 0; color: var(--foreground-muted); font-size: 12px; }

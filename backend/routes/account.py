@@ -13,6 +13,7 @@ from flask import Blueprint, current_app, jsonify, request
 from werkzeug.security import generate_password_hash
 
 if __package__ == "backend.routes":
+    from ..request_history_search import local_release_group_metadata
     from ..responses import api_error, request_json_object
     from ..security import (
         admin_required,
@@ -24,6 +25,7 @@ if __package__ == "backend.routes":
     from ..storage import (
         db,
         count_request_history,
+        count_request_history_groups,
         delete_recommendation_cache,
         get_lastfm_api_key,
         get_request_history,
@@ -32,6 +34,7 @@ if __package__ == "backend.routes":
     )
     from ..workers import recommendations as recommendation_worker
 else:  # Support the existing `python backend/app.py` entry point.
+    from request_history_search import local_release_group_metadata
     from responses import api_error, request_json_object
     from security import (
         admin_required,
@@ -43,6 +46,7 @@ else:  # Support the existing `python backend/app.py` entry point.
     from storage import (
         db,
         count_request_history,
+        count_request_history_groups,
         delete_recommendation_cache,
         get_lastfm_api_key,
         get_request_history,
@@ -135,7 +139,7 @@ def _explicit_anime_history_link(item):
     }
 
 
-def _profile_history_item(row, plex_index, anime_link_cache=None):
+def _profile_history_item(row, plex_index, anime_link_cache=None, *, local_only=False):
     item = dict(row)
     explicit_anime_link = _explicit_anime_history_link(item)
     if explicit_anime_link:
@@ -166,7 +170,7 @@ def _profile_history_item(row, plex_index, anime_link_cache=None):
             item.get(field)
             for field in ("artist_name", "release_type", "release_date")
         ):
-            cached = _cached_release_group_metadata(item["mbid"])
+            cached = local_release_group_metadata(item["mbid"]) if local_only else _cached_release_group_metadata(item["mbid"])
             item["artist_name"] = (
                 item.get("artist_name")
                 or cached.get("artist_name")
@@ -302,7 +306,11 @@ def account_profile():
     page = _requested_page()
     if page is None:
         return api_error("Page must be a positive integer.")
-    total = count_request_history(user["id"])
+    query = request.args.get("q", "").strip()
+    if len(query) > 500:
+        return api_error("Search must be 500 characters or fewer.")
+    group_counts = count_request_history_groups(user["id"], query=query) if query else None
+    total = sum(group_counts.values()) if group_counts else count_request_history(user["id"])
     history = {"artist": [], "release-group": []}
     plex_index = _profile_plex_index()
     anime_link_cache = {}
@@ -310,16 +318,18 @@ def account_profile():
         user["id"],
         limit=REQUESTS_PAGE_SIZE,
         offset=(page - 1) * REQUESTS_PAGE_SIZE,
+        query=query,
     )]
     apply_release_group_lifecycle(rows)
     for row in rows:
         history[row["kind"]].append(
-            _profile_history_item(row, plex_index, anime_link_cache)
+            _profile_history_item(row, plex_index, anime_link_cache, local_only=bool(query))
         )
     return jsonify({
         "username": user["username"],
         "user": _profile_user_payload(user),
         "requests": history,
+        "matchCounts": group_counts,
         "pagination": {
             "page": page,
             "pageSize": REQUESTS_PAGE_SIZE,

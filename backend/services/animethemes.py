@@ -291,6 +291,14 @@ def detail(slug):
         ttl=_DETAIL_CACHE_TTL,
     )
     anime = data.get("anime") if isinstance(data, dict) else None
+    if isinstance(anime, dict):
+        # Retain only known names in application storage; Requests search never
+        # calls this lookup and does not depend on this HTTP cache's lifetime.
+        if __package__ == "backend.services":
+            from ..request_history_search import remember_anime_names
+        else:
+            from request_history_search import remember_anime_names
+        remember_anime_names(anime)
     return _normalize_detail(anime) if isinstance(anime, dict) else None
 
 

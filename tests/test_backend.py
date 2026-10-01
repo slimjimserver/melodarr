@@ -2346,13 +2346,14 @@ class DeploymentConfigTests(unittest.TestCase):
             '<a data-account-route="requests" href="#">Requests</a>',
             frontend,
         )
-        self.assertIn('return `/${encodedUsername}/requests${query}`', typescript)
+        self.assertIn('return `/${encodedUsername}/requests${query.size ? `?${query}` : ""}`', typescript)
         self.assertIn('className = "request-pagination"', typescript)
         self.assertIn(
-            '/api/account/profile?username=${encodeURIComponent(targetUsername)}'
-            '&page=${encodeURIComponent(targetRequestPage)}',
+            'new URLSearchParams({ username: targetUsername, page: String(requestPage) })',
             typescript,
         )
+        self.assertIn('if (query) params.set("q", query)', typescript)
+        self.assertIn('api(`/api/account/profile?${params}`', typescript)
         # The header and the mobile tab bar both carry a button per view, and
         # detail/account views have none, so this must not use the strict
         # single-element helper that throws when a selector matches nothing.
@@ -5693,7 +5694,9 @@ class LidarrRequestTests(DatabaseTestCase):
         self.assertEqual((mbid, album_id, artist_id, title), (
             self.album_mbid, 33, 44, "Test Album",
         ))
-        self.assertEqual(enqueue_search.call_args.kwargs, {
+        search_metadata = enqueue_search.call_args.kwargs["search_metadata"]
+        self.assertTrue(any(item.get("title") == "Test Album" for item in search_metadata))
+        self.assertEqual({key: value for key, value in enqueue_search.call_args.kwargs.items() if key != "search_metadata"}, {
             "artist_name": "Test Artist",
             "release_type": "Album",
             "release_date": "2020-03-18",
@@ -5802,7 +5805,9 @@ class LidarrRequestTests(DatabaseTestCase):
         self.assertEqual(record_history.call_args.args[1:4], (
             "release-group", self.album_mbid, "Theme Single"
         ))
-        self.assertEqual(record_history.call_args.kwargs, {
+        search_metadata = record_history.call_args.kwargs["search_metadata"]
+        self.assertTrue(any(item.get("title") == "Theme Single" for item in search_metadata))
+        self.assertEqual({key: value for key, value in record_history.call_args.kwargs.items() if key != "search_metadata"}, {
             "artist_name": "Theme Artist",
             "release_type": "Single",
             "release_date": "2026-01-02",

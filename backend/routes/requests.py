@@ -153,6 +153,7 @@ def _release_history_metadata(*albums):
         "artist_name": artist_name,
         "release_type": release_type,
         "release_date": release_date,
+        "search_metadata": albums,
     }
 
 
@@ -190,7 +191,7 @@ def request_artist():
         })
         added = lidarr.add_artist(artist)
         if added.status_code == 400 and "already" in added.text.lower():
-            record_request(current_user()["id"], "artist", mbid, artist.get("artistName", "Artist"))
+            record_request(current_user()["id"], "artist", mbid, artist.get("artistName", "Artist"), search_metadata=(artist,))
             lidarr_library_worker.request_scan()
             return jsonify({"message": "This artist is already in Lidarr.", "alreadyExists": True})
         added.raise_for_status()
@@ -201,7 +202,7 @@ def request_artist():
             "monitorNewItems": artist["monitorNewItems"],
         })
         editor_update.raise_for_status()
-        record_request(current_user()["id"], "artist", mbid, artist.get("artistName", "Artist"))
+        record_request(current_user()["id"], "artist", mbid, artist.get("artistName", "Artist"), search_metadata=(artist, created_artist))
         lidarr_library_worker.request_scan()
         return jsonify({"message": f"{artist.get('artistName', 'Artist')} was sent to Lidarr.", "artist": created_artist}), 201
     except (ValueError, TypeError):
