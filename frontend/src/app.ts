@@ -1226,7 +1226,10 @@ function setupNavigation() {
         const mutation = tasteMutations.get(requestId);
         if (mutation?.owner !== owner) return;
         toggle.checked = mutation.included;
-        toggle.disabled = mutation.pending;
+        // Keep keyboard focus during saving; the change guard below prevents
+        // further mutations while aria-disabled communicates the pending state.
+        if (mutation.pending) toggle.setAttribute("aria-disabled", "true");
+        else toggle.removeAttribute("aria-disabled");
         status.textContent = mutation.message;
       };
       // A pending save belongs to the request, not to a particular card node.
@@ -1235,7 +1238,10 @@ function setupNavigation() {
       toggle.addEventListener("change", async () => {
         const included = toggle.checked;
         const existing = tasteMutations.get(requestId);
-        if (existing?.owner === owner && existing.pending) return;
+        if (existing?.owner === owner && existing.pending) {
+          toggle.checked = existing.included;
+          return;
+        }
         const mutation = { owner, included, previous: !included, pending: true, message: "Saving…" };
         tasteMutations.set(requestId, mutation);
         const updateVisibleCards = () => {
@@ -1287,6 +1293,10 @@ function setupNavigation() {
       plexBadge.append(icon);
       main.append(plexBadge);
     }
+    row.querySelectorAll<HTMLElement>('a, input[type="checkbox"]').forEach(control => {
+      const identity = control instanceof HTMLAnchorElement ? `link:${control.getAttribute("href")}` : "recommendations";
+      control.dataset.requestFocusKey = JSON.stringify([route, item.id ?? item.mbid, identity]);
+    });
     return row;
   }
 
@@ -1470,6 +1480,21 @@ function setupNavigation() {
         let searchGeneration = 0;
         let searchAbort: AbortController | undefined;
         let composing = false;
+        const focusedResultKey = () => {
+          const focused = document.activeElement;
+          return focused instanceof HTMLElement && results.contains(focused)
+            ? focused.dataset.requestFocusKey || "" : null;
+        };
+        const restoreResultFocus = (key: string | null, fallback: HTMLElement) => {
+          if (key === null) return;
+          const replacement = Array.from(results.querySelectorAll<HTMLElement>("[data-request-focus-key]"))
+            .find(control => key && control.dataset.requestFocusKey === key);
+          if (replacement && !replacement.matches(":disabled")) {
+            const section = replacement.closest("details");
+            if (section && !replacement.matches("summary")) section.open = true;
+            replacement.focus();
+          } else fallback.focus();
+        };
         const disablePagination = () => {
           results.querySelectorAll<HTMLButtonElement>(".request-pagination button").forEach(button => { button.disabled = true; });
         };
@@ -1478,7 +1503,10 @@ function setupNavigation() {
           searchAbort?.abort();
         });
 
-        const renderResults = (data: JsonObject, query: string, requestStatus: string) => {
+        const renderResults = (data: JsonObject, query: string, requestStatus: string, focusFallback: HTMLElement) => {
+          // Read focus at replacement time, rather than when loading began:
+          // users can continue navigating while a response is pending.
+          const focusKey = focusedResultKey();
           results.replaceChildren();
           const filtered = Boolean(query) || requestStatus !== "all";
           const emptyMessage = query ? "No matching requests."
@@ -1492,6 +1520,7 @@ function setupNavigation() {
             const section = document.createElement("details");
             section.className = "account-section request-history-section";
             const summary = document.createElement("summary");
+            summary.dataset.requestFocusKey = `section:${route}`;
             const heading = document.createElement("h2");
             const count = data.matchCounts?.[route === "artists" ? "artist" : "release-group"] ?? requests.length;
             section.open = filtered ? count > 0 : route === "albums";
@@ -1541,9 +1570,10 @@ function setupNavigation() {
           next.addEventListener("click", () => showRequestPage(pagination.page + 1));
           paginationControls.append(previous, status, next);
           results.append(paginationControls);
+          restoreResultFocus(focusKey, focusFallback);
         };
 
-        const loadResults = async (query: string, requestPage: number | string, requestStatus: string) => {
+        const loadResults = async (query: string, requestPage: number | string, requestStatus: string, focusFallback: HTMLElement = searchInput) => {
           searchAbort?.abort();
           const generation = ++searchGeneration;
           const fetchController = new AbortController();
@@ -1568,18 +1598,20 @@ function setupNavigation() {
               data = await api(`/api/account/profile?${params}`, { signal: fetchController.signal });
             }
             if (!isCurrentRender() || generation !== searchGeneration) return;
-            renderResults(data, query, requestStatus);
+            renderResults(data, query, requestStatus, focusFallback);
           } catch (error) {
             if (error.name !== "AbortError" && isCurrentRender() && generation === searchGeneration) {
+              const focusKey = focusedResultKey();
               results.replaceChildren();
               const validation = ["Page must be a positive integer.", "Search must be 500 characters or fewer.", "Status must be all, requested, or available."];
               setMessage(searchStatus, validation.includes(error.message) ? error.message : "Requests could not be loaded. Please try again.", true);
+              restoreResultFocus(focusKey, focusFallback);
             }
           } finally {
             if (generation === searchGeneration) results.removeAttribute("aria-busy");
           }
         };
-        const applySearch = () => {
+        const applySearch = (focusFallback: HTMLElement = searchInput) => {
           window.clearTimeout(searchTimer);
           if (!isCurrentRender() || composing) return;
           activeAccountRequestQuery = searchInput.value.trim();
@@ -1588,7 +1620,7 @@ function setupNavigation() {
           window.history.replaceState(
             { account: "requests", username: targetUsername, page: 1 }, "", accountPath("requests", targetUsername, 1),
           );
-          void loadResults(activeAccountRequestQuery, 1, activeAccountRequestStatus);
+          void loadResults(activeAccountRequestQuery, 1, activeAccountRequestStatus, focusFallback);
         };
         const scheduleSearch = () => {
           clear.hidden = !searchInput.value;
@@ -1602,7 +1634,7 @@ function setupNavigation() {
         searchInput.addEventListener("compositionend", () => { composing = false; scheduleSearch(); });
         searchInput.addEventListener("input", scheduleSearch);
         searchForm.addEventListener("submit", event => { event.preventDefault(); applySearch(); });
-        statusSelect.addEventListener("change", applySearch);
+        statusSelect.addEventListener("change", () => applySearch(statusSelect));
         clear.addEventListener("click", () => {
           composing = false;
           searchInput.value = "";

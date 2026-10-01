@@ -4662,7 +4662,10 @@
   showDetailFromLocation();
 
   const backToTop = $("#back-to-top");
-  backToTop.addEventListener("click", () => window.scrollTo({ top: 0, behavior: "smooth" }));
+  backToTop.addEventListener("click", () => window.scrollTo({
+    top: 0,
+    behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
+  }));
   window.addEventListener("scroll", () => {
     backToTop.classList.toggle("visible", window.scrollY > 400);
   }, { passive: true });
