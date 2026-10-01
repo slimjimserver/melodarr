@@ -116,6 +116,13 @@ def _backfill_catalog_anime_names(connection):
     for row in connection.execute("SELECT DISTINCT anime_slug, anime_name FROM anime_theme_release_group_links"):
         save_names(connection, "anime", row["anime_slug"], [row["anime_slug"], row["anime_name"]], catalog=True)
     with cache_db() as cached:
+        # init_db() can run before init_cache_db() on a fresh volume, or after
+        # the disposable cache is removed. Missing cache data is not an error;
+        # genuine cache I/O/schema failures must still roll back the migration.
+        if not cached.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'api_cache'"
+        ).fetchone():
+            return
         for row in cached.execute("SELECT value FROM api_cache WHERE cache_key LIKE 'animethemes-detail:%'"):
             try:
                 payload = json.loads(row[0])

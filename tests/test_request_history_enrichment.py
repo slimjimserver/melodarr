@@ -8,13 +8,44 @@ else:
     from test_backend import DatabaseTestCase
 
 import json
+import os
 import sqlite3
+import tempfile
 import time
+import unittest
 from unittest.mock import patch
 
 from backend import api_cache, request_history_search as search, storage
 from backend.routes import account
 from backend.services import anime_theme_links, musicbrainz
+
+
+class RequestHistoryFreshStartupTests(unittest.TestCase):
+    def test_durable_database_can_initialize_before_fresh_cache(self):
+        for empty_file in (False, True):
+            with self.subTest(empty_file=empty_file), tempfile.TemporaryDirectory() as directory:
+                database = os.path.join(directory, "melodarr.db")
+                cache = os.path.join(directory, "cache", "metadata.db")
+                if empty_file:
+                    os.makedirs(os.path.dirname(cache))
+                    sqlite3.connect(cache).close()
+                with patch.object(storage, "DATABASE", database), \
+                     patch.object(storage, "SETTINGS_FILE", os.path.join(directory, "settings.json")), \
+                     patch.object(api_cache, "CACHE_DATABASE", cache), \
+                     patch("requests.sessions.Session.request", side_effect=AssertionError("Startup attempted upstream I/O")) as network:
+                    # Match the Docker runtime smoke check's initialization order.
+                    storage.init_db()
+                    api_cache.init_cache_db()
+                    with storage.db() as connection:
+                        self.assertEqual(connection.execute("SELECT COUNT(*) FROM request_history").fetchone()[0], 0)
+                        self.assertEqual(connection.execute("SELECT COUNT(*) FROM request_history_search_migrations").fetchone()[0], 1)
+                        before = list(connection.iterdump())
+                    storage.init_db()
+                    with storage.db() as connection:
+                        self.assertEqual(list(connection.iterdump()), before)
+                    with api_cache.cache_db() as connection:
+                        self.assertEqual(connection.execute("SELECT COUNT(*) FROM api_cache").fetchone()[0], 0)
+                    network.assert_not_called()
 
 
 class RequestHistoryEnrichmentTests(DatabaseTestCase):
@@ -63,6 +94,40 @@ class RequestHistoryEnrichmentTests(DatabaseTestCase):
         with storage.db() as connection:
             return {table: [tuple(row) for row in connection.execute("SELECT * FROM " + table + " ORDER BY 1, 2")]
                     for table in ("request_history", "request_history_search_entities", "request_history_search_aliases")}
+
+    def test_anime_alias_cleanup_with_missing_cache_preserves_local_data(self):
+        storage.record_request(self.user_id, "artist", self.artist, "Artist", search_metadata=({"aliases": ["Artist Alias"]},))
+        storage.record_request(self.user_id, "release-group", "group", "Album", anime_slug="shared-anime", anime_name="Row Local Name", search_metadata=({"aliases": ["Album Alias"]},))
+        with storage.db() as connection:
+            connection.execute("DELETE FROM request_history_search_migrations")
+            connection.execute("INSERT INTO request_history_search_aliases VALUES ('anime', 'shared-anime', 'untrustedalias')")
+            connection.execute(
+                "INSERT INTO anime_theme_release_group_links "
+                "(anime_slug, anime_name, theme_id, theme_label, theme_type, song_title, release_group_mbid, created_at, updated_at) "
+                "VALUES ('shared-anime', 'Trusted Mapping Name', 1, 'OP', 'OP', 'Song', 'group', 0, 0)"
+            )
+        before = self.snapshot()
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(api_cache, "CACHE_DATABASE", os.path.join(directory, "cache", "metadata.db")):
+            storage.init_db()
+            first = self.snapshot()
+            self.assertEqual(first["request_history"], before["request_history"])
+            self.assertEqual(first["request_history_search_entities"], before["request_history_search_entities"])
+            self.assertEqual(
+                [row for row in first["request_history_search_aliases"] if row[0] != "anime"],
+                [row for row in before["request_history_search_aliases"] if row[0] != "anime"],
+            )
+            self.assertEqual(
+                {tuple(row) for row in first["request_history_search_aliases"] if row[0] == "anime"},
+                {("anime", "shared-anime", "sharedanime"), ("anime", "shared-anime", "trustedmappingname")},
+            )
+            storage.init_db()
+            self.assertEqual(self.snapshot(), first)
+        for query in ("Trusted Mapping Name", "Row Local Name", "Album Alias"):
+            self.assertEqual(self.profile(q=query)["pagination"]["total"], 1)
+        self.assertEqual(self.profile(q="Artist Alias")["pagination"]["total"], 1)
+        self.assertEqual(self.profile(q="Untrusted Alias")["pagination"]["total"], 0)
+        self.network.assert_not_called()
 
     def test_transient_backfill_cache_failure_rolls_back_and_retries(self):
         self.seed(3, kind="artist", mbid=self.artist)
