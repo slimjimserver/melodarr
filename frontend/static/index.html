@@ -14,7 +14,7 @@
   <script src="/static/theme.js"></script>
   <link rel="stylesheet" href="/static/style.css">
 </head>
-<body data-discovery-src="/static/discovery.js">
+<body data-discovery-src="/static/discovery.js" data-rooms-src="/static/rooms.js">
   <a class="skip-link" href="#main-content">Skip to main content</a>
   <div id="pull-to-refresh" class="pull-to-refresh" aria-live="polite" aria-label="Pull down to refresh">↓</div>
   <header>
@@ -26,6 +26,7 @@
       <a class="nav-link active" href="/" data-view="discover" aria-current="page">Discover</a>
       <a class="nav-link" href="/library" data-view="library">Your library</a>
       <a class="nav-link" href="/" data-view="account" data-primary-account="requests">Requests</a>
+      <a class="nav-link" href="/rooms" data-view="rooms">Rooms</a>
       <a class="nav-link admin-only" href="/settings" data-view="settings">Settings</a>
     </nav>
     <div id="status" class="status" role="status" aria-live="polite">Checking services…</div>
@@ -149,6 +150,11 @@
   </section>
 
   <main id="main-content" tabindex="-1">
+    <section id="rooms" class="view">
+      <p class="eyebrow">A SHARED JUKEBOX</p>
+      <h1>Your music.<br><em>Everyone’s next.</em></h1>
+      <div id="room-root" data-host="true"></div>
+    </section>
     <section id="discover" class="view active">
       <p class="eyebrow">FIND YOUR NEXT FAVORITE</p>
       <h1>What do you want<br>to hear <em>next?</em></h1>
@@ -554,6 +560,7 @@
     </form>
   </dialog>
   <nav class="tab-bar" aria-label="Primary">
+    <a class="nav-link" href="/rooms" data-view="rooms"><span class="tab-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><circle cx="8" cy="8" r="3"/><circle cx="17" cy="9" r="2"/><path d="M2 21v-3a6 6 0 0 1 12 0v3M16 15a5 5 0 0 1 6 5"/></svg></span>Rooms</a>
     <a class="nav-link active" href="/" data-view="discover" aria-current="page"><span class="tab-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="2.25"/><path d="m14 10 3.5-3.5-3.5 7.5-7.5 3.5L10 14"/></svg></span>Discover</a>
     <a class="nav-link" href="/library" data-view="library"><span class="tab-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path d="M5 5.5h12.5A1.5 1.5 0 0 1 19 7v12H6.5A1.5 1.5 0 0 1 5 17.5v-12Z"/><path d="M8 2.5h9.5A1.5 1.5 0 0 1 19 4v1.5M8 9h8M8 12.5h8"/></svg></span>Library</a>
     <a class="nav-link" href="/" data-view="account" data-primary-account="requests"><span class="tab-icon" aria-hidden="true"><svg viewBox="0 0 24 24" focusable="false"><path d="M9 18V5l11-2v13M9 9l11-2"/><ellipse cx="6" cy="18" rx="3" ry="2.5"/><ellipse cx="17" cy="16" rx="3" ry="2.5"/></svg></span>Requests</a>

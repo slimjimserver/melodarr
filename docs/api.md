@@ -7,6 +7,9 @@ endpoints; it does not grant access to private accounts or administrator setting
 A machine-readable version of this contract is available in
 [`openapi.yaml`](openapi.yaml).
 
+The session/guest Rooms API is documented separately in [`rooms.md`](rooms.md).
+Automation API keys do not authorize Room hosting or queue management.
+
 ## Authentication
 
 Melodarr generates an API key automatically on first start. An administrator

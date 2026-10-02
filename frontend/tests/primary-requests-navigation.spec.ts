@@ -33,8 +33,8 @@ for (const theme of ["midnight", "warm"]) {
       await expect(page.locator("#library")).toBeVisible();
       const desktop = page.locator(".header-nav");
       const mobile = page.locator(".tab-bar");
-      await expect(desktop.locator("a")).toHaveText(["Discover", "Your library", "Requests", "Settings"]);
-      await expect(mobile.locator("a")).toHaveText(["Discover", "Library", "Requests", "Settings"]);
+      await expect(desktop.locator("a")).toHaveText(["Discover", "Your library", "Requests", "Rooms", "Settings"]);
+      await expect(mobile.locator("a")).toHaveText(["Rooms", "Discover", "Library", "Requests", "Settings"]);
       await expect(desktop.locator('[data-primary-account="requests"]')).toHaveAttribute("href", "/ada/requests");
       const musicIcon = mobile.locator('[data-primary-account="requests"] .tab-icon');
       await expect(musicIcon).toHaveAttribute("aria-hidden", "true");
@@ -73,12 +73,12 @@ for (const theme of ["midnight", "warm"]) {
             }),
           };
         });
-        expect(metrics.items).toHaveLength(4);
+        expect(metrics.items).toHaveLength(5);
         expect(metrics.scroll).toBeLessThanOrEqual(metrics.viewport);
         expect(metrics.bottom).toBe(900);
         expect(metrics.padding).toBe("24px");
         for (const item of metrics.items) {
-          expect(item.width).toBeCloseTo(metrics.viewport / 4, 1);
+          expect(item.width).toBeCloseTo(metrics.viewport / 5, 1);
           expect(item.left).toBeGreaterThanOrEqual(0);
           expect(item.right).toBeLessThanOrEqual(metrics.viewport);
           expect(item.labelLeft).toBeGreaterThanOrEqual(item.left);

@@ -30,6 +30,7 @@ if __package__:
     from .routes.notifications import blueprint as notifications_blueprint
     from .routes.pages import blueprint as pages_blueprint
     from .routes.requests import blueprint as requests_blueprint
+    from .routes.rooms import blueprint as rooms_blueprint
     from .routes.settings import blueprint as settings_blueprint
     from .security import verify_csrf_token
     from .storage import init_db
@@ -55,6 +56,7 @@ else:  # Support the existing `python backend/app.py` entry point.
     from routes.notifications import blueprint as notifications_blueprint
     from routes.pages import blueprint as pages_blueprint
     from routes.requests import blueprint as requests_blueprint
+    from routes.rooms import blueprint as rooms_blueprint
     from routes.settings import blueprint as settings_blueprint
     from security import verify_csrf_token
     from storage import init_db
@@ -155,6 +157,7 @@ BLUEPRINTS = (
     library_blueprint,
     music_blueprint,
     requests_blueprint,
+    rooms_blueprint,
     settings_blueprint,
     notifications_blueprint,
     pages_blueprint,

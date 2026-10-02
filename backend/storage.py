@@ -1016,6 +1016,11 @@ def init_db():
             "CREATE UNIQUE INDEX IF NOT EXISTS users_plex_id_unique "
             "ON users(plex_id) WHERE plex_id IS NOT NULL"
         )
+        if __package__:
+            from .room_storage import migrate as migrate_rooms
+        else:
+            from room_storage import migrate as migrate_rooms
+        migrate_rooms(connection)
         plex_flow_schema = connection.execute(
             "SELECT sql FROM sqlite_master "
             "WHERE type = 'table' AND name = 'plex_auth_flows'"

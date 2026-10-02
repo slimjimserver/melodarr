@@ -41,6 +41,7 @@ docs/*
 !docs/api.md
 !docs/openapi.yaml
 !docs/request-history-search.md
+!docs/rooms.md
 
 # Editors / OS
 .idea/

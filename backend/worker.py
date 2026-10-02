@@ -17,6 +17,7 @@ if __package__:
     from .workers import plex_metadata as plex_metadata_worker
     from .workers import charts as chart_worker
     from .workers import recommendations as recommendation_worker
+    from .workers import rooms as rooms_worker
     from .workers import similar_artists as similar_artist_worker
 else:  # Support `python backend/worker.py` for local development.
     from api_cache import init_cache_db
@@ -33,6 +34,7 @@ else:  # Support `python backend/worker.py` for local development.
     from workers import plex_metadata as plex_metadata_worker
     from workers import charts as chart_worker
     from workers import recommendations as recommendation_worker
+    from workers import rooms as rooms_worker
     from workers import similar_artists as similar_artist_worker
 
 
@@ -46,6 +48,7 @@ def main():
     """Initialize storage and start background jobs in a controlled sequence."""
     init_cache_db()
     init_db()
+    Thread(target=rooms_worker.run, name="room-reconciliation", daemon=True).start()
     anime_metadata_thread = Thread(
         target=anime_metadata_worker.run,
         name="anime-musicbrainz-resolution",

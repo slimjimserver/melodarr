@@ -35,7 +35,7 @@ interface AppElement extends HTMLElement {
   fetchPriority: string;
 }
 type AccountPage = "profile" | "requests" | "general" | "linked-accounts" | "notifications" | "invitations";
-type AppView = "discover" | "detail" | "library" | "settings" | "account";
+type AppView = "discover" | "detail" | "library" | "settings" | "account" | "rooms";
 type SettingsPage = "services" | "notifications" | "requests" | "users" | "jobs";
 type ThemeName = "midnight" | "warm";
 
@@ -255,7 +255,7 @@ let accountRenderAbort: AbortController | undefined;
 let sessionExpiryHandled = false;
 // Plex holdings tell a requester what is already available, so the library is
 // readable by every account. Settings remains administrator-only.
-const VIEWS_FOR_EVERY_USER = ["discover", "detail", "library", "account"];
+const VIEWS_FOR_EVERY_USER = ["discover", "detail", "library", "account", "rooms"];
 
 if ("scrollRestoration" in window.history) {
   window.history.scrollRestoration = "manual";
@@ -1137,6 +1137,12 @@ function setupNavigation() {
     if (updateHistory) {
       const path = view === "discover" ? "/" : `/${view}`;
       window.history.pushState({ view }, "", path);
+    }
+    window.dispatchEvent(new CustomEvent("melodarr-view-changed", { detail: view }));
+    if (view === "rooms") {
+      void import(document.body.dataset.roomsSrc || "/static/rooms.js").then((module) => {
+        if (document.querySelector("#rooms.active") && currentUser) module.showHostRooms(currentUser.csrfToken || "");
+      }).catch((error) => showToast(error.message, true));
     }
     resetPageScroll();
     focusMainContent();
@@ -2047,8 +2053,8 @@ function setupNavigation() {
   window.addEventListener("popstate", () => {
     // Fixed application routes take precedence over username routes, including
     // when authentication restores the current URL after a full page load.
-    if (["/", "/discover", "/library", "/library/"].includes(window.location.pathname)) {
-      showView(window.location.pathname.startsWith("/library") ? "library" : "discover", false);
+    if (["/", "/discover", "/library", "/library/", "/rooms"].includes(window.location.pathname)) {
+      showView(window.location.pathname === "/rooms" ? "rooms" : window.location.pathname.startsWith("/library") ? "library" : "discover", false);
       return;
     }
     if (["/settings", "/settings/notifications", "/settings/requests", "/settings/users", "/settings/jobs"].includes(window.location.pathname)) {
@@ -2088,12 +2094,12 @@ function setupNavigation() {
       return;
     }
     const view = window.location.pathname.slice(1) || "discover";
-    showView((["discover", "library", "settings"].includes(view) ? view : "discover") as AppView, false);
+    showView((["discover", "library", "settings", "rooms"].includes(view) ? view : "discover") as AppView, false);
   });
 
   const initialView = window.location.pathname.slice(1) || "discover";
   if (["settings/notifications", "settings/requests", "settings/users", "settings/jobs"].includes(initialView)) showView("settings", false);
-  else if (["library", "settings"].includes(initialView)) showView(initialView as AppView, false);
+  else if (["library", "settings", "rooms"].includes(initialView)) showView(initialView as AppView, false);
 
   document.querySelectorAll<HTMLAnchorElement>(".tab-bar .nav-link").forEach((link) => link.addEventListener("click", (event) => {
     if (event.defaultPrevented) {

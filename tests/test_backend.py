@@ -227,8 +227,8 @@ class ApplicationFactoryTests(DatabaseTestCase):
             for method in rule.methods
             if method not in {"HEAD", "OPTIONS"}
         }
-        self.assertEqual(len(rules), 117)
-        self.assertEqual(len(route_methods), 117)
+        self.assertEqual(len(rules), 131)
+        self.assertEqual(len(route_methods), 131)
         for route in (("/api/discover/charts", "GET"), ("/api/discover/preferences", "GET"),
                       ("/api/discover/preferences", "POST"), ("/api/discover/request-influence", "POST")):
             self.assertIn(route, route_methods)
@@ -613,6 +613,7 @@ class WorkerEntrypointTests(unittest.TestCase):
         lidarr_library_thread = Mock()
         notification_thread = Mock()
         thread_class.side_effect = [
+            Mock(),  # Rooms reconciliation thread.
             anime_metadata_thread,
             anime_enrichment_thread,
             artist_metadata_thread,
@@ -631,7 +632,9 @@ class WorkerEntrypointTests(unittest.TestCase):
         run.side_effect = lambda *_args: calls.append("recommendations")
         worker.main()
         self.assertEqual(calls, ["cache", "database", "recommendations"])
-        self.assertEqual(thread_class.call_count, 13)
+        self.assertEqual(thread_class.call_count, 14)
+        thread_class.assert_any_call(target=worker.rooms_worker.run,
+                                     name="room-reconciliation", daemon=True)
         thread_class.assert_any_call(
             target=anime_metadata_worker.run,
             name="anime-musicbrainz-resolution",

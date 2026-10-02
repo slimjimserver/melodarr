@@ -189,6 +189,11 @@ def verify_csrf_token():
         "/api/auth/plex/"
     ):
         return None
+    view = current_app.view_functions.get(request.endpoint or "")
+    if view and getattr(view, "_melodarr_room_guest_route", False):
+        # Only Rooms join/add opt in. They enforce same-origin JSON plus a
+        # random room-scoped capability and independent guest CSRF token.
+        return None
     if _request_allows_api_key() and _valid_automation_api_key():
         return None
     expected_token = session.get("csrf_token", "")

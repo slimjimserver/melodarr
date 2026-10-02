@@ -270,7 +270,7 @@ const server = createServer(async (request, response) => {
     }
   }
   response.writeHead(200, { "content-type": "text/html" });
-  response.end(await readFile(join(staticRoot, "index.html")));
+  response.end(await readFile(join(staticRoot, /^\/rooms\/[^/]+\/?$/.test(url.pathname) ? "room.html" : "index.html")));
 });
 
 server.listen(4173, "127.0.0.1");

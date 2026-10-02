@@ -1725,9 +1725,9 @@ def machine_search():
     return _search_response()
 
 
-def _search_response():
-    query = request.args.get("q", "").strip()
-    search_type = request.args.get("type", "artist")
+def _search_response(*, query=None, search_type=None):
+    query = request.args.get("q", "").strip() if query is None else query
+    search_type = request.args.get("type", "artist") if search_type is None else search_type
     if len(query) < 2:
         return api_error("Enter at least two characters.")
     if search_type not in {"artist", "album", "track", "anime"}:

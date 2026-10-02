@@ -18,7 +18,7 @@ blueprint = Blueprint("pages", __name__)
 
 STATIC_ROOT = os.path.join(FRONTEND_ROOT, "static")
 ICON_ROOT = os.path.join(FRONTEND_ROOT, "icons")
-FINGERPRINTED_ASSETS = ("theme.js", "app.js", "discovery.js", "style.css")
+FINGERPRINTED_ASSETS = ("theme.js", "app.js", "discovery.js", "rooms.js", "style.css")
 _document_cache = {}
 
 
@@ -71,6 +71,7 @@ blueprint.add_url_rule("/settings/jobs", view_func=frontend_index)
 blueprint.add_url_rule("/settings/requests", view_func=frontend_index)
 blueprint.add_url_rule("/settings/users", view_func=frontend_index)
 blueprint.add_url_rule("/library", view_func=frontend_index)
+blueprint.add_url_rule("/rooms", view_func=frontend_index)
 blueprint.add_url_rule("/<username>", view_func=frontend_index)
 blueprint.add_url_rule("/<username>/requests", view_func=frontend_index)
 blueprint.add_url_rule("/<username>/settings/<section>", view_func=frontend_index)
@@ -79,6 +80,19 @@ blueprint.add_url_rule("/albums/<mbid>", view_func=frontend_index)
 blueprint.add_url_rule("/releases/<mbid>", view_func=frontend_index)
 blueprint.add_url_rule("/anime/<slug>", view_func=frontend_index)
 blueprint.add_url_rule("/series/<slug>", view_func=frontend_index)
+
+
+@blueprint.get("/rooms/<code>")
+def guest_room(code):
+    with open(os.path.join(STATIC_ROOT, "room.html"), encoding="utf-8") as file:
+        document = file.read()
+    version = _asset_version()
+    document = re.sub(r"(/static/(?:theme.js|rooms.js|style.css))", rf"\1?v={version}", document)
+    response = Response(document, mimetype="text/html")
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Content-Security-Policy"] = "frame-ancestors 'none'"
+    return response
 
 
 @blueprint.get("/icons/<path:filename>")
