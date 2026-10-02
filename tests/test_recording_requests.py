@@ -440,7 +440,8 @@ class RecordingRequestTests(DatabaseTestCase):
         self.assertIsNone(payload["downloadStatus"])
 
     def test_local_storage_error_has_safe_503(self):
-        with patch.object(plex, "recording_availability", side_effect=sqlite3.OperationalError("private-path")):
+        with patch.object(plex, "recording_availability", side_effect=sqlite3.OperationalError("private-path")), \
+             patch.object(plex, "recording_availabilities", side_effect=sqlite3.OperationalError("private-path")):
             for response in (self.client.get(URL), self.post()):
                 self.assertEqual(response.status_code, 503)
                 self.assertNotIn("private", response.get_data(as_text=True))
@@ -455,7 +456,7 @@ class RecordingRequestTests(DatabaseTestCase):
             self.assertTrue(connection.execute("PRAGMA index_list(recording_acquisition_requesters)").fetchall())
             self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
             with self.assertRaises(sqlite3.IntegrityError):
-                connection.execute("INSERT INTO recording_acquisition_requesters VALUES (?, 999999, 0)", (RECORDING,))
+                connection.execute("INSERT INTO recording_acquisition_requesters(recording_mbid, user_id, requested_at) VALUES (?, 999999, 0)", (RECORDING,))
             connection.execute("DELETE FROM users WHERE id = ?", (self.user_id,))
         self.assertEqual(self.rows("recording_acquisition_requesters"), [])
         self.assertEqual(len(self.rows("recording_acquisitions")), 1)

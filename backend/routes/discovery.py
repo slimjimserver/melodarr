@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import unicodedata
+from uuid import UUID
 
 import requests
 from flask import Blueprint, jsonify, request
@@ -19,8 +20,8 @@ if __package__ == "backend.routes":
     from .. import recommendations as recommendation_engine
     from ..media_urls import artist_cover_art, release_group_cover_art
     from ..responses import api_error
-    from ..security import current_user, login_required
-    from ..services import animethemes, charts, lastfm, musicbrainz, plex
+    from ..security import current_user, login_or_api_key_required, login_required
+    from ..services import animethemes, charts, lastfm, musicbrainz, plex, recording_requests
     from ..storage import (
         get_lastfm_api_key,
         get_recommendation_cache,
@@ -37,8 +38,8 @@ else:  # Support the existing `python backend/app.py` entry point.
     import track_search_index
     from media_urls import artist_cover_art, release_group_cover_art
     from responses import api_error
-    from security import current_user, login_required
-    from services import animethemes, charts, lastfm, musicbrainz, plex
+    from security import current_user, login_or_api_key_required, login_required
+    from services import animethemes, charts, lastfm, musicbrainz, plex, recording_requests
     from storage import get_lastfm_api_key, get_recommendation_cache, get_service
     from workers import artist_metadata as artist_metadata_worker
     from workers import recommendations as recommendation_worker
@@ -966,6 +967,11 @@ def _local_track_resolution(plan):
 
     group_ids = {match["release_group_mbid"] for match in matches}
     groups = track_search_index.cached_release_groups(group_ids)
+    recording_ids = {}
+    for match in sorted(matches, key=lambda item: item.get("recording_mbid") or ""):
+        recording_id = _recording_mbid(match.get("recording_mbid"))
+        if recording_id:
+            recording_ids.setdefault(match["release_group_mbid"], recording_id)
     results = []
     for group_id in sorted(group_ids):
         group = groups.get(group_id)
@@ -988,6 +994,7 @@ def _local_track_resolution(plan):
             "score": 100,
             "matchedTrack": chosen_interpretation["title"],
             "matchedTrackArtist": artist_name,
+            **({"recordingMbid": recording_ids[group_id]} if group_id in recording_ids else {}),
             "_rank": _local_release_group_rank(group),
         })
     results.sort(key=lambda result: result["_rank"])
@@ -1345,6 +1352,7 @@ def _recording_release_group_candidates(response, plan):
                 "score": _recording_score(recording),
                 "matchedTrack": recording.get("title") or "Untitled track",
                 "matchedTrackArtist": _artist_credit_name(recording),
+                "recordingMbid": _recording_mbid(recording.get("id")),
                 "rank": rank,
             }
 
@@ -1401,7 +1409,28 @@ def _recording_release_group_results(response, plan):
             "score": candidate["score"],
             "matchedTrack": candidate["matchedTrack"],
             "matchedTrackArtist": candidate["matchedTrackArtist"],
+            **({"recordingMbid": candidate["recordingMbid"]} if candidate["recordingMbid"] else {}),
         })
+    return results
+
+
+def _recording_mbid(value):
+    """Only a resolved recording identity, never a release-group/track ID."""
+    try:
+        return str(UUID(str(value)))
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def _enrich_track_recording_states(results):
+    """Attach compact local state once per unique recording on this page."""
+    identities = list(dict.fromkeys(result["recordingMbid"] for result in results if result.get("recordingMbid")))
+    states = recording_requests.recording_states(identities)
+    fields = ("status", "available", "plexCopyCount", "downloadStatus", "target", "retrying")
+    compact = {identity: {field: state[field] for field in fields} for identity, state in states.items()}
+    for result in results:
+        if result.get("recordingMbid") in compact:
+            result["recordingState"] = compact[result["recordingMbid"]]
     return results
 
 
@@ -1687,6 +1716,16 @@ def discover_metrics():
 @blueprint.get("/api/search")
 @login_required
 def search():
+    return _search_response()
+
+
+@blueprint.get("/api/v1/search")
+@login_or_api_key_required
+def machine_search():
+    return _search_response()
+
+
+def _search_response():
     query = request.args.get("q", "").strip()
     search_type = request.args.get("type", "artist")
     if len(query) < 2:
@@ -1740,7 +1779,7 @@ def search():
             and request.args.get("musicbrainz") != "1"
         ):
             return jsonify({
-                "results": local_resolution["results"],
+                "results": _enrich_track_recording_states(local_resolution["results"]),
                 "type": search_type,
                 "candidateCount": len(local_resolution["results"]),
                 "source": "local",
@@ -1782,7 +1821,7 @@ def search():
             alias_results = _track_release_group_alias_results(track_plan)
             if alias_results:
                 return jsonify({
-                    "results": alias_results,
+                    "results": _enrich_track_recording_states(alias_results),
                     "type": search_type,
                     "candidateCount": len(alias_results),
                     "source": "musicbrainz",
@@ -1853,6 +1892,7 @@ def search():
         ]
     else:
         results = _recording_release_group_results(response, track_plan)
+        _enrich_track_recording_states(results)
     payload = {
         "results": results,
         "type": search_type,

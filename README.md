@@ -56,6 +56,13 @@ AnimeThemes does not assign every anime to a higher-level series. In that case, 
 
 See the [Melodarr API guide](docs/api.md) for authentication, request and response schemas, examples, errors, and the OpenAPI specification.
 
+The same key also authorizes `GET /api/v1/search` and recording availability,
+acquisition, and request lifecycle under `/api/v1/music/recordings/{recordingMbid}`.
+Recording request POSTs require no browser login, cookie, or CSRF token. They
+reuse the existing acquisition machinery with an explicit automation origin and
+no fake user account. Track search includes compact local recording state in
+one response; ordinary searches do not initiate acquisitions.
+
 ## Environment variables
 
 The included Docker Compose setup does not require any extra environment variables. By default, it keeps the main database and metadata cache under the persistent `/app/data` mount.

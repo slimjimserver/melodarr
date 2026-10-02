@@ -75,7 +75,8 @@ interface AdminUser extends AdminUserIdentity {
 }
 
 interface AdminRequest {
-  id: number;
+  id: number | string;
+  source: "user" | "automation";
   kind: "artist" | "release-group";
   mbid: string;
   name: string;
@@ -101,7 +102,11 @@ interface AdminRequest {
   song_id?: string | number;
   song_title?: string;
   animeThemes?: AnimeThemeLink[];
-  requester: AdminUserIdentity;
+  requester: AdminUserIdentity | {
+    id: null;
+    username: string;
+    userType: "automation";
+  };
 }
 
 function pushDeviceMetadata(): JsonObject {
@@ -2173,6 +2178,12 @@ function adminUserRouteUsername(user: AdminUserIdentity) {
   return user.localUsername || user.username;
 }
 
+function adminRequestDisplayName(item: AdminRequest) {
+  return item.requester.userType === "automation"
+    ? "Automation API"
+    : adminUserDisplayName(item.requester);
+}
+
 function createUserAvatar(user: AdminUserIdentity, large = false) {
   const avatar = document.createElement("span");
   avatar.className = `user-avatar${large ? " user-avatar-large" : ""}`;
@@ -2265,13 +2276,27 @@ function createAdminRequestItem(item: AdminRequest) {
   const requester = document.createElement("div");
   requester.className = "admin-request-requester";
   const requesterCopy = document.createElement("span");
-  const requesterName = document.createElement("a");
-  requesterName.className = "admin-request-requester-link";
-  requesterName.href = `/${encodeURIComponent(adminUserRouteUsername(item.requester))}`;
-  requesterName.textContent = adminUserDisplayName(item.requester);
+  let requesterName: HTMLElement;
+  let avatar: HTMLElement;
+  if (item.requester.userType === "automation") {
+    requesterName = document.createElement("strong");
+    avatar = document.createElement("span");
+    avatar.className = "user-avatar";
+    avatar.textContent = "A";
+    avatar.setAttribute("aria-hidden", "true");
+  } else {
+    const link = document.createElement("a");
+    link.className = "admin-request-requester-link";
+    link.href = `/${encodeURIComponent(adminUserRouteUsername(item.requester))}`;
+    requesterName = link;
+    avatar = createUserAvatar(item.requester);
+  }
+  requesterName.textContent = adminRequestDisplayName(item);
   const requesterMeta = document.createElement("small");
   const requestedAtDate = joinedDate(item.created_at);
-  const accountType = item.requester.userType === "plex" ? "Plex user" : "Local account";
+  const accountType = item.requester.userType === "automation"
+    ? "Automation"
+    : item.requester.userType === "plex" ? "Plex user" : "Local account";
   if (requestedAtDate) {
     const requestedAt = document.createElement("time");
     requestedAt.dateTime = requestedAtDate.toISOString();
@@ -2282,7 +2307,7 @@ function createAdminRequestItem(item: AdminRequest) {
     requesterMeta.textContent = accountType;
   }
   requesterCopy.append(requesterName, requesterMeta);
-  requester.append(createUserAvatar(item.requester), requesterCopy);
+  requester.append(avatar, requesterCopy);
 
   row.append(detail, requester);
   const plexBadge = createAdminRequestPlexBadge(item);
@@ -2323,9 +2348,9 @@ function renderAdminRequests() {
       item.artist_name,
       item.release_type,
       item.release_date,
-      adminUserDisplayName(item.requester),
-      item.requester.localUsername,
-      item.requester.plexEmail,
+      adminRequestDisplayName(item),
+      item.requester.userType !== "automation" ? item.requester.localUsername : "",
+      item.requester.userType !== "automation" ? item.requester.plexEmail : "",
     ].filter(Boolean).join(" ")).includes(query);
   });
   list.replaceChildren();
@@ -2335,7 +2360,7 @@ function renderAdminRequests() {
     empty.className = "message admin-request-empty";
     empty.textContent = adminRequests.length
       ? "No requests match the current filters."
-      : "No requests yet. Artist and release requests will appear here as users make them.";
+      : "No requests yet. Requests from users and automation will appear here.";
     list.append(empty);
   } else {
     visibleRequests.forEach((item) => list.append(createAdminRequestItem(item)));

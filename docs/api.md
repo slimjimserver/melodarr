@@ -1,8 +1,8 @@
 # Melodarr API
 
-Melodarr currently exposes one endpoint for trusted external automation. The
-API key is scoped to this endpoint and does not grant access to the rest of the
-Melodarr API or administrator interface.
+Melodarr exposes versioned recording, search, and AnimeThemes resolver endpoints
+for trusted external automation. The instance API key authorizes these machine
+endpoints; it does not grant access to private accounts or administrator settings.
 
 A machine-readable version of this contract is available in
 [`openapi.yaml`](openapi.yaml).
@@ -27,6 +27,94 @@ Melodarr.
 Treat the key as a secret. Do not put it in logs, source control, screenshots,
 or publicly shared command output. Regenerating it immediately invalidates the
 previous key.
+
+Versioned endpoints reuse `login_or_api_key_required` and accept either the
+instance key or a signed-in session. A valid key bypasses CSRF only on routes
+that explicitly enable API-key authentication. Session-only POSTs still require
+the session's `X-CSRF-Token`. Missing/invalid credentials return `401`; a valid
+session can still authenticate when no valid key is supplied. For recording
+POST, a valid key identifies the automation origin even if a session cookie
+is also present. The existing unversioned browser routes retain session/CSRF
+authentication.
+
+## Machine recording and search API
+
+| Method | Endpoint | Behavior |
+| --- | --- | --- |
+| GET | `/api/v1/music/recordings/{recordingMbid}/availability` | Exact indexed Plex copies. |
+| GET | `/api/v1/music/recordings/{recordingMbid}/acquisition` | Read-only acquisition target resolution. |
+| GET | `/api/v1/music/recordings/{recordingMbid}/request` | Current local/cached recording lifecycle. |
+| POST | `/api/v1/music/recordings/{recordingMbid}/request` | Initiate or reuse the global recording acquisition. |
+| GET | `/api/v1/search?type=track&q=...` | Existing search results with compact recording state. |
+
+Recording response shapes, UUID validation, lifecycle precedence, and status
+codes match the corresponding browser endpoints documented below. Machine
+search calls the same search pipeline and also accepts the existing `artist`,
+`album`, and `anime` types. Availability, lifecycle, and search state enrichment
+use local/cached evidence. Acquisition GET may perform its existing MusicBrainz
+resolution but does not initiate work. Recording POST has no required body and
+returns `202` for new accepted work, or `200` for an existing acquisition/READY
+recording. Resolver/provider errors remain sanitized.
+
+Curl examples (set `MELODARR_API_KEY` securely in your shell; no cookie or CSRF
+token is required):
+
+```bash
+curl --get 'https://melodarr.example/api/v1/search' \
+  -H "X-Api-Key: $MELODARR_API_KEY" \
+  --data-urlencode 'type=track' --data-urlencode 'q=Melatonin Tinashe'
+
+curl 'https://melodarr.example/api/v1/music/recordings/89448197-91b7-4f39-80a6-95455ee1eed8/availability' \
+  -H "X-Api-Key: $MELODARR_API_KEY"
+
+curl 'https://melodarr.example/api/v1/music/recordings/89448197-91b7-4f39-80a6-95455ee1eed8/acquisition' \
+  -H "X-Api-Key: $MELODARR_API_KEY"
+
+curl 'https://melodarr.example/api/v1/music/recordings/89448197-91b7-4f39-80a6-95455ee1eed8/request' \
+  -H "X-Api-Key: $MELODARR_API_KEY"
+
+curl -X POST 'https://melodarr.example/api/v1/music/recordings/89448197-91b7-4f39-80a6-95455ee1eed8/request' \
+  -H 'Content-Type: application/json' -H "X-Api-Key: $MELODARR_API_KEY"
+```
+
+### Requester origin, history, and notifications
+
+One global acquisition remains keyed by recording MBID. Recording requester and
+pending-job associations explicitly store `source: user` with a real `user_id`,
+or `source: automation` with `user_id: null`. Automation never creates a user or
+borrows an administrator account. Partial unique indexes allow at most one
+automation association per recording/job; user associations remain unique per
+user. The migration preserves valid existing user associations and timestamps.
+
+An initial automation acquisition uses the same locked release-group service,
+Lidarr defaults, metadata-refresh/search queue, and worker wakeups as a user
+request. Its release-group audit is stored in `automation_request_history`
+(`source: automation`, null `user_id`), once per release group. It does not create
+private user history or change a user's recommendation history. The recording
+association records when automation joined that exact recording acquisition.
+Personal request-history endpoints continue to list only that user's history.
+The administrator Requests view (`GET /api/admin/requests`) combines user
+history and the existing automation audit, including audit rows created before
+this view was added, with shared pagination and release-group lifecycle/Plex
+badges. Each entry has `source: user` or `source: automation`. Automation entries
+show **Automation API**, with requester `id: null`, `userType: automation`, and
+no user-profile link. Their entry IDs use `automation:<audit-id>` so they cannot
+collide with the existing numeric user-history IDs. This view remains restricted
+to signed-in administrators; the automation key does not grant admin access.
+
+Enabled administrator request notifications label the requester **Automation
+API** and can reach every opted-in admin. There is no machine recipient for
+personal "requested music available" alerts; existing general new-music alerts
+continue to follow user preferences. Repeated API POSTs and cross-origin
+attachments create no duplicate Lidarr work, private history, release-group
+audit, or request notifications. A later UI user attaches to an automation
+acquisition, and automation can attach to a user's acquisition. Automation
+associations keep pending work alive after user deletion and across restarts.
+Already-READY POSTs perform no acquisition/requester/audit writes, as before.
+
+Neither the key nor requester identities are included in recording/search
+responses; only the existing lifecycle fields and compact target snapshots are
+returned. Keys are not stored in requester/audit rows.
 
 ## Resolve AnimeThemes series
 
@@ -151,7 +239,9 @@ GET /api/music/recording/{recordingMbid}/availability
 ```
 
 This endpoint requires a signed-in Melodarr browser session. The automation
-API key does not authorize it. GET requests do not require a CSRF token.
+API key does not authorize this unversioned browser route. Use its
+`/api/v1/music/recordings/{recordingMbid}/availability` counterpart for key
+authentication. GET requests do not require a CSRF token.
 Malformed UUIDs return `400`, unauthenticated requests return `401`, and a
 temporarily unavailable local index returns `503`. Responses use `Cache-Control: no-store`.
 
@@ -259,6 +349,91 @@ only changed track rows and their ISRC relations. Full scans remove deleted
 tracks. Recording and ISRC lookups retain multiple Plex copies; ISRCs are
 secondary identifiers and are not unique. The internal
 `track_search_index.plex_isrc_tracks()` helper supports indexed ISRC lookup.
+
+## Track search recording state
+
+```http
+GET /api/search?type=track&q=Song%20Artist
+```
+
+This unversioned browser route requires a signed-in Melodarr session; use
+`/api/v1/search` for automation API-key access. Existing query validation,
+MusicBrainz/local search behavior, ranking,
+ordering, and the 25-card limit are unchanged. Plain titles, title plus artist,
+ISRCs, and version intent use the existing search interpretation.
+
+Track search still returns **release-group cards**: `id` is the release-group
+MBID, `name` is its display title, and `matchedTrack`/`matchedTrackArtist`
+describe the matched recording. The additive `recordingMbid` field identifies
+that exact MusicBrainz **recording**, never a MusicBrainz track MBID or the card's
+release group. Several cards can refer to the same recording. For local cards
+with multiple exact recording matches, the first valid recording MBID in
+lexical order is used deterministically without changing card ranking.
+
+Each card with a resolved recording MBID also includes `recordingState`:
+
+```json
+{
+  "id": "22222222-2222-4222-8222-222222222222",
+  "name": "Song Single",
+  "artist": "Artist",
+  "matchedTrack": "Song",
+  "matchedTrackArtist": "Artist",
+  "recordingMbid": "11111111-1111-4111-8111-111111111111",
+  "recordingState": {
+    "status": "downloading",
+    "available": false,
+    "plexCopyCount": 0,
+    "downloadStatus": {"progress": 37, "status": "downloading"},
+    "target": {
+      "releaseGroupMbid": "22222222-2222-4222-8222-222222222222",
+      "title": "Song Single",
+      "artistName": "Artist",
+      "primaryType": "Single"
+    },
+    "retrying": false
+  }
+}
+```
+
+`status` uses the same lifecycle definition as recording request GET, with
+precedence `ready` → `waiting_for_plex` → `downloading` → `queued` → `requested`
+→ `not_requested`. `ready` means the exact MusicBrainz recording MBID is present
+in Melodarr's indexed Plex library, scoped to the configured server and selected
+sections. It overrides stale download state. `available` is true only for
+`ready`; `plexCopyCount` counts distinct playable indexed Plex copies. Full
+tracks are omitted; fetch recording availability when concrete playback items
+are needed.
+
+`waiting_for_plex` means the persisted target release group is fully available
+in cached Lidarr state while the exact recording is still absent from Plex.
+`downloadStatus` is the same normalized, client-safe cached download projection
+as recording request GET (including progress and available safe timing/status
+fields), otherwise null. `retrying` is true only for a queued job with a stored
+error; raw worker errors are never returned. `target` contains only the already
+persisted acquisition snapshot, otherwise null. Historical empty titles/artists
+and unknown/null primary types remain as stored.
+
+With no acquisition or Plex copy, state is `not_requested`, `available: false`,
+`plexCopyCount: 0`, `downloadStatus: null`, `target: null`, and `retrying: false`.
+Cards lacking a resolved recording MBID (including release-group alias-only
+fallbacks) remain usable and omit both `recordingMbid` and `recordingState`.
+
+Search enrichment is based on local/cached state and does not initiate an
+acquisition. It does not resolve unrequested targets, enrich target metadata
+through MusicBrainz, contact Plex/Lidarr live, scan libraries, enqueue work, or
+modify recording intent or request history. The original search's MusicBrainz
+calls and disposable search-cache behavior are unchanged.
+
+The reusable `recording_requests.recording_states(recording_mbids)` service
+deduplicates/normalizes UUIDs and returns a mapping keyed by recording MBID,
+without depending on Flask request globals. A 25-recording page uses one
+indexed Plex grouped-count query and one indexed acquisition/pending-job join,
+plus at most one read each of the cached Lidarr library and download snapshots.
+The library snapshot uses existing memoization; pages with no missing active
+intent skip both snapshots. Larger callers are chunked in groups of 500.
+Recording request GET uses this primitive with `include_tracks=True` to retain
+its full Plex copies and adds `plexCopyCount` to its existing response.
 
 ## Recording requests and lifecycle
 
@@ -413,8 +588,9 @@ recording on GET is a normal `200`/`not_requested` response.
 GET /api/music/recording/{recordingMbid}/acquisition
 ```
 
-This read-only endpoint requires a signed-in session, not an automation API
-key. It does not add anything to Lidarr, start searches/downloads, create
+This unversioned browser endpoint requires a signed-in session; its
+`/api/v1/music/recordings/{recordingMbid}/acquisition` counterpart accepts the
+automation API key. It does not add anything to Lidarr, start searches/downloads, create
 request history, or scan Plex. Responses use `Cache-Control: no-store`.
 
 The result contains `recordingMbid`, `recordingTitle`, `recordingArtistMbids`,

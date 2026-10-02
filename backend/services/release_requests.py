@@ -36,6 +36,14 @@ def _error(message, status_code=400, *, safe_error=None):
 
 
 def request_release_group_for_user(mbid, user, *, anime_context=None):
+    return request_release_group(mbid, user, anime_context=anime_context)
+
+
+def request_release_group_for_automation(mbid):
+    return request_release_group(mbid)
+
+
+def request_release_group(mbid, user=None, *, anime_context=None):
     """Submit one shared acquisition; callers render the structured result.
 
     Anime snapshots are validated by the route. Locking also coalesces separate
@@ -86,17 +94,19 @@ def _release_history_metadata(*albums):
 
 
 def _request_release_group(mbid, user, anime_context):
+    user_id = user["id"] if user is not None else None
+    requester_name = user["username"] if user is not None else "Automation API"
     pending = pending_lidarr_search(mbid)
     if pending:
         record_request(
-            user["id"],
+            user_id,
             "release-group",
             mbid,
             pending["name"],
             **anime_context,
         )
         notifications.queue_admin_request(
-            user["id"], user["username"], mbid, pending["name"]
+            user_id, requester_name, mbid, pending["name"]
         )
         return ReleaseGroupRequestResult({
             "message": (
@@ -160,7 +170,7 @@ def _request_release_group(mbid, user, anime_context):
                     created_album, album
                 )
                 record_request(
-                    user["id"],
+                    user_id,
                     "release-group",
                     mbid,
                     created_album.get("title", album.get("title", "Release group")),
@@ -168,8 +178,8 @@ def _request_release_group(mbid, user, anime_context):
                     **anime_context,
                 )
                 notifications.queue_admin_request(
-                    user["id"],
-                    user["username"],
+                    user_id,
+                    requester_name,
                     mbid,
                     created_album.get(
                         "title", album.get("title", "Release group")
@@ -194,7 +204,7 @@ def _request_release_group(mbid, user, anime_context):
         title = created_album.get("title", album.get("title", "Release group"))
         history_metadata = _release_history_metadata(created_album, album)
         enqueue_lidarr_search(
-            user["id"],
+            user_id,
             mbid,
             created_album["id"],
             artist_id,
@@ -203,8 +213,8 @@ def _request_release_group(mbid, user, anime_context):
             **anime_context,
         )
         notifications.queue_admin_request(
-            user["id"],
-            user["username"],
+            user_id,
+            requester_name,
             mbid,
             title,
             history_metadata["artist_name"],

@@ -16,9 +16,11 @@ def _availability(recording_mbid):
     return plex.recording_availability(storage.get_service("plex"), recording_mbid)
 
 
-def _lifecycle(availability, intent):
+def _lifecycle(availability, intent, album=None, download=None, pending=None):
+    """Pure lifecycle projection shared by compact batches and full responses."""
     payload = {
         **availability,
+        "plexCopyCount": availability.get("plexCopyCount", len(availability.get("tracks", []))),
         "status": "ready" if availability["available"] else "not_requested",
         "recordingTitle": intent["recording_title"] if intent else None,
         "target": {
@@ -33,10 +35,6 @@ def _lifecycle(availability, intent):
     }
     if availability["available"] or not intent:
         return payload
-    target_id = intent["release_group_mbid"]
-    album = lidarr.cached_library_availability().get(target_id)
-    download = lidarr.cached_download_availability().get(target_id)
-    pending = storage.pending_lidarr_search(target_id)
     state, download_status = lidarr.release_group_lifecycle(album, download, bool(pending))
     payload.update(
         status="waiting_for_plex" if state == "available" else state,
@@ -46,10 +44,39 @@ def _lifecycle(availability, intent):
     return payload
 
 
+def recording_states(recording_mbids, *, include_tracks=False):
+    """Read local lifecycle state once per unique, canonical recording MBID.
+
+    Search pages need one indexed Plex COUNT query, one indexed intent/pending
+    join, and at most one read of each Lidarr snapshot. No request globals,
+    acquisition resolution, provider calls, or durable mutations are involved.
+    Larger inputs use bounded SQL batches. Full copies are optional for GET.
+    """
+    identities = list(dict.fromkeys(str(UUID(str(value))) for value in recording_mbids))
+    if not identities:
+        return {}
+    availability = plex.recording_availabilities(
+        storage.get_service("plex"), identities, include_tracks=include_tracks,
+    )
+    intents = storage.recording_acquisitions(identities)
+    active = any(identity in intents and not availability[identity]["available"] for identity in identities)
+    albums = lidarr.cached_library_availability() if active else {}
+    downloads = lidarr.cached_download_availability() if active else {}
+    result = {}
+    for identity in identities:
+        intent = intents.get(identity)
+        target = intent["release_group_mbid"] if intent else None
+        pending = {"last_error": intent["pending_last_error"]} if intent and intent["pending_mbid"] else None
+        result[identity] = _lifecycle(
+            availability[identity], intent, albums.get(target), downloads.get(target), pending,
+        )
+    return result
+
+
 def status(recording_mbid):
     """Only indexed SQL and cached snapshots; no provider calls or mutations."""
-    availability = _availability(recording_mbid)
-    return _lifecycle(availability, storage.recording_acquisition(recording_mbid))
+    identity = str(UUID(str(recording_mbid)))
+    return recording_states([identity], include_tracks=True)[identity]
 
 
 def _ready(recording_mbid, availability):
@@ -62,7 +89,18 @@ def _ready(recording_mbid, availability):
 
 
 def request_for_user(recording_mbid, user):
+    """Initiate or attach a real signed-in user to the shared recording."""
+    return _request_recording(recording_mbid, user)
+
+
+def request_for_automation(recording_mbid):
+    """Initiate or attach the machine origin without assigning any user ID."""
+    return _request_recording(recording_mbid, None)
+
+
+def _request_recording(recording_mbid, user):
     """Plex first, then reuse accepted intent or initiate its selected target."""
+    user_id = user["id"] if user is not None else None
     availability = _availability(recording_mbid)
     if availability["available"]:
         return _ready(recording_mbid, availability)
@@ -74,7 +112,7 @@ def request_for_user(recording_mbid, user):
         intent = storage.recording_acquisition(recording_mbid)
         already_requested = bool(intent)
         if intent:
-            storage.add_recording_acquisition_requester(recording_mbid, user["id"])
+            storage.add_recording_acquisition_requester(recording_mbid, user_id)
         else:
             resolution = recording_acquisition.resolve(recording_mbid)
             if resolution.get("state") == "musicbrainz_unavailable":
@@ -84,11 +122,14 @@ def request_for_user(recording_mbid, user):
                 return {"error": "No release group containing this exact recording could be found."}, 404
             # Treat malformed cache/provider data as unusable, never fake work.
             target = {**target, "releaseGroupMbid": str(UUID(target["releaseGroupMbid"]))}
-            result = release_requests.request_release_group_for_user(target["releaseGroupMbid"], user)
+            if user is None:
+                result = release_requests.request_release_group_for_automation(target["releaseGroupMbid"])
+            else:
+                result = release_requests.request_release_group_for_user(target["releaseGroupMbid"], user)
             if not result.accepted:
                 return {"error": result.safe_error}, result.status_code
             storage.save_recording_acquisition(
-                recording_mbid, target, resolution.get("recordingTitle") or "", user["id"],
+                recording_mbid, target, resolution.get("recordingTitle") or "", user_id,
             )
         payload = status(recording_mbid)
         payload.update(alreadyAvailable=False, alreadyRequested=already_requested)

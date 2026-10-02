@@ -970,3 +970,26 @@ def recording_availability(config, recording_id):
         _snapshot_id(config), recording_id, section_ids=config.get("librarySectionIds"),
     )
     return {"available": bool(tracks), "recordingMbid": recording_id, "tracks": tracks}
+
+
+def recording_availabilities(config, recording_mbids, *, include_tracks=False):
+    """Batch exact indexed availability with the same server/section scope."""
+    copies = {}
+    if config:
+        lookup = (
+            track_search_index.plex_recording_tracks_batch if include_tracks
+            else track_search_index.plex_recording_copy_counts
+        )
+        copies = lookup(
+            _snapshot_id(config), recording_mbids,
+            section_ids=config.get("librarySectionIds"),
+        )
+    result = {}
+    for identity in recording_mbids:
+        tracks = copies.get(identity, []) if include_tracks else None
+        count = len(tracks) if include_tracks else copies.get(identity, 0)
+        result[identity] = {
+            "recordingMbid": identity, "available": bool(count), "plexCopyCount": count,
+            **({"tracks": tracks} if include_tracks else {}),
+        }
+    return result

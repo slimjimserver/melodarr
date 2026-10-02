@@ -199,6 +199,7 @@ class DatabaseTestCase(unittest.TestCase):
             connection.execute("DELETE FROM recommendation_cache")
             connection.execute("DELETE FROM plex_listens")
             connection.execute("DELETE FROM request_history")
+            connection.execute("DELETE FROM automation_request_history")
             connection.execute("DELETE FROM account_invitations")
             connection.execute("DELETE FROM recording_acquisitions")
             connection.execute("DELETE FROM users")
@@ -226,8 +227,8 @@ class ApplicationFactoryTests(DatabaseTestCase):
             for method in rule.methods
             if method not in {"HEAD", "OPTIONS"}
         }
-        self.assertEqual(len(rules), 112)
-        self.assertEqual(len(route_methods), 112)
+        self.assertEqual(len(rules), 117)
+        self.assertEqual(len(route_methods), 117)
         for route in (("/api/discover/charts", "GET"), ("/api/discover/preferences", "GET"),
                       ("/api/discover/preferences", "POST"), ("/api/discover/request-influence", "POST")):
             self.assertIn(route, route_methods)
@@ -2469,7 +2470,7 @@ class DeploymentConfigTests(unittest.TestCase):
             typescript,
         )
         self.assertIn(
-            "requesterName.href = `/${encodeURIComponent(adminUserRouteUsername(item.requester))}`",
+            "link.href = `/${encodeURIComponent(adminUserRouteUsername(item.requester))}`",
             typescript,
         )
         self.assertIn(

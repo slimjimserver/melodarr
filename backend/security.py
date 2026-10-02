@@ -142,7 +142,12 @@ def login_required(view):
 def _valid_automation_api_key():
     expected = current_app.config.get("AUTOMATION_API_KEY", "")
     received = request.headers.get("X-Api-Key", "")
-    return bool(expected and received) and compare_digest(expected, received)
+    return bool(expected and received) and compare_digest(expected.encode("utf-8"), received.encode("utf-8"))
+
+
+def api_key_authenticated():
+    """Explicit machine origin only on routes that opt into key authentication."""
+    return _request_allows_api_key() and _valid_automation_api_key()
 
 
 def _request_allows_api_key():

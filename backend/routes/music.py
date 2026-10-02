@@ -16,7 +16,7 @@ if __package__ == "backend.routes":
         release_group_cover_art,
     )
     from ..responses import api_error
-    from ..security import current_user, login_required
+    from ..security import api_key_authenticated, current_user, login_or_api_key_required, login_required
     from ..services import (
         anime_artist_links,
         anime_theme_links,
@@ -43,7 +43,7 @@ else:
         release_group_cover_art,
     )
     from responses import api_error
-    from security import current_user, login_required
+    from security import api_key_authenticated, current_user, login_or_api_key_required, login_required
     from services import (
         anime_artist_links,
         anime_theme_links,
@@ -515,6 +515,16 @@ def artist_track_search(mbid):
 @blueprint.get("/api/music/recording/<mbid>/availability")
 @login_required
 def recording_availability(mbid):
+    return _recording_availability_response(mbid)
+
+
+@blueprint.get("/api/v1/music/recordings/<mbid>/availability")
+@login_or_api_key_required
+def machine_recording_availability(mbid):
+    return _recording_availability_response(mbid)
+
+
+def _recording_availability_response(mbid):
     try:
         recording_id = str(UUID(mbid))
     except ValueError:
@@ -539,7 +549,19 @@ def request_recording(mbid):
     return _recording_request_response(mbid, initiate=True)
 
 
-def _recording_request_response(mbid, *, initiate):
+@blueprint.get("/api/v1/music/recordings/<mbid>/request")
+@login_or_api_key_required
+def machine_recording_request_status(mbid):
+    return _recording_request_response(mbid, initiate=False)
+
+
+@blueprint.post("/api/v1/music/recordings/<mbid>/request")
+@login_or_api_key_required
+def machine_request_recording(mbid):
+    return _recording_request_response(mbid, initiate=True, automation=api_key_authenticated())
+
+
+def _recording_request_response(mbid, *, initiate, automation=False):
     try:
         recording_id = str(UUID(mbid))
     except ValueError:
@@ -548,7 +570,10 @@ def _recording_request_response(mbid, *, initiate):
         return response
     try:
         if initiate:
-            payload, status_code = recording_requests.request_for_user(recording_id, current_user())
+            if automation:
+                payload, status_code = recording_requests.request_for_automation(recording_id)
+            else:
+                payload, status_code = recording_requests.request_for_user(recording_id, current_user())
         else:
             payload, status_code = recording_requests.status(recording_id), 200
     except TimeoutError:
@@ -567,6 +592,16 @@ def _recording_request_response(mbid, *, initiate):
 @blueprint.get("/api/music/recording/<mbid>/acquisition")
 @login_required
 def recording_acquisition_target(mbid):
+    return _recording_acquisition_response(mbid)
+
+
+@blueprint.get("/api/v1/music/recordings/<mbid>/acquisition")
+@login_or_api_key_required
+def machine_recording_acquisition_target(mbid):
+    return _recording_acquisition_response(mbid)
+
+
+def _recording_acquisition_response(mbid):
     """Describe an exact acquisition target without requesting any media."""
     try:
         recording_id = str(UUID(mbid))

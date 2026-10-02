@@ -1620,6 +1620,46 @@ def plex_recording_tracks(server_id, recording_mbid, *, section_ids=None):
     )
 
 
+def plex_recording_copy_counts(server_id, recording_mbids, *, section_ids=None):
+    """Count playable exact recording copies without loading tracks or ISRCs."""
+    identities = list(dict.fromkeys(recording_mbids))
+    if not identities or (section_ids is not None and not section_ids):
+        return {}
+    initialize()
+    counts = {}
+    with cache_db() as connection:
+        for offset in range(0, len(identities), 500):
+            batch = identities[offset:offset + 500]
+            predicate = f"recording_mbid IN ({', '.join('?' for _ in batch)})"
+            parameters = [server_id, *batch]
+            if section_ids is not None:
+                predicate += f" AND section_id IN ({', '.join('?' for _ in section_ids)})"
+                parameters.extend(str(value) for value in section_ids)
+            rows = connection.execute(
+                "SELECT recording_mbid, COUNT(*) AS copies "
+                "FROM track_search_plex_tracks INDEXED BY idx_track_search_plex_recording "
+                f"WHERE server_id = ? AND {predicate} AND plex_key != '' "
+                "GROUP BY recording_mbid", parameters,
+            ).fetchall()
+            counts.update((row["recording_mbid"], row["copies"]) for row in rows)
+    return counts
+
+
+def plex_recording_tracks_batch(server_id, recording_mbids, *, section_ids=None):
+    """Load full copies in bounded batches for callers that need playback data."""
+    identities = list(dict.fromkeys(recording_mbids))
+    result = {}
+    for offset in range(0, len(identities), 500):
+        batch = identities[offset:offset + 500]
+        tracks = _plex_track_lookup(
+            server_id, f"t.recording_mbid IN ({', '.join('?' for _ in batch)})",
+            batch, section_ids, recording_index=True,
+        )
+        for track in tracks:
+            result.setdefault(track["musicbrainzRecordingId"], []).append(track)
+    return result
+
+
 def plex_isrc_tracks(server_id, isrc, *, section_ids=None):
     return _plex_track_lookup(
         server_id,

@@ -227,8 +227,15 @@ def record_request(
     song_title="",
     search_metadata=(),
 ):
-    """Record an artist or release-group request for one user."""
+    """Record private user history or an explicit automation audit event."""
     with db() as connection:
+        if user_id is None:
+            _record_automation_request(connection, kind, mbid, name, artist_name, release_type, release_date)
+            connection.execute(
+                "INSERT OR IGNORE INTO pending_lidarr_search_requesters (job_id, user_id, source) "
+                "SELECT id, NULL, 'automation' FROM pending_lidarr_searches WHERE mbid = ?", (mbid,),
+            )
+            return
         history_cursor = connection.execute(
             "INSERT INTO request_history "
             "(user_id, kind, mbid, name, artist_name, release_type, "
@@ -262,6 +269,16 @@ def record_request(
             )
 
     _wake_recommendations()
+
+
+def _record_automation_request(connection, kind, mbid, name, artist_name, release_type, release_date):
+    """Machine audit is durable and never belongs to a user's private history."""
+    connection.execute(
+        "INSERT OR IGNORE INTO automation_request_history "
+        "(source, user_id, kind, mbid, name, artist_name, release_type, release_date, created_at) "
+        "VALUES ('automation', NULL, ?, ?, ?, ?, ?, ?, ?)",
+        (kind, mbid, name, artist_name or None, release_type or None, release_date or None, time.time()),
+    )
 
 
 def enqueue_lidarr_search(
@@ -299,9 +316,12 @@ def enqueue_lidarr_search(
         ).fetchone()["id"]
         connection.execute(
             "INSERT OR IGNORE INTO pending_lidarr_search_requesters "
-            "(job_id, user_id) VALUES (?, ?)",
-            (job_id, user_id),
+            "(job_id, user_id, source) VALUES (?, ?, ?)",
+            (job_id, user_id, "automation" if user_id is None else "user"),
         )
+        if user_id is None:
+            _record_automation_request(connection, "release-group", mbid, name, artist_name, release_type, release_date)
+            return bool(cursor.rowcount)
         # The queue is shared across users by release-group MBID, while
         # request history is private per user. Even when another request
         # already created the shared job, retain this user's action.
@@ -350,6 +370,32 @@ def recording_acquisition(recording_mbid):
     return dict(row) if row else None
 
 
+def recording_acquisitions(recording_mbids):
+    """Batch immutable targets and pending jobs through their MBID indexes.
+
+    One SELECT/connection for a search page; chunk larger callers to stay below
+    SQLite's bind limit. Pending error text is internal and must not be exposed.
+    """
+    identities = list(dict.fromkeys(recording_mbids))
+    if not identities:
+        return {}
+    result = {}
+    with db() as connection:
+        for offset in range(0, len(identities), 500):
+            batch = identities[offset:offset + 500]
+            placeholders = ", ".join("?" for _ in batch)
+            rows = connection.execute(
+                "SELECT intent.*, pending.mbid AS pending_mbid, "
+                "pending.last_error AS pending_last_error "
+                "FROM recording_acquisitions intent "
+                "LEFT JOIN pending_lidarr_searches pending "
+                "ON pending.mbid = intent.release_group_mbid "
+                f"WHERE intent.recording_mbid IN ({placeholders})", batch,
+            ).fetchall()
+            result.update((row["recording_mbid"], dict(row)) for row in rows)
+    return result
+
+
 def save_recording_acquisition(recording_mbid, target, recording_title, user_id):
     """Persist accepted work and its initial requester in one short transaction.
 
@@ -372,8 +418,8 @@ def save_recording_acquisition(recording_mbid, target, recording_title, user_id)
 def _add_recording_requester(connection, recording_mbid, user_id, now):
     inserted = connection.execute(
         "INSERT OR IGNORE INTO recording_acquisition_requesters "
-        "(recording_mbid, user_id, requested_at) VALUES (?, ?, ?)",
-        (recording_mbid, user_id, now),
+        "(recording_mbid, user_id, requested_at, source) VALUES (?, ?, ?, ?)",
+        (recording_mbid, user_id, now, "automation" if user_id is None else "user"),
     ).rowcount
     if inserted:
         connection.execute(
@@ -384,10 +430,10 @@ def _add_recording_requester(connection, recording_mbid, user_id, now):
     # its first requester deletes their account. This does not create work,
     # history rows, or duplicate notifications on repeated recording requests.
     connection.execute(
-        "INSERT OR IGNORE INTO pending_lidarr_search_requesters (job_id, user_id) "
-        "SELECT id, ? FROM pending_lidarr_searches WHERE mbid = "
+        "INSERT OR IGNORE INTO pending_lidarr_search_requesters (job_id, user_id, source) "
+        "SELECT id, ?, ? FROM pending_lidarr_searches WHERE mbid = "
         "(SELECT release_group_mbid FROM recording_acquisitions WHERE recording_mbid = ?)",
-        (user_id, recording_mbid),
+        (user_id, "automation" if user_id is None else "user", recording_mbid),
     )
 
 
@@ -648,6 +694,41 @@ def _create_pending_lidarr_searches_table(connection):
     """)
 
 
+def _migrate_requester_sources(connection, table, identity, reference, *, timestamp=False):
+    """Upgrade user-only associations while preserving their FKs/timestamps.
+
+    Names are internal schema constants. User associations retain their composite
+    PK. A partial unique index makes the NULL-user automation origin idempotent.
+    """
+    columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+    legacy = None
+    if columns and "source" not in columns:
+        legacy = f"{table}_user_legacy"
+        connection.execute(f"ALTER TABLE {table} RENAME TO {legacy}")
+    connection.execute(
+        f"CREATE TABLE IF NOT EXISTS {table} ("
+        f"{identity} {'TEXT' if timestamp else 'INTEGER'} NOT NULL REFERENCES {reference} ON DELETE CASCADE, "
+        "user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, "
+        + ("requested_at REAL NOT NULL, " if timestamp else "")
+        + "source TEXT NOT NULL DEFAULT 'user' "
+        "CHECK ((source = 'user' AND user_id IS NOT NULL) OR (source = 'automation' AND user_id IS NULL)), "
+        f"PRIMARY KEY({identity}, user_id))"
+    )
+    if legacy:
+        copied = f"{identity}, user_id" + (", requested_at" if timestamp else "")
+        parent, parent_key = reference.rstrip(")").split("(")
+        connection.execute(
+            f"INSERT INTO {table} ({copied}) SELECT {copied} FROM {legacy} "
+            "WHERE user_id IN (SELECT id FROM users) "
+            f"AND {identity} IN (SELECT {parent_key} FROM {parent})"
+        )
+        connection.execute(f"DROP TABLE {legacy}")
+    connection.execute(
+        f"CREATE UNIQUE INDEX IF NOT EXISTS {table}_automation "
+        f"ON {table}({identity}) WHERE source = 'automation'"
+    )
+
+
 def _migrate_pending_lidarr_searches(connection):
     """Separate shared queue work from the users who requested it."""
     exists = connection.execute(
@@ -687,15 +768,9 @@ def _migrate_pending_lidarr_searches(connection):
     else:
         _create_pending_lidarr_searches_table(connection)
 
-    connection.execute("""
-        CREATE TABLE IF NOT EXISTS pending_lidarr_search_requesters (
-            job_id INTEGER NOT NULL
-                REFERENCES pending_lidarr_searches(id) ON DELETE CASCADE,
-            user_id INTEGER NOT NULL
-                REFERENCES users(id) ON DELETE CASCADE,
-            PRIMARY KEY(job_id, user_id)
-        )
-    """)
+    _migrate_requester_sources(
+        connection, "pending_lidarr_search_requesters", "job_id", "pending_lidarr_searches(id)",
+    )
     if legacy_table:
         connection.execute(
             "INSERT OR IGNORE INTO pending_lidarr_search_requesters "
@@ -739,8 +814,8 @@ def _delete_legacy_orphans(connection):
         )
     connection.execute(
         "DELETE FROM pending_lidarr_search_requesters "
-        "WHERE NOT EXISTS (SELECT 1 FROM users "
-        "WHERE users.id = pending_lidarr_search_requesters.user_id) "
+        "WHERE (user_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM users "
+        "WHERE users.id = pending_lidarr_search_requesters.user_id)) "
         "OR NOT EXISTS (SELECT 1 FROM pending_lidarr_searches "
         "WHERE pending_lidarr_searches.id = "
         "pending_lidarr_search_requesters.job_id)"
@@ -995,6 +1070,21 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS request_history_recent "
             "ON request_history(created_at DESC, id DESC)"
         )
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS automation_request_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL CHECK(source = 'automation'),
+                user_id INTEGER CHECK(user_id IS NULL),
+                kind TEXT NOT NULL CHECK(kind IN ('artist', 'release-group')),
+                mbid TEXT NOT NULL,
+                name TEXT NOT NULL,
+                artist_name TEXT,
+                release_type TEXT,
+                release_date TEXT,
+                created_at REAL NOT NULL,
+                UNIQUE(kind, mbid)
+            )
+        """)
         connection.execute("""
             CREATE TABLE IF NOT EXISTS recommendation_preferences (
                 user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -1402,15 +1492,10 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS recording_acquisitions_release_group "
             "ON recording_acquisitions(release_group_mbid)"
         )
-        connection.execute("""
-            CREATE TABLE IF NOT EXISTS recording_acquisition_requesters (
-                recording_mbid TEXT NOT NULL
-                    REFERENCES recording_acquisitions(recording_mbid) ON DELETE CASCADE,
-                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                requested_at REAL NOT NULL,
-                PRIMARY KEY(recording_mbid, user_id)
-            )
-        """)
+        _migrate_requester_sources(
+            connection, "recording_acquisition_requesters", "recording_mbid",
+            "recording_acquisitions(recording_mbid)", timestamp=True,
+        )
         connection.execute(
             "CREATE INDEX IF NOT EXISTS recording_acquisition_requesters_user "
             "ON recording_acquisition_requesters(user_id, recording_mbid)"
