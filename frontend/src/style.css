@@ -1277,6 +1277,16 @@ button,
   .theme-toggle { width: 44px; min-width: 44px; height: 44px; flex: 0 0 44px; padding: 0; }
 }
 
+@media (min-width: 701px) and (max-width: 900px) {
+  /* Leave room for all five links and account controls with wider system fonts. */
+  header { gap: 12px; padding-right: 16px; padding-left: 16px; }
+  .header-nav { gap: 0; }
+  .header-nav .nav-link { padding-right: 6px; padding-left: 6px; }
+  .logout { display: grid; flex: 0 0 44px; width: 44px; height: 44px; place-items: center; padding: 0; }
+  .logout-icon { display: block; }
+  .logout-label { position: absolute; width: 1px; height: 1px; overflow: hidden; margin: -1px; clip: rect(0 0 0 0); white-space: nowrap; }
+}
+
 @media (max-width: 700px) {
   header { padding-right: 14px; padding-left: 14px; }
 

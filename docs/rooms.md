@@ -228,7 +228,7 @@ mutation requests.
 ## Validation results
 
 - Full Python backend suite: **1,032 tests passed**, including **82 Rooms tests**.
-- Full Playwright browser suite: **190 tests passed**, including **10 Rooms tests**.
+- Full Playwright browser suite: **194 tests passed**, including **10 Rooms tests**.
 - Frontend type checks (`pnpm run check`) and production build (`pnpm run build`)
   passed.
 - Targeted Rooms backend suite: **82 tests passed**; the full browser suite includes
