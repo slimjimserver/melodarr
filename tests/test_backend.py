@@ -225,8 +225,8 @@ class ApplicationFactoryTests(DatabaseTestCase):
             for method in rule.methods
             if method not in {"HEAD", "OPTIONS"}
         }
-        self.assertEqual(len(rules), 108)
-        self.assertEqual(len(route_methods), 108)
+        self.assertEqual(len(rules), 109)
+        self.assertEqual(len(route_methods), 109)
         for route in (("/api/discover/charts", "GET"), ("/api/discover/preferences", "GET"),
                       ("/api/discover/preferences", "POST"), ("/api/discover/request-influence", "POST")):
             self.assertIn(route, route_methods)
@@ -785,13 +785,16 @@ class PlexMetadataWorkerTests(unittest.TestCase):
         with plex_metadata_worker.queue_lock:
             plex_metadata_worker.queued_artist_ids.clear()
             plex_metadata_worker.queued_release_ids.clear()
+            plex_metadata_worker.queued_track_ids.clear()
             plex_metadata_worker.full_enrichment_requested = False
-            plex_metadata_worker.job_state["queued"] = 0
+            plex_metadata_worker.job_state.update(
+                running=False, queued=0, completed=0, total=0, phase="idle",
+            )
         plex_metadata_worker.wake_requested.clear()
 
     @patch("backend.workers.plex_metadata.plex.apply_release_group_mappings")
     @patch("backend.workers.plex_metadata.plex.unresolved_musicbrainz_releases")
-    @patch("backend.workers.plex_metadata.musicbrainz.get")
+    @patch("backend.workers.plex_metadata.musicbrainz.release_track_metadata")
     def test_release_ids_are_resolved_to_release_groups_in_background(
         self, musicbrainz_get, unresolved, apply_mappings
     ):
@@ -804,14 +807,14 @@ class PlexMetadataWorkerTests(unittest.TestCase):
         plex_metadata_worker._resolve_release_groups({"url": "http://plex"})
 
         musicbrainz_get.assert_called_once_with(
-            "/release/release-1",
-            "release-groups+artist-credits",
+            "release-1",
             priority="background",
         )
         apply_mappings.assert_called_once_with(
             {"url": "http://plex"},
             {"release-1": "release-group-1"},
             artist_mappings={"release-1": "artist-1"},
+            release_metadata={"release-1": musicbrainz_get.return_value},
         )
 
     @patch("backend.workers.plex_metadata.plex.music_library")
@@ -859,9 +862,87 @@ class PlexMetadataWorkerTests(unittest.TestCase):
             "/artist/artist-2", "url-rels+genres", priority="background"
         )
 
+    @patch("backend.workers.plex_metadata.musicbrainz.get")
+    def test_various_artists_does_not_warm_the_global_compilation_catalogue(self, get):
+        get.return_value = {"name": "Various Artists"}
+        plex_metadata_worker._warm_artist_discographies(
+            {"url": "http://plex"}, {plex_metadata_worker.VARIOUS_ARTISTS_ID}
+        )
+        get.assert_called_once_with(
+            f"/artist/{plex_metadata_worker.VARIOUS_ARTISTS_ID}",
+            "url-rels+genres", priority="background",
+        )
+        self.assertEqual(plex_metadata_worker.status()["completed"], 1)
+
+    @patch("backend.workers.plex_metadata.MAX_DISCOGRAPHY_PAGES_PER_ARTIST", 2)
+    def test_large_warmup_is_bounded_and_continues_to_the_next_artist(self):
+        observed_phases = []
+
+        def get(path, _inc, **kwargs):
+            if path.startswith("/artist/"):
+                return {"name": path.rsplit("/", 1)[-1]}
+            observed_phases.append(plex_metadata_worker.status()["phase"])
+            if kwargs["artist"] == "large":
+                return {
+                    "release-groups": [{"id": f"group-{kwargs['offset']}"}],
+                    "release-group-count": 100000,
+                    "release-group-offset": kwargs["offset"],
+                }
+            return {"release-groups": [], "release-group-count": 0}
+
+        with (
+            patch.object(plex_metadata_worker.musicbrainz, "get", side_effect=get) as fetch,
+            self.assertLogs("backend.workers.plex_metadata", level="WARNING"),
+        ):
+            plex_metadata_worker._warm_artist_discographies({}, {"large", "small"})
+        self.assertEqual(fetch.call_count, 5)
+        self.assertEqual(observed_phases, [
+            "artist discographies · large · page 1",
+            "artist discographies · large · page 2",
+            "artist discographies · small · page 1",
+        ])
+        self.assertEqual(plex_metadata_worker.status()["completed"], 2)
+
+    def test_invalid_discography_pagination_does_not_loop(self):
+        for second_page in (
+            {"release-groups": [{"id": "same"}], "release-group-count": 100000},
+            {"release-groups": [{"id": "other"}], "release-group-count": 100000,
+             "release-group-offset": 0},
+        ):
+            with (
+                self.subTest(page=second_page),
+                patch.object(plex_metadata_worker.musicbrainz, "get", side_effect=[
+                    {"name": "artist"},
+                    {"release-groups": [{"id": "same"}], "release-group-count": 100000},
+                    second_page,
+                ]) as get,
+                self.assertLogs("backend.workers.plex_metadata", level="WARNING"),
+            ):
+                plex_metadata_worker._warm_artist_discographies({}, {"artist"})
+            self.assertEqual(get.call_count, 3)
+            self.assertEqual(plex_metadata_worker.status()["completed"], 1)
+
+    def test_owned_tracks_are_enriched_before_optional_discographies(self):
+        calls = Mock()
+        config = {"url": "http://plex"}
+        with (
+            patch.object(plex_metadata_worker, "get_service", return_value=config),
+            patch.object(plex_metadata_worker, "_resolve_release_groups", return_value={"inferred"}) as releases,
+            patch.object(plex_metadata_worker, "_resolve_tracks") as tracks,
+            patch.object(plex_metadata_worker, "_warm_artist_discographies") as artists,
+        ):
+            calls.attach_mock(releases, "releases")
+            calls.attach_mock(tracks, "tracks")
+            calls.attach_mock(artists, "artists")
+            plex_metadata_worker._run_enrichment({"existing"}, {"release"}, {"track"})
+        self.assertEqual([call[0] for call in calls.mock_calls], ["releases", "tracks", "artists"])
+        artists.assert_called_once_with(config, {"existing", "inferred"})
+        self.assertFalse(plex_metadata_worker.status()["running"])
+        self.assertEqual(plex_metadata_worker.status()["phase"], "idle")
+
     @patch("backend.workers.plex_metadata.plex.unresolved_musicbrainz_releases")
     @patch("backend.workers.plex_metadata.plex.apply_release_group_mappings")
-    @patch("backend.workers.plex_metadata.musicbrainz.get")
+    @patch("backend.workers.plex_metadata.musicbrainz.release_track_metadata")
     def test_targeted_release_enrichment_does_not_walk_unresolved_inventory(
         self, musicbrainz_get, apply_mappings, unresolved
     ):
@@ -879,6 +960,7 @@ class PlexMetadataWorkerTests(unittest.TestCase):
             {"url": "http://plex"},
             {"release-2": "release-group-2"},
             artist_mappings={"release-2": "artist-2"},
+            release_metadata={"release-2": musicbrainz_get.return_value},
         )
 
     @patch("backend.workers.plex_metadata.wake_requested.set")
@@ -5199,6 +5281,57 @@ class ApiCacheTests(DatabaseTestCase):
         )
         self.assertEqual(api_cache._request_locks, {})
 
+    def test_critical_musicbrainz_request_can_fill_a_key_held_by_paused_background_work(self):
+        background_waiting = Event()
+        results = []
+        failures = []
+        original_wait = musicbrainz._wait_for_request_slot
+
+        def wait_for_slot(priority, interval):
+            if priority == "background":
+                background_waiting.set()
+            original_wait(priority, interval)
+
+        def load(priority):
+            try:
+                results.append(musicbrainz._cached_get(
+                    "https://musicbrainz.test/priority-inversion",
+                    priority=priority,
+                    request_interval_seconds=0,
+                    namespace="priority-inversion-test",
+                    ttl=60,
+                    include_cache_status=True,
+                ))
+            except Exception as exc:  # pragma: no cover - asserted below
+                failures.append(exc)
+
+        background = Thread(target=load, args=("background",), daemon=True)
+        critical = Thread(target=load, args=("critical",), daemon=True)
+        with (
+            patch.object(musicbrainz, "_critical_operations", 0),
+            patch.object(musicbrainz, "_next_request_at", 0.0),
+            patch.object(musicbrainz, "_wait_for_request_slot", side_effect=wait_for_slot),
+            patch.object(musicbrainz, "_http_get", return_value=Response(200, {"id": "shared"})) as get,
+        ):
+            with musicbrainz.critical_operation():
+                background.start()
+                paused = background_waiting.wait(1)
+                critical.start()
+                critical.join(1)
+                finished_before_background_resumed = not critical.is_alive()
+            # Always release the critical operation before assertions, so the
+            # original deadlock can also be tested without leaving stuck threads.
+            background.join(2)
+            critical.join(2)
+        self.assertTrue(paused)
+        self.assertTrue(finished_before_background_resumed)
+        self.assertFalse(background.is_alive())
+        self.assertFalse(critical.is_alive())
+        self.assertFalse(failures)
+        self.assertCountEqual(results, [({"id": "shared"}, False), ({"id": "shared"}, True)])
+        get.assert_called_once()
+        self.assertEqual(api_cache._request_locks, {})
+
     def test_failed_coalesced_cache_misses_clean_up_and_allow_a_later_request(self):
         url = "https://example.test/coalesced-failure"
         namespace = "coalesced-failure-test"
@@ -6807,6 +6940,7 @@ class MusicBrainzClientTests(unittest.TestCase):
         self.original_prefetch_waiters = musicbrainz._prefetch_waiters
         self.original_critical_streak = musicbrainz._critical_streak
         self.original_critical_operations = musicbrainz._critical_operations
+        self.original_critical_operation_deadlines = musicbrainz._critical_operation_deadlines
         self.original_background_failure_streak = (
             musicbrainz._background_failure_streak
         )
@@ -6817,6 +6951,7 @@ class MusicBrainzClientTests(unittest.TestCase):
         musicbrainz._prefetch_waiters = 0
         musicbrainz._critical_streak = 0
         musicbrainz._critical_operations = 0
+        musicbrainz._critical_operation_deadlines = {}
         musicbrainz._background_failure_streak = 0
         musicbrainz._background_resume_at = 0.0
         if hasattr(musicbrainz._session_state, "session"):
@@ -6829,6 +6964,7 @@ class MusicBrainzClientTests(unittest.TestCase):
         musicbrainz._prefetch_waiters = self.original_prefetch_waiters
         musicbrainz._critical_streak = self.original_critical_streak
         musicbrainz._critical_operations = self.original_critical_operations
+        musicbrainz._critical_operation_deadlines = self.original_critical_operation_deadlines
         musicbrainz._background_failure_streak = (
             self.original_background_failure_streak
         )
@@ -7116,6 +7252,19 @@ class MusicBrainzClientTests(unittest.TestCase):
             self.assertFalse(musicbrainz._priority_is_blocked("interactive"))
             self.assertTrue(musicbrainz._priority_is_blocked("prefetch"))
             self.assertTrue(musicbrainz._priority_is_blocked("background"))
+
+    @patch("backend.services.musicbrainz.time.monotonic", return_value=100.0)
+    def test_large_discography_stops_pausing_workers_after_thirty_seconds(self, monotonic):
+        with musicbrainz.critical_operation():
+            self.assertTrue(musicbrainz._priority_is_blocked("background"))
+            self.assertTrue(musicbrainz._priority_is_blocked("prefetch"))
+            monotonic.return_value = 100.0 + musicbrainz._CRITICAL_OPERATION_PAUSE_SECONDS
+            self.assertFalse(musicbrainz._priority_is_blocked("background"))
+            self.assertFalse(musicbrainz._priority_is_blocked("prefetch"))
+            self.assertEqual(musicbrainz._critical_operations, 1)
+            self.assertFalse(musicbrainz._priority_is_blocked("critical"))
+        self.assertEqual(musicbrainz._critical_operations, 0)
+        self.assertEqual(musicbrainz._critical_operation_deadlines, {})
 
     @patch("backend.services.musicbrainz.cached_json_get")
     def test_release_group_search_uses_search_cache(self, cached_get):
@@ -9447,7 +9596,7 @@ class MusicRoutesTests(DatabaseTestCase):
         get.assert_called_once()
         self.assertEqual(
             get.call_args.args[1],
-            "recordings+artist-credits+release-groups",
+            "recordings+artist-credits+release-groups+isrcs",
         )
         index_release.assert_called_once()
 
@@ -9567,7 +9716,7 @@ class MusicRoutesTests(DatabaseTestCase):
         index_cached_release,
     ):
         cached_response.return_value = {"id": "release-id"}
-        index_cached_release.side_effect = [False, True]
+        index_cached_release.side_effect = [False, False, True]
 
         response = self.client.get(
             "/api/music/release/release-id",
@@ -9579,6 +9728,10 @@ class MusicRoutesTests(DatabaseTestCase):
         self.assertEqual(
             [item.args[0] for item in index_cached_release.call_args_list],
             [
+                musicbrainz.metadata_cache_key(
+                    "/release/release-id",
+                    "recordings+artist-credits+release-groups+isrcs",
+                ),
                 musicbrainz.metadata_cache_key(
                     "/release/release-id",
                     "recordings+artist-credits+release-groups",
@@ -9946,7 +10099,7 @@ class MusicRoutesTests(DatabaseTestCase):
         self.assertTrue(get.call_args.kwargs["cache_only"])
         self.assertEqual(
             get.call_args.args[1],
-            "recordings+artist-credits+release-groups",
+            "recordings+artist-credits+release-groups+isrcs",
         )
 
     @patch("backend.routes.music.musicbrainz.get")
@@ -12835,6 +12988,7 @@ class PlexClientTests(unittest.TestCase):
             "token": "token",
             "machineIdentifier": "server-1",
         }
+        get.side_effect = list(get.side_effect) + [Response(payload={"MediaContainer": {"Metadata": []}})]
         artists = plex.music_library(config)
         releases = plex.library_release_groups(config)
         self.assertEqual([artist["name"] for artist in artists], ["alpha", "Zulu"])
@@ -12873,7 +13027,7 @@ class PlexClientTests(unittest.TestCase):
             enriched["musicbrainzReleaseGroupId"],
             "22222222-2222-2222-2222-222222222222",
         )
-        self.assertEqual(get.call_count, 3)
+        self.assertEqual(get.call_count, 4)
         self.assertEqual(get.call_args_list[1].kwargs["params"]["type"], 8)
         self.assertEqual(get.call_args_list[2].kwargs["params"]["type"], 9)
         self.assertEqual(get.call_args_list[2].kwargs["params"]["includeGuids"], 1)
@@ -12909,6 +13063,8 @@ class PlexClientTests(unittest.TestCase):
             }]}}),
         ]
 
+        fixtures = list(get.side_effect)
+        get.side_effect = fixtures[:2] + [Response(payload={"MediaContainer": {"Metadata": []}})] * 2 + fixtures[2:]
         result = plex._scan_sections(
             {
                 "url": "http://plex:32400",
@@ -12952,6 +13108,8 @@ class PlexClientTests(unittest.TestCase):
             }]}}),
         ]
 
+        fixtures = list(get.side_effect)
+        get.side_effect = fixtures[:2] + [Response(payload={"MediaContainer": {"Metadata": []}})] * 2 + fixtures[2:]
         result = plex._scan_sections(
             {
                 "url": "http://plex:32400",
@@ -12970,8 +13128,8 @@ class PlexClientTests(unittest.TestCase):
             result["releaseGroups"][0]["artistRatingKey"],
             "10",
         )
-        self.assertIn("/library/metadata/10", get.call_args_list[2].args[0])
-        self.assertNotIn("/children", get.call_args_list[2].args[0])
+        self.assertIn("/library/metadata/10", get.call_args_list[4].args[0])
+        self.assertNotIn("/children", get.call_args_list[4].args[0])
 
     @patch("backend.services.plex.set_cache_document")
     @patch("backend.services.plex.upsert_cache_documents")
@@ -13081,6 +13239,7 @@ class PlexClientTests(unittest.TestCase):
             Response(payload={"MediaContainer": {"Metadata": []}}),
         ]
 
+        get.side_effect = list(get.side_effect) + [Response(payload={"MediaContainer": {"Metadata": []}})]
         result = plex.full_library_scan({
             "url": "http://plex:32400",
             "token": "token",
@@ -13096,7 +13255,7 @@ class PlexClientTests(unittest.TestCase):
         self.assertIn("/library/sections/2/all", get.call_args_list[2].args[0])
         self.assertEqual(get.call_args_list[1].kwargs["params"]["type"], 8)
         self.assertEqual(get.call_args_list[2].kwargs["params"]["type"], 9)
-        self.assertEqual(get.call_count, 3)
+        self.assertEqual(get.call_count, 4)
 
     def test_unchanged_recent_scan_skips_snapshot_and_guid_writes(self):
         artist = {

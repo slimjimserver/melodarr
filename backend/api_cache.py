@@ -437,8 +437,14 @@ def cached_json_get(
     reject_redirects=False,
     request_get=None,
     after_response=None,
+    coalescing_scope=None,
 ):
-    """Fetch JSON; cache_params can omit credentials sent in request params."""
+    """Fetch JSON; optionally isolate cache-miss owners by scheduling scope.
+
+    Scopes share cached values but never wait for each other's live requests.
+    This keeps higher-priority work from waiting on a paused cache owner.
+    cache_params can omit credentials sent in request params.
+    """
     key = cache_key(namespace, url, params if cache_params is None else cache_params)
     if not force_refresh:
         value = _fresh_cache_value(key)
@@ -447,7 +453,8 @@ def cached_json_get(
     if cache_only:
         return (None, False) if include_cache_status else None
 
-    coalescing_lock = _request_lock(key) if not force_refresh else nullcontext()
+    lock_key = key if coalescing_scope is None else (key, coalescing_scope)
+    coalescing_lock = _request_lock(lock_key) if not force_refresh else nullcontext()
     with coalescing_lock:
         # Another request may have filled the cache while this one waited. This
         # happens before provider pacing, so followers consume no upstream slot.
@@ -598,6 +605,12 @@ def delete_cache_namespace(namespace):
         cursor = connection.execute(
             "DELETE FROM api_cache WHERE cache_key LIKE ?", (f"{namespace}:%",)
         )
+        if namespace == "plex-library":
+            for table in ("track_search_plex_tracks", "track_search_plex_isrcs"):
+                if connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,),
+                ).fetchone():
+                    connection.execute(f"DELETE FROM {table}")
         return cursor.rowcount
 
     return _cache_operation(

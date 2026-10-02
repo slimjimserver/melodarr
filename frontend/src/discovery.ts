@@ -2110,6 +2110,13 @@
   }
 
   function createReleaseGroupCard(group: JsonObject) {
+    if (group.localOnly) {
+      const card = createCard(releaseGroupDisplayTitle(group), String(group.date || ""));
+      if (group.plexUrl) {
+        card.append(createServiceIconLink(group.plexUrl, "/icons/plex.svg", "Open in Plex"));
+      }
+      return card;
+    }
     const card = createCard(
       releaseGroupDisplayTitle(group),
       [group.date, ...(group.animeNames || []), ...(group.secondaryTypes || []), group.disambiguation]
@@ -4002,7 +4009,9 @@
       } else {
         resetDetailCover();
       }
-      $("#detail-subtitle").textContent = [data.country, data.disambiguation].filter(Boolean).join(" · ");
+      $("#detail-subtitle").textContent = data.libraryOnly
+        ? "Albums in your libraries"
+        : [data.country, data.disambiguation].filter(Boolean).join(" · ");
       const meta = createMeta("artist", data);
       addMuteButton(requiredDescendant<HTMLElement>(meta, ".external-icons"), "artist", String(data.id));
       const facts = [data.type, data.gender, data.area, data.lifeSpan?.begin].filter(Boolean).join(" · ");
@@ -4021,11 +4030,14 @@
       const refreshButton = document.createElement("button");
       refreshButton.className = "secondary-action refresh-discography";
       refreshButton.type = "button";
-      refreshButton.textContent = "Refresh discography";
+      const refreshLabel = data.libraryOnly ? "Refresh library albums" : "Refresh discography";
+      refreshButton.textContent = refreshLabel;
       refreshButton.addEventListener("click", async () => {
         refreshButton.disabled = true;
         refreshButton.textContent = "Refreshing…";
-        $("#detail-message").textContent = "Refreshing the complete discography from MusicBrainz…";
+        $("#detail-message").textContent = data.libraryOnly
+          ? "Refreshing albums from your libraries…"
+          : "Refreshing the complete discography from MusicBrainz…";
         const action = captureDetailActionContext();
         try {
           const refreshed = await postJson(
@@ -4037,18 +4049,21 @@
           if (!isCurrentDetailAction(action)) return;
           if (currentDetail?.kind === "artist" && currentDetail?.id === data.id) {
             renderDetail("artist", refreshed);
-            $("#detail-message").textContent = "Discography refreshed from MusicBrainz.";
+            $("#detail-message").textContent = refreshed.libraryOnly
+              ? "Library albums refreshed."
+              : "Discography refreshed from MusicBrainz.";
           }
         } catch (error) {
           if (!isCurrentDetailAction(action) || error.name === "AbortError") return;
           $("#detail-message").textContent = error.message;
           refreshButton.disabled = false;
-          refreshButton.textContent = "Refresh discography";
+          refreshButton.textContent = refreshLabel;
         }
       });
       const actions = document.createElement("div");
       actions.className = "detail-actions";
-      actions.append(requestButton, refreshButton);
+      if (!data.libraryOnly) actions.append(requestButton);
+      actions.append(refreshButton);
       results.append(actions);
 
       results.append(renderDiscography(data));

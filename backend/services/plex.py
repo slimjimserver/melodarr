@@ -37,7 +37,11 @@ else:  # Support the existing `python backend/app.py` entry point.
 
 
 scan_lock = RLock()
-SNAPSHOT_VERSION = 6
+SNAPSHOT_VERSION = 7
+TRACK_MAPPING_FIELDS = (
+    "musicbrainzRecordingId", "musicbrainzReleaseGroupId", "isrcs",
+    "mappingSource", "mappingConfidence",
+)
 METADATA_TAG_FIELDS = {
     "genres": "Genre",
     "styles": "Style",
@@ -283,6 +287,64 @@ def _normalize_release_group(config, section, item):
     }
 
 
+def _integer(value):
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_track(config, section, item):
+    """A Plex Track GUID identifies a release track, never a recording."""
+    guids = _guids(item)
+    rating_key = str(item.get("ratingKey") or "")
+    return {
+        "ratingKey": rating_key,
+        "key": item.get("key") or (f"/library/metadata/{rating_key}" if rating_key else ""),
+        "plexGuid": _plex_metadata_guid(guids, "track"),
+        "guids": guids,
+        "title": item.get("title") or "",
+        "trackArtist": item.get("originalTitle") or item.get("grandparentTitle") or "",
+        "albumArtist": item.get("grandparentTitle") or "",
+        "albumTitle": item.get("parentTitle") or "",
+        "durationMs": _integer(item.get("duration")),
+        "trackNumber": _integer(item.get("index")),
+        "discNumber": _integer(item.get("parentIndex")),
+        "year": _integer(item.get("parentYear") or item.get("year")),
+        "librarySectionId": str(section["id"]),
+        "librarySectionTitle": section.get("title") or "",
+        "artistRatingKey": str(item.get("grandparentRatingKey") or ""),
+        "albumRatingKey": str(item.get("parentRatingKey") or ""),
+        "musicbrainzTrackId": _musicbrainz_id(guids),
+        "musicbrainzRecordingId": "",
+        "musicbrainzReleaseId": "",
+        "musicbrainzReleaseGroupId": "",
+        "isrcs": [],
+        "mappingSource": "",
+        "mappingConfidence": "",
+    }
+
+
+def _metadata_pages(config, path, headers, **params):
+    """Bound response sizes while retaining all items in large libraries."""
+    start = 0
+    while True:
+        response = request_without_redirects(
+            requests.get, f"{config['url']}{path}",
+            params={**params, "includeGuids": 1,
+                    "X-Plex-Container-Start": start, "X-Plex-Container-Size": 500},
+            headers=headers, timeout=20,
+        )
+        response.raise_for_status()
+        container = response.json().get("MediaContainer", {})
+        items = container.get("Metadata", [])
+        yield from items
+        start += len(items)
+        total = _integer(container.get("totalSize"))
+        if not items or total is None or start >= total:
+            break
+
+
 def _parent_artist(config, section, release_group, headers):
     """Load or minimally reconstruct the artist owning a recent Plex album."""
     key = release_group.get("artistKey") or ""
@@ -326,26 +388,21 @@ def _parent_artist(config, section, release_group, headers):
     }
 
 
-def _scan_sections(config, sections, *, recently_added=False):
-    base = config["url"]
+def _scan_sections(config, sections, *, recently_added=False, known_album_ids=()):
     headers = _headers(config, accept_json=True)
-    result = {"artists": [], "releaseGroups": []}
+    result = {"artists": [], "releaseGroups": [], "tracks": []}
     for section in sections:
         endpoint = "recentlyAdded" if recently_added else "all"
         section_releases = []
         for media_type, plex_type, collection, normalizer in (
             (8, "artist", "artists", _normalize_artist),
             (9, "album", "releaseGroups", _normalize_release_group),
+            (10, "track", "tracks", _normalize_track),
         ):
-            response = request_without_redirects(
-                requests.get,
-                f"{base}/library/sections/{section['id']}/{endpoint}",
-                params={"type": media_type, "includeGuids": 1},
-                headers=headers,
-                timeout=20,
+            metadata = _metadata_pages(
+                config, f"/library/sections/{section['id']}/{endpoint}",
+                headers, type=media_type,
             )
-            response.raise_for_status()
-            metadata = response.json().get("MediaContainer", {}).get("Metadata", [])
             normalized = [
                 normalizer(config, section, item)
                 for item in metadata
@@ -359,6 +416,33 @@ def _scan_sections(config, sections, *, recently_added=False):
             if collection == "releaseGroups":
                 section_releases = normalized
         if recently_added:
+            known = set(known_album_ids) | {item.get("ratingKey") for item in section_releases}
+            parent_ids = {
+                item.get("albumRatingKey") for item in result["tracks"]
+                if item.get("librarySectionId") == section["id"] and item.get("albumRatingKey")
+            }
+            for rating_key in sorted(parent_ids - known):
+                try:
+                    items = list(_metadata_pages(config, f"/library/metadata/{rating_key}", headers))
+                    for item in items:
+                        if not item.get("type") or item["type"] == "album":
+                            album = _normalize_release_group(config, section, item)
+                            section_releases.append(album)
+                            result["releaseGroups"].append(album)
+                except requests.RequestException:
+                    # Keep the tracks when their parent is not yet available.
+                    pass
+            # recentlyAdded may ignore type=10 or list only some songs. Read
+            # each recent album's children to cover the complete new album.
+            for release_group in section_releases:
+                rating_key = release_group.get("ratingKey")
+                if not rating_key:
+                    continue
+                for item in _metadata_pages(
+                    config, f"/library/metadata/{rating_key}/children", headers,
+                ):
+                    if not item.get("type") or item["type"] == "track":
+                        result["tracks"].append(_normalize_track(config, section, item))
             known_artist_ids = {
                 artist.get("ratingKey")
                 for artist in result["artists"]
@@ -382,9 +466,31 @@ def _scan_sections(config, sections, *, recently_added=False):
                     result["artists"].append(artist)
                     if artist.get("ratingKey"):
                         known_artist_ids.add(artist["ratingKey"])
+    result["tracks"] = list({
+        _item_identity(item): item for item in result["tracks"]
+    }.values())
     for collection in result.values():
-        collection.sort(key=lambda item: (item.get("name") or "").casefold())
+        collection.sort(key=_sort_key)
     return result
+
+
+def _sort_key(item):
+    return ((item.get("name") or item.get("title") or "").casefold(),
+            item.get("ratingKey") or "")
+
+
+def _attach_track_releases(inventory, previous_tracks=()):
+    albums = {item.get("ratingKey"): item for item in inventory.get("releaseGroups", [])}
+    previous = {_item_identity(item): item for item in previous_tracks}
+    for track in inventory.get("tracks", []):
+        album = albums.get(track.get("albumRatingKey"), {})
+        track["musicbrainzReleaseId"] = album.get("musicbrainzReleaseId") or ""
+        old = previous.get(_item_identity(track), {})
+        if (old.get("musicbrainzTrackId") == track.get("musicbrainzTrackId")
+                and old.get("musicbrainzReleaseId") == track["musicbrainzReleaseId"]):
+            for field in TRACK_MAPPING_FIELDS:
+                if field in old:
+                    track[field] = old[field]
 
 
 def _snapshot_id(config):
@@ -442,13 +548,19 @@ def _save_snapshot(
     *,
     replace_guids=False,
     guid_inventory=None,
+    track_inventory=None,
+    invalidate_details=True,
 ):
+    payload["serverId"] = _snapshot_id(config)
     set_cache_document(
         "plex-library", _snapshot_id(config), payload, PLEX_LIBRARY_CACHE_TTL
     )
-    track_search_index.index_plex_library(payload)
+    track_search_index.index_plex_library(
+        payload, server_id=_snapshot_id(config), track_inventory=track_inventory,
+    )
     invalidate_document(_index_key(_snapshot_id(config)))
-    invalidate_detail_payloads()
+    if invalidate_details:
+        invalidate_detail_payloads()
     documents = _guid_documents(config, guid_inventory or payload)
     if replace_guids:
         replace_cache_documents("plex-guid", documents, PLEX_LIBRARY_CACHE_TTL)
@@ -460,6 +572,7 @@ def _scan_result(inventory, *, artist_items=(), release_items=(), changed):
     """Return the inventory plus the exact MusicBrainz work caused by a scan."""
     return {
         "artists": inventory.get("artists", []),
+        "tracks": inventory.get("tracks", []),
         "artistMbids": sorted({
             item["musicbrainzId"]
             for item in artist_items
@@ -470,6 +583,14 @@ def _scan_result(inventory, *, artist_items=(), release_items=(), changed):
             for item in release_items
             if item.get("musicbrainzReleaseId")
             and not item.get("releaseGroupResolved")
+        } | {
+            item["musicbrainzReleaseId"]
+            for item in inventory.get("tracks", [])
+            if item.get("musicbrainzReleaseId") and not item.get("musicbrainzRecordingId")
+        }),
+        "trackMbids": sorted({
+            item["musicbrainzTrackId"] for item in inventory.get("tracks", [])
+            if item.get("musicbrainzTrackId") and not item.get("musicbrainzRecordingId")
         }),
         "changed": changed,
     }
@@ -487,18 +608,22 @@ def full_library_scan(config):
                     "musicbrainzReleaseGroupId", ""
                 ),
                 "releaseGroupResolved": item.get("releaseGroupResolved", False),
+                "trackMetadataResolved": item.get("trackMetadataResolved", False),
+                "releaseMetadataMissing": item.get("releaseMetadataMissing", False),
             }
             for item in previous.get("releaseGroups", [])
             if item.get("musicbrainzReleaseId")
         }
         sections = selected_music_sections(config)
         inventory = _scan_sections(config, sections)
+        inventory.setdefault("tracks", [])
         for release_group in inventory["releaseGroups"]:
             mapping = previous_mappings.get(
                 release_group.get("musicbrainzReleaseId")
             )
             if mapping:
                 release_group.update(mapping)
+        _attach_track_releases(inventory, previous.get("tracks", []))
         payload = {
             "snapshotVersion": SNAPSHOT_VERSION,
             **inventory,
@@ -517,6 +642,7 @@ def full_library_scan(config):
             or previous.get("sectionIds") != payload["sectionIds"]
             or previous.get("artists") != inventory["artists"]
             or previous.get("releaseGroups") != inventory["releaseGroups"]
+            or previous.get("tracks", []) != inventory["tracks"]
         )
         _save_snapshot(config, payload, replace_guids=True)
         return _scan_result(
@@ -528,7 +654,7 @@ def full_library_scan(config):
 
 
 def recently_added_scan(config):
-    """Merge recently added artists and release groups into the full snapshot."""
+    """Merge recent inventory and upsert only changed tracks in SQLite."""
     with scan_lock:
         sections = selected_music_sections(config)
         section_ids = [section["id"] for section in sections]
@@ -541,18 +667,27 @@ def recently_added_scan(config):
             or cached.get("sectionIds") != section_ids
         ):
             return full_library_scan(config)
-        recent = _scan_sections(config, sections, recently_added=True)
+        recent = _scan_sections(
+            config, sections, recently_added=True,
+            known_album_ids={item.get("ratingKey") for item in cached.get("releaseGroups", [])},
+        )
+        recent.setdefault("tracks", [])
         merged_inventory = {}
         changed_inventory = {"artists": [], "releaseGroups": []}
-        recent_inventory = {"artists": [], "releaseGroups": []}
-        for collection_name in ("artists", "releaseGroups"):
+        recent_inventory = {"artists": [], "releaseGroups": [], "tracks": []}
+        for collection_name in ("artists", "releaseGroups", "tracks"):
+            if collection_name == "tracks":
+                _attach_track_releases(
+                    {"releaseGroups": merged_inventory["releaseGroups"], "tracks": recent["tracks"]},
+                    cached.get("tracks", []),
+                )
             merged = {
                 _item_identity(item): item
                 for item in cached.get(collection_name, [])
-                if item.get("name")
+                if collection_name == "tracks" or item.get("name")
             }
             for item in recent[collection_name]:
-                if item.get("name"):
+                if collection_name == "tracks" or item.get("name"):
                     identity = _item_identity(item)
                     previous_item = merged.get(identity, {})
                     updated_item = {**previous_item, **item}
@@ -562,24 +697,27 @@ def recently_added_scan(config):
                     for field_name in METADATA_TAG_FIELDS:
                         if not item.get(field_name) and previous_item.get(field_name):
                             updated_item[field_name] = previous_item[field_name]
-                    if previous_item.get("releaseGroupResolved"):
+                    if (previous_item.get("releaseGroupResolved")
+                            and previous_item.get("musicbrainzReleaseId") == item.get("musicbrainzReleaseId")):
                         updated_item.update({
                             "musicbrainzReleaseGroupId": previous_item.get(
                                 "musicbrainzReleaseGroupId", ""
                             ),
                             "releaseGroupResolved": True,
+                            "trackMetadataResolved": previous_item.get("trackMetadataResolved", False),
+                            "releaseMetadataMissing": previous_item.get("releaseMetadataMissing", False),
                         })
                     recent_inventory[collection_name].append(updated_item)
                     if updated_item != previous_item:
-                        changed_inventory[collection_name].append(updated_item)
+                        changed_inventory.setdefault(collection_name, []).append(updated_item)
                         merged[identity] = updated_item
             merged_inventory[collection_name] = sorted(
-                merged.values(), key=lambda item: (item.get("name") or "").casefold()
+                merged.values(), key=_sort_key
             )
         changed = any(changed_inventory.values())
         if not changed:
             return _scan_result(
-                cached,
+                recent_inventory,
                 release_items=recent_inventory["releaseGroups"],
                 changed=False,
             )
@@ -589,9 +727,13 @@ def recently_added_scan(config):
             "sectionIds": section_ids,
             "scannedAt": time.time(),
         }
-        _save_snapshot(config, payload, guid_inventory=changed_inventory)
+        _save_snapshot(
+            config, payload, guid_inventory=changed_inventory,
+            track_inventory=changed_inventory.get("tracks", []),
+            invalidate_details=bool(changed_inventory["artists"] or changed_inventory["releaseGroups"]),
+        )
         return _scan_result(
-            merged_inventory,
+            recent_inventory,
             artist_items=changed_inventory["artists"],
             release_items=recent_inventory["releaseGroups"],
             changed=True,
@@ -676,15 +818,21 @@ def library_release_groups(config):
 
 def unresolved_musicbrainz_releases(config):
     """Return Plex albums whose release MBID still needs a group lookup."""
+    snapshot = cached_library_snapshot(config)
+    track_releases = {
+        item.get("musicbrainzReleaseId") for item in snapshot.get("tracks", [])
+        if not item.get("musicbrainzRecordingId")
+    }
     return [
         item
-        for item in library_release_groups(config)
+        for item in snapshot.get("releaseGroups", [])
         if item.get("musicbrainzReleaseId")
-        and not item.get("releaseGroupResolved")
+        and (not item.get("releaseGroupResolved")
+             or item.get("musicbrainzReleaseId") in track_releases)
     ]
 
 
-def apply_release_group_mappings(config, mappings, *, artist_mappings=None):
+def apply_release_group_mappings(config, mappings, *, artist_mappings=None, release_metadata=None):
     """Persist release-group mappings and inferred parent-artist MBIDs."""
     if not mappings:
         return 0
@@ -711,9 +859,17 @@ def apply_release_group_mappings(config, mappings, *, artist_mappings=None):
             release_id = item.get("musicbrainzReleaseId")
             if release_id not in mappings:
                 continue
-            item["musicbrainzReleaseGroupId"] = mappings[release_id] or ""
-            item["releaseGroupResolved"] = True
-            changed_releases.append(item)
+            update = {
+                "musicbrainzReleaseGroupId": mappings[release_id] or "",
+                "releaseGroupResolved": True,
+            }
+            if release_metadata is not None and release_id in release_metadata:
+                metadata = release_metadata[release_id] or {}
+                usable = any(medium.get("tracks") for medium in metadata.get("media", []))
+                update.update(trackMetadataResolved=usable, releaseMetadataMissing=not usable)
+            if any(item.get(field) != value for field, value in update.items()):
+                item.update(update)
+                changed_releases.append(item)
 
             artist_id = artist_mappings.get(release_id)
             if not artist_id:
@@ -727,17 +883,87 @@ def apply_release_group_mappings(config, mappings, *, artist_mappings=None):
             if artist is not None and not artist.get("musicbrainzId"):
                 artist["musicbrainzId"] = artist_id
                 changed_artists.append(artist)
-        if not changed_releases and not changed_artists:
+        track_mappings = {}
+        for release_id, metadata in (release_metadata or {}).items():
+            if not metadata:
+                continue
+            group_id = (metadata.get("release-group") or {}).get("id", "")
+            for medium in metadata.get("media", []):
+                for mb_track in medium.get("tracks", []):
+                    recording = mb_track.get("recording") or {}
+                    recording_id = _musicbrainz_id([f"mbid://{recording.get('id', '')}"])
+                    if mb_track.get("id") and recording_id:
+                        track_mappings[(release_id, mb_track["id"].casefold())] = {
+                            "musicbrainzRecordingId": recording_id,
+                            "musicbrainzReleaseGroupId": group_id,
+                            "isrcs": track_search_index.normalize_isrcs(recording.get("isrcs")),
+                            "mappingSource": "release_track", "mappingConfidence": "exact",
+                        }
+        changed_tracks = []
+        for track in payload.get("tracks", []):
+            mapping = track_mappings.get((track.get("musicbrainzReleaseId"), track.get("musicbrainzTrackId")))
+            if mapping and any(track.get(field) != value for field, value in mapping.items()):
+                track.update(mapping)
+                changed_tracks.append(track)
+        if not changed_releases and not changed_artists and not changed_tracks:
             return 0
-        set_cache_document(
-            "plex-library", _snapshot_id(config), payload, PLEX_LIBRARY_CACHE_TTL
-        )
-        track_search_index.index_plex_library(payload)
-        invalidate_document(_index_key(_snapshot_id(config)))
-        invalidate_detail_payloads()
-        documents = _guid_documents(config, {
+        _save_snapshot(config, payload, guid_inventory={
             "artists": changed_artists,
             "releaseGroups": changed_releases,
-        })
-        upsert_cache_documents("plex-guid", documents, PLEX_LIBRARY_CACHE_TTL)
+        }, track_inventory=changed_tracks, invalidate_details=bool(changed_artists or changed_releases))
         return len(changed_releases)
+
+
+def fallback_track_ids(config, track_ids=None):
+    """Only fall back when a parent release is absent or confirmed unusable."""
+    snapshot = cached_library_snapshot(config)
+    return _fallback_track_ids(snapshot, track_ids)
+
+
+def _fallback_track_ids(snapshot, track_ids):
+    albums = {item.get("ratingKey"): item for item in snapshot.get("releaseGroups", [])}
+    return sorted({
+        track["musicbrainzTrackId"] for track in snapshot.get("tracks", [])
+        if track.get("musicbrainzTrackId") and not track.get("musicbrainzRecordingId")
+        and (track_ids is None or track["musicbrainzTrackId"] in track_ids)
+        and (not track.get("musicbrainzReleaseId")
+             or albums.get(track.get("albumRatingKey"), {}).get("releaseMetadataMissing"))
+    })
+
+
+def apply_track_recording_mappings(config, mappings):
+    if not mappings:
+        return 0
+    with scan_lock:
+        payload = get_cache_document("plex-library", _snapshot_id(config), allow_expired=True)
+        if not payload:
+            return 0
+        eligible = set(_fallback_track_ids(payload, set(mappings)))
+        changed = []
+        for track in payload.get("tracks", []):
+            track_id = track.get("musicbrainzTrackId")
+            if track_id not in eligible:
+                continue
+            recording = mappings[track_id]
+            recording_id = _musicbrainz_id([f"mbid://{recording.get('id', '')}"])
+            if not recording_id:
+                continue
+            track.update(
+                musicbrainzRecordingId=recording_id,
+                isrcs=track_search_index.normalize_isrcs(recording.get("isrcs")),
+                mappingSource="track_search", mappingConfidence="exact",
+            )
+            changed.append(track)
+        if changed:
+            _save_snapshot(
+                config, payload, guid_inventory={"artists": [], "releaseGroups": []},
+                track_inventory=changed, invalidate_details=False,
+            )
+        return len(changed)
+
+
+def recording_availability(config, recording_id):
+    tracks = track_search_index.plex_recording_tracks(
+        _snapshot_id(config), recording_id, section_ids=config.get("librarySectionIds"),
+    )
+    return {"available": bool(tracks), "recordingMbid": recording_id, "tracks": tracks}

@@ -72,10 +72,11 @@ def _run_scan(kind):
             remove_stale_plex_artist_artwork(valid_artwork)
         else:
             result = plex.recently_added_scan(config)
-        if result["artistMbids"] or result["releaseMbids"]:
+        if result["artistMbids"] or result["releaseMbids"] or result.get("trackMbids"):
             plex_metadata.request_enrichment(
                 artist_ids=result["artistMbids"],
                 release_ids=result["releaseMbids"],
+                **({"track_ids": result["trackMbids"]} if result.get("trackMbids") else {}),
             )
     except (ValueError, requests.RequestException) as exc:
         logger.warning("Plex %s music-library scan failed: %s", kind, exc)
