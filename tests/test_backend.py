@@ -225,12 +225,13 @@ class ApplicationFactoryTests(DatabaseTestCase):
             for method in rule.methods
             if method not in {"HEAD", "OPTIONS"}
         }
-        self.assertEqual(len(rules), 109)
-        self.assertEqual(len(route_methods), 109)
+        self.assertEqual(len(rules), 110)
+        self.assertEqual(len(route_methods), 110)
         for route in (("/api/discover/charts", "GET"), ("/api/discover/preferences", "GET"),
                       ("/api/discover/preferences", "POST"), ("/api/discover/request-influence", "POST")):
             self.assertIn(route, route_methods)
         self.assertIn(("/api/music/artist/<mbid>/similar", "GET"), route_methods)
+        self.assertIn(("/api/music/recording/<mbid>/acquisition", "GET"), route_methods)
         self.assertIn(
             ("/api/music/release-groups/availability", "GET"),
             route_methods,

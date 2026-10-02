@@ -253,6 +253,13 @@ def document_cache_key(namespace, document_id):
     return f"{namespace}:{digest}"
 
 
+@contextmanager
+def cache_document_lock(namespace, document_id):
+    """Coalesce concurrent builders of the same locally assembled document."""
+    with _request_lock(document_cache_key(namespace, document_id)):
+        yield
+
+
 def get_cache_document(namespace, document_id, *, allow_expired=False):
     """Read a non-HTTP cache document used by a background scan."""
     key = document_cache_key(namespace, document_id)

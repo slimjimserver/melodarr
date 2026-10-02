@@ -7,6 +7,7 @@ import unicodedata
 from contextlib import contextmanager
 from threading import Lock, local
 from urllib.parse import quote, urlsplit, urlunsplit
+from uuid import UUID
 from xml.etree import ElementTree
 
 import requests
@@ -41,6 +42,7 @@ else:  # Support the existing `python backend/app.py` entry point.
 TEST_RECORDING_ID = "5f396c8b-ae2e-48de-afbc-904f4f0d66fc"
 VARIOUS_ARTISTS_ID = "89ad4ac3-39f7-470e-963a-56509c546377"
 RELEASE_TRACK_INCLUDES = "recordings+artist-credits+release-groups+isrcs"
+RECORDING_RELEASE_INCLUDES = "recordings+release-groups+artist-credits+media"
 SEARCH_UNAVAILABLE_MESSAGE = (
     "MusicBrainz search is unavailable. If this is a self-hosted server, "
     "check that its search/Solr service is running and reachable from the "
@@ -448,6 +450,50 @@ def get(
         cache_only=cache_only,
         cache_response=cache_response,
     )
+
+
+def browse_releases_by_recording(
+    recording_id, *, priority="interactive", cache_ttl=None, force_refresh=False,
+):
+    """Read every directly linked release, rejecting incomplete page sets.
+
+    MusicBrainz can return fewer than limit releases because of its track
+    budget. Only the actual number returned advances the offset.
+    """
+    recording_id = str(UUID(str(recording_id)))
+    releases, seen, offset, expected_total = [], set(), 0, None
+    while True:
+        page = get(
+            "/release", RECORDING_RELEASE_INCLUDES, priority=priority,
+            recording=recording_id, limit=100, offset=offset,
+            cache_ttl=cache_ttl, force_refresh=force_refresh,
+        )
+        try:
+            total = page["release-count"]
+            actual_offset = page.get("release-offset", offset)
+            batch = page["releases"]
+            if (
+                isinstance(total, bool) or not isinstance(total, int) or total < 0
+                or isinstance(actual_offset, bool) or not isinstance(actual_offset, int)
+                or actual_offset != offset
+                or not isinstance(batch, list) or offset + len(batch) > total
+                or (not batch and offset < total)
+                or (expected_total is not None and total != expected_total)
+            ):
+                raise ValueError
+            ids = [str(UUID(str(release["id"]))) for release in batch]
+            if len(set(ids)) != len(ids) or seen.intersection(ids):
+                raise ValueError
+        except (TypeError, KeyError, ValueError, AttributeError) as exc:
+            raise requests.RequestException(
+                "MusicBrainz returned an incomplete recording release collection."
+            ) from exc
+        expected_total = total
+        releases.extend(batch)
+        seen.update(ids)
+        offset += len(batch)
+        if offset == total:
+            return releases
 
 
 def release_track_metadata(release_id, *, priority="background"):

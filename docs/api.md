@@ -259,3 +259,120 @@ only changed track rows and their ISRC relations. Full scans remove deleted
 tracks. Recording and ISRC lookups retain multiple Plex copies; ISRCs are
 secondary identifiers and are not unique. The internal
 `track_search_index.plex_isrc_tracks()` helper supports indexed ISRC lookup.
+
+## Recording acquisition targets
+
+```http
+GET /api/music/recording/{recordingMbid}/acquisition
+```
+
+This read-only endpoint requires a signed-in session, not an automation API
+key. It does not add anything to Lidarr, start searches/downloads, create
+request history, or scan Plex. Responses use `Cache-Control: no-store`.
+
+The result contains `recordingMbid`, `recordingTitle`, `recordingArtistMbids`,
+`state`, `available`, `needsAcquisition`, `enumeratedReleaseCount`,
+`candidateCount`, `target`, and `alternatives`. `available` is obtained from
+the local Plex recording index and `needsAcquisition` is its inverse. A
+recording already in Plex still receives an acquisition target for diagnostics.
+`target` is the first ranked release group; alternatives contain every other
+verified group in deterministic order. Empty results have a null target.
+
+Candidate fields:
+
+| Field | Meaning |
+| --- | --- |
+| `releaseGroupMbid`, `title` | Exact release-group identity and MusicBrainz title. |
+| `artistName`, `artistMbids`, `artistCreditSource` | Credit from the group, or a containing release when group credit is unavailable. |
+| `primaryType`, `secondaryTypes` | Actual MusicBrainz types; an unknown primary type remains null. |
+| `firstReleaseDate`, `firstReleaseDateSource` | Group date, falling back to the earliest verified containing-release date. Partial dates are retained. |
+| `minimumTrackCount` | Smallest known total across all media of a containing release; null when unknown. This is a size hint, not a guaranteed download size. |
+| `minimumOfficialTrackCount` | The same hint restricted to Official containing releases. |
+| `officialReleaseCount`, `containingReleaseCount`, `releaseStatusCounts` | Counts of unique editions proven to contain the recording. |
+| `containingReleases` | Release MBIDs, status, date, track count, and matching MusicBrainz track MBIDs. |
+| `containsExactRecording` | Always true for eligible candidates. |
+| `artistRelevance` | `same-credit`, `overlapping-credit`, `different-credit`, or `unknown`, based on artist MBIDs, not display names. |
+| `ranking`, `rankTuple`, `selectionReasons` | Named lexicographic components, the ordered tuple, and human-readable evidence. Lower tuples win. |
+| `availableInLidarr`, `fullyAvailableInLidarr` | Current cached Lidarr tracking/completion, added after ranking. Tracking does not necessarily mean all files are present. |
+| `lidarrTrackFileCount`, `lidarrTotalTrackCount` | File counts from the cached Lidarr snapshot. |
+
+### Exact containment and pagination
+
+The resolver looks up the exact recording with `inc=artist-credits`, then
+browses `/release?recording={recordingMbid}` with
+`inc=recordings+release-groups+artist-credits+media`, `limit=100`, and `offset`.
+It advances by the actual number of releases returned until the reported
+total is reached. It rejects changing totals, incorrect offsets, repeated
+release IDs, empty intermediate pages, and malformed responses. No partial
+candidate set is promoted into a resolved result.
+
+Each containing release must have `media[].tracks[].recording.id` equal to
+the requested recording MBID. Missing tracklists receive an exact release
+lookup through the existing MusicBrainz client. Explicitly different
+recordings are excluded even if their title/artist/ISRC matches. Missing group
+metadata receives at most one lookup per unique group. Recording lookup
+linked-release lists and the compact search index are not used to enumerate
+the complete candidate set.
+
+### Ranking
+
+The tuple, in order, is:
+
+```text
+(
+  nonOfficialOnlyPenalty,
+  primaryTypeRank,
+  broadPackagingPenalty,
+  minimumTrackCount,
+  artistRelevanceRank,
+  releaseStatusRank,
+  secondaryTypePenalty,
+  firstReleaseDate,
+  releaseGroupMbid
+)
+```
+
+Known Bootleg/Pseudo-Release/Withdrawn/Cancelled-only groups receive the first
+penalty; an unknown status does not imply an unusable release. Otherwise the
+primary ordering is Single → EP → Album → Other → Broadcast → unknown.
+Within the same primary type, straightforward packaging beats
+Compilation/Various Artists packaging, then smaller known containing
+releases win (unknown size sorts last). Artist credits prefer equal MBID
+sets, then overlap, then unrelated credits, with missing evidence last.
+Official status wins the later status tie-break, followed by Promotion,
+unknown, Bootleg, Pseudo-Release, Withdrawn, and Cancelled. Fewer secondary
+types, earlier dates, and finally the group MBID break remaining ties.
+Missing sizes/dates have explicit sort-last sentinels in `ranking`.
+
+Compilations, Live, Remix, Soundtrack, DJ-mix, Mixtape/Street, and Demo groups
+are retained when they contain the exact recording. A normal Single beats
+an EP/Album regardless of a later date or a larger track count; the exception
+for known non-official-only groups lets a clean Official Album beat a
+bootleg-only Single. Existing AnimeThemes/discovery preferences are unchanged.
+
+### Caching and failure states
+
+Complete normalized MusicBrainz results use a **seven-day TTL** in
+`musicbrainz-metadata:recording-acquisition-v1` within the existing cache
+database. Cache identity includes the recording MBID and configured
+MusicBrainz base URL. Clearing the MusicBrainz metadata cache also clears
+this nested scope; changing its schema version invalidates older results.
+An expired normalized document triggers a provider refresh. If that document
+was already removed by cache cleanup, the result is rebuilt through the
+existing HTTP cache. Fresh raw provider documents can satisfy a cold miss.
+Concurrent builders for the same recording/provider are coalesced.
+
+Provider failures and incomplete page sets are not cached as completed
+results. Plex availability and cached Lidarr status are read on every
+request and are never stored in the normalized result or used to change
+recording identity/ranking. Lidarr is read once for all candidates.
+
+| State/status | Meaning |
+| --- | --- |
+| `resolved` / `200` | A verified target and zero or more alternatives. |
+| `no_releases` / `200` | MusicBrainz returned a complete, empty release collection. |
+| `no_release_groups` / `200` | Releases exist but none produces an exact, usable group candidate. |
+| `musicbrainz_unavailable` / `502` | Provider/network/metadata completeness failure; null target and a fixed public error. |
+| `400` | Invalid recording UUID. |
+| `401` | Session authentication required. |
+| `503` | Local index/cache could not be read; fixed public error. |

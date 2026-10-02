@@ -24,6 +24,7 @@ if __package__ == "backend.routes":
         lidarr,
         musicbrainz,
         plex,
+        recording_acquisition,
     )
     from ..storage import (
         get_lastfm_api_key,
@@ -49,6 +50,7 @@ else:
         lidarr,
         musicbrainz,
         plex,
+        recording_acquisition,
     )
     from storage import (
         get_lastfm_api_key,
@@ -530,6 +532,50 @@ def recording_availability(mbid):
     except (OSError, sqlite3.Error):
         return api_error("Plex availability could not be loaded.", 503)
     return _availability_response(payload)
+
+
+@blueprint.get("/api/music/recording/<mbid>/acquisition")
+@login_required
+def recording_acquisition_target(mbid):
+    """Describe an exact acquisition target without requesting any media."""
+    try:
+        recording_id = str(UUID(mbid))
+    except ValueError:
+        return api_error("Recording ID must be a valid MusicBrainz UUID.")
+    try:
+        config = get_service("plex")
+        available = bool(config and plex.recording_availability(config, recording_id)["available"])
+        resolution = recording_acquisition.resolve(recording_id)
+        lidarr_groups = lidarr.cached_library_availability()
+
+        def candidate_status(candidate):
+            if candidate is None:
+                return None
+            album = lidarr_groups.get(candidate["releaseGroupMbid"]) or {}
+            return {
+                **candidate,
+                "availableInLidarr": bool(album),
+                "fullyAvailableInLidarr": bool(album.get("fullyAvailable")),
+                "lidarrTrackFileCount": album.get("trackFileCount", 0),
+                "lidarrTotalTrackCount": album.get("totalTrackCount", 0),
+            }
+
+        payload = {
+            **resolution, "available": available, "needsAcquisition": not available,
+            "target": candidate_status(resolution["target"]),
+            "alternatives": [candidate_status(item) for item in resolution["alternatives"]],
+        }
+    except (OSError, sqlite3.Error):
+        response = _availability_response({"error": "Recording acquisition metadata could not be loaded."})
+        response.status_code = 503
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    if resolution["state"] == "musicbrainz_unavailable":
+        payload["error"] = "MusicBrainz could not resolve acquisition releases."
+    response = _availability_response(payload)
+    if resolution["state"] == "musicbrainz_unavailable":
+        response.status_code = 502
+    return response
 
 
 @blueprint.get("/api/music/release-group/<mbid>/availability")
