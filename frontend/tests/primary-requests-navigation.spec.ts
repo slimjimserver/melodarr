@@ -86,22 +86,31 @@ for (const theme of ["midnight", "warm"]) {
           expect(item.bottom).toBeLessThanOrEqual(item.contentBottom);
         }
       } else {
-        // Exercise both configured system and generic fallback fonts; their
-        // widths differ between Windows development and Linux CI.
-        for (const font of ["system-ui, sans-serif", "sans-serif"]) {
+        // System font widths differ between Windows and Linux. Verdana also
+        // exercises wider tablet labels on Windows, where both fallbacks fit.
+        const fonts = ["system-ui, sans-serif", "sans-serif"];
+        if (width <= 900) fonts.push("Verdana, sans-serif");
+        for (const font of fonts) {
           await page.evaluate(font => { document.body.style.fontFamily = font; }, font);
-          const metrics = await desktop.evaluate(nav => ({ right: nav.getBoundingClientRect().right,
-            scroll: document.documentElement.scrollWidth, viewport: document.documentElement.clientWidth,
-            controls: [...document.querySelectorAll<HTMLElement>("header > *")]
-              .filter(item => getComputedStyle(item).display !== "none")
-              .map(item => ({ name: item.id || item.className, left: item.getBoundingClientRect().left,
-                right: item.getBoundingClientRect().right })),
-          }));
+          const metrics = await desktop.evaluate(nav => {
+            const header = nav.parentElement!;
+            const bounds = header.getBoundingClientRect();
+            const style = getComputedStyle(header);
+            return { right: nav.getBoundingClientRect().right,
+              scroll: document.documentElement.scrollWidth, viewport: document.documentElement.clientWidth,
+              contentLeft: bounds.left + parseFloat(style.paddingLeft),
+              contentRight: bounds.right - parseFloat(style.paddingRight),
+              controls: [...header.querySelectorAll<HTMLElement>(":scope > *")]
+                .filter(item => getComputedStyle(item).display !== "none")
+                .map(item => ({ name: item.id || item.className, left: item.getBoundingClientRect().left,
+                  right: item.getBoundingClientRect().right })),
+            };
+          });
           expect(metrics.right).toBeLessThanOrEqual(width);
           expect(metrics.scroll, `${font}: ${JSON.stringify(metrics.controls)}`).toBeLessThanOrEqual(metrics.viewport);
           for (const control of metrics.controls) {
-            expect(control.left, `${font}: ${control.name}`).toBeGreaterThanOrEqual(0);
-            expect(control.right, `${font}: ${control.name}`).toBeLessThanOrEqual(width);
+            expect(control.left, `${font}: ${control.name}`).toBeGreaterThanOrEqual(metrics.contentLeft - .5);
+            expect(control.right, `${font}: ${control.name}`).toBeLessThanOrEqual(metrics.contentRight + .5);
           }
           for (let i = 1; i < metrics.controls.length; i++) {
             expect(metrics.controls[i].left).toBeGreaterThanOrEqual(metrics.controls[i - 1].right);
