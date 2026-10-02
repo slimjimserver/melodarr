@@ -200,6 +200,7 @@ class DatabaseTestCase(unittest.TestCase):
             connection.execute("DELETE FROM plex_listens")
             connection.execute("DELETE FROM request_history")
             connection.execute("DELETE FROM account_invitations")
+            connection.execute("DELETE FROM recording_acquisitions")
             connection.execute("DELETE FROM users")
         write_settings_file({})
         with cache_db() as connection:
@@ -225,8 +226,8 @@ class ApplicationFactoryTests(DatabaseTestCase):
             for method in rule.methods
             if method not in {"HEAD", "OPTIONS"}
         }
-        self.assertEqual(len(rules), 110)
-        self.assertEqual(len(route_methods), 110)
+        self.assertEqual(len(rules), 112)
+        self.assertEqual(len(route_methods), 112)
         for route in (("/api/discover/charts", "GET"), ("/api/discover/preferences", "GET"),
                       ("/api/discover/preferences", "POST"), ("/api/discover/request-influence", "POST")):
             self.assertIn(route, route_methods)
@@ -5730,8 +5731,8 @@ class LidarrRequestTests(DatabaseTestCase):
         self.assertEqual(listener_history[0]["theme_id"], 1477)
         self.assertEqual(listener_history[0]["song_title"], "Haruka Kanata")
 
-    @patch("backend.routes.requests.lidarr.lookup_album")
-    @patch("backend.routes.requests.get_service", return_value=None)
+    @patch("backend.services.release_requests.lidarr.lookup_album")
+    @patch("backend.services.release_requests.get_service", return_value=None)
     def test_release_group_request_reports_unconfigured_lidarr_as_json(
         self, get_service, lookup_album
     ):
@@ -5780,13 +5781,13 @@ class LidarrRequestTests(DatabaseTestCase):
         history = self.request_history()
         self.assertEqual((history[0]["kind"], history[0]["mbid"]), ("artist", self.artist_mbid))
 
-    @patch("backend.routes.requests.notifications.queue_admin_request")
-    @patch("backend.routes.requests.lidarr_search_worker.request_work")
-    @patch("backend.routes.requests.enqueue_lidarr_search")
-    @patch("backend.routes.requests.lidarr.start_command")
-    @patch("backend.routes.requests.lidarr.add_album")
-    @patch("backend.routes.requests.lidarr.lookup_album")
-    @patch("backend.routes.requests.get_service")
+    @patch("backend.services.release_requests.notifications.queue_admin_request")
+    @patch("backend.services.release_requests.lidarr_search_worker.request_work")
+    @patch("backend.services.release_requests.enqueue_lidarr_search")
+    @patch("backend.services.release_requests.lidarr.start_command")
+    @patch("backend.services.release_requests.lidarr.add_album")
+    @patch("backend.services.release_requests.lidarr.lookup_album")
+    @patch("backend.services.release_requests.get_service")
     def test_new_album_persists_refresh_then_search_job(
         self, get_service, lookup_album, add_album, start_command,
         enqueue_search, request_work, queue_admin_request
@@ -5852,12 +5853,12 @@ class LidarrRequestTests(DatabaseTestCase):
         request_work.assert_called_once_with()
         start_command.assert_not_called()
 
-    @patch("backend.routes.requests.lidarr_search_worker.request_work")
-    @patch("backend.routes.requests.enqueue_lidarr_search")
-    @patch("backend.routes.requests.lidarr.albums_by_release_group")
-    @patch("backend.routes.requests.lidarr.add_album")
-    @patch("backend.routes.requests.lidarr.lookup_album")
-    @patch("backend.routes.requests.get_service")
+    @patch("backend.services.release_requests.lidarr_search_worker.request_work")
+    @patch("backend.services.release_requests.enqueue_lidarr_search")
+    @patch("backend.services.release_requests.lidarr.albums_by_release_group")
+    @patch("backend.services.release_requests.lidarr.add_album")
+    @patch("backend.services.release_requests.lidarr.lookup_album")
+    @patch("backend.services.release_requests.get_service")
     def test_existing_incomplete_album_refreshes_before_search(
         self, get_service, lookup_album, add_album, albums_by_release_group,
         enqueue_search, request_work
@@ -5893,11 +5894,11 @@ class LidarrRequestTests(DatabaseTestCase):
         )
         request_work.assert_called_once_with()
 
-    @patch("backend.routes.requests.record_request")
-    @patch("backend.routes.requests.lidarr.albums_by_release_group")
-    @patch("backend.routes.requests.lidarr.add_album")
-    @patch("backend.routes.requests.lidarr.lookup_album")
-    @patch("backend.routes.requests.get_service")
+    @patch("backend.services.release_requests.record_request")
+    @patch("backend.services.release_requests.lidarr.albums_by_release_group")
+    @patch("backend.services.release_requests.lidarr.add_album")
+    @patch("backend.services.release_requests.lidarr.lookup_album")
+    @patch("backend.services.release_requests.get_service")
     def test_fully_available_album_history_preserves_anime_context(
         self, get_service, lookup_album, add_album, albums_by_release_group,
         record_history
@@ -5953,11 +5954,11 @@ class LidarrRequestTests(DatabaseTestCase):
             "song_title": "Haruka Kanata",
         })
 
-    @patch("backend.routes.requests.lidarr_search_worker.request_work")
-    @patch("backend.routes.requests.enqueue_lidarr_search")
-    @patch("backend.routes.requests.lidarr.add_album")
-    @patch("backend.routes.requests.lidarr.lookup_album")
-    @patch("backend.routes.requests.get_service")
+    @patch("backend.services.release_requests.lidarr_search_worker.request_work")
+    @patch("backend.services.release_requests.enqueue_lidarr_search")
+    @patch("backend.services.release_requests.lidarr.add_album")
+    @patch("backend.services.release_requests.lidarr.lookup_album")
+    @patch("backend.services.release_requests.get_service")
     def test_new_album_uses_album_refresh_regardless_of_artist_state(
         self, get_service, lookup_album, add_album, enqueue_search, request_work
     ):

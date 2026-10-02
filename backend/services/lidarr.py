@@ -378,7 +378,7 @@ def refresh_download_snapshot(config=None):
 
 def cached_download_availability():
     """Read the worker-written snapshot; never issue a web-request queue call."""
-    snapshot = get_cache_document(DOWNLOAD_SNAPSHOT_NAMESPACE, DOWNLOAD_SNAPSHOT_KEY)
+    snapshot = get_cache_document(DOWNLOAD_SNAPSHOT_NAMESPACE, DOWNLOAD_SNAPSHOT_KEY, read_only=True)
     if not isinstance(snapshot, dict):
         return {}
     albums = snapshot.get("albums")
@@ -404,6 +404,18 @@ def public_download_status(value):
     if completion_time:
         sanitized["estimatedCompletionTime"] = completion_time
     return sanitized
+
+
+def release_group_lifecycle(album=None, download=None, pending=False):
+    """Shared cached precedence for details, history, and recording requests."""
+    if album and album.get("fullyAvailable"):
+        return "available", None
+    download_status = public_download_status(download)
+    if download_status:
+        return "downloading", download_status
+    if pending:
+        return "queued", None
+    return "requested", None
 
 
 def album_availability(album):
@@ -463,7 +475,7 @@ def cached_library_index():
     """Return the cached Lidarr library document, parsed at most once."""
     return memoized_document(
         LIBRARY_INDEX_KEY,
-        lambda: get_cache_document("lidarr-library", "albums", allow_expired=True) or {},
+        lambda: get_cache_document("lidarr-library", "albums", allow_expired=True, read_only=True) or {},
     )
 
 

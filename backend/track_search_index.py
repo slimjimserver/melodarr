@@ -1642,18 +1642,22 @@ def _plex_track_lookup(server_id, predicate, identities, section_ids, *, recordi
     with cache_db() as connection:
         index = " INDEXED BY idx_track_search_plex_recording" if recording_index else ""
         rows = connection.execute(
-            f"SELECT t.* FROM track_search_plex_tracks t{index} WHERE t.server_id = ? AND {predicate} "
-            "AND t.plex_key != '' ORDER BY t.rating_key", parameters,
+            f"SELECT t.*, i.isrc FROM track_search_plex_tracks t{index} "
+            "LEFT JOIN track_search_plex_isrcs i "
+            "ON i.server_id = t.server_id AND i.rating_key = t.rating_key "
+            f"WHERE t.server_id = ? AND {predicate} "
+            "AND t.plex_key != '' ORDER BY t.rating_key, i.isrc", parameters,
         ).fetchall()
-        result = []
+        result = {}
         for row in rows:
-            track = {field: row[column] for field, column in PLEX_TRACK_COLUMNS.items()}
-            track["isrcs"] = [item[0] for item in connection.execute(
-                "SELECT isrc FROM track_search_plex_isrcs WHERE server_id = ? AND rating_key = ? ORDER BY isrc",
-                (server_id, row["rating_key"]),
-            )]
-            result.append(track)
-        return result
+            if row["rating_key"] not in result:
+                result[row["rating_key"]] = {
+                    **{field: row[column] for field, column in PLEX_TRACK_COLUMNS.items()},
+                    "isrcs": [],
+                }
+            if row["isrc"]:
+                result[row["rating_key"]]["isrcs"].append(row["isrc"])
+        return list(result.values())
 
 
 def index_plex_artists(payload):

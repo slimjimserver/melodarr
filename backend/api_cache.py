@@ -113,7 +113,7 @@ def _cache_operation(operation, *, locked_default=_RAISE_ON_LOCK, description="a
             time.sleep(delay)
 
 
-def _cached_value(key, row):
+def _cached_value(key, row, *, discard_invalid=True):
     """Decode one row, discarding corruption from the disposable cache."""
     if row is None:
         return None
@@ -121,9 +121,11 @@ def _cached_value(key, row):
         return json.loads(row["value"])
     except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         logger.warning(
-            "Discarding invalid metadata cache entry (%s)",
+            "Invalid metadata cache entry (%s)",
             _safe_error_label(exc),
         )
+        if not discard_invalid:
+            return None
 
         def delete_invalid(connection):
             connection.execute(
@@ -260,8 +262,8 @@ def cache_document_lock(namespace, document_id):
         yield
 
 
-def get_cache_document(namespace, document_id, *, allow_expired=False):
-    """Read a non-HTTP cache document used by a background scan."""
+def get_cache_document(namespace, document_id, *, allow_expired=False, read_only=False):
+    """Read a worker document; read-only callers also leave corrupt rows alone."""
     key = document_cache_key(namespace, document_id)
 
     def read(connection):
@@ -278,7 +280,7 @@ def get_cache_document(namespace, document_id, *, allow_expired=False):
         locked_default=None,
         description=f"read the {namespace} document",
     )
-    return _cached_value(key, row)
+    return _cached_value(key, row, discard_invalid=not read_only)
 
 
 def set_cache_document(namespace, document_id, value, ttl):

@@ -340,6 +340,62 @@ def pending_lidarr_search(mbid):
         ).fetchone()
 
 
+def recording_acquisition(recording_mbid):
+    """Read the immutable acquisition target with one primary-key lookup."""
+    with db() as connection:
+        row = connection.execute(
+            "SELECT * FROM recording_acquisitions WHERE recording_mbid = ?",
+            (recording_mbid,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def save_recording_acquisition(recording_mbid, target, recording_title, user_id):
+    """Persist accepted work and its initial requester in one short transaction.
+
+    The caller holds the recording initiation lock. Conflict handling also
+    protects the chosen target from replacement by future callers.
+    """
+    now = time.time()
+    with db() as connection:
+        connection.execute(
+            "INSERT OR IGNORE INTO recording_acquisitions "
+            "(recording_mbid, release_group_mbid, recording_title, target_title, "
+            "artist_name, primary_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (recording_mbid, target["releaseGroupMbid"], recording_title,
+             target.get("title") or "", target.get("artistName") or "",
+             target.get("primaryType"), now, now),
+        )
+        _add_recording_requester(connection, recording_mbid, user_id, now)
+
+
+def _add_recording_requester(connection, recording_mbid, user_id, now):
+    inserted = connection.execute(
+        "INSERT OR IGNORE INTO recording_acquisition_requesters "
+        "(recording_mbid, user_id, requested_at) VALUES (?, ?, ?)",
+        (recording_mbid, user_id, now),
+    ).rowcount
+    if inserted:
+        connection.execute(
+            "UPDATE recording_acquisitions SET updated_at = ? WHERE recording_mbid = ?",
+            (now, recording_mbid),
+        )
+    # Keep a shared pending job associated with every interested user even if
+    # its first requester deletes their account. This does not create work,
+    # history rows, or duplicate notifications on repeated recording requests.
+    connection.execute(
+        "INSERT OR IGNORE INTO pending_lidarr_search_requesters (job_id, user_id) "
+        "SELECT id, ? FROM pending_lidarr_searches WHERE mbid = "
+        "(SELECT release_group_mbid FROM recording_acquisitions WHERE recording_mbid = ?)",
+        (user_id, recording_mbid),
+    )
+
+
+def add_recording_acquisition_requester(recording_mbid, user_id):
+    with db() as connection:
+        _add_recording_requester(connection, recording_mbid, user_id, time.time())
+
+
 def pending_lidarr_search_mbids(mbids):
     """Return pending release groups in one bounded query for history pages."""
     normalized = {str(mbid).casefold() for mbid in mbids if mbid}
@@ -1330,6 +1386,35 @@ def init_db():
             "ON anime_artist_links(artist_mbid)"
         )
         _migrate_pending_lidarr_searches(connection)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS recording_acquisitions (
+                recording_mbid TEXT NOT NULL PRIMARY KEY,
+                release_group_mbid TEXT NOT NULL,
+                recording_title TEXT NOT NULL DEFAULT '',
+                target_title TEXT NOT NULL DEFAULT '',
+                artist_name TEXT NOT NULL DEFAULT '',
+                primary_type TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+        """)
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS recording_acquisitions_release_group "
+            "ON recording_acquisitions(release_group_mbid)"
+        )
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS recording_acquisition_requesters (
+                recording_mbid TEXT NOT NULL
+                    REFERENCES recording_acquisitions(recording_mbid) ON DELETE CASCADE,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                requested_at REAL NOT NULL,
+                PRIMARY KEY(recording_mbid, user_id)
+            )
+        """)
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS recording_acquisition_requesters_user "
+            "ON recording_acquisition_requesters(user_id, recording_mbid)"
+        )
         # Release-group requests always use RefreshAlbum. Convert work queued
         # by versions that conditionally selected RefreshArtist as well.
         connection.execute(

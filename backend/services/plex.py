@@ -963,6 +963,9 @@ def apply_track_recording_mappings(config, mappings):
 
 
 def recording_availability(config, recording_id):
+    """Exact local recording lookup shared by availability and request APIs."""
+    if not config:
+        return {"available": False, "recordingMbid": recording_id, "tracks": []}
     tracks = track_search_index.plex_recording_tracks(
         _snapshot_id(config), recording_id, section_ids=config.get("librarySectionIds"),
     )

@@ -260,6 +260,153 @@ tracks. Recording and ISRC lookups retain multiple Plex copies; ISRCs are
 secondary identifiers and are not unique. The internal
 `track_search_index.plex_isrc_tracks()` helper supports indexed ISRC lookup.
 
+## Recording requests and lifecycle
+
+```http
+POST /api/music/recording/{recordingMbid}/request
+GET  /api/music/recording/{recordingMbid}/request
+```
+
+POST means “make this exact MusicBrainz recording playable in Plex.” Both
+endpoints require a signed-in Melodarr session; the automation API key does
+not authorize them. POST requires the session's `X-CSRF-Token` header and no
+request body. GET requires no CSRF token. UUIDs use the same normalization as
+recording availability. Lifecycle responses and recording-handler errors use
+`Cache-Control: no-store`; authentication and CSRF errors follow the existing
+session conventions.
+
+POST checks the indexed Plex recording lookup first. If the exact recording
+is already present, it returns `200`, `status: "ready"`, `available: true`,
+`alreadyAvailable: true`, and every indexed Plex copy. This path does not
+resolve MusicBrainz metadata, touch Lidarr, create intent/requester/history
+rows, send notifications, or enqueue work.
+
+For a missing recording, POST reuses an existing acquisition target or asks
+the read-only acquisition resolver for its preferred target using the existing
+Single → EP → Album → Other → Broadcast → unknown ranking. A new request uses
+the same internal release-group operation as `/api/request/release-group`:
+Lidarr defaults, already-pending/already-existing handling, metadata refresh,
+album search, request history, admin notifications, and worker wakeups are
+preserved. Recording intent is persisted only after that operation accepts
+the target. New accepted work returns `202`; an existing recording acquisition
+returns `200` with `alreadyRequested: true`. If Plex observes the recording
+before the new POST finishes, the response can already be `200`/`ready`.
+
+Repeated POSTs preserve the original target and the same user's first request
+timestamp. A second authenticated user becomes another requester without
+rerunning the resolver or submitting another Lidarr request. The initial
+release-group action creates its normal history/notification; attaching to
+existing recording intent adds no duplicate history or notification. Targets
+are never automatically changed when metadata or ranking rules change.
+
+Example new request (GET returns the same lifecycle fields without the two
+POST-only `alreadyAvailable` and `alreadyRequested` flags):
+
+```json
+{
+  "recordingMbid": "11111111-1111-4111-8111-111111111111",
+  "recordingTitle": "Song",
+  "status": "queued",
+  "available": false,
+  "alreadyAvailable": false,
+  "alreadyRequested": false,
+  "target": {
+    "releaseGroupMbid": "22222222-2222-4222-8222-222222222222",
+    "title": "Song Single",
+    "artistName": "Artist",
+    "primaryType": "Single"
+  },
+  "requestedAt": 1790899200.0,
+  "downloadStatus": null,
+  "retrying": false,
+  "tracks": []
+}
+```
+
+`recordingTitle`, the target's title/artist/type, and `requestedAt` (Unix seconds
+of the initial accepted recording request) are durable snapshots. Unknown
+primary types remain null. With no intent, these metadata fields are null.
+No requester identities, service credentials, filesystem paths, upstream
+response bodies, or raw pending-worker errors are returned.
+
+Lifecycle precedence, highest first:
+
+| Status | Authoritative local condition |
+| --- | --- |
+| `ready` | The exact recording MBID exists in the selected Plex server/sections' recording index. Wins over all stale Lidarr data. |
+| `waiting_for_plex` | The selected release group is fully available in the cached Lidarr library, but the exact recording is absent from Plex. |
+| `downloading` | Cached, normalized download information exists for the selected release group. |
+| `queued` | A durable metadata-refresh/search follow-up job exists for the selected group. |
+| `requested` | Accepted recording intent exists, with none of the stronger conditions. |
+| `not_requested` | No intent and no exact indexed Plex recording. |
+
+READY means **the exact requested recording MBID exists in Plex**, never just
+that Lidarr imported its release group. `waiting_for_plex` can persist if the
+downloaded edition lacks that recording, Plex has not scanned it, or exact
+identity enrichment is unresolved. No filename, title, ISRC, or fuzzy match
+substitutes for the recording MBID.
+
+When `downloading`, `downloadStatus` is the existing client-safe Lidarr subset:
+`progress` (0–100), `status`, `trackedDownloadStatus`, `trackedDownloadState`,
+`timeLeft`, and `estimatedCompletionTime`, when known. It is null for all other
+states, including `ready` and `waiting_for_plex`. Download snapshots expire
+after 30 seconds; stale/expired queue entries do not imply permanent progress.
+`retrying: true` identifies a queued follow-up with a retryable worker error.
+There is no terminal `failed` state: follow-ups retry with bounded backoff.
+There is no `searching` state: the submitted search command ID exists only
+until the worker removes the pending job on its next pass.
+
+GET is a local read: one recording-index lookup, a primary-key intent lookup,
+and, only for missing recordings with intent, cached Lidarr library/download
+snapshots and an indexed pending-job lookup. It makes no live MusicBrainz,
+Lidarr, or Plex calls, runs no resolver, starts no scans, rebuilds no indexes,
+and writes no lifecycle/requester state. Library JSON is memoized rather than
+scanned for each group. Cached state can lag a newly accepted Lidarr operation;
+the next worker snapshot supplies the observed state.
+
+### Persistence, concurrency, and completion
+
+The normal startup migration adds `recording_acquisitions` (one immutable
+selected target per recording) and `recording_acquisition_requesters` (one
+relationship per recording/user, with its first request timestamp). Foreign
+keys cascade requester deletion when users or intent are deleted. Indexes
+cover recording identity, target release group, and requester user ID. No
+lifecycle string is stored. Global intent survives deletion of its last
+requester, so existing accepted work is still recognized.
+
+Initiation uses OS file locks in `request-locks/` beside the durable database.
+Recording locks coalesce concurrent duplicate POSTs; release-group locks also
+coalesce separate recordings/direct album requests choosing the same target
+while its job is pending. Locks span threads/processes, release on process
+exit, and hold no SQLite writer transaction during upstream calls. Waiting
+times out after 45 seconds with a safe `503`; callers may retry. Lock files
+must not be removed while Melodarr is running. All web processes must share
+the same database and lock directory on a filesystem supporting OS locks.
+
+Synchronous rejection, missing target, configuration failure, or connection
+failure leaves no accepted recording intent and allows a later POST retry.
+An interruption or database failure after downstream acceptance but before
+intent persistence cannot be made atomic with Lidarr: the next POST uses the
+existing pending/already-existing release-group behavior to recover. Once
+intent is committed, polling never reruns the resolver or retargets it.
+
+Normal Lidarr library scans refresh completion approximately every 2 minutes;
+queue snapshots refresh every 7 seconds. The existing Plex worker runs recent
+scans every 3 minutes and full scans every 12 hours, plus its existing startup
+and manual scans. These scans update the track index and schedule exact
+MusicBrainz track-to-recording enrichment where needed. After Plex itself
+exposes the imported track and enrichment indexes its exact recording MBID,
+the next GET changes `waiting_for_plex` to `ready` and returns every indexed
+copy in the same deterministic order and shape as recording availability.
+Neither recording endpoint introduces a Plex polling loop or wakes scans.
+
+Errors use the normal `{"error": "..."}` shape: `400` invalid UUID, `401`
+unsigned-in caller, `403` missing/invalid POST CSRF token, `404` no valid
+acquisition target or target absent from Lidarr, `502` unavailable MusicBrainz
+or rejected/unreachable Lidarr, and `503` invalid/missing Lidarr configuration,
+local storage trouble, or initiation lock contention. A missing unrequested
+recording on GET is a normal `200`/`not_requested` response.
+
 ## Recording acquisition targets
 
 ```http

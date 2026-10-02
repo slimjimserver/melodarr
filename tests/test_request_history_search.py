@@ -257,7 +257,7 @@ class RequestHistorySearchTests(DatabaseTestCase):
         with other_client.session_transaction() as session:
             session["user_id"] = other
             session["csrf_token"] = "other-csrf"
-        with patch("backend.routes.requests.notifications.queue_admin_request"), \
+        with patch("backend.services.release_requests.notifications.queue_admin_request"), \
              patch("backend.services.musicbrainz.get", side_effect=AssertionError("Unexpected MusicBrainz lookup")), \
              patch("backend.services.animethemes.detail", side_effect=AssertionError("Unexpected AnimeThemes lookup")), \
              patch("backend.services.lidarr.lookup_album", side_effect=AssertionError("Unexpected Lidarr lookup")):

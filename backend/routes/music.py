@@ -6,7 +6,7 @@ from urllib.parse import quote, urlsplit
 from uuid import UUID
 
 import requests
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, current_app, jsonify, request
 
 if __package__ == "backend.routes":
     from .. import detail_cache, track_search_index
@@ -16,7 +16,7 @@ if __package__ == "backend.routes":
         release_group_cover_art,
     )
     from ..responses import api_error
-    from ..security import login_required
+    from ..security import current_user, login_required
     from ..services import (
         anime_artist_links,
         anime_theme_links,
@@ -25,6 +25,7 @@ if __package__ == "backend.routes":
         musicbrainz,
         plex,
         recording_acquisition,
+        recording_requests,
     )
     from ..storage import (
         get_lastfm_api_key,
@@ -42,7 +43,7 @@ else:
         release_group_cover_art,
     )
     from responses import api_error
-    from security import login_required
+    from security import current_user, login_required
     from services import (
         anime_artist_links,
         anime_theme_links,
@@ -51,6 +52,7 @@ else:
         musicbrainz,
         plex,
         recording_acquisition,
+        recording_requests,
     )
     from storage import (
         get_lastfm_api_key,
@@ -150,13 +152,7 @@ def _availability_response(payload):
 
 def _release_group_lifecycle(mbid, lidarr_album=None, download=None, pending=False):
     """Apply imported > queue > durable follow-up > request lifecycle precedence."""
-    if lidarr_album and lidarr_album.get("fullyAvailable"):
-        return "available", None
-    if download:
-        return "downloading", lidarr.public_download_status(download)
-    if pending:
-        return "queued", None
-    return "requested", None
+    return lidarr.release_group_lifecycle(lidarr_album, download, pending)
 
 
 def _download_snapshot():
@@ -525,13 +521,47 @@ def recording_availability(mbid):
         return api_error("Recording ID must be a valid MusicBrainz UUID.")
     config = get_service("plex")
     try:
-        payload = (
-            plex.recording_availability(config, recording_id) if config else
-            {"available": False, "recordingMbid": recording_id, "tracks": []}
-        )
+        payload = plex.recording_availability(config, recording_id)
     except (OSError, sqlite3.Error):
         return api_error("Plex availability could not be loaded.", 503)
     return _availability_response(payload)
+
+
+@blueprint.get("/api/music/recording/<mbid>/request")
+@login_required
+def recording_request_status(mbid):
+    return _recording_request_response(mbid, initiate=False)
+
+
+@blueprint.post("/api/music/recording/<mbid>/request")
+@login_required
+def request_recording(mbid):
+    return _recording_request_response(mbid, initiate=True)
+
+
+def _recording_request_response(mbid, *, initiate):
+    try:
+        recording_id = str(UUID(mbid))
+    except ValueError:
+        response = _availability_response({"error": "Recording ID must be a valid MusicBrainz UUID."})
+        response.status_code = 400
+        return response
+    try:
+        if initiate:
+            payload, status_code = recording_requests.request_for_user(recording_id, current_user())
+        else:
+            payload, status_code = recording_requests.status(recording_id), 200
+    except TimeoutError:
+        payload, status_code = {"error": "Another recording request is still being processed. Retry shortly."}, 503
+    except (OSError, sqlite3.Error):
+        payload, status_code = {"error": "Recording request data could not be loaded or saved."}, 503
+    except Exception as exc:
+        # Do not reflect provider URLs, filesystem paths, or response bodies.
+        current_app.logger.warning("Recording request failed (%s)", type(exc).__name__)
+        payload, status_code = {"error": "Recording request could not be processed."}, 502 if initiate else 503
+    response = _availability_response(payload)
+    response.status_code = status_code
+    return response
 
 
 @blueprint.get("/api/music/recording/<mbid>/acquisition")
