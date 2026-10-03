@@ -6,6 +6,11 @@ interface RoomState {
   queueWarning: boolean; syncError?: string; playbackState: string; guestCount: number;
 }
 interface RoomChoice extends RoomTrack { id: string; state: string; artwork?: string }
+interface RoomSession extends RoomTrack { id: string; deviceName: string; product: string; platform: string; state: string }
+class RoomCallError extends Error {
+  selectionRequired = false;
+  sessions: RoomSession[] = [];
+}
 
 const root = document.querySelector<HTMLElement>("#room-root")!;
 const host = root?.dataset.host === "true";
@@ -38,7 +43,12 @@ async function call<T>(url: string, method = "GET", payload?: unknown): Promise<
   if (!host && guestCsrf) headers.set("X-Room-CSRF", guestCsrf);
   const response = await fetch(url, { method, headers, body: payload === undefined ? undefined : JSON.stringify(payload) });
   const result = await response.json().catch(() => { throw new Error("The Room returned an unexpected response. Retry shortly."); });
-  if (!response.ok) throw new Error(result.error || "The Room could not be updated. Retry shortly.");
+  if (!response.ok) {
+    const error = new RoomCallError(result.error || "The Room could not be updated. Retry shortly.");
+    error.selectionRequired = result.selectionRequired === true;
+    error.sessions = Array.isArray(result.sessions) ? result.sessions : [];
+    throw error;
+  }
   return result;
 }
 function stop() {
@@ -201,18 +211,53 @@ export async function showHostRooms(token: string) {
     if (generation !== requestGeneration) return;
     if (room) { render(room); setupSearch(); watch(); return; }
     roomPanel.append(element("p", "First start playing music in Plexamp and add at least one more song to Up Next. Your existing Plex queue is imported into the Room; current and Up Next stay protected.", "intro"));
-    roomPanel.append(button("Start Room", async () => {
+    const startRoom = async (sessionId?: string) => {
       connection.textContent = "Detecting active Plexamp playback…";
       try {
-        const { room } = await call<{room: RoomState}>("/api/rooms", "POST");
+        const { room } = await call<{room: RoomState}>("/api/rooms", "POST", sessionId ? { sessionId } : undefined);
         if (generation !== requestGeneration) return;
         render(room); setupSearch(); watch();
       } catch (error) {
+        if (generation !== requestGeneration) return;
+        if (error instanceof RoomCallError && error.selectionRequired) {
+          showDevices(error.sessions); message.textContent = error.message; return;
+        }
         const response = await call<{room: RoomState | null}>("/api/rooms/active").catch(() => ({ room: null }));
         if (generation === requestGeneration && response.room) { render(response.room); setupSearch(); watch(); }
         throw error;
       } finally { connection.textContent = ""; }
-    }));
+    };
+    const showDevices = (sessions: RoomSession[]) => {
+      roomPanel.querySelector(".room-device-picker")?.remove();
+      const picker = element("section", "", "room-device-picker");
+      const form = element("form"), devices = element("fieldset");
+      devices.append(element("legend", "Choose a Plexamp device"));
+      sessions.forEach((session) => {
+        const label = element("label"), radio = element("input");
+        radio.type = "radio"; radio.name = "sessionId"; radio.value = session.id; radio.required = true;
+        const details = element("span");
+        details.append(element("strong", session.deviceName || session.product || "Plexamp device"),
+          element("p", [session.product, session.platform].filter(Boolean).join(" · ")),
+          element("p", `${session.state === "paused" ? "Paused" : "Playing"}: ${session.title}${session.artist ? ` — ${session.artist}` : ""}`));
+        label.append(radio, details); devices.append(label);
+      });
+      const submit = element("button", "Start Room on selected device"); submit.type = "submit"; submit.disabled = sessions.length === 0;
+      form.append(devices, submit);
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault(); submit.disabled = true; message.textContent = "";
+        const selection = new FormData(form).get("sessionId");
+        try { if (typeof selection === "string") await startRoom(selection); }
+        catch (error) { if (generation === requestGeneration) message.textContent = error.message; }
+        finally { submit.disabled = sessions.length === 0; }
+      });
+      picker.append(form, button("Refresh devices", async () => {
+        const response = await call<{sessions: RoomSession[]}>("/api/rooms/sessions");
+        if (generation === requestGeneration) showDevices(response.sessions);
+      }));
+      if (!sessions.length) picker.append(element("p", "No active Plexamp devices found. Start playback, then refresh devices."));
+      roomPanel.append(picker);
+    };
+    roomPanel.append(button("Start Room", () => startRoom()));
   } catch (error) { if (generation === requestGeneration) message.textContent = error.message; }
 }
 window.addEventListener("melodarr-view-changed", (event) => { if ((event as CustomEvent).detail !== "rooms") stop(); });

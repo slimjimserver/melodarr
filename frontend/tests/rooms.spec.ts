@@ -43,6 +43,86 @@ test("host route shows startup instructions and actionable playback failure", as
   await expect(page.getByText(/No active Plexamp playback found/)).toBeVisible();
 });
 
+const sessions = [
+  { id: "a".repeat(64), clientId: "phone", sessionKey: "801", deviceName: "Jeremy’s iPhone", product: "Plexamp", platform: "iOS", state: "playing", title: "Phone song", artist: "Artist" },
+  { id: "b".repeat(64), clientId: "pc", sessionKey: "802", deviceName: "Apollo", product: "Plexamp", platform: "Windows", state: "playing", title: "PC song", artist: "Artist" },
+];
+
+test("multiple active devices render a chooser and submit the selected session ID", async ({ page }) => {
+  await host(page);
+  await page.route("**/api/rooms/active", route => route.fulfill({ json: { room: null } }));
+  let starts = 0;
+  await page.route("**/api/rooms", async route => {
+    starts++;
+    if (starts === 1) {
+      await route.fulfill({ status: 409, json: { error: "Choose a device for this Room.", selectionRequired: true, sessions } });
+    } else {
+      expect(route.request().postDataJSON()).toEqual({ sessionId: sessions[0].id });
+      await route.fulfill({ status: 201, json: { room } });
+    }
+  });
+  await page.goto("/rooms");
+  await page.getByRole("button", { name: "Start Room", exact: true }).click();
+  await expect(page.getByRole("group", { name: "Choose a Plexamp device" })).toBeVisible();
+  await expect(page.getByText("Plexamp · iOS", { exact: true })).toBeVisible();
+  await expect(page.getByText("Plexamp · Windows", { exact: true })).toBeVisible();
+  await expect(page.getByText("Playing: Phone song — Artist", { exact: true })).toBeVisible();
+  await expect(page.getByRole("radio")).toHaveCount(2);
+  expect(starts).toBe(1);
+  await page.getByRole("radio", { name: /Jeremy’s iPhone/ }).check();
+  await page.getByRole("button", { name: "Start Room on selected device" }).click();
+  await expect(page.locator(".room-queue li")).toHaveCount(2);
+  await expect(page.getByRole("radio")).toHaveCount(0);
+  expect(starts).toBe(2);
+});
+
+test("stale device selection refreshes choices without automatically starting another device", async ({ page }) => {
+  await host(page);
+  await page.route("**/api/rooms/active", route => route.fulfill({ json: { room: null } }));
+  let starts = 0;
+  await page.route("**/api/rooms", async route => {
+    starts++;
+    if (starts === 2) expect(route.request().postDataJSON()).toEqual({ sessionId: sessions[0].id });
+    await route.fulfill({ status: 409, json: { error: starts === 1 ? "Choose a device." : "The selected device is no longer available.", selectionRequired: true, sessions: starts === 1 ? sessions : [sessions[1]] } });
+  });
+  await page.route("**/api/rooms/sessions", route => route.fulfill({ json: { sessions: [] } }));
+  await page.goto("/rooms");
+  await page.getByRole("button", { name: "Start Room", exact: true }).click();
+  await page.getByRole("radio", { name: /Jeremy’s iPhone/ }).check();
+  await page.getByRole("button", { name: "Start Room on selected device" }).click();
+  await expect(page.getByRole("radio")).toHaveCount(1);
+  await expect(page.getByRole("radio", { name: /Apollo/ })).toBeVisible();
+  await expect(page.getByText("The selected device is no longer available.", { exact: true })).toBeVisible();
+  expect(starts).toBe(2);
+  await page.getByRole("button", { name: "Refresh devices" }).click();
+  await expect(page.getByRole("radio")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Start Room on selected device" })).toBeDisabled();
+  await expect(page.getByText(/No active Plexamp devices found/)).toBeVisible();
+  expect(starts).toBe(2);
+});
+
+test("guest SSE keeps intermediate acquisition requested until queue confirmation is ready", async ({ page }) => {
+  await page.addInitScript(() => {
+    const Original = window.EventSource;
+    window.EventSource = class extends Original {
+      constructor(url: string | URL, options?: EventSourceInit) {
+        super(url, options);
+        (window as Window & { roomSource?: EventSource }).roomSource = this;
+      }
+    };
+  });
+  await guest(page);
+  const state = page.locator('[data-entry-id="entry-two"] .request-lifecycle');
+  await expect(state).toHaveText("Requested");
+  for (const [version, projected] of [[4, "requested"], [5, "ready"]] as const) {
+    await page.evaluate(snapshot => (window as Window & { roomSource?: EventSource }).roomSource?.dispatchEvent(
+      new MessageEvent("room", { data: JSON.stringify(snapshot) }),
+    ), { ...room, version, queue: [room.queue[0], { ...room.queue[1], state: projected }] });
+    await expect(state).toHaveText(projected === "ready" ? "Ready" : "Requested");
+    await expect(page.locator(".room-queue")).not.toContainText(/Downloading|Waiting for Plex|Waiting for queue/);
+  }
+});
+
 test("host shows Up Next, warns, and submits opaque reorder and removal IDs", async ({ page }) => {
   await host(page);
   await page.route("**/api/rooms/active", route => route.fulfill({ json: { room } }));

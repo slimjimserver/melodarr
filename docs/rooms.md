@@ -11,8 +11,10 @@ with no source labels or fabricated requester information.
 ## Starting and using a Room
 
 Start Plexamp playback with at least one more song in Up Next, open **Rooms**,
-and choose **Start Room**. The host needs a linked Plex account and exactly one
-active Plexamp device. A queue with just current A and next B is sufficient.
+and choose **Start Room**. The host needs a linked Plex account and active
+Plexamp playback. A single eligible device starts directly. When multiple
+devices are playing, choose the phone/computer whose queue the Room should use.
+A queue with just current A and next B is sufficient.
 Starting imports the existing upcoming queue without changing PMS: A remains
 Now Playing, B is **Up Next · Locked**, and C/D/E keep their PMS positions.
 Imported upcoming entries, including B, receive durable Room entry IDs, exact
@@ -90,6 +92,99 @@ that operation is cleared or its entry becomes normal Ready. Ineffective moves
 or deletes remain errors. A completed passive pass clears old `sync_error`
 even when an individual operation is deferred, and unchanged passes remain
 idempotent.
+
+## Retention and maintenance
+
+Ending a Room marks it closed without modifying PMS. Closed Rooms retain their
+entries, guests, tombstones, and recovery/write journals for seven days
+for troubleshooting. The existing Rooms worker runs maintenance on startup and
+hourly thereafter, deleting at most 25 sufficiently old closed Rooms per pass.
+Foreign-key cascades delete their Room-local dependents and journals. Closed
+Rooms without a known closing timestamp are retained conservatively.
+
+Active Rooms are never eligible for deletion, regardless of age, idle playback,
+missing notifications, or a disconnected device. They remain recoverable until
+the host explicitly ends them. Global recording acquisitions, their requester
+associations, and request histories survive Room cleanup.
+
+Search choices expire after one hour. Maintenance removes up to 500 expired
+choices and 500 obsolete rate-limit rows per pass, including choices belonging
+to active Rooms. These choices are temporary search capabilities, not accepted
+requests or recovery data. Search uses the same bounded expired-choice pruning. Retention, expiry,
+batch sizes, and the maintenance interval are named constants in the existing
+Rooms service/worker. Repeated maintenance is harmless.
+
+## Host diagnostics and session discovery
+
+`GET /api/rooms/<code>/diagnostics` is private to that Room's signed-in host,
+including during closed-Room retention. Guests, anonymous callers, unrelated
+signed-in users (including administrators), and automation API keys cannot use
+it. Responses use the Rooms API's `no-store` policy.
+
+The response explicitly allowlists:
+
+- Room UUID/code, revision/status, dirty flag, server/client/session/queue IDs,
+  current/next item IDs, playback state, saved device name/product/platform,
+  and a sanitized synchronization error indicator.
+- Read-only PMS queue items with exact `playQueueItemId`, `ratingKey`, safe
+  title/artist/album metadata, current/next IDs, reachability and a safe error.
+- All saved entries, including played/removed entries and duplicates: Room
+  entry UUID, position, recording/release-group MBIDs, Plex identities, metadata,
+  requester, real lifecycle/playback state, removal/lock flags, creation time,
+  append journal IDs, protected-boundary deferral and a safe error indicator.
+- Pending remove/order/placement intent and legacy trim IDs. Unknown JSON
+  fields and invalid identity values are omitted rather than dumping journals.
+- Each entry's exact recording lifecycle status, availability and Plex copy
+  count, using the existing local batch lifecycle service.
+
+Diagnostics does not reconcile, observe/persist playback, initiate acquisition,
+retry writes, change order, or increment revisions. PMS/lifecycle failures still
+return persisted diagnostics with generic error messages. Credentials, guest
+token hashes/CSRF tokens, cookies, private provider payloads, raw provider errors
+and exception traces are excluded. Older Rooms retain their original binding;
+device labels default to empty when they predate this migration.
+
+`GET /api/rooms/sessions` is read-only and requires a signed-in user. It lists
+only that user's playing Plexamp music sessions, with safe device labels,
+platform/product, track metadata and a stable server/device selection ID.
+Queue/current IDs are included when matching playback notifications are already
+available. Paused playback remains supported for an existing Room, as before.
+
+`POST /api/rooms` accepts an optional JSON body `{"sessionId": "..."}`. With no
+selection, zero sessions produces the existing playback guidance, one starts
+directly, and multiple return HTTP 409 with `selectionRequired: true` and current
+choices. The minimal device picker submits the selected ID and can refresh via
+the discovery endpoint. A stale selection returns refreshed choices and never
+falls back to a different device.
+
+The ID binds the configured Plex server and client identity, not a stream key.
+Startup rechecks ownership, the live stream, complete queue, current item and
+immediate next item before saving the Room. Track advancement or a rotated
+stream key between discovery and creation can be accepted on that device.
+Equivalent duplicate session observations are deduplicated; genuinely separate
+devices remain separate choices. Once started, existing device-bound stream
+rediscovery and queue-switch protection apply.
+
+## Lifecycle and guest presentation
+
+The authoritative recording lifecycle still owns acquisition readiness. Hosts
+see `requested`, `queued`, `downloading`, `waiting_for_plex`,
+`waiting_for_queue`, and `ready`; transitions can skip intermediate states.
+Exact Plex availability overrides a stale acquisition status. An available
+recording awaiting this PlayQueue's confirmation is `waiting_for_queue`, and
+only a confirmed materialized queue instance becomes `ready`.
+
+A temporary local-index gap does not demote a previously Plex-ready pending
+entry to `requested` or initiate acquisition again. Live recording readiness
+and playable copies are still required to retry its queue insertion. Locked
+Up Next deferrals retry automatically after the boundary advances, while other
+PMS changes continue to synchronize.
+
+Guests receive a pure presentation of the same authoritative snapshot: every
+intermediate acquisition/materialization state is `requested`, and confirmed
+entries are `ready`. This applies to join, add, GET, search and SSE responses.
+It changes neither persisted state nor revisions. Host responses and private
+diagnostics preserve full detail; reconciliation has one shared implementation.
 
 `dirty`/`sync_error` alone never authorize restoring old Room order. A temporary
 observation failure therefore cannot create a fight with later Plexamp edits.
@@ -185,9 +280,10 @@ source is introduced.
 | Shared queue synchronization and write journals | `backend/services/rooms.py` |
 | Owned stream discovery, notifications, PMS REST | `backend/services/plex_rooms.py` |
 | Permissions, guest capabilities, SSE and safe artwork | `backend/routes/rooms.py` |
-| Periodic acquisition/playback reconciliation | `backend/workers/rooms.py` |
-| Existing host/guest presentation | `frontend/src/rooms.ts` |
-| Regressions | `tests/test_rooms.py`, `frontend/tests/rooms.spec.ts` |
+| Read-only host diagnostics | `backend/services/room_diagnostics.py` |
+| Periodic reconciliation and bounded maintenance | `backend/workers/rooms.py` |
+| Host/guest presentation and device picker | `frontend/src/rooms.ts` |
+| Regressions | `tests/test_rooms.py`, `tests/test_room_hardening.py`, `frontend/tests/rooms.spec.ts` |
 
 ## HTTP routes
 
@@ -196,7 +292,9 @@ All routes are under `/api/rooms`; automation API keys grant no Room authority.
 | Method and path | Access / purpose |
 | --- | --- |
 | GET `/active` | Signed-in host's active Room |
-| POST `/api/rooms` | Signed-in host starts Room |
+| GET `/sessions` | Signed-in user discovers their active Plexamp devices |
+| POST `/api/rooms` | Signed-in host starts Room; optional `{sessionId}` |
+| GET `/<code>/diagnostics` | That signed-in host only; read-only private diagnostics |
 | POST `/<code>/join` | Public; creates/reuses scoped guest identity |
 | GET `/<code>` | Host or joined guest; safe state |
 | GET `/<code>/search?q=...` | Participant; existing track search |
@@ -208,7 +306,7 @@ All routes are under `/api/rooms`; automation API keys grant no Room authority.
 | GET `/<code>/events` | Participant; SSE updates and closure |
 | GET `/<code>/artwork/<release-group-mbid>` | Participant; scoped artwork |
 
-JSON join/entry/order/delete requests require `Content-Type: application/json`
+JSON start/join/entry/order/delete requests require `Content-Type: application/json`
 and `X-Room-Request: 1`. Host mutations require the existing `X-CSRF-Token`;
 guest additions require the `X-Room-CSRF` returned by join. The random guest
 capability is in an HttpOnly, SameSite=Lax cookie scoped to the Room API path.
@@ -244,22 +342,28 @@ Application URL; Origin checks support upstream TLS termination. CORS is disable
 
 | Check | Result |
 | --- | --- |
-| Targeted backend: `python -m unittest tests.test_rooms` | 108 passed |
-| Full backend: `python -m unittest discover -s tests -t . -v` | 1,058 passed |
-| Targeted browser: `pnpm run test:browser tests/rooms.spec.ts` | 14 passed |
-| Full browser: `pnpm run test:browser` | 198 passed |
+| Targeted hardening and two affected guest SSE regressions | 31 passed |
+| Full Rooms backend: `python -m unittest tests.test_rooms tests.test_room_hardening` | 142 passed |
+| Full backend: `python -m unittest discover -s tests -t .` | 1,092 passed |
+| Targeted browser: `pnpm run test:browser tests/rooms.spec.ts` | 17 passed |
+| Full browser: `pnpm run test:browser` | 201 passed |
 | Frontend: `pnpm run check`, `pnpm run build` | Passed |
 | Ruff on Rooms modules/tests; repository `E9,F63,F7,F82`; changed Python formatting | Passed |
 | `git diff --check` | Passed |
 
-This iteration adds ten backend regressions and one browser regression covering
-the requested/download/materialized sequence, passive edits and new Up Next,
-raw pending positions ahead of locked next, deferred worker retry, the exact
-365 MBID with real indexed readiness, interrupted-add adoption, satisfied and
-protected removes, subset reorder recovery, legacy flag recovery, missing
-playable copies, SSE, and idempotence. Migration coverage exercises the new
-columns on the old schema. Existing acquisition, duplicate identity, write-race,
-security, and concurrency regressions remain in the suites.
+This iteration adds 29 backend tests for bounded cleanup, FK cascades, global
+request preservation, read-only diagnostics, secret exclusion, exact lifecycle
+transitions, guest JSON/SSE projection and multi-device selection/revalidation.
+Three browser regressions cover device selection, a vanished selection without
+fallback, refresh to an empty device list, and guest Requested-to-Ready updates.
+The factory inventory now explicitly verifies both added endpoints. The large
+legacy `test_backend.py` has the same 12 existing general Ruff findings as HEAD;
+this task introduces none, and repository correctness checks pass. Its four-line
+route-inventory assertion update does not reformat unrelated tests.
+
+Existing acquisition, duplicate identity, synchronization/write-race, migration,
+security, concurrency and recovery regressions remain in the suites. Live
+restart/recovery was already manually validated and was not redesigned.
 
 ## Real PMS/Plexamp acceptance checks
 
@@ -281,3 +385,6 @@ deployment, exercise live PMS with local and remote/cellular Plexamp:
    deferred placement that retries after playback advances.
 6. Verify SSE add/remove/reorder through the HTTPS proxy, scoped guest cookies,
    near-empty warnings, and exhausted-player behavior.
+7. With phone and PC both playing, select each device in separate Rooms and
+   compare the private diagnostics binding with its live queue. Stop the selected
+   device or switch its queue; confirm it never falls back to the other device.

@@ -25,7 +25,7 @@ if __package__ == "backend.routes":
     from ..artwork_cache import cached_artwork
     from ..responses import api_error
     from ..security import current_user, login_required
-    from ..services import musicbrainz, plex_rooms, rooms
+    from ..services import musicbrainz, plex_rooms, room_diagnostics, rooms
     from .discovery import _search_response
 else:
     import storage
@@ -33,7 +33,7 @@ else:
     from responses import api_error
     from routes.discovery import _search_response
     from security import current_user, login_required
-    from services import musicbrainz, plex_rooms, rooms
+    from services import musicbrainz, plex_rooms, room_diagnostics, rooms
 
 
 blueprint = Blueprint("rooms", __name__)
@@ -55,6 +55,10 @@ def boundary(view):
             return view(*args, **kwargs)
         except rooms.RoomError as exc:
             return api_error(str(exc), exc.status)
+        except plex_rooms.SessionSelectionError as exc:
+            return jsonify(
+                {"error": str(exc), "selectionRequired": True, "sessions": exc.sessions}
+            ), 409
         except plex_rooms.QueueError as exc:
             return api_error(str(exc), 502)
         except TimeoutError:
@@ -70,7 +74,10 @@ def rate(action, maximum, *, identity=None):
     window = int(time.time() // 60)
     with storage.db() as connection:
         connection.execute("BEGIN IMMEDIATE")
-        connection.execute("DELETE FROM room_rate_limits WHERE window<?", (window - 2,))
+        connection.execute(
+            "DELETE FROM room_rate_limits WHERE window<?",
+            (window - rooms.RATE_LIMIT_RETENTION_WINDOWS,),
+        )
         connection.execute(
             "INSERT INTO room_rate_limits VALUES (?,?,?,1) ON CONFLICT(identity,action,window) DO UPDATE SET count=count+1",
             (identity, action, window),
@@ -176,7 +183,35 @@ def active():
 @boundary
 def start():
     rate("start", 4, identity=f"host:{current_user()['id']}")
-    return jsonify({"room": rooms.start(current_user())}), 201
+    payload = safe_json({"sessionId"}) if request.get_data() else {}
+    selection = payload.get("sessionId")
+    if selection is not None and (
+        not isinstance(selection, str) or not re.fullmatch(r"[0-9a-f]{64}", selection)
+    ):
+        raise rooms.RoomError("Choose an active Plexamp device.")
+    return jsonify({"room": rooms.start(current_user(), session_id=selection)}), 201
+
+
+@blueprint.get("/api/rooms/sessions")
+@login_required
+@boundary
+def sessions():
+    return jsonify(
+        {
+            "sessions": plex_rooms.PMSQueue(storage.get_service("plex")).sessions(
+                current_user()
+            )
+        }
+    )
+
+
+@blueprint.get("/api/rooms/<code>/diagnostics")
+@login_required
+@boundary
+def diagnostics(code):
+    room = code_room(code)
+    owner(room)
+    return jsonify(room_diagnostics.inspect(room))
 
 
 @blueprint.post("/api/rooms/<code>/join")
@@ -194,7 +229,12 @@ def join(code):
     ):
         raise rooms.RoomError("Guest names must be text of 60 characters or fewer.")
     guest, token = rooms.join(room["code"], name, request.cookies.get("room_guest"))
-    response = jsonify({"guest": guest, "room": rooms.snapshot(room["code"])})
+    response = jsonify(
+        {
+            "guest": guest,
+            "room": rooms.project_snapshot(rooms.snapshot(room["code"]), host=False),
+        }
+    )
     response.set_cookie(
         "room_guest",
         token,
@@ -212,8 +252,14 @@ def join(code):
 def state(code):
     rate("state", 90)
     room = code_room(code)
-    participant(room)
-    return jsonify({"room": rooms.snapshot(room["code"])})
+    person = participant(room)
+    return jsonify(
+        {
+            "room": rooms.project_snapshot(
+                rooms.snapshot(room["code"]), host=person["host"]
+            )
+        }
+    )
 
 
 @blueprint.get("/api/rooms/<code>/search")
@@ -235,9 +281,13 @@ def search(code):
         return api_error(
             "Track search could not be completed. Retry shortly.", response.status_code
         )
-    return jsonify(
-        {"results": rooms.save_choices(room, response.get_json().get("results", []))}
-    )
+    choices = rooms.save_choices(room, response.get_json().get("results", []))
+    if not person["host"]:
+        choices = [
+            {**choice, "state": "ready" if choice["state"] == "ready" else "requested"}
+            for choice in choices
+        ]
+    return jsonify({"results": choices})
 
 
 @blueprint.post("/api/rooms/<code>/entries")
@@ -254,11 +304,14 @@ def add(code):
         raise rooms.RoomError("Choose a track from the Room search results.")
     return jsonify(
         {
-            "room": rooms.add(
-                room["code"],
-                choice,
-                person["name"],
-                None if person["host"] else person["id"],
+            "room": rooms.project_snapshot(
+                rooms.add(
+                    room["code"],
+                    choice,
+                    person["name"],
+                    None if person["host"] else person["id"],
+                ),
+                host=person["host"],
             )
         }
     ), 201
@@ -364,7 +417,9 @@ def events(code):
         version, deadline = None, time.monotonic() + 25
         try:
             while time.monotonic() < deadline:
-                state = rooms.snapshot(room["code"])
+                state = rooms.project_snapshot(
+                    rooms.snapshot(room["code"]), host=person["host"]
+                )
                 if state["version"] != version:
                     yield f"event: room\ndata: {json.dumps(state)}\n\n"
                     version = state["version"]

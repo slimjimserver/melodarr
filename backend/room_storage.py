@@ -43,6 +43,9 @@ def migrate(connection):
         """CREATE TABLE IF NOT EXISTS room_rate_limits (
             identity TEXT NOT NULL, action TEXT NOT NULL, window INTEGER NOT NULL,
             count INTEGER NOT NULL, PRIMARY KEY(identity,action,window))""",
+        "CREATE INDEX IF NOT EXISTS rooms_closed_retention ON rooms(closed_at,id) WHERE status='closed'",
+        "CREATE INDEX IF NOT EXISTS room_choices_expiration ON room_choices(expires_at,id)",
+        "CREATE INDEX IF NOT EXISTS room_rate_limits_window ON room_rate_limits(window)",
     )
     for statement in statements:
         connection.execute(statement)
@@ -66,6 +69,11 @@ def migrate(connection):
         connection.execute(
             "ALTER TABLE rooms ADD COLUMN write_intent TEXT NOT NULL DEFAULT '{}'"
         )
+    for name in ("device_name", "device_product", "device_platform"):
+        if name not in columns:
+            connection.execute(
+                f"ALTER TABLE rooms ADD COLUMN {name} TEXT NOT NULL DEFAULT ''"
+            )
     entry_columns = {
         row[1]: row for row in connection.execute("PRAGMA table_info(room_entries)")
     }

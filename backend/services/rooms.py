@@ -26,6 +26,12 @@ else:
 logger = logging.getLogger(__name__)
 CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
 MAX_ENTRIES = 200
+CLOSED_ROOM_RETENTION_SECONDS = 7 * 24 * 60 * 60
+CHOICE_TTL_SECONDS = 60 * 60
+CLEANUP_ROOM_BATCH_SIZE = 25
+CLEANUP_CHOICE_BATCH_SIZE = 500
+CLEANUP_RATE_BATCH_SIZE = 500
+RATE_LIMIT_RETENTION_WINDOWS = 2
 
 
 class RoomError(Exception):
@@ -124,20 +130,70 @@ def bump(connection, room_id):
     connection.execute("UPDATE rooms SET version=version+1 WHERE id=?", (room_id,))
 
 
+def project_snapshot(state, *, host):
+    """Guest presentation never changes the authoritative snapshot or database."""
+    if host:
+        return state
+    return {
+        **state,
+        "queue": [
+            {**entry, "state": "ready" if entry["state"] == "ready" else "requested"}
+            for entry in state["queue"]
+        ],
+    }
+
+
+def _cleanup_choices(connection, now):
+    return connection.execute(
+        "DELETE FROM room_choices WHERE id IN (SELECT id FROM room_choices "
+        "WHERE expires_at<=? ORDER BY expires_at,id LIMIT ?)",
+        (now, CLEANUP_CHOICE_BATCH_SIZE),
+    ).rowcount
+
+
+def cleanup(*, now=None):
+    """Bounded Room-local retention; active Rooms and global requests survive."""
+    now = time.time() if now is None else now
+    with storage.db() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        closed = connection.execute(
+            "DELETE FROM rooms WHERE id IN (SELECT id FROM rooms "
+            "WHERE status='closed' AND closed_at<? ORDER BY closed_at,id LIMIT ?)",
+            (now - CLOSED_ROOM_RETENTION_SECONDS, CLEANUP_ROOM_BATCH_SIZE),
+        ).rowcount
+        choices = _cleanup_choices(connection, now)
+        rates = connection.execute(
+            "DELETE FROM room_rate_limits WHERE rowid IN (SELECT rowid FROM room_rate_limits "
+            "WHERE window<? ORDER BY window LIMIT ?)",
+            (int(now // 60) - RATE_LIMIT_RETENTION_WINDOWS, CLEANUP_RATE_BATCH_SIZE),
+        ).rowcount
+    return {"rooms": closed, "choices": choices, "rateLimits": rates}
+
+
 def queue_lock(room):
     return request_lock(
         "room-queue", f"{room['server_id']}:{room['queue_id']}", timeout=35
     )
 
 
-def start(user):
+def start(user, *, session_id=None):
     with request_lock("room-host", user["id"]):
         if host_room(user["id"]):
             raise RoomError("You already have an active Room.", 409)
         adapter = plex_rooms.PMSQueue(storage.get_service("plex"))
-        discovered = adapter.discover(user)
+        discovered = (
+            adapter.discover(user)
+            if session_id is None
+            else adapter.discover(user, session_id=session_id)
+        )
         lock_identity = {"server_id": adapter.server_id, **discovered}
         with queue_lock(lock_identity):
+            # Revalidate the chosen device under the queue lock. Never switch
+            # to another client if playback disappeared or its queue changed.
+            event, session = playback_event(
+                {**lock_identity, "host_user_id": user["id"]}, adapter
+            )
+            discovered.update(**session, current_item_id=str(event["playQueueItemID"]))
             queue = adapter.load(discovered["queue_id"])
             items = queue.get("Metadata", [])
             index = next(
@@ -153,13 +209,18 @@ def start(user):
                     "Add at least one more song to Plexamp's Up Next, then retry starting your Room.",
                     409,
                 )
+            if str(items[index].get("ratingKey") or "") != session["rating_key"]:
+                raise RoomError(
+                    "Plexamp advanced during startup. Retry starting the Room.", 409
+                )
             room_id = str(uuid4())
             code = "".join(secrets.choice(CODE_ALPHABET) for _ in range(10))
             try:
                 with storage.db() as connection:
                     connection.execute(
                         "INSERT INTO rooms(id,code,host_user_id,status,created_at,server_id,client_id,session_key,queue_id,"
-                        "current_item_id,handoff_item_id,trim_ids,now_playing,handoff) VALUES (?,?,?,'active',?,?,?,?,?,?,?,?,?,?)",
+                        "current_item_id,handoff_item_id,trim_ids,now_playing,handoff,device_name,device_product,device_platform) "
+                        "VALUES (?,?,?,'active',?,?,?,?,?,?,?,?,?,?,?,?,?)",
                         (
                             room_id,
                             code,
@@ -174,6 +235,9 @@ def start(user):
                             "[]",
                             json.dumps(plex_rooms.public_track(items[index])),
                             json.dumps(plex_rooms.public_track(items[index + 1])),
+                            discovered.get("device_name", ""),
+                            discovered.get("product", ""),
+                            discovered.get("platform", ""),
                         ),
                     )
             except sqlite3.IntegrityError:
@@ -241,9 +305,7 @@ def guest(room, token):
 def save_choices(room, results):
     safe = []
     with storage.db() as connection:
-        connection.execute(
-            "DELETE FROM room_choices WHERE expires_at<?", (time.time(),)
-        )
+        _cleanup_choices(connection, time.time())
         for result in results[:25]:
             try:
                 mbid = str(UUID(str(result.get("recordingMbid"))))
@@ -266,7 +328,7 @@ def save_choices(room, results):
                     title,
                     artist,
                     release,
-                    time.time() + 3600,
+                    time.time() + CHOICE_TTL_SECONDS,
                 ),
             )
             state = (result.get("recordingState") or {}).get("status", "not_requested")
@@ -657,7 +719,13 @@ def acquisition_bridge(room, *, initiate=False):
     )
     for row in active:
         lifecycle = states[row["recording_mbid"]]
-        if initiate and lifecycle["status"] == "not_requested" and not row["error"]:
+        if (
+            initiate
+            and lifecycle["status"] == "not_requested"
+            and not lifecycle.get("available")
+            and row["state"] != "waiting_for_queue"
+            and not row["error"]
+        ):
             with storage.db() as connection:
                 host = connection.execute(
                     "SELECT * FROM users WHERE id=?", (room["host_user_id"],)
@@ -681,13 +749,23 @@ def acquisition_bridge(room, *, initiate=False):
             else:
                 lifecycle = recording_requests.status(row["recording_mbid"])
                 states[row["recording_mbid"]] = lifecycle
-        status = (
-            lifecycle["status"]
-            if lifecycle["status"] != "not_requested"
-            else "requested"
-        )
-        if status == "ready":
+        # Exact Plex availability outranks acquisition/cache status. Room Ready
+        # still requires confirmation of this particular PlayQueue instance.
+        if lifecycle.get("available") or lifecycle["status"] == "ready":
+            lifecycle = {**lifecycle, "status": "ready"}
+            states[row["recording_mbid"]] = lifecycle
             status = "waiting_for_queue"
+        elif lifecycle["status"] == "not_requested":
+            # A temporary local-index gap must not re-request a recording which
+            # already reached Plex readiness. Live readiness is still required
+            # before retrying its materialization.
+            status = (
+                "waiting_for_queue"
+                if row["state"] == "waiting_for_queue"
+                else "requested"
+            )
+        else:
+            status = lifecycle["status"]
         if status != row["state"]:
             with storage.db() as connection:
                 connection.execute(

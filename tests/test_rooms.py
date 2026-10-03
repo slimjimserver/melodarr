@@ -137,7 +137,7 @@ class FakePMS:
             self.manual_end = identity
 
 
-class RoomTests(DatabaseTestCase):
+class RoomTestCase(DatabaseTestCase):
     def setUp(self):
         super().setUp()
         with api_cache.cache_db() as connection:
@@ -295,6 +295,8 @@ class RoomTests(DatabaseTestCase):
             headers={"X-CSRF-Token": self.csrf, "X-Room-Request": "1"},
         )
 
+
+class RoomTests(RoomTestCase):
     def test_no_active_playback_creates_no_room(self):
         self.pms.discover = Mock(
             side_effect=plex_rooms.QueueError(
@@ -646,7 +648,11 @@ class RoomTests(DatabaseTestCase):
         self.addCleanup(response.close)
         iterator = iter(response.response)
         initial = json.loads(next(iterator).decode().split("data: ", 1)[1])
-        self.assertEqual(self.request_queue(initial)[0]["state"], "waiting_for_plex")
+        self.assertEqual(self.request_queue(initial)[0]["state"], "requested")
+        self.assertEqual(
+            self.request_queue(rooms.snapshot(room["code"]))[0]["state"],
+            "waiting_for_plex",
+        )
         self.index_pending_recording()
         retry = self.post(f"/api/rooms/{room['code']}/sync")
         self.assertEqual(retry.status_code, 200, retry.get_json())
@@ -2442,7 +2448,7 @@ class RoomTests(DatabaseTestCase):
             with patch.object(routes.time, "sleep"):
                 self.assertEqual(next(iterator), b": heartbeat\n\n")
                 update = json.loads(next(iterator).decode().split("data: ", 1)[1])
-            self.assertEqual(update, state)
+            self.assertEqual(update, rooms.project_snapshot(state, host=False))
             self.assertEqual(rooms.reconcile(room["code"]), state)
         self.assertEqual(state["queue"][0]["title"], "Song 900")
         self.assertTrue(state["queue"][0]["locked"])
@@ -2752,7 +2758,16 @@ class PMSProtocolTests(DatabaseTestCase):
         for sessions in (
             [],
             [{**self.session, "Player": {**self.session["Player"], "state": "paused"}}],
-            [self.session, self.session],
+            [
+                self.session,
+                {
+                    **self.session,
+                    "Player": {
+                        **self.session["Player"],
+                        "machineIdentifier": "other-client",
+                    },
+                },
+            ],
         ):
             with (
                 patch.object(self.pms, "call", return_value={"Metadata": sessions}),
