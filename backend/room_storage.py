@@ -16,6 +16,7 @@ def migrate(connection):
             playback_state TEXT NOT NULL DEFAULT 'playing',
             warning INTEGER NOT NULL DEFAULT 0, sync_error TEXT,
             dirty INTEGER NOT NULL DEFAULT 1, write_pending INTEGER NOT NULL DEFAULT 0,
+            write_intent TEXT NOT NULL DEFAULT '{}',
             version INTEGER NOT NULL DEFAULT 1)""",
         "CREATE UNIQUE INDEX IF NOT EXISTS rooms_active_host ON rooms(host_user_id) WHERE status='active'",
         "CREATE UNIQUE INDEX IF NOT EXISTS rooms_active_queue ON rooms(server_id,queue_id) WHERE status='active'",
@@ -37,7 +38,7 @@ def migrate(connection):
             created_at REAL NOT NULL, state TEXT NOT NULL DEFAULT 'requested',
             playback TEXT NOT NULL DEFAULT 'upcoming' CHECK(playback IN ('upcoming','playing','played')),
             rating_key TEXT, queue_item_id TEXT, add_before TEXT,
-            removed INTEGER NOT NULL DEFAULT 0, error TEXT)""",
+            removed INTEGER NOT NULL DEFAULT 0, error TEXT, deferred_until TEXT)""",
         "CREATE INDEX IF NOT EXISTS room_entries_order ON room_entries(room_id,position)",
         """CREATE TABLE IF NOT EXISTS room_rate_limits (
             identity TEXT NOT NULL, action TEXT NOT NULL, window INTEGER NOT NULL,
@@ -60,6 +61,10 @@ def migrate(connection):
         connection.execute(
             "UPDATE rooms SET write_pending=1 WHERE dirty=1 AND EXISTS "
             "(SELECT 1 FROM room_entries WHERE room_id=rooms.id)"
+        )
+    if "write_intent" not in columns:
+        connection.execute(
+            "ALTER TABLE rooms ADD COLUMN write_intent TEXT NOT NULL DEFAULT '{}'"
         )
     entry_columns = {
         row[1]: row for row in connection.execute("PRAGMA table_info(room_entries)")
@@ -87,3 +92,7 @@ def migrate(connection):
         connection.execute(
             "ALTER TABLE room_entries ADD COLUMN album TEXT NOT NULL DEFAULT ''"
         )
+    if "deferred_until" not in entry_columns and not (
+        entry_columns["recording_mbid"][3] or entry_columns["requester"][3]
+    ):
+        connection.execute("ALTER TABLE room_entries ADD COLUMN deferred_until TEXT")

@@ -345,8 +345,8 @@ def edit(code, user_id, *, order=None, remove_id=None, version=None):
             observe(room, adapter, queue)
             _recover_adds(room, queue)
             ids, index, _current = observe(room, adapter, queue)
-            if not room["write_pending"]:
-                _adopt(room, queue, ids, index)
+            intent = _write_intent(room, ids, index)
+            _adopt(room, queue, ids, index, intent)
             active = _active_entries(room)
             locked = _logical_boundary(room, active)
         except plex_rooms.QueueError as exc:
@@ -370,13 +370,30 @@ def edit(code, user_id, *, order=None, remove_id=None, version=None):
                         "UPDATE room_entries SET position=? WHERE room_id=? AND id=?",
                         (index, room["id"], identity),
                     )
+                by_id = {row["id"]: row for row in active}
+                intent["order"] = [
+                    by_id[identity]["queue_item_id"]
+                    for identity in order
+                    if by_id[identity]["queue_item_id"]
+                    and by_id[identity]["queue_item_id"] != room["next_item_id"]
+                ]
             if remove_id is not None:
                 connection.execute(
                     "UPDATE room_entries SET removed=1 WHERE room_id=? AND id=?",
                     (room["id"], remove_id),
                 )
+                target = next(row for row in active if row["id"] == remove_id)
+                if target["queue_item_id"]:
+                    intent.setdefault("remove", []).append(target["queue_item_id"])
+                else:
+                    intent.get("placements", {}).pop(remove_id, None)
+                    connection.execute(
+                        "UPDATE room_entries SET add_before=NULL WHERE id=?",
+                        (remove_id,),
+                    )
             connection.execute(
-                "UPDATE rooms SET dirty=1,write_pending=1 WHERE id=?", (room["id"],)
+                "UPDATE rooms SET dirty=1,write_pending=?,write_intent=? WHERE id=?",
+                (bool(intent), json.dumps(intent), room["id"]),
             )
             bump(connection, room["id"])
         sync_locked(room_by_code(code), adapter)
@@ -549,15 +566,10 @@ def _active_entries(room):
 
 
 def _logical_boundary(room, active):
-    """Never reconcile a logical prefix across an already locked PMS item."""
-    locked = next(
+    """The live materialized boundary is independent of placeholder positions."""
+    return next(
         (row for row in active if row["queue_item_id"] == room["next_item_id"]), None
     )
-    if locked and active[0]["id"] != locked["id"]:
-        raise plex_rooms.QueueError(
-            "Room order disagrees with live Up Next. Wait for playback to advance or restart the Room."
-        )
-    return locked
 
 
 def _read_stable(room, adapter, *, appended=None):
@@ -625,12 +637,17 @@ def _manual_buffer(queue, ids, index):
 
 def acquisition_bridge(room, *, initiate=False):
     """Advance the existing local lifecycle even when PMS is unavailable."""
+    placements = json.loads(room["write_intent"]).get("placements", {})
     active = [
         row
         for row in entries(room["id"])
         if row["playback"] == "upcoming"
         and not row["removed"]
-        and not row["queue_item_id"]
+        and (
+            not row["queue_item_id"]
+            or row["id"] in placements
+            or row["state"] != "ready"
+        )
         and row["recording_mbid"]
     ]
     states = recording_requests.recording_states(
@@ -667,8 +684,8 @@ def acquisition_bridge(room, *, initiate=False):
             if lifecycle["status"] != "not_requested"
             else "requested"
         )
-        if status == "ready" and (not row["queue_item_id"] or row["state"] != "ready"):
-            status = "waiting_for_plex"
+        if status == "ready":
+            status = "waiting_for_queue"
         if status != row["state"]:
             with storage.db() as connection:
                 connection.execute(
@@ -682,13 +699,14 @@ def sync_locked(room, adapter=None, *, initiate=False):
     if room["status"] != "active":
         return
     try:
-        states = acquisition_bridge(room, initiate=initiate)
         _sync(
             room,
             adapter or plex_rooms.PMSQueue(storage.get_service("plex")),
-            states,
+            initiate=initiate,
         )
     except (plex_rooms.QueueError, TimeoutError) as exc:
+        # Local acquisition must still advance during observation/PMS outages.
+        acquisition_bridge(room, initiate=initiate)
         _sync_error(room, exc)
 
 
@@ -742,12 +760,13 @@ def _recover_adds(room, queue):
             bump(connection, room["id"])
 
 
-def _adopt(room, queue, ids, index):
+def _adopt(room, queue, ids, index, intent=None):
     """Persist the live materialized queue without writing to PMS.
 
-    Pending requests keep their position before the next surviving materialized
-    entry (or at the tail). Reordering those anchors while placeholders exist is
-    deliberately deferred: retain intent and stop rather than guess placement.
+    Pending requests follow their next surviving anchor or the tail. A blocked
+    placeholder waits for its protected boundary to advance, then rebases just
+    below the new boundary. Neither pending positions nor write journals veto
+    materialized adoption.
     """
     tracks = queue.get("Metadata", [])[index + 1 :]
     if any(
@@ -766,22 +785,17 @@ def _adopt(room, queue, ids, index):
     active = _active_entries(room)
     future = ids[index + 1 :]
     future_set = set(future)
-    pending = [row for row in active if not row["queue_item_id"]]
-    old_common = [
-        row["queue_item_id"] for row in active if row["queue_item_id"] in future_set
-    ]
-    common_set = set(old_common)
-    if pending and old_common != [
-        identity for identity in future if identity in common_set
-    ]:
-        raise plex_rooms.QueueError(
-            "Plex queue order changed around pending requests. Pending intent is preserved; "
-            "wait for playback to advance or end this Room before retrying."
-        )
+    placements = (intent or {}).get("placements", {})
     before = {}
     tail = []
+    rebased = []
+    deferrals = []
     for offset, row in enumerate(active):
         if row["queue_item_id"]:
+            continue
+        if row["deferred_until"] and row["deferred_until"] != room["next_item_id"]:
+            rebased.append(row)
+            deferrals.append((None, row["id"]))
             continue
         anchor = next(
             (
@@ -792,10 +806,17 @@ def _adopt(room, queue, ids, index):
             None,
         )
         (before.setdefault(anchor, []) if anchor else tail).append(row)
+        if anchor == room["next_item_id"] and not row["deferred_until"]:
+            deferrals.append((anchor, row["id"]))
     ordered = []
     changed = False
     with storage.db() as connection:
         connection.execute("BEGIN IMMEDIATE")
+        if deferrals:
+            connection.executemany(
+                "UPDATE room_entries SET deferred_until=? WHERE id=?", deferrals
+            )
+            changed = True
         for track in tracks:
             identity = str(track["playQueueItemID"])
             ordered.extend(before.get(identity, []))
@@ -824,7 +845,7 @@ def _adopt(room, queue, ids, index):
                     metadata["artist"],
                     metadata["album"],
                     str(track["ratingKey"]),
-                    "ready",
+                    "waiting_for_queue" if row["id"] in placements else "ready",
                     "upcoming",
                     0,
                     None,
@@ -849,6 +870,10 @@ def _adopt(room, queue, ids, index):
                     )
                     changed = True
             ordered.append(row)
+            if identity == room["next_item_id"]:
+                ordered.extend(rebased)
+        if not room["next_item_id"]:
+            ordered.extend(rebased)
         ordered.extend(tail)
         for position, row in enumerate(ordered):
             if position != row["position"]:
@@ -875,140 +900,273 @@ def _adopt(room, queue, ids, index):
     return _active_entries(room)
 
 
-def _finish_sync(room):
+def _save_intent(room, intent):
+    """Journal exact operations, never use dirty/order as an ownership claim."""
+    intent = {key: value for key, value in intent.items() if value}
+    encoded = json.dumps(intent)
+    pending = bool(intent)
+    if (room["write_intent"], bool(room["write_pending"])) != (encoded, pending):
+        with storage.db() as connection:
+            connection.execute(
+                "UPDATE rooms SET write_intent=?,write_pending=? WHERE id=?",
+                (encoded, pending, room["id"]),
+            )
+    room.update(write_intent=encoded, write_pending=int(pending))
+
+
+def _reservation(row, active, ids, index):
+    """Queue anchors for one pending placement, independent of other placeholders."""
+    offset = next(n for n, entry in enumerate(active) if entry["id"] == row["id"])
+    future = set(ids[index + 1 :])
+    before = next(
+        (
+            entry["queue_item_id"]
+            for entry in active[offset + 1 :]
+            if entry["queue_item_id"] in future
+        ),
+        None,
+    )
+    after = next(
+        (
+            entry["queue_item_id"]
+            for entry in reversed(active[:offset])
+            if entry["queue_item_id"] in future
+        ),
+        None,
+    )
+    return {"before": before, "after": after}
+
+
+def _write_intent(room, ids, index):
+    intent = json.loads(room["write_intent"])
+    if intent or not room["write_pending"]:
+        return intent
+    # Upgrade legacy interrupted writes once, before passive adoption changes
+    # their DB positions. The old flag also represented boundary-only failures;
+    # retain only identifiable operations over known instances, never freeze PMS.
+    active = _active_entries(room)
+    intent = {
+        "remove": [
+            row["queue_item_id"]
+            for row in entries(room["id"])
+            if row["removed"] and row["queue_item_id"]
+        ],
+        "order": [
+            row["queue_item_id"]
+            for row in active
+            if row["queue_item_id"] and row["queue_item_id"] != room["next_item_id"]
+        ],
+        "placements": {
+            row["id"]: _reservation(row, active, ids, index)
+            for row in active
+            if row["add_before"] or row["queue_item_id"] and row["state"] != "ready"
+        },
+    }
+    _save_intent(room, intent)
+    return intent
+
+
+def _finish_sync(room, intent):
+    _save_intent(room, intent)
     with storage.db() as connection:
         connection.execute(
-            "UPDATE rooms SET sync_error=NULL,dirty=0,write_pending=0,version=version+1 "
-            "WHERE id=? AND (sync_error IS NOT NULL OR dirty=1 OR write_pending=1)",
+            "UPDATE rooms SET sync_error=NULL,dirty=0,version=version+1 "
+            "WHERE id=? AND (sync_error IS NOT NULL OR dirty=1)",
             (room["id"],),
         )
-    room.update(sync_error=None, dirty=0, write_pending=0)
+    room.update(sync_error=None, dirty=0)
 
 
-def _sync(room, adapter, states):
+def _confirm(room, adapter, ids):
+    queue, actual, index = _read_stable(room, adapter)
+    if actual != ids:
+        raise plex_rooms.QueueError(
+            "Plex did not confirm the Room queue order. Room intent is saved; retry shortly."
+        )
+    return queue, index
+
+
+def _placement_anchor(room, placement, ids, index, identity=None):
+    """Return a legal insertion anchor, or defer only this operation."""
+    remaining = [value for value in ids if value != identity]
+    boundary = room["next_item_id"] or room["current_item_id"]
+    before, after = placement["before"], placement["after"]
+    if before == room["next_item_id"] and before:
+        return None
+    if before in remaining and remaining.index(before) > remaining.index(boundary):
+        return remaining[remaining.index(before) - 1]
+    if after in remaining and remaining.index(after) >= remaining.index(boundary):
+        return after
+    # Both old anchors may have played or been removed. Rebase below the live
+    # boundary instead of trying to restore consumed history or the old Up Next.
+    return boundary
+
+
+def _sync(room, adapter, *, initiate=False):
     if adapter.server_id != room["server_id"]:
         raise plex_rooms.QueueError(
             "The configured Plex server changed. End this Room before starting another."
         )
     queue = adapter.load(room["queue_id"])
-    ids, index, current = observe(room, adapter, queue)
+    ids, index, _current = observe(room, adapter, queue)
     _recover_adds(room, queue)
-    # Recovered appends may already be playing or Up Next.
-    ids, index, current = observe(room, adapter, queue)
-    if not room["write_pending"]:
-        _adopt(room, queue, ids, index)
-    active = _active_entries(room)
-    ready = [
-        row
-        for row in active
-        if not row["queue_item_id"]
-        and states.get(row["recording_mbid"], {}).get("status") == "ready"
-    ]
-    if not room["write_pending"] and not ready:
-        _finish_sync(room)
-        return
-    # Durable order/tombstones become write intent only for a host action or
-    # newly playable request, never just because an observation failed.
-    if not room["write_pending"]:
-        with storage.db() as connection:
-            connection.execute(
-                "UPDATE rooms SET write_pending=1 WHERE id=?", (room["id"],)
-            )
-        room["write_pending"] = 1
-    _logical_boundary(room, active)
-    if any(
-        row["queue_item_id"] and row["queue_item_id"] not in ids[index + 1 :]
-        for row in active
-    ):
-        raise plex_rooms.QueueError(
-            "The live queue changed during saved Room intent. Inspect Plexamp before retrying."
-        )
-    # Recovery does not treat an interrupted delete/reorder as a host edit.
-    # Unknown instances during recovery are retained, but ambiguous changes
-    # stop this write; the reconciler must never delete them to enforce ownership.
-    known = {
-        row["queue_item_id"] for row in entries(room["id"]) if row["queue_item_id"]
-    }
-    # Older Rooms stored their startup next only in handoff/up_next. Recovery
-    # must retain that protected anchor before the first passive import.
-    known.add(room["next_item_id"])
-    if any(identity not in known for identity in ids[index + 1 :]):
-        raise plex_rooms.QueueError(
-            "Plex queue changed during saved Room intent. Inspect Plexamp before retrying."
-        )
-    for row in entries(room["id"]):
-        identity = row["queue_item_id"]
-        if not row["removed"] or identity not in ids:
+    ids, index, _current = observe(room, adapter, queue)
+    intent = _write_intent(room, ids, index)
+    _adopt(room, queue, ids, index, intent)
+    states = acquisition_bridge(room, initiate=initiate)
+
+    for identity in list(intent.get("remove", [])):
+        # A removal already done externally, or consumed by playback, is satisfied.
+        if identity not in ids or ids.index(identity) <= index:
+            intent["remove"].remove(identity)
+            _save_intent(room, intent)
+            continue
+        if identity == room["next_item_id"]:
             continue
         _protect(room, adapter, identity, expected_ids=ids)
         adapter.remove(room["queue_id"], identity)
         ids.remove(identity)
-    for row in ready:
-        tracks = states[row["recording_mbid"]].get("tracks", [])
-        if not tracks:
-            raise plex_rooms.QueueError(
-                "Plex availability has no playable copy yet. Retry shortly."
-            )
-        before = list(ids)
-        with storage.db() as connection:
-            connection.execute(
-                "UPDATE room_entries SET rating_key=?,add_before=? WHERE id=?",
-                (str(tracks[0]["ratingKey"]), json.dumps(before), row["id"]),
-            )
-        _protect(room, adapter, expected_ids=ids, append=True)
-        adapter.add(room["queue_id"], tracks[0])
-        queue = adapter.load(room["queue_id"])
-        added = [
-            item
-            for item in queue.get("Metadata", [])
-            if str(item["playQueueItemID"]) not in before
-            and str(item.get("ratingKey")) == str(tracks[0]["ratingKey"])
+        queue, index = _confirm(room, adapter, ids)
+        intent["remove"].remove(identity)
+        _save_intent(room, intent)
+
+    if "order" in intent:
+        # Rebase the saved relative order into only its editable live slots.
+        # New external instances keep their slots; current/new Up Next stay put.
+        boundary = index + bool(room["next_item_id"])
+        desired = [
+            identity for identity in intent["order"] if identity in ids[boundary + 1 :]
         ]
-        if len(added) != 1:
-            raise plex_rooms.QueueError(
-                "Plex did not confirm the new queue entry. Room intent is saved; retry shortly."
-            )
-        identity = str(added[0]["playQueueItemID"])
-        with storage.db() as connection:
-            connection.execute(
-                "UPDATE room_entries SET queue_item_id=?,add_before=NULL,error=NULL WHERE id=?",
-                (identity, row["id"]),
-            )
-            bump(connection, room["id"])
-        queue, actual, index = _read_stable(room, adapter, appended=identity)
-        if [value for value in actual if value != identity] != ids:
-            raise plex_rooms.QueueError(
-                "The live protected queue changed during the addition. Room intent is saved; retry shortly."
-            )
-        ids = actual
-    active = _active_entries(room)
-    _logical_boundary(room, active)
-    anchor = room["next_item_id"] or current
-    expected = [
-        row["queue_item_id"]
-        for row in active
-        if row["queue_item_id"] and row["queue_item_id"] != anchor
-    ]
-    for identity in expected:
-        if identity not in ids or ids.index(identity) <= index:
-            raise plex_rooms.QueueError(
-                "The live queue changed during saved Room intent. Retry shortly."
-            )
-        if ids.index(identity) != ids.index(anchor) + 1:
-            _protect(room, adapter, identity, after=anchor, expected_ids=ids)
-            adapter.move(room["queue_id"], identity, anchor)
-            ids.remove(identity)
-            ids.insert(ids.index(anchor) + 1, identity)
-        anchor = identity
-    queue, actual, index = _read_stable(room, adapter)
-    if actual != ids or actual[index + 1 + bool(room["next_item_id"]) :] != expected:
-        raise plex_rooms.QueueError(
-            "Plex did not confirm the Room queue order. Room intent is saved; retry shortly."
+        subset = set(desired)
+        replacements = iter(desired)
+        expected = [
+            next(replacements) if identity in subset else identity for identity in ids
+        ]
+        owns_suffix = set(ids[boundary + 1 :]) == subset
+        offsets = (
+            range(boundary + 1, len(expected))
+            if owns_suffix
+            else range(len(expected) - 1, boundary, -1)
         )
-    # PMS confirmation is the materialized truth, independent of acquisition
-    # cache availability. Keep MBIDs/requesters on the original logical entries.
-    _adopt(room, queue, actual, index)
-    _finish_sync(room)
+        for offset in offsets:
+            identity = expected[offset]
+            if identity not in subset:
+                continue
+            if owns_suffix:
+                anchor = ids[offset - 1]
+            else:
+                remaining = [value for value in ids if value != identity]
+                following = expected[offset + 1] if offset + 1 < len(expected) else None
+                anchor = (
+                    remaining[remaining.index(following) - 1]
+                    if following
+                    else remaining[-1]
+                )
+            if ids.index(identity) != ids.index(anchor) + 1:
+                _protect(room, adapter, identity, after=anchor, expected_ids=ids)
+                adapter.move(room["queue_id"], identity, anchor)
+                ids.remove(identity)
+                ids.insert(ids.index(anchor) + 1, identity)
+        if ids != [queue_item["playQueueItemID"] for queue_item in queue["Metadata"]]:
+            queue, index = _confirm(room, adapter, ids)
+        intent.pop("order")
+        _save_intent(room, intent)
+
+    # A placement journal survives an interrupted append or move. Unmaterialized
+    # entries without a journal retain their own logical reservation.
+    _adopt(room, queue, ids, index, intent)
+    active = _active_entries(room)
+    active_ids = {row["id"] for row in active}
+    for identity in list(intent.get("placements", {})):
+        if identity not in active_ids:
+            intent["placements"].pop(identity)
+    _save_intent(room, intent)
+    for row in active:
+        placements = intent.setdefault("placements", {})
+        placement = placements.get(row["id"])
+        lifecycle = states.get(row["recording_mbid"], {})
+        if placement is None:
+            if row["queue_item_id"] or lifecycle.get("status") != "ready":
+                continue
+            if row["deferred_until"] == room["next_item_id"] and row["deferred_until"]:
+                continue
+            placement = _reservation(row, _active_entries(room), ids, index)
+        identity = row["queue_item_id"]
+        # An interrupted addition that has since become locked is confirmed by
+        # its exact PMS identity; never move it across the boundary to restore intent.
+        if identity in ids and ids.index(identity) <= index + bool(
+            room["next_item_id"]
+        ):
+            placements.pop(row["id"], None)
+            _save_intent(room, intent)
+            continue
+        anchor = _placement_anchor(room, placement, ids, index, identity)
+        if anchor is None:
+            if not identity and row["deferred_until"] != room["next_item_id"]:
+                with storage.db() as connection:
+                    connection.execute(
+                        "UPDATE room_entries SET deferred_until=? WHERE id=?",
+                        (room["next_item_id"], row["id"]),
+                    )
+                    bump(connection, room["id"])
+            continue
+        if not identity:
+            if lifecycle.get("status") != "ready":
+                continue
+            tracks = lifecycle.get("tracks", [])
+            if not tracks:
+                # Availability can be between indexing steps. Retry this entry,
+                # while the confirmed materialized projection remains usable.
+                continue
+            placements[row["id"]] = placement
+            _save_intent(room, intent)
+            before = list(ids)
+            with storage.db() as connection:
+                connection.execute(
+                    "UPDATE room_entries SET rating_key=?,add_before=? WHERE id=?",
+                    (str(tracks[0]["ratingKey"]), json.dumps(before), row["id"]),
+                )
+            _protect(room, adapter, expected_ids=ids, append=True)
+            adapter.add(room["queue_id"], tracks[0])
+            queue = adapter.load(room["queue_id"])
+            added = [
+                track
+                for track in queue.get("Metadata", [])
+                if str(track["playQueueItemID"]) not in before
+                and str(track.get("ratingKey")) == str(tracks[0]["ratingKey"])
+            ]
+            if len(added) != 1:
+                raise plex_rooms.QueueError(
+                    "Plex did not confirm the new queue entry. Room intent is saved; retry shortly."
+                )
+            identity = str(added[0]["playQueueItemID"])
+            with storage.db() as connection:
+                connection.execute(
+                    "UPDATE room_entries SET queue_item_id=?,add_before=NULL,error=NULL WHERE id=?",
+                    (identity, row["id"]),
+                )
+                bump(connection, room["id"])
+            queue, actual, index = _read_stable(room, adapter, appended=identity)
+            if [value for value in actual if value != identity] != ids:
+                raise plex_rooms.QueueError(
+                    "The live protected queue changed during the addition. Room intent is saved; retry shortly."
+                )
+            ids = actual
+        if identity != room["next_item_id"]:
+            anchor = _placement_anchor(room, placement, ids, index, identity)
+            if anchor is None:
+                continue
+            if ids.index(identity) != ids.index(anchor) + 1:
+                _protect(room, adapter, identity, after=anchor, expected_ids=ids)
+                adapter.move(room["queue_id"], identity, anchor)
+                ids.remove(identity)
+                ids.insert(ids.index(anchor) + 1, identity)
+            queue, index = _confirm(room, adapter, ids)
+        placements.pop(row["id"], None)
+        _save_intent(room, intent)
+
+    _adopt(room, queue, ids, index, intent)
+    _finish_sync(room, intent)
 
 
 def reconcile(code, *, retry=False, initiate=False):

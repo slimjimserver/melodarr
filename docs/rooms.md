@@ -45,7 +45,7 @@ host's current stream on the original device, loads the complete active PMS
 queue, verifies its identity, and updates playback/Up Next. Interrupted append
 journals are recovered before external changes are interpreted.
 
-With no outstanding Melodarr write, synchronization makes no PMS mutations:
+Every pass adopts the materialized PMS projection before attempting saved writes:
 
 - New future queue item IDs become persisted Ready Room entries in PMS order.
   A batch of Autoplay songs is handled like any other queue additions.
@@ -59,19 +59,32 @@ With no outstanding Melodarr write, synchronization makes no PMS mutations:
 - Changed state increments the Room revision, driving existing SSE snapshots.
   An unchanged queue produces no new revision or PMS write.
 
-A Melodarr host reorder/remove persists logical order/tombstones and a
-`write_pending` journal flag. A newly ready request uses the same flag before
-materializing. These writes reload the live stream and complete queue before
-each PMS command, verify current/next, session, target, anchor, and expected
-queue IDs, and abort safely on a race. Appends retain `add_before` IDs until
-an exact new instance is recovered. Rating keys identify an interrupted append
-among new IDs; they never merge/remove ordinary queue entries.
+A Melodarr host reorder/remove persists exact mutation intent in
+`rooms.write_intent`: queue item IDs to remove, the known materialized subset
+whose relative order changed, and per-entry placement anchors. `write_pending`
+is a summary of that journal, never a gate on passive adoption. Logical pending
+positions and `dirty` alone do not authorize restoring the whole queue.
 
-The final PMS read must confirm the complete expected sequence before entries
-are marked Ready and write intent is cleared. An ineffective move/delete or
-ambiguous interrupted append is an error. A follow-up passive pass is idempotent.
-Unknown items appearing during interrupted write recovery are preserved and
-cause a safe synchronization error instead of being deleted.
+Recovery first observes the live baseline and recovers interrupted appends by
+`add_before` IDs and rating key. It then adopts external changes, refreshes local
+acquisition, and attempts individual applicable operations:
+
+- An already absent or consumed remove is satisfied and cleared. A remove that
+  became Up Next waits without hiding or deleting the protected instance.
+- A saved reorder applies only to its surviving editable subset. External
+  instances retain their live slots; current and the new Up Next stay protected.
+- Each append/placement has its own anchors. A protected placement waits while
+  unrelated queue adoption and other legal placements continue.
+- An interrupted append with multiple possible new instances remains an unsafe
+  Room-wide error. Ordinary duplicate tracks remain distinct by queue item ID.
+
+Every actual PMS command still reloads the live stream and complete queue,
+checks session/current/next, target/anchor and expected queue IDs, and aborts
+safely on a race. A confirming read must match the predicted sequence before
+that operation is cleared or its entry becomes normal Ready. Ineffective moves
+or deletes remain errors. A completed passive pass clears old `sync_error`
+even when an individual operation is deferred, and unchanged passes remain
+idempotent.
 
 `dirty`/`sync_error` alone never authorize restoring old Room order. A temporary
 observation failure therefore cannot create a fight with later Plexamp edits.
@@ -94,35 +107,70 @@ needs verification against the actual PMS version.
 ## Persistence and acquisition
 
 `backend/room_storage.py` runs through the normal `storage.init_db` migration.
-The idempotent migration adds `rooms.write_pending` and `room_entries.album`.
+The idempotent migration adds `rooms.write_pending`, `rooms.write_intent`,
+`room_entries.album`, and `room_entries.deferred_until`.
 `recording_mbid` and `requester` now allow NULL. SQLite requires a transactional
 child-table rebuild to relax the old NOT NULL constraints; saved IDs, MBIDs,
 requesters, guest foreign keys, playback, tombstones, append journals, and the
-ordering index are retained. Legacy dirty Rooms with entries retain saved write
-intent on upgrade. No origin/source column or sentinel UUID is added.
+ordering index are retained. Legacy dirty Rooms with entries retain their flag
+on upgrade; the next reconciliation captures identifiable operations into the
+new journal before adopting PMS. No origin/source column or sentinel UUID is added.
 
 Missing songs still reserve a logical position and use the existing
 `recording_requests` lifecycle: Requested → Queued → Downloading → Waiting for
-Plex → Ready. The host sponsors guest acquisition through the existing request
+Plex → Ready · Waiting for queue → Ready. Waiting for Plex means the exact
+recording is absent from the Plex index. `waiting_for_queue` means the recording
+lifecycle reports Ready but placement has not been confirmed in this queue.
+The host sponsors guest acquisition through the existing request
 history and notification path. Removing a Room entry never cancels shared
 acquisition. The acquisition bridge continues during PMS outages. Already
 materialized songs use PMS readiness without depending on acquisition-cache
-availability. The frontend omits the requester line when no requester exists.
+availability. Every reconciliation refreshes unmaterialized and unconfirmed
+MBID-backed entries; an interrupted placement is not excluded merely because
+it already has a queue item ID. The frontend omits the requester line when no
+requester exists.
 PMS artwork URLs are not exposed to guests; safe album metadata is retained,
 while existing release-group artwork continues for known requests.
 
 ### Pending ordering follow-up
 
-Pending requests retain their position before the next surviving materialized
-anchor, or at the tail. Normal late readiness fills that reserved position while
-it remains behind Up Next. If an external reorder changes the order of existing
-anchors while placeholders exist, synchronization preserves pending intent and
-reports an error without guessing a merged order or writing PMS. Likewise, a
-pending position ahead of a locked materialized entry cannot be filled ahead
-of it. Playback advancement may resolve the conflict; otherwise end the Room
-and start another. Comprehensive ordering for simultaneous pending downloads
-and external reorders remains a separate iteration. No acquisition state machine
-is added by this change.
+Pending requests follow their next surviving materialized anchor, or the tail.
+External reorders never fail solely because pending anchors moved. A raw pending
+position before live Up Next is valid Room intent, although it cannot be filled
+at that point. The snapshot displays the actual locked item first; boundary
+validation uses its materialized identity rather than the first database row.
+
+When a pending reservation lies before Up Next, `deferred_until` remembers that
+protected instance. The entry stays Requested/Queued/Downloading/Waiting for
+Plex or Ready · Waiting for queue according to the authoritative lifecycle.
+Worker ticks continue adopting Plexamp additions, removals, reorders, and Play
+Next. Once the boundary changes, the blocked pending group rebases just below
+new Up Next (or current if there is no next) and available entries materialize
+normally. This deliberately gives the live protected boundary priority over
+perfect preservation of pending placement through arbitrary simultaneous edits.
+
+### Root-cause trace and acquisition evidence
+
+The previous `_adopt` could preserve a placeholder ahead of an anchor that
+became live Up Next, while the public snapshot sorted that locked anchor first.
+`_logical_boundary` rejected the underlying first row. `_sync` set `write_pending`
+before this rejection, so retries skipped adoption and its unknown-item guard
+rejected subsequent external additions. A separate pending-anchor reorder guard
+also prevented passive reconciliation. These guards are removed; protected
+network-write checks remain.
+
+The normal recording status endpoint delegates to the same `recording_states`
+function used by Rooms. In the inspected previous code a Ready result became
+Waiting for Plex, not Requested. Requested was produced from authoritative
+`not_requested`, remained stale on excluded entries with a queue item ID, or
+was the frontend fallback for an unknown state. The local database had no Rooms
+and no data for recording `bd9fd6a1-d41b-4b82-9ead-a4f958749a77`; consequently
+its exact live transition cannot be attributed to one of those paths from local
+evidence. The regression now uses that exact MBID and Plex copy `270909` with
+the real indexed lifecycle, seeds a stale Requested Room row ahead of locked
+Up Next, and verifies Waiting for queue followed by confirmed Ready on playback
+advancement. No separate acquisition state machine or alternate readiness
+source is introduced.
 
 ## Implementation
 
@@ -191,19 +239,22 @@ Application URL; Origin checks support upstream TLS termination. CORS is disable
 
 | Check | Result |
 | --- | --- |
-| Targeted backend: `python -m unittest tests.test_rooms` | 98 passed |
-| Full backend: `python -m unittest discover -s tests -t . -v` | 1,048 passed |
-| Targeted browser: `pnpm run test:browser tests/rooms.spec.ts` | 13 passed |
-| Full browser: `pnpm run test:browser` | 197 passed |
+| Targeted backend: `python -m unittest tests.test_rooms` | 108 passed |
+| Full backend: `python -m unittest discover -s tests -t . -v` | 1,058 passed |
+| Targeted browser: `pnpm run test:browser tests/rooms.spec.ts` | 14 passed |
+| Full browser: `pnpm run test:browser` | 198 passed |
 | Frontend: `pnpm run check`, `pnpm run build` | Passed |
 | Ruff on Rooms modules/tests; repository `E9,F63,F7,F82`; changed Python formatting | Passed |
 | `git diff --check` | Passed |
 
-Coverage replaces suffix-deletion expectations with adoption and adds 16 backend
-and three browser regressions for startup imports, external edits, duplicates,
-metadata, pending preservation, SSE/idempotence, write races, schema/journal
-upgrades, and host editing beyond the guest request limit. Existing acquisition,
-security, and concurrency regressions remain in the passing suites.
+This iteration adds ten backend regressions and one browser regression covering
+the requested/download/materialized sequence, passive edits and new Up Next,
+raw pending positions ahead of locked next, deferred worker retry, the exact
+365 MBID with real indexed readiness, interrupted-add adoption, satisfied and
+protected removes, subset reorder recovery, legacy flag recovery, missing
+playable copies, SSE, and idempotence. Migration coverage exercises the new
+columns on the old schema. Existing acquisition, duplicate identity, write-race,
+security, and concurrency regressions remain in the suites.
 
 ## Real PMS/Plexamp acceptance checks
 
@@ -220,8 +271,8 @@ deployment, exercise live PMS with local and remote/cellular Plexamp:
    device, and disconnect/reconnect notifications. Switch queues/servers and
    confirm safe errors. End a Room while music continues.
 5. Interrupt append/move/delete and restart Melodarr; verify recovery, protected
-   boundaries, and safe failure on ambiguous external changes during recovery.
+   boundaries, and adoption of unrelated external changes and safe failure on ambiguous appends.
    Acquire a missing recording through Lidarr/Plex and verify late readiness and
-   the documented pending-order conflict.
+   deferred placement that retries after playback advances.
 6. Verify SSE add/remove/reorder through the HTTPS proxy, scoped guest cookies,
    near-empty warnings, and exhausted-player behavior.

@@ -135,6 +135,40 @@ test("guest sees externally synchronized entries with optional requester and no 
   await expect(page.getByRole("button", { name: /Remove|Move/ })).toHaveCount(0);
 });
 
+test("pending acquisition labels distinguish Plex indexing from queue placement across SSE updates", async ({ page }) => {
+  await page.addInitScript(() => {
+    const Original = window.EventSource;
+    window.EventSource = class extends Original {
+      constructor(url: string | URL, options?: EventSourceInit) {
+        super(url, options);
+        (window as Window & { roomSource?: EventSource }).roomSource = this;
+      }
+    };
+  });
+  await host(page);
+  const initial = { ...room, handoff: {}, queue: [
+    { ...room.queue[0], locked: true },
+    { ...room.queue[1], title: "365", state: "downloading" },
+  ] };
+  await events(page, initial);
+  await page.route("**/api/rooms/active", route => route.fulfill({ json: { room: initial } }));
+  await page.goto("/rooms");
+  const pending = page.locator('[data-entry-id="entry-two"] .request-lifecycle');
+  await expect(pending).toHaveText("Downloading");
+  for (const [index, [state, label]] of [
+    ["waiting_for_plex", "Waiting for Plex"],
+    ["waiting_for_queue", "Ready · Waiting for queue"],
+    ["ready", "Ready"],
+  ].entries()) {
+    await page.evaluate(snapshot => (window as Window & { roomSource?: EventSource }).roomSource?.dispatchEvent(
+      new MessageEvent("room", { data: JSON.stringify(snapshot) }),
+    ), { ...initial, version: 4 + index, queue: [initial.queue[0], { ...initial.queue[1], state }] });
+    await expect(pending).toHaveText(label);
+    await expect(page.getByRole("button", { name: "Remove Available song" })).toBeDisabled();
+    await expect(page.locator(".room-panel .message.error")).toHaveCount(0);
+  }
+});
+
 for (const width of [320, 390]) {
   test(`guest can join and request at ${width}px without application navigation`, async ({ page }) => {
     await page.setViewportSize({ width, height: 850 });

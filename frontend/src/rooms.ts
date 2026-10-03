@@ -91,6 +91,7 @@ function watch() {
 const stateLabels: Record<string, string> = {
   ready: "Ready", requested: "Requested", not_requested: "Requested", queued: "Queued",
   downloading: "Downloading", waiting_for_plex: "Waiting for Plex",
+  waiting_for_queue: "Ready · Waiting for queue",
 };
 function trackCard(track: Partial<RoomTrack>, label: string) {
   const card = element("section", "", "room-track");
