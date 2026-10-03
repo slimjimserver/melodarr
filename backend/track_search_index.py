@@ -1640,6 +1640,22 @@ def plex_recording_mbids_by_rating_key(server_id, rating_keys):
     return result
 
 
+def plex_tracks_by_rating_key(server_id, rating_keys):
+    """Resolve queue artwork identities locally, in bounded primary-key batches."""
+    identities = list(dict.fromkeys(str(value) for value in rating_keys if value))
+    result = {}
+    for offset in range(0, len(identities), 500):
+        batch = identities[offset : offset + 500]
+        tracks = _plex_track_lookup(
+            server_id,
+            f"t.rating_key IN ({', '.join('?' for _ in batch)})",
+            batch,
+            None,
+        )
+        result.update((track["ratingKey"], track) for track in tracks)
+    return result
+
+
 def plex_recording_copy_counts(server_id, recording_mbids, *, section_ids=None):
     """Count playable exact recording copies without loading tracks or ISRCs."""
     identities = list(dict.fromkeys(recording_mbids))

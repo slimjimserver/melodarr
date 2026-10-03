@@ -22,14 +22,14 @@ from flask import (
 
 if __package__ == "backend.routes":
     from .. import storage
-    from ..artwork_cache import cached_artwork
+    from ..artwork_cache import cached_artwork, serve_cached_artwork
     from ..responses import api_error
     from ..security import current_user, login_required
     from ..services import musicbrainz, plex_rooms, room_diagnostics, rooms
     from .discovery import _search_response
 else:
     import storage
-    from artwork_cache import cached_artwork
+    from artwork_cache import cached_artwork, serve_cached_artwork
     from responses import api_error
     from routes.discovery import _search_response
     from security import current_user, login_required
@@ -163,7 +163,16 @@ def owner(room):
 
 @blueprint.after_request
 def private_response(response):
-    response.headers["Cache-Control"] = "no-store"
+    if request.endpoint in {
+        "rooms.artwork",
+        "rooms.plex_artwork",
+    } and response.status_code in {200, 304}:
+        # Room capabilities stay scoped; only the participant's browser caches
+        # image bytes. JSON, SSE and failed image requests remain uncached.
+        response.cache_control.public = False
+        response.cache_control.private = True
+    else:
+        response.headers["Cache-Control"] = "no-store"
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["X-Content-Type-Options"] = "nosniff"
     if response.status_code == 429:
@@ -393,11 +402,34 @@ def artwork(code, mbid):
             "UNION ALL SELECT 1 FROM room_entries WHERE room_id=? AND release_group_mbid=? LIMIT 1",
             (room["id"], mbid, time.time(), room["id"], mbid),
         ).fetchone()
-    if not allowed:
+    if not allowed and not _has_artwork(rooms.snapshot(room["code"]), request.path):
         raise rooms.RoomError("Artwork unavailable.", 404)
     return cached_artwork(
-        f"release-group-{mbid}", musicbrainz.cover_art_url(mbid, size=500), size="thumb"
+        f"release-group-{mbid}",
+        musicbrainz.cover_art_url(mbid, size=500),
+        size=request.args.get("size") or "thumb",
     )
+
+
+def _has_artwork(state, path):
+    tracks = [state["nowPlaying"], state["upNext"], state["handoff"], *state["queue"]]
+    return any(
+        path == track.get(field)
+        for track in tracks
+        for field in ("artwork", "artworkFallback")
+    )
+
+
+@blueprint.get("/api/rooms/<code>/plex-artwork/<cache_key>")
+@boundary
+def plex_artwork(code, cache_key):
+    room = code_room(code)
+    participant(room)
+    if not re.fullmatch(r"plex-album-[0-9a-f]{64}", cache_key) or not _has_artwork(
+        rooms.snapshot(room["code"]), request.path
+    ):
+        raise rooms.RoomError("Artwork unavailable.", 404)
+    return serve_cached_artwork(cache_key, size=request.args.get("size") or "thumb")
 
 
 @blueprint.get("/api/rooms/<code>/events")
@@ -420,9 +452,23 @@ def events(code):
                 state = rooms.project_snapshot(
                     rooms.snapshot(room["code"]), host=person["host"]
                 )
-                if state["version"] != version:
+                # Artwork can arrive from the library worker without a queue
+                # edit. Preserve queue versions while publishing additive art.
+                revision = (
+                    state["version"],
+                    tuple(
+                        (track.get("artwork"), track.get("artworkFallback"))
+                        for track in [
+                            state["nowPlaying"],
+                            state["upNext"],
+                            state["handoff"],
+                            *state["queue"],
+                        ]
+                    ),
+                )
+                if revision != version:
                     yield f"event: room\ndata: {json.dumps(state)}\n\n"
-                    version = state["version"]
+                    version = revision
                 if state["status"] == "closed":
                     break
                 yield ": heartbeat\n\n"

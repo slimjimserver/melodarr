@@ -1,5 +1,5 @@
-interface RoomTrack { title: string; artist: string; album?: string }
-interface RoomEntry extends RoomTrack { id: string; recordingMbid?: string | null; requester?: string | null; state: string; locked?: boolean; error?: string; artwork?: string }
+interface RoomTrack { title: string; artist: string; album?: string; artwork?: string; artworkFallback?: string }
+interface RoomEntry extends RoomTrack { id: string; recordingMbid?: string | null; requester?: string | null; state: string; locked?: boolean; error?: string }
 interface RoomState {
   code: string; status: string; version: number; joinPath: string;
   nowPlaying: RoomTrack; handoff: Partial<RoomTrack>; upNext?: Partial<RoomTrack>; queue: RoomEntry[];
@@ -17,6 +17,8 @@ const host = root?.dataset.host === "true";
 let csrf = "", guestCsrf = "", code = "", current: RoomState | undefined;
 let generation = 0, source: EventSource | undefined, reconnect: number | undefined, retryDelay = 2000;
 let message!: HTMLElement, connection!: HTMLElement, roomPanel!: HTMLElement, searchPanel!: HTMLElement;
+let player: ReturnType<typeof createPlayer> | undefined;
+const queueRows = new Map<string, ReturnType<typeof createQueueRow>>();
 
 function element<K extends keyof HTMLElementTagNameMap>(tag: K, text = "", className = "") {
   const node = document.createElement(tag);
@@ -29,10 +31,11 @@ function button(text: string, action: () => Promise<void> | void) {
   node.type = "button";
   node.addEventListener("click", async () => {
     const actionGeneration = generation;
+    node.dataset.busy = "true";
     node.disabled = true;
     message.textContent = "";
     try { await action(); } catch (error) { if (generation === actionGeneration) message.textContent = error.message; }
-    finally { node.disabled = false; }
+    finally { delete node.dataset.busy; node.disabled = node.dataset.unavailable === "true"; }
   });
   return node;
 }
@@ -58,6 +61,7 @@ function stop() {
   reconnect = undefined;
 }
 function mount() {
+  player = undefined; queueRows.clear();
   root.replaceChildren();
   message = element("p", "", "message error"); message.setAttribute("role", "status");
   connection = element("p", "", "room-connection");
@@ -103,74 +107,157 @@ const stateLabels: Record<string, string> = {
   downloading: "Downloading", waiting_for_plex: "Waiting for Plex",
   waiting_for_queue: "Ready · Waiting for queue",
 };
-function trackCard(track: Partial<RoomTrack>, label: string) {
-  const card = element("section", "", "room-track");
-  card.append(element("p", label, "eyebrow"), element("h3", track.title || "No track detected"), element("p", track.artist || ""));
-  return card;
+function setText(node: HTMLElement, text: string) {
+  if (node.textContent !== text) node.textContent = text;
 }
-function render(state: RoomState) {
-  if (current?.code === state.code && current.version > state.version) return;
-  current = state; code = state.code;
-  roomPanel.replaceChildren();
-  const heading = element("div", "", "room-heading");
-  heading.append(element("h2", `Room ${state.code}`), element("p", `${state.guestCount} guests joined`));
-  roomPanel.append(heading);
-  if (state.status === "closed") {
-    stop(); connection.textContent = "Room ended";
-    roomPanel.append(element("p", "This Room has ended. Plexamp playback continues with its current queue."));
-    searchPanel.hidden = true;
-    if (host) roomPanel.append(button("Start another Room", () => showHostRooms(csrf)));
-    return;
-  }
-  if (host) {
-    const share = element("div", "", "room-share"), label = element("label", "Guest join URL");
-    const input = element("input"); input.readOnly = true; input.value = new URL(state.joinPath, window.location.origin).href;
-    label.append(input);
-    share.append(label, button("Copy room URL", async () => {
-      try { await navigator.clipboard.writeText(input.value); message.textContent = "Room URL copied."; }
-      catch { input.focus(); input.select(); message.textContent = "Select and copy the Room URL."; }
-    }));
-    roomPanel.append(share);
-  }
-  roomPanel.append(trackCard(state.nowPlaying, state.playbackState === "playing" ? "NOW PLAYING" : `PLAYBACK ${state.playbackState.toUpperCase()}`));
-  if (state.upNext?.title && !state.queue.some(entry => entry.locked)) roomPanel.append(trackCard(state.upNext, "UP NEXT · LOCKED"));
-  if (host && state.queueWarning) roomPanel.append(element("p", "Room queue is almost empty. Add another playable song before playback ends.", "room-warning"));
-  if (state.syncError) roomPanel.append(element("p", state.syncError, "message error"));
-  roomPanel.append(element("h2", "Upcoming Room queue"));
-  if (!state.queue.length) roomPanel.append(element("p", "Search below to add the first Room song."));
-  const list = element("ol", "", "room-queue");
-  state.queue.forEach((entry, index) => {
-    const row = element("li"); row.dataset.entryId = entry.id;
-    if (entry.artwork) { const image = element("img"); image.src = entry.artwork; image.alt = ""; image.loading = "lazy"; row.append(image); }
-    const details = element("div", "", "room-entry-detail");
-    details.append(element("strong", entry.title), element("p", entry.artist));
-    if (entry.requester) details.append(element("p", `Requested by ${entry.requester}`));
-    details.append(element("span", stateLabels[entry.state] || "Requested", `request-lifecycle ${entry.state}`));
-    if (entry.locked) details.append(element("span", "Up Next · Locked", "request-lifecycle ready"));
-    if (entry.error) details.append(element("p", entry.error, "message error"));
-    row.append(details);
-    if (host) {
-      const controls = element("div", "", "room-entry-controls");
-      const move = async (offset: number) => {
-        if (entry.locked || state.queue[index+offset]?.locked) return;
-        const order = state.queue.map(item => item.id);
-        [order[index], order[index+offset]] = [order[index+offset], order[index]];
-        await mutate("order", "PUT", { entryIds: order, version: state.version });
-      };
-      const up = button("↑", () => move(-1)); up.setAttribute("aria-label", `Move ${entry.title} up`); up.disabled = !!entry.locked || index === 0 || !!state.queue[index-1]?.locked;
-      const down = button("↓", () => move(1)); down.setAttribute("aria-label", `Move ${entry.title} down`); down.disabled = !!entry.locked || index === state.queue.length-1 || !!state.queue[index+1]?.locked;
-      const remove = button("Remove", () => { if (!entry.locked) return mutate(`entries/${entry.id}`, "DELETE", { version: state.version }); }); remove.setAttribute("aria-label", `Remove ${entry.title}`); remove.disabled = !!entry.locked;
-      controls.append(up, down, remove); row.append(controls);
-    }
-    list.append(row);
+function setDisabled(node: HTMLButtonElement, disabled: boolean) {
+  node.dataset.unavailable = String(disabled);
+  node.disabled = disabled || node.dataset.busy === "true";
+}
+function createArtwork(eager = false) {
+  const frame = element("div", "", "room-artwork");
+  const placeholder = element("span", "♫", "room-artwork-placeholder"); placeholder.setAttribute("aria-hidden", "true");
+  const image = element("img"); image.width = eager ? 640 : 64; image.height = eager ? 640 : 64;
+  image.loading = eager ? "eager" : "lazy"; image.decoding = "async"; image.hidden = true;
+  if (eager) image.setAttribute("fetchpriority", "high");
+  frame.append(placeholder, image);
+  let identity = "", fallback = "";
+  const sized = (url: string) => `${url}${url.includes("?") ? "&" : "?"}size=${eager ? "large" : "thumb"}`;
+  image.addEventListener("load", () => {
+    if (!image.getAttribute("src") || !image.complete || !image.naturalWidth) return;
+    image.hidden = false; frame.classList.add("has-artwork"); frame.removeAttribute("role"); frame.removeAttribute("aria-label");
   });
-  roomPanel.append(list);
+  image.addEventListener("error", () => {
+    if (fallback) { const url = fallback; fallback = ""; image.src = sized(url); }
+    else { image.hidden = true; frame.classList.remove("has-artwork"); frame.setAttribute("role", "img"); frame.setAttribute("aria-label", "Album artwork unavailable"); }
+  });
+  return { frame, update(track: Partial<RoomTrack>) {
+    image.alt = `Album artwork for ${track.album || track.title || "the current track"}${track.artist ? ` by ${track.artist}` : ""}`;
+    const nextIdentity = `${track.artwork || ""}|${track.artworkFallback || ""}`;
+    if (identity === nextIdentity) return;
+    identity = nextIdentity; fallback = track.artworkFallback || "";
+    image.hidden = true; frame.classList.remove("has-artwork");
+    frame.setAttribute("role", "img"); frame.setAttribute("aria-label", "Album artwork unavailable");
+    if (track.artwork) { image.src = sized(track.artwork); image.hidden = false; }
+    else image.removeAttribute("src");
+  } };
+}
+function createPlayer() {
+  const heading = element("div", "", "room-heading");
+  const roomInfo = element("div"), name = element("h2"), guests = element("p"); roomInfo.append(name, guests); heading.append(roomInfo);
+  if (host) {
+    const disclosure = element("details", "", "room-invite"), input = element("input"), label = element("label", "Guest join URL");
+    input.readOnly = true; label.append(input); disclosure.append(element("summary", "Invite link"), label); roomInfo.append(disclosure);
+    const invite = button("Copy Invite Link", async () => {
+      const url = new URL(current!.joinPath, window.location.origin).href;
+      try { await navigator.clipboard.writeText(url); message.textContent = "Invite link copied."; }
+      catch {
+        disclosure.open = true; input.focus(); input.select(); message.textContent = "Select and copy the invite link.";
+      }
+    });
+    heading.append(invite);
+  }
+  const hero = element("section", "", "room-now-playing"); hero.setAttribute("aria-label", "Now Playing");
+  const artwork = createArtwork(true), metadata = element("div", "", "room-now-metadata");
+  const label = element("p", "NOW PLAYING", "eyebrow"), title = element("h2", "", "room-now-title");
+  const artist = element("p", "", "room-now-artist"), album = element("p", "", "room-now-album");
+  metadata.append(label, title, artist, album); hero.append(artwork.frame, metadata);
+  const warning = element("p", "Room queue is almost empty. Add another playable song before playback ends.", "room-warning");
+  const syncError = element("p");
+  const queueHeading = element("div", "", "room-queue-heading"), count = element("span");
+  queueHeading.append(element("h2", "Up Next"), count);
+  const next = element("div", "", "room-next-preview"), nextArtwork = createArtwork();
+  const nextDetail = element("div", "", "room-entry-detail"), nextTitle = element("strong"), nextArtist = element("p");
+  nextDetail.append(nextTitle, nextArtist, element("span", "Up Next · Locked", "room-lock")); next.append(nextArtwork.frame, nextDetail);
+  const empty = element("p", "Search below to add the first Room song.", "room-empty");
+  const list = element("ol", "", "room-queue"); list.setAttribute("aria-label", "Up Next queue");
+  roomPanel.replaceChildren(heading, hero, warning, syncError, queueHeading, next, empty, list);
   if (host) {
     const actions = element("div", "", "room-actions");
     actions.append(button("Retry synchronization", () => mutate("sync", "POST")), button("End Room", () => mutate("end", "POST")));
     roomPanel.append(actions);
   }
-  roomPanel.append(element("p", "Plexamp refreshes queue changes when playback advances. Playback controls stay in Plexamp.", "room-note"));
+  roomPanel.append(element("p", "Playback stays in Plexamp. Queue changes refresh there when playback advances.", "room-note"));
+  return { name, guests, artwork, label, title, artist, album, warning, syncError, count, next, nextArtwork, nextTitle, nextArtist, empty, list };
+}
+function createQueueRow(id: string) {
+  const row = element("li"); row.dataset.entryId = id;
+  const artwork = createArtwork(), details = element("div", "", "room-entry-detail");
+  const title = element("strong", "", "room-entry-title"), artist = element("p", "", "room-entry-artist");
+  const meta = element("div", "", "room-entry-meta"), requester = element("span", "", "room-requester");
+  const status = element("span", "", "request-lifecycle"), lock = element("span", "Up Next · Locked", "room-lock");
+  const error = element("p"); meta.append(lock, status, requester); details.append(title, artist, meta, error);
+  row.append(artwork.frame, details);
+  let controls: { up: HTMLButtonElement; down: HTMLButtonElement; remove: HTMLButtonElement } | undefined;
+  if (host) {
+    const group = element("div", "", "room-entry-controls"); group.setAttribute("role", "group"); group.setAttribute("aria-label", "Queue actions");
+    const move = async (offset: number) => {
+      const state = current!, index = state.queue.findIndex(entry => entry.id === id);
+      if (index < 0 || state.queue[index].locked || !state.queue[index+offset] || state.queue[index+offset].locked) return;
+      const order = state.queue.map(entry => entry.id);
+      [order[index], order[index+offset]] = [order[index+offset], order[index]];
+      await mutate("order", "PUT", { entryIds: order, version: state.version });
+    };
+    const up = button("↑", () => move(-1)), down = button("↓", () => move(1));
+    const remove = button("×", () => {
+      if (current?.queue.some(entry => entry.id === id && !entry.locked)) return mutate(`entries/${id}`, "DELETE", { version: current.version });
+    });
+    controls = { up, down, remove }; group.append(up, down, remove); row.append(group);
+  }
+  return { row, update(entry: RoomEntry, index: number, state: RoomState) {
+    artwork.update(entry); setText(title, entry.title); setText(artist, entry.artist);
+    setText(requester, entry.requester ? `Requested by ${entry.requester}` : ""); requester.hidden = !entry.requester;
+    // Guest presentation is limited even if an intermediate host state arrives.
+    const lifecycle = host ? entry.state : entry.state === "ready" ? "ready" : "requested";
+    setText(status, stateLabels[lifecycle] || "Requested"); status.className = `request-lifecycle ${lifecycle}`;
+    lock.hidden = !entry.locked;
+    setText(error, host ? entry.error || "" : ""); error.hidden = !host || !entry.error;
+    error.className = host && entry.error ? "message error" : "";
+    if (controls) {
+      controls.up.setAttribute("aria-label", `Move ${entry.title} up`); controls.up.title = "Move up";
+      controls.down.setAttribute("aria-label", `Move ${entry.title} down`); controls.down.title = "Move down";
+      controls.remove.setAttribute("aria-label", `Remove ${entry.title}`); controls.remove.title = "Remove from queue";
+      setDisabled(controls.up, !!entry.locked || index === 0 || !!state.queue[index-1]?.locked);
+      setDisabled(controls.down, !!entry.locked || index === state.queue.length-1 || !!state.queue[index+1]?.locked);
+      setDisabled(controls.remove, !!entry.locked);
+    }
+  } };
+}
+function render(state: RoomState) {
+  if (current?.code === state.code && current.version > state.version) return;
+  current = state; code = state.code;
+  if (state.status === "closed") {
+    stop(); connection.textContent = "Room ended";
+    player = undefined; queueRows.clear();
+    roomPanel.replaceChildren(element("h2", `Room ${state.code}`), element("p", "This Room has ended. Plexamp playback continues with its current queue."));
+    searchPanel.hidden = true;
+    if (host) roomPanel.append(button("Start another Room", () => showHostRooms(csrf)));
+    return;
+  }
+  player ||= createPlayer();
+  setText(player.name, `Room ${state.code}`); setText(player.guests, `${state.guestCount} ${state.guestCount === 1 ? "guest" : "guests"}`);
+  const inviteInput = roomPanel.querySelector<HTMLInputElement>(".room-invite input");
+  if (inviteInput) inviteInput.value = new URL(state.joinPath, window.location.origin).href;
+  player.artwork.update(state.nowPlaying);
+  setText(player.label, state.playbackState === "playing" ? "NOW PLAYING" : `PLAYBACK ${state.playbackState.toUpperCase()}`);
+  setText(player.title, state.nowPlaying.title || "No track detected");
+  setText(player.artist, state.nowPlaying.artist || ""); setText(player.album, state.nowPlaying.album || "");
+  player.warning.hidden = !host || !state.queueWarning;
+  setText(player.syncError, state.syncError || ""); player.syncError.hidden = !state.syncError;
+  player.syncError.className = state.syncError ? "message error" : "";
+  const showNext = !!state.upNext?.title && !state.queue.some(entry => entry.locked);
+  player.next.hidden = !showNext;
+  if (showNext) { player.nextArtwork.update(state.upNext!); setText(player.nextTitle, state.upNext!.title!); setText(player.nextArtist, state.upNext!.artist || ""); }
+  setText(player.count, `${state.queue.length + Number(showNext)} tracks`);
+  player.empty.hidden = state.queue.length > 0 || showNext;
+  const ids = new Set(state.queue.map(entry => entry.id));
+  for (const [id, item] of queueRows) { if (!ids.has(id)) { item.row.remove(); queueRows.delete(id); } }
+  state.queue.forEach((entry, index) => {
+    let item = queueRows.get(entry.id);
+    if (!item) { item = createQueueRow(entry.id); queueRows.set(entry.id, item); }
+    item.update(entry, index, state);
+    if (player!.list.children[index] !== item.row) player!.list.insertBefore(item.row, player!.list.children[index] || null);
+  });
   searchPanel.hidden = false;
 }
 function setupSearch() {
@@ -189,7 +276,7 @@ function setupSearch() {
       if (!response.results.length) results.append(element("p", "No requestable tracks found. Try a more specific title and artist."));
       response.results.forEach((choice) => {
         const row = element("div", "", "room-search-result");
-        if (choice.artwork) { const image = element("img"); image.src = choice.artwork; image.alt = ""; image.loading = "lazy"; row.append(image); }
+        const artwork = createArtwork(); artwork.update(choice); row.append(artwork.frame);
         const detail = element("div", "", "room-entry-detail");
         detail.append(element("strong", choice.title), element("p", choice.artist), element("p", choice.album || ""), element("span", stateLabels[choice.state] || "Request to acquire"));
         const add = button("Request track", async () => {

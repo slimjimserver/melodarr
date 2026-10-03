@@ -227,10 +227,11 @@ class ApplicationFactoryTests(DatabaseTestCase):
             for method in rule.methods
             if method not in {"HEAD", "OPTIONS"}
         }
-        self.assertEqual(len(rules), 133)
-        self.assertEqual(len(route_methods), 133)
+        self.assertEqual(len(rules), 134)
+        self.assertEqual(len(route_methods), 134)
         self.assertIn(("/api/rooms/sessions", "GET"), route_methods)
         self.assertIn(("/api/rooms/<code>/diagnostics", "GET"), route_methods)
+        self.assertIn(("/api/rooms/<code>/plex-artwork/<cache_key>", "GET"), route_methods)
         for route in (("/api/discover/charts", "GET"), ("/api/discover/preferences", "GET"),
                       ("/api/discover/preferences", "POST"), ("/api/discover/request-influence", "POST")):
             self.assertIn(route, route_methods)

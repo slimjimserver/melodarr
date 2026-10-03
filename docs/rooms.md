@@ -44,6 +44,61 @@ Plexamp clients may display PMS writes when playback advances. Playback controls
 stay in Plexamp. Keep playable songs queued: pending requests cannot prevent
 exhaustion, and Rooms cannot start/restart an idle player.
 
+## Player presentation and cached artwork
+
+Now Playing uses a responsive square cover with title, track artist and album.
+Desktop places a 280px cover beside the metadata; mobile stacks a cover up to
+360px above centered metadata. Up Next uses compact 52px mobile / 60px desktop
+covers, quiet lifecycle pills and small host reorder/remove buttons. The next
+live item has an **Up Next · Locked** badge and disabled host controls. Unknown
+requesters are omitted. Guests keep Requested/Ready presentation and the same
+layout, without host controls or detailed acquisition errors.
+
+Artwork identity resolves locally through `track_search_plex_tracks` using the
+Room server and rating key, then `albumRatingKey` and the Plex library cache's
+`releaseGroupsByRatingKey` album/thumbnail. The existing Plex library scan worker
+warms album thumbnails into `backend.artwork_cache`'s existing disk cache,
+resizing, negative-cache and eviction system. There was no existing Plex album
+image route; the Room-scoped `/api/rooms/<code>/plex-artwork/<opaque-key>` route
+serves cached files only. Image renders and snapshot serialization never fetch
+PMS artwork. Plex authentication stays in worker request headers.
+
+Materialized items prefer cached Plex album art, then the existing Room
+release-group artwork route, then a fixed square placeholder. Pending requests
+use release-group art until they materialize. `nowPlaying`, `upNext`, `handoff`
+and queue entries carry additive `artwork` / `artworkFallback` URLs; Plex IDs
+remain internal and `queue[].recordingMbid` is retained. Successful image
+responses have private browser caching, normal dimensions and revision-based
+Plex ETags. Covers load eagerly in the hero and lazily in the queue.
+
+The existing `room` SSE channel also publishes artwork changes when the queue
+revision is unchanged. The frontend updates existing hero/entry DOM nodes by
+entry ID, retaining unchanged controls, covers and keyboard focus. Duplicate
+queue instances keep independent rows. Acquisition, queue reconciliation,
+protected boundaries and recovery decisions are unchanged.
+
+Player redesign validation:
+
+| Check | Result |
+| --- | --- |
+| Focused player browser tests | 14 passed |
+| Existing Rooms browser tests | 17 passed |
+| Full browser suite | 215 passed |
+| Complete Rooms backend plus artwork/cache/Plex index/worker/factory regressions | 229 passed |
+| Frontend typecheck and production build | Passed |
+| Ruff on changed backend modules and new artwork tests | Passed |
+| Ruff formatting on changed modules/tests, with range formatting for the index helper | Passed |
+| Repository Python correctness rules (`E9,F63,F7,F82`) | Passed |
+| `git diff --check` | Passed |
+
+Fourteen new browser tests and fourteen new backend tests cover hero metadata,
+cached art precedence, pending materialization, missing/failed artwork, scoped
+image access and caching, protected controls, guest projection, null requesters,
+SSE updates without replacement, independent duplicate entries, and Unicode
+layouts at 320px/390px. Desktop and mobile screenshots were visually inspected.
+Backend PMS/provider transport and browser snapshots are fixtures; no live Plex
+player was controlled during validation.
+
 ## Passive synchronization and saved writes
 
 The existing worker reconciles active Rooms every five seconds. Local development
@@ -327,8 +382,9 @@ Application URL; Origin checks support upstream TLS termination. CORS is disable
 - Bodies reject unknown fields; choices/tokens are scoped to one Room. Guests
   cannot supply URLs, addresses, or Plex identifiers. Server URLs use configured
   PMS settings and redirect rejection. Cross-origin JSON mutations are rejected.
-- Guest documents use `frame-ancestors 'none'`; Room responses use no-store and
-  no-referrer. SSE uses participant authorization, ends on closure, and allows
+- Guest documents use `frame-ancestors 'none'`; Room JSON/SSE and errors use no-store
+  and no-referrer. Successful artwork responses use private browser caching.
+  SSE uses participant authorization, ends on closure, and allows
   at most six bounded streams per process. Reverse proxies must disable buffering.
 - Guest presence counts guests joined, not online presence. Guest additions are
   limited to 200 upcoming entries, guests to 500. Imported PMS items are retained;

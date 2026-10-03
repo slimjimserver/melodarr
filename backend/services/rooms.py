@@ -15,12 +15,12 @@ from uuid import UUID, uuid4
 if __package__ == "backend.services":
     from .. import storage, track_search_index
     from ..request_locks import request_lock
-    from . import plex_rooms, recording_requests
+    from . import plex_rooms, recording_requests, room_artwork
 else:
     import storage
     import track_search_index
     from request_locks import request_lock
-    from services import plex_rooms, recording_requests
+    from services import plex_rooms, recording_requests, room_artwork
 
 
 logger = logging.getLogger(__name__)
@@ -92,6 +92,14 @@ def snapshot(code):
         guest_count = connection.execute(
             "SELECT COUNT(*) FROM room_guests WHERE room_id=?", (room["id"],)
         ).fetchone()[0]
+        now, handoff, up_next = (
+            json.loads(room[field]) for field in ("now_playing", "handoff", "up_next")
+        )
+        artwork = room_artwork.context(
+            room,
+            [track.get("ratingKey") for track in (now, handoff, up_next)]
+            + [row["rating_key"] for row in rows if row["queue_item_id"]],
+        )
         return {
             "code": room["code"],
             "status": room["status"],
@@ -100,9 +108,9 @@ def snapshot(code):
             "closedAt": room["closed_at"],
             "joinPath": f"/rooms/{room['code']}",
             "guestCount": guest_count,
-            "nowPlaying": json.loads(room["now_playing"]),
-            "handoff": json.loads(room["handoff"]),
-            "upNext": json.loads(room["up_next"]),
+            "nowPlaying": room_artwork.public_track(room, now, artwork),
+            "handoff": room_artwork.public_track(room, handoff, artwork),
+            "upNext": room_artwork.public_track(room, up_next, artwork),
             "playbackState": room["playback_state"],
             "queueWarning": bool(room["warning"]),
             "syncError": room["sync_error"],
@@ -117,9 +125,12 @@ def snapshot(code):
                     "state": row["state"],
                     "locked": row["queue_item_id"] == room["next_item_id"],
                     "error": row["error"],
-                    "artwork": f"/api/rooms/{room['code']}/artwork/{row['release_group_mbid']}"
-                    if row["release_group_mbid"]
-                    else "",
+                    **room_artwork.fields(
+                        room,
+                        artwork,
+                        rating_key=row["rating_key"] if row["queue_item_id"] else None,
+                        release_group=row["release_group_mbid"],
+                    ),
                 }
                 for row in rows
             ],
@@ -128,6 +139,14 @@ def snapshot(code):
 
 def bump(connection, room_id):
     connection.execute("UPDATE rooms SET version=version+1 WHERE id=?", (room_id,))
+
+
+def _stored_track(item):
+    # Presentation identity only; never change queue reconciliation decisions.
+    return {
+        **plex_rooms.public_track(item),
+        "ratingKey": str(item.get("ratingKey") or ""),
+    }
 
 
 def project_snapshot(state, *, host):
@@ -233,8 +252,8 @@ def start(user, *, session_id=None):
                             discovered["current_item_id"],
                             str(items[index + 1]["playQueueItemID"]),
                             "[]",
-                            json.dumps(plex_rooms.public_track(items[index])),
-                            json.dumps(plex_rooms.public_track(items[index + 1])),
+                            json.dumps(_stored_track(items[index])),
+                            json.dumps(_stored_track(items[index + 1])),
                             discovered.get("device_name", ""),
                             discovered.get("product", ""),
                             discovered.get("platform", ""),
@@ -536,16 +555,16 @@ def observe(room, adapter, queue):
             "Plexamp advanced while its queue was loading. Retry shortly."
         )
     state = str(event["state"])
-    now = json.dumps(plex_rooms.public_track(items[index]))
+    now = json.dumps(_stored_track(items[index]))
     next_id = ids[index + 1] if index + 1 < len(ids) else ""
-    up_next = json.dumps(plex_rooms.public_track(items[index + 1]) if next_id else {})
+    up_next = json.dumps(_stored_track(items[index + 1]) if next_id else {})
     # Consume the startup buffer once, including when it becomes the playing
     # item. Retained/reordered history must never resurrect this queue anchor.
     handoff_id = room["handoff_item_id"]
     if handoff_id not in ids[index + 1 :]:
         handoff_id = ""
     handoff = json.dumps(
-        plex_rooms.public_track(items[ids.index(handoff_id)]) if handoff_id else {}
+        _stored_track(items[ids.index(handoff_id)]) if handoff_id else {}
     )
     warning = int(len(items[index + 1 :]) <= 1 or state == "stopped")
     with storage.db() as connection:

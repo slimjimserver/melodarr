@@ -7,15 +7,18 @@ from threading import Event, Lock
 import requests
 
 if __package__ == "backend.workers":
-    from ..artwork_cache import plex_artist_artwork_key, remove_stale_plex_artist_artwork
+    from ..artwork_cache import (
+        plex_artist_artwork_key,
+        remove_stale_plex_artist_artwork,
+    )
     from ..config import PLEX_FULL_SCAN_INTERVAL, PLEX_RECENT_SCAN_INTERVAL
-    from ..services import plex
+    from ..services import plex, room_artwork
     from ..storage import get_service
     from . import plex_metadata
 else:
     from artwork_cache import plex_artist_artwork_key, remove_stale_plex_artist_artwork
     from config import PLEX_FULL_SCAN_INTERVAL, PLEX_RECENT_SCAN_INTERVAL
-    from services import plex
+    from services import plex, room_artwork
     from storage import get_service
     from workers import plex_metadata
 
@@ -76,8 +79,13 @@ def _run_scan(kind):
             plex_metadata.request_enrichment(
                 artist_ids=result["artistMbids"],
                 release_ids=result["releaseMbids"],
-                **({"track_ids": result["trackMbids"]} if result.get("trackMbids") else {}),
+                **(
+                    {"track_ids": result["trackMbids"]}
+                    if result.get("trackMbids")
+                    else {}
+                ),
             )
+        room_artwork.warm_album_artwork(config)
     except (ValueError, requests.RequestException) as exc:
         logger.warning("Plex %s music-library scan failed: %s", kind, exc)
     except Exception:
@@ -107,7 +115,9 @@ def run(initial_delay=0):
         if "full" in requested or full_due:
             _run_scan("full")
             # A full scan includes all recently added artists.
-            job_state["recent"]["nextExecutionAt"] = time.time() + PLEX_RECENT_SCAN_INTERVAL
+            job_state["recent"]["nextExecutionAt"] = (
+                time.time() + PLEX_RECENT_SCAN_INTERVAL
+            )
         elif "recent" in requested or recent_due:
             _run_scan("recent")
 
