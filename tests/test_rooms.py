@@ -140,6 +140,9 @@ class FakePMS:
 class RoomTests(DatabaseTestCase):
     def setUp(self):
         super().setUp()
+        with api_cache.cache_db() as connection:
+            connection.execute("DELETE FROM track_search_plex_tracks")
+            connection.execute("DELETE FROM track_search_plex_isrcs")
         with storage.db() as connection:
             connection.execute("DELETE FROM room_rate_limits")
         self.csrf = self.register()
@@ -338,6 +341,124 @@ class RoomTests(DatabaseTestCase):
         self.assertEqual(response.status_code, 409)
         self.assertIn("Up Next", response.get_json()["error"])
         self.assertIsNone(rooms.host_room(self.user["id"]))
+
+    def test_imported_recording_mbids_use_server_and_rating_key(self):
+        track_search_index.index_plex_library(
+            {
+                "serverId": "server",
+                "tracks": [
+                    {"ratingKey": "102", "musicbrainzRecordingId": RECORDING},
+                    {"ratingKey": "902", "musicbrainzRecordingId": "invalid"},
+                ],
+            }
+        )
+        track_search_index.index_plex_library(
+            {
+                "serverId": "other-server",
+                "tracks": [
+                    {"ratingKey": "102", "musicbrainzRecordingId": OTHER},
+                    {"ratingKey": "903", "musicbrainzRecordingId": OTHER},
+                ],
+            }
+        )
+        room = self.start()
+        self.assertEqual(room["queue"][0]["recordingMbid"], RECORDING)
+        self.pms.items.extend([item(900, 102), item(901), item(902), item(903)])
+        worker.tick()
+        state = rooms.snapshot(room["code"])
+        self.assertEqual(
+            [entry["recordingMbid"] for entry in state["queue"]],
+            [RECORDING, RECORDING, None, None, None],
+        )
+        self.assertEqual(len({entry["id"] for entry in state["queue"]}), 5)
+        self.assertTrue(all(entry["requester"] is None for entry in state["queue"]))
+        self.assertTrue(all(entry["state"] == "ready" for entry in state["queue"]))
+        self.assertEqual(self.pms.calls, [])
+        self.acquire.assert_not_called()
+
+    def test_existing_import_backfills_recording_mbid_and_emits_sse_once(self):
+        room = self.start()
+        original_id = room["queue"][0]["id"]
+        response = self.client.get(f"/api/rooms/{room['code']}/events", buffered=False)
+        self.addCleanup(response.close)
+        iterator = iter(response.response)
+        initial = json.loads(next(iterator).decode().split("data: ", 1)[1])
+        self.assertIsNone(initial["queue"][0]["recordingMbid"])
+        track_search_index.index_plex_library(
+            {
+                "serverId": "server",
+                "tracks": [{"ratingKey": "102", "musicbrainzRecordingId": OTHER}],
+            }
+        )
+        worker.tick()
+        state = rooms.snapshot(room["code"])
+        self.assertEqual(state["version"], room["version"] + 1)
+        self.assertEqual(state["queue"][0]["id"], original_id)
+        self.assertEqual(state["queue"][0]["recordingMbid"], OTHER)
+        self.assertIn(b": heartbeat", next(iterator))
+        with patch.object(routes.time, "sleep"):
+            update = json.loads(next(iterator).decode().split("data: ", 1)[1])
+            self.assertEqual(update, state)
+            worker.tick()
+            self.assertEqual(rooms.snapshot(room["code"]), state)
+            self.assertIn(b": heartbeat", next(iterator))
+            self.assertIn(b": heartbeat", next(iterator))
+        row = rooms.entries(rooms.room_by_code(room["code"])["id"])[0]
+        self.assertEqual(row["recording_mbid"], OTHER)
+        self.assertEqual(self.pms.calls, [])
+        self.acquire.assert_not_called()
+
+    def test_indexed_recording_mbid_does_not_replace_saved_request(self):
+        room = self.add(self.start())
+        track_search_index.index_plex_library(
+            {
+                "serverId": "server",
+                "tracks": [{"ratingKey": "500", "musicbrainzRecordingId": OTHER}],
+            }
+        )
+        worker.tick()
+        state = rooms.snapshot(room["code"])
+        self.assertEqual(state, room)
+        self.assertEqual(self.request_queue(state)[0]["recordingMbid"], RECORDING)
+
+    def test_unavailable_recording_index_does_not_block_queue_import(self):
+        room = self.start()
+        self.pms.items.append(item(900))
+        with patch.object(
+            track_search_index,
+            "plex_recording_mbids_by_rating_key",
+            side_effect=sqlite3.OperationalError("Index unavailable"),
+        ):
+            worker.tick()
+        state = rooms.snapshot(room["code"])
+        self.assertIsNone(state["syncError"])
+        self.assertEqual(state["queue"][-1]["title"], "Song 900")
+        self.assertIsNone(state["queue"][-1]["recordingMbid"])
+        self.assertEqual(self.pms.calls, [])
+
+    def test_recording_mbid_lookup_batches_primary_key_queries(self):
+        tracks = [
+            {"ratingKey": str(key), "musicbrainzRecordingId": RECORDING}
+            for key in range(600)
+        ]
+        track_search_index.index_plex_library({"serverId": "server", "tracks": tracks})
+        statements = []
+        with api_cache.cache_db() as connection:
+            connection.set_trace_callback(statements.append)
+            with patch.object(track_search_index, "cache_db", return_value=connection):
+                result = track_search_index.plex_recording_mbids_by_rating_key(
+                    "server", [track["ratingKey"] for track in tracks] * 2
+                )
+            connection.set_trace_callback(None)
+            plan = connection.execute(
+                "EXPLAIN QUERY PLAN SELECT rating_key, recording_mbid "
+                "FROM track_search_plex_tracks WHERE server_id = ? AND rating_key IN (?, ?)",
+                ("server", "1", "2"),
+            ).fetchall()
+        self.assertEqual(result, {str(key): RECORDING for key in range(600)})
+        queries = [sql for sql in statements if sql.startswith("SELECT rating_key")]
+        self.assertEqual(len(queries), 2)
+        self.assertTrue(any("PRIMARY KEY" in row["detail"] for row in plan))
 
     def test_one_room_per_host_and_idempotent_migration(self):
         room = self.start()
@@ -654,11 +775,19 @@ class RoomTests(DatabaseTestCase):
         )
 
     def test_guest_security_payload_and_cookie(self):
-        room = self.start()
+        room = self.add(self.add(self.start()), OTHER)
+        self.assertEqual(
+            [entry["recordingMbid"] for entry in room["queue"]],
+            [None, RECORDING, OTHER],
+        )
         client, payload, headers = self.guest(room)
         self.assertEqual(payload["guest"]["name"], "Guest #1")
         self.assertEqual(self.guest(room)[1]["guest"]["name"], "Guest #2")
         response = client.get(f"/api/rooms/{room['code']}")
+        self.assertEqual(
+            [entry["recordingMbid"] for entry in response.get_json()["room"]["queue"]],
+            [None, RECORDING, OTHER],
+        )
         body = response.get_data(as_text=True)
         for secret in (
             "private-plex-token",
@@ -1649,7 +1778,7 @@ class RoomTests(DatabaseTestCase):
             self.assertEqual(response.headers["Retry-After"], "60")
 
     def test_sse_authorization_update_and_clean_closure(self):
-        room = self.start()
+        room = self.add(self.add(self.start()), OTHER)
         self.assertEqual(
             self.app.test_client().get(f"/api/rooms/{room['code']}/events").status_code,
             403,
@@ -1657,7 +1786,13 @@ class RoomTests(DatabaseTestCase):
         client, _, _ = self.guest(room)
         response = client.get(f"/api/rooms/{room['code']}/events", buffered=False)
         iterator = iter(response.response)
-        self.assertIn(b"event: room", next(iterator))
+        initial = next(iterator)
+        self.assertIn(b"event: room", initial)
+        state = json.loads(initial.decode().split("data: ", 1)[1])
+        self.assertEqual(
+            [entry["recordingMbid"] for entry in state["queue"]],
+            [None, RECORDING, OTHER],
+        )
         self.post(f"/api/rooms/{room['code']}/end")
         remainder = b"".join(iterator)
         self.assertIn(b'"status": "closed"', remainder)

@@ -13,11 +13,12 @@ from hashlib import sha256
 from uuid import UUID, uuid4
 
 if __package__ == "backend.services":
-    from .. import storage
+    from .. import storage, track_search_index
     from ..request_locks import request_lock
     from . import plex_rooms, recording_requests
 else:
     import storage
+    import track_search_index
     from request_locks import request_lock
     from services import plex_rooms, recording_requests
 
@@ -102,6 +103,7 @@ def snapshot(code):
             "queue": [
                 {
                     "id": row["id"],
+                    "recordingMbid": row["recording_mbid"],
                     "title": row["title"],
                     "artist": row["artist"],
                     "album": row["album"],
@@ -782,6 +784,19 @@ def _adopt(room, queue, ids, index, intent=None):
         raise plex_rooms.QueueError(
             "Room queue item identities are ambiguous. Restart the Room."
         )
+    missing_mbids = [
+        str(track["ratingKey"])
+        for track in tracks
+        if not by_item.get(str(track["playQueueItemID"]), {}).get("recording_mbid")
+    ]
+    try:
+        recording_mbids = track_search_index.plex_recording_mbids_by_rating_key(
+            room["server_id"], missing_mbids
+        )
+    except (OSError, sqlite3.Error) as exc:
+        # Optional identity metadata must not stop live queue adoption.
+        logger.warning("Room recording metadata lookup failed (%s)", type(exc).__name__)
+        recording_mbids = {}
     active = _active_entries(room)
     future = ids[index + 1 :]
     future_set = set(future)
@@ -826,7 +841,7 @@ def _adopt(room, queue, ids, index, intent=None):
                 row = {"id": str(uuid4()), "position": -1}
                 connection.execute(
                     "INSERT INTO room_entries(id,room_id,position,title,artist,album,created_at,"
-                    "state,rating_key,queue_item_id) VALUES (?,?,0,?,?,?,?,'ready',?,?)",
+                    "state,rating_key,queue_item_id,recording_mbid) VALUES (?,?,0,?,?,?,?,'ready',?,?,?)",
                     (
                         row["id"],
                         room["id"],
@@ -836,6 +851,7 @@ def _adopt(room, queue, ids, index, intent=None):
                         time.time(),
                         str(track["ratingKey"]),
                         identity,
+                        recording_mbids.get(str(track["ratingKey"])),
                     ),
                 )
                 changed = True
@@ -845,6 +861,8 @@ def _adopt(room, queue, ids, index, intent=None):
                     metadata["artist"],
                     metadata["album"],
                     str(track["ratingKey"]),
+                    row["recording_mbid"]
+                    or recording_mbids.get(str(track["ratingKey"])),
                     "waiting_for_queue" if row["id"] in placements else "ready",
                     "upcoming",
                     0,
@@ -857,6 +875,7 @@ def _adopt(room, queue, ids, index, intent=None):
                         "artist",
                         "album",
                         "rating_key",
+                        "recording_mbid",
                         "state",
                         "playback",
                         "removed",
@@ -864,7 +883,7 @@ def _adopt(room, queue, ids, index, intent=None):
                     )
                 ):
                     connection.execute(
-                        "UPDATE room_entries SET title=?,artist=?,album=?,rating_key=?,state=?,"
+                        "UPDATE room_entries SET title=?,artist=?,album=?,rating_key=?,recording_mbid=?,state=?,"
                         "playback=?,removed=?,error=? WHERE id=?",
                         (*values, row["id"]),
                     )

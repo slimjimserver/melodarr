@@ -18,6 +18,11 @@ Now Playing, B is **Up Next · Locked**, and C/D/E keep their PMS positions.
 Imported upcoming entries, including B, receive durable Room entry IDs, exact
 Plex queue item IDs/rating keys, safe title/artist/album metadata, and Ready
 state. A recording MBID or requester is not required.
+Room JSON responses and SSE snapshots include `queue[].recordingMbid` for
+comparing the recording with the recording availability API. Imported PMS items
+resolve their recording MBID from the local library index using the Room's Plex
+server and the track's rating key. Synchronization also fills missing MBIDs on
+existing imports. Saved request MBIDs are preserved; unknown mappings stay `null`.
 
 Share the Room code or `/rooms/<code>` URL. Guests join with an optional name,
 search, and request songs without Melodarr/Plex accounts. Blank names become

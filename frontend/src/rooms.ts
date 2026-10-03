@@ -1,5 +1,5 @@
 interface RoomTrack { title: string; artist: string; album?: string }
-interface RoomEntry extends RoomTrack { id: string; requester?: string | null; state: string; locked?: boolean; error?: string; artwork?: string }
+interface RoomEntry extends RoomTrack { id: string; recordingMbid?: string | null; requester?: string | null; state: string; locked?: boolean; error?: string; artwork?: string }
 interface RoomState {
   code: string; status: string; version: number; joinPath: string;
   nowPlaying: RoomTrack; handoff: Partial<RoomTrack>; upNext?: Partial<RoomTrack>; queue: RoomEntry[];

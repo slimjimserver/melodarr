@@ -1620,6 +1620,26 @@ def plex_recording_tracks(server_id, recording_mbid, *, section_ids=None):
     )
 
 
+def plex_recording_mbids_by_rating_key(server_id, rating_keys):
+    """Resolve known queue tracks using their server-scoped primary keys."""
+    identities = list(dict.fromkeys(str(value) for value in rating_keys))
+    if not identities:
+        return {}
+    initialize()
+    result = {}
+    with cache_db() as connection:
+        for offset in range(0, len(identities), 500):
+            batch = identities[offset:offset + 500]
+            placeholders = ', '.join('?' for _ in batch)
+            rows = connection.execute(
+                "SELECT rating_key, recording_mbid FROM track_search_plex_tracks "
+                f"WHERE server_id = ? AND rating_key IN ({placeholders}) "
+                "AND recording_mbid != ''", [server_id, *batch],
+            )
+            result.update((row["rating_key"], row["recording_mbid"]) for row in rows)
+    return result
+
+
 def plex_recording_copy_counts(server_id, recording_mbids, *, section_ids=None):
     """Count playable exact recording copies without loading tracks or ISRCs."""
     identities = list(dict.fromkeys(recording_mbids))
