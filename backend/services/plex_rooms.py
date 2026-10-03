@@ -12,6 +12,8 @@ from urllib.parse import urlsplit, urlunsplit
 import requests
 import websocket
 
+MAX_QUEUE_ITEMS = 10000
+
 if __package__ == "backend.services":
     from ..http_security import request_without_redirects
     from . import plex
@@ -266,7 +268,7 @@ class PMSQueue:
             "GET",
             f"/playQueues/{queue_id}",
             own=0,
-            window=10000,
+            window=MAX_QUEUE_ITEMS,
             includeBefore=1,
             includeAfter=1,
         )
@@ -279,6 +281,8 @@ class PMSQueue:
                 and all(
                     isinstance(item, dict)
                     and str(item.get("playQueueItemID") or "").isdigit()
+                    and item.get("type") == "track"
+                    and str(item.get("ratingKey") or "").isdigit()
                     for item in items
                 )
                 and len({str(item["playQueueItemID"]) for item in items}) == len(items)

@@ -104,6 +104,7 @@ def snapshot(code):
                     "id": row["id"],
                     "title": row["title"],
                     "artist": row["artist"],
+                    "album": row["album"],
                     "requester": row["requester"],
                     "state": row["state"],
                     "locked": row["queue_item_id"] == room["next_item_id"],
@@ -168,15 +169,7 @@ def start(user):
                             discovered["queue_id"],
                             discovered["current_item_id"],
                             str(items[index + 1]["playQueueItemID"]),
-                            json.dumps(
-                                {
-                                    "current": discovered["current_item_id"],
-                                    "items": [
-                                        str(item["playQueueItemID"])
-                                        for item in items[index + 2 :]
-                                    ],
-                                }
-                            ),
+                            "[]",
                             json.dumps(plex_rooms.public_track(items[index])),
                             json.dumps(plex_rooms.public_track(items[index + 1])),
                         ),
@@ -348,7 +341,12 @@ def edit(code, user_id, *, order=None, remove_id=None, version=None):
         adapter = plex_rooms.PMSQueue(storage.get_service("plex"))
         # Observe fresh playback before deciding which entries are editable.
         try:
-            observe(room, adapter, adapter.load(room["queue_id"]))
+            queue = adapter.load(room["queue_id"])
+            observe(room, adapter, queue)
+            _recover_adds(room, queue)
+            ids, index, _current = observe(room, adapter, queue)
+            if not room["write_pending"]:
+                _adopt(room, queue, ids, index)
             active = _active_entries(room)
             locked = _logical_boundary(room, active)
         except plex_rooms.QueueError as exc:
@@ -377,7 +375,9 @@ def edit(code, user_id, *, order=None, remove_id=None, version=None):
                     "UPDATE room_entries SET removed=1 WHERE room_id=? AND id=?",
                     (room["id"], remove_id),
                 )
-            connection.execute("UPDATE rooms SET dirty=1 WHERE id=?", (room["id"],))
+            connection.execute(
+                "UPDATE rooms SET dirty=1,write_pending=1 WHERE id=?", (room["id"],)
+            )
             bump(connection, room["id"])
         sync_locked(room_by_code(code), adapter)
     return snapshot(code)
@@ -628,7 +628,10 @@ def acquisition_bridge(room, *, initiate=False):
     active = [
         row
         for row in entries(room["id"])
-        if row["playback"] == "upcoming" and not row["removed"]
+        if row["playback"] == "upcoming"
+        and not row["removed"]
+        and not row["queue_item_id"]
+        and row["recording_mbid"]
     ]
     states = recording_requests.recording_states(
         [row["recording_mbid"] for row in active], include_tracks=True
@@ -707,129 +710,277 @@ def _sync_error(room, exc):
     raise RoomError(message, 502) from None
 
 
+def _recover_adds(room, queue):
+    """Claim interrupted appends before interpreting PMS as external input."""
+    rows = entries(room["id"])
+    claimed = {row["queue_item_id"] for row in rows if row["queue_item_id"]}
+    recovered = []
+    for row in rows:
+        if not row["add_before"] or row["queue_item_id"]:
+            continue
+        before = set(json.loads(row["add_before"]))
+        candidates = [
+            str(item["playQueueItemID"])
+            for item in queue.get("Metadata", [])
+            if str(item["playQueueItemID"]) not in before
+            and str(item.get("ratingKey")) == row["rating_key"]
+        ]
+        if len(candidates) > 1 or any(identity in claimed for identity in candidates):
+            raise plex_rooms.QueueError(
+                "An interrupted Plex addition is ambiguous. Inspect Plexamp and restart the Room."
+            )
+        if candidates or row["removed"]:
+            identity = candidates[0] if candidates else None
+            recovered.append((identity, row["id"]))
+            claimed.add(identity)
+    if recovered:
+        with storage.db() as connection:
+            connection.executemany(
+                "UPDATE room_entries SET queue_item_id=?,add_before=NULL WHERE id=?",
+                recovered,
+            )
+            bump(connection, room["id"])
+
+
+def _adopt(room, queue, ids, index):
+    """Persist the live materialized queue without writing to PMS.
+
+    Pending requests keep their position before the next surviving materialized
+    entry (or at the tail). Reordering those anchors while placeholders exist is
+    deliberately deferred: retain intent and stop rather than guess placement.
+    """
+    tracks = queue.get("Metadata", [])[index + 1 :]
+    if any(
+        item.get("type") != "track" or not str(item.get("ratingKey") or "").isdigit()
+        for item in tracks
+    ):
+        raise plex_rooms.QueueError(
+            "Plex returned an unplayable queue item. Retry shortly."
+        )
+    rows = entries(room["id"])
+    by_item = {row["queue_item_id"]: row for row in rows if row["queue_item_id"]}
+    if len(by_item) != sum(bool(row["queue_item_id"]) for row in rows):
+        raise plex_rooms.QueueError(
+            "Room queue item identities are ambiguous. Restart the Room."
+        )
+    active = _active_entries(room)
+    future = ids[index + 1 :]
+    future_set = set(future)
+    pending = [row for row in active if not row["queue_item_id"]]
+    old_common = [
+        row["queue_item_id"] for row in active if row["queue_item_id"] in future_set
+    ]
+    common_set = set(old_common)
+    if pending and old_common != [
+        identity for identity in future if identity in common_set
+    ]:
+        raise plex_rooms.QueueError(
+            "Plex queue order changed around pending requests. Pending intent is preserved; "
+            "wait for playback to advance or end this Room before retrying."
+        )
+    before = {}
+    tail = []
+    for offset, row in enumerate(active):
+        if row["queue_item_id"]:
+            continue
+        anchor = next(
+            (
+                later["queue_item_id"]
+                for later in active[offset + 1 :]
+                if later["queue_item_id"] in future_set
+            ),
+            None,
+        )
+        (before.setdefault(anchor, []) if anchor else tail).append(row)
+    ordered = []
+    changed = False
+    with storage.db() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        for track in tracks:
+            identity = str(track["playQueueItemID"])
+            ordered.extend(before.get(identity, []))
+            row = by_item.get(identity)
+            metadata = plex_rooms.public_track(track)
+            if row is None:
+                row = {"id": str(uuid4()), "position": -1}
+                connection.execute(
+                    "INSERT INTO room_entries(id,room_id,position,title,artist,album,created_at,"
+                    "state,rating_key,queue_item_id) VALUES (?,?,0,?,?,?,?,'ready',?,?)",
+                    (
+                        row["id"],
+                        room["id"],
+                        metadata["title"],
+                        metadata["artist"],
+                        metadata["album"],
+                        time.time(),
+                        str(track["ratingKey"]),
+                        identity,
+                    ),
+                )
+                changed = True
+            else:
+                values = (
+                    metadata["title"],
+                    metadata["artist"],
+                    metadata["album"],
+                    str(track["ratingKey"]),
+                    "ready",
+                    "upcoming",
+                    0,
+                    None,
+                )
+                if values != tuple(
+                    row[name]
+                    for name in (
+                        "title",
+                        "artist",
+                        "album",
+                        "rating_key",
+                        "state",
+                        "playback",
+                        "removed",
+                        "error",
+                    )
+                ):
+                    connection.execute(
+                        "UPDATE room_entries SET title=?,artist=?,album=?,rating_key=?,state=?,"
+                        "playback=?,removed=?,error=? WHERE id=?",
+                        (*values, row["id"]),
+                    )
+                    changed = True
+            ordered.append(row)
+        ordered.extend(tail)
+        for position, row in enumerate(ordered):
+            if position != row["position"]:
+                connection.execute(
+                    "UPDATE room_entries SET position=? WHERE id=?",
+                    (position, row["id"]),
+                )
+                changed = True
+        # observe() has already classified playing/history instances. Only
+        # still-upcoming materialized entries can be external removals.
+        for row in active:
+            if row["queue_item_id"] and row["queue_item_id"] not in future_set:
+                connection.execute(
+                    "UPDATE room_entries SET removed=1 WHERE id=?", (row["id"],)
+                )
+                changed = True
+        if changed:
+            bump(connection, room["id"])
+        # Retire the obsolete startup trimming journal without replaying it.
+        if room["trim_ids"] != "[]":
+            connection.execute(
+                "UPDATE rooms SET trim_ids='[]' WHERE id=?", (room["id"],)
+            )
+    return _active_entries(room)
+
+
+def _finish_sync(room):
+    with storage.db() as connection:
+        connection.execute(
+            "UPDATE rooms SET sync_error=NULL,dirty=0,write_pending=0,version=version+1 "
+            "WHERE id=? AND (sync_error IS NOT NULL OR dirty=1 OR write_pending=1)",
+            (room["id"],),
+        )
+    room.update(sync_error=None, dirty=0, write_pending=0)
+
+
 def _sync(room, adapter, states):
     if adapter.server_id != room["server_id"]:
         raise plex_rooms.QueueError(
             "The configured Plex server changed. End this Room before starting another."
         )
     queue = adapter.load(room["queue_id"])
-    takeover = json.loads(room["trim_ids"])
-    pending_takeover = isinstance(takeover, dict) or bool(takeover)
-    trim = takeover["items"] if isinstance(takeover, dict) else takeover
-    initial_current = (
-        takeover["current"] if isinstance(takeover, dict) else room["current_item_id"]
-    )
     ids, index, current = observe(room, adapter, queue)
-    if pending_takeover and (current in trim or current != initial_current):
-        raise plex_rooms.QueueError(
-            "Playback advanced before handoff completed. End this Room, add a next song, and start again."
-        )
-    rows = entries(room["id"])
-    # A failed append may have reached PMS before its ID was persisted. Resolve
-    # every journal BEFORE deciding which suffix items are foreign.
-    for row in rows:
-        if row["add_before"] and not row["queue_item_id"]:
-            added = [
-                item
-                for item in queue.get("Metadata", [])
-                if str(item["playQueueItemID"]) not in json.loads(row["add_before"])
-                and str(item.get("ratingKey")) == row["rating_key"]
-            ]
-            if len(added) > 1:
-                raise plex_rooms.QueueError(
-                    "An interrupted Plex addition is ambiguous. Inspect Plexamp and restart the Room."
-                )
-            if added or row["removed"]:
-                with storage.db() as connection:
-                    connection.execute(
-                        "UPDATE room_entries SET queue_item_id=?,add_before=NULL WHERE id=?",
-                        (
-                            str(added[0]["playQueueItemID"]) if added else None,
-                            row["id"],
-                        ),
-                    )
-                    bump(connection, room["id"])
-    # Recovered appends may already be playing or locked next.
+    _recover_adds(room, queue)
+    # Recovered appends may already be playing or Up Next.
     ids, index, current = observe(room, adapter, queue)
+    if not room["write_pending"]:
+        _adopt(room, queue, ids, index)
     active = _active_entries(room)
-    _logical_boundary(room, active)
-    owned = {row["queue_item_id"] for row in active if row["queue_item_id"]}
-    if not owned.issubset(set(ids[index + 1 :])):
-        raise plex_rooms.QueueError(
-            "A Room song was removed in Plexamp. Remove its Room entry or restart the Room."
-        )
-    for row in entries(room["id"]):
-        if row["removed"] and row["queue_item_id"] in {current, room["next_item_id"]}:
-            raise plex_rooms.QueueError(
-                "An entry scheduled for removal is now playing or Up Next. Manage playback in Plexamp."
-            )
-    boundary = index + bool(room["next_item_id"])
-    # Ownership covers the entire suffix, including foreign tracks interspersed
-    # between Room instances. Rating keys are deliberately not used here.
-    for identity in ids[boundary + 1 :]:
-        if identity not in owned:
-            _protect(room, adapter, identity, expected_ids=ids)
-            adapter.remove(room["queue_id"], identity)
-            ids.remove(identity)
-    if pending_takeover:
+    ready = [
+        row
+        for row in active
+        if not row["queue_item_id"]
+        and states.get(row["recording_mbid"], {}).get("status") == "ready"
+    ]
+    if not room["write_pending"] and not ready:
+        _finish_sync(room)
+        return
+    # Durable order/tombstones become write intent only for a host action or
+    # newly playable request, never just because an observation failed.
+    if not room["write_pending"]:
         with storage.db() as connection:
             connection.execute(
-                "UPDATE rooms SET trim_ids='[]' WHERE id=?", (room["id"],)
+                "UPDATE rooms SET write_pending=1 WHERE id=?", (room["id"],)
             )
-    for row in active:
-        lifecycle = states[row["recording_mbid"]]
-        if lifecycle["status"] != "ready":
+        room["write_pending"] = 1
+    _logical_boundary(room, active)
+    if any(
+        row["queue_item_id"] and row["queue_item_id"] not in ids[index + 1 :]
+        for row in active
+    ):
+        raise plex_rooms.QueueError(
+            "The live queue changed during saved Room intent. Inspect Plexamp before retrying."
+        )
+    # Recovery does not treat an interrupted delete/reorder as a host edit.
+    # Unknown instances during recovery are retained, but ambiguous changes
+    # stop this write; the reconciler must never delete them to enforce ownership.
+    known = {
+        row["queue_item_id"] for row in entries(room["id"]) if row["queue_item_id"]
+    }
+    # Older Rooms stored their startup next only in handoff/up_next. Recovery
+    # must retain that protected anchor before the first passive import.
+    known.add(room["next_item_id"])
+    if any(identity not in known for identity in ids[index + 1 :]):
+        raise plex_rooms.QueueError(
+            "Plex queue changed during saved Room intent. Inspect Plexamp before retrying."
+        )
+    for row in entries(room["id"]):
+        identity = row["queue_item_id"]
+        if not row["removed"] or identity not in ids:
             continue
-        if not row["queue_item_id"]:
-            tracks = lifecycle.get("tracks", [])
-            if not tracks:
-                raise plex_rooms.QueueError(
-                    "Plex availability has no playable copy yet. Retry shortly."
-                )
-            if row["add_before"]:
-                before = json.loads(row["add_before"])
-                added = [
-                    item
-                    for item in queue.get("Metadata", [])
-                    if str(item["playQueueItemID"]) not in before
-                    and str(item.get("ratingKey")) == row["rating_key"]
-                ]
-                if len(added) > 1:
-                    raise plex_rooms.QueueError(
-                        "An interrupted Plex addition is ambiguous. Inspect Plexamp and restart the Room."
-                    )
-            else:
-                before, added = ids, []
-                with storage.db() as connection:
-                    connection.execute(
-                        "UPDATE room_entries SET rating_key=?,add_before=? WHERE id=?",
-                        (str(tracks[0]["ratingKey"]), json.dumps(before), row["id"]),
-                    )
-                row["rating_key"] = str(tracks[0]["ratingKey"])
-            if not added:
-                _protect(room, adapter, expected_ids=ids, append=True)
-                adapter.add(room["queue_id"], tracks[0])
-                queue = adapter.load(room["queue_id"])
-                added = [
-                    item
-                    for item in queue.get("Metadata", [])
-                    if str(item["playQueueItemID"]) not in before
-                    and str(item.get("ratingKey")) == row["rating_key"]
-                ]
-            if len(added) != 1:
-                raise plex_rooms.QueueError(
-                    "Plex did not confirm the new queue entry. Room intent is saved; retry shortly."
-                )
-            with storage.db() as connection:
-                connection.execute(
-                    "UPDATE room_entries SET queue_item_id=?,add_before=NULL,error=NULL WHERE id=?",
-                    (str(added[0]["playQueueItemID"]), row["id"]),
-                )
-                bump(connection, room["id"])
-            queue, ids, index = _read_stable(
-                room, adapter, appended=str(added[0]["playQueueItemID"])
+        _protect(room, adapter, identity, expected_ids=ids)
+        adapter.remove(room["queue_id"], identity)
+        ids.remove(identity)
+    for row in ready:
+        tracks = states[row["recording_mbid"]].get("tracks", [])
+        if not tracks:
+            raise plex_rooms.QueueError(
+                "Plex availability has no playable copy yet. Retry shortly."
             )
-    # Only change PMS where the playable subset differs from Room intent.
+        before = list(ids)
+        with storage.db() as connection:
+            connection.execute(
+                "UPDATE room_entries SET rating_key=?,add_before=? WHERE id=?",
+                (str(tracks[0]["ratingKey"]), json.dumps(before), row["id"]),
+            )
+        _protect(room, adapter, expected_ids=ids, append=True)
+        adapter.add(room["queue_id"], tracks[0])
+        queue = adapter.load(room["queue_id"])
+        added = [
+            item
+            for item in queue.get("Metadata", [])
+            if str(item["playQueueItemID"]) not in before
+            and str(item.get("ratingKey")) == str(tracks[0]["ratingKey"])
+        ]
+        if len(added) != 1:
+            raise plex_rooms.QueueError(
+                "Plex did not confirm the new queue entry. Room intent is saved; retry shortly."
+            )
+        identity = str(added[0]["playQueueItemID"])
+        with storage.db() as connection:
+            connection.execute(
+                "UPDATE room_entries SET queue_item_id=?,add_before=NULL,error=NULL WHERE id=?",
+                (identity, row["id"]),
+            )
+            bump(connection, room["id"])
+        queue, actual, index = _read_stable(room, adapter, appended=identity)
+        if [value for value in actual if value != identity] != ids:
+            raise plex_rooms.QueueError(
+                "The live protected queue changed during the addition. Room intent is saved; retry shortly."
+            )
+        ids = actual
     active = _active_entries(room)
     _logical_boundary(room, active)
     anchor = room["next_item_id"] or current
@@ -839,44 +990,25 @@ def _sync(room, adapter, states):
         if row["queue_item_id"] and row["queue_item_id"] != anchor
     ]
     for identity in expected:
-        if identity not in ids:
+        if identity not in ids or ids.index(identity) <= index:
             raise plex_rooms.QueueError(
-                "A Room song was removed in Plexamp. Remove its Room entry or restart the Room."
+                "The live queue changed during saved Room intent. Retry shortly."
             )
-        if ids.index(identity) <= index:
-            continue
         if ids.index(identity) != ids.index(anchor) + 1:
             _protect(room, adapter, identity, after=anchor, expected_ids=ids)
             adapter.move(room["queue_id"], identity, anchor)
             ids.remove(identity)
             ids.insert(ids.index(anchor) + 1, identity)
         anchor = identity
-    queue, ids, index = _read_stable(room, adapter)
-    boundary = index + bool(room["next_item_id"])
-    if ids[boundary + 1 :] != expected:
+    queue, actual, index = _read_stable(room, adapter)
+    if actual != ids or actual[index + 1 + bool(room["next_item_id"]) :] != expected:
         raise plex_rooms.QueueError(
             "Plex did not confirm the Room queue order. Room intent is saved; retry shortly."
         )
-    confirmed = []
-    for row in active:
-        if not row["queue_item_id"]:
-            continue
-        if (
-            states[row["recording_mbid"]]["status"] == "ready"
-            and row["state"] != "ready"
-        ):
-            confirmed.append(row["id"])
-    with storage.db() as connection:
-        for identity in confirmed:
-            connection.execute(
-                "UPDATE room_entries SET state='ready',error=NULL WHERE id=?",
-                (identity,),
-            )
-        if confirmed or room["sync_error"] or room["dirty"]:
-            bump(connection, room["id"])
-        connection.execute(
-            "UPDATE rooms SET sync_error=NULL,dirty=0 WHERE id=?", (room["id"],)
-        )
+    # PMS confirmation is the materialized truth, independent of acquisition
+    # cache availability. Keep MBIDs/requesters on the original logical entries.
+    _adopt(room, queue, actual, index)
+    _finish_sync(room)
 
 
 def reconcile(code, *, retry=False, initiate=False):

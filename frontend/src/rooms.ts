@@ -1,5 +1,5 @@
 interface RoomTrack { title: string; artist: string; album?: string }
-interface RoomEntry extends RoomTrack { id: string; requester: string; state: string; locked?: boolean; error?: string; artwork?: string }
+interface RoomEntry extends RoomTrack { id: string; requester?: string | null; state: string; locked?: boolean; error?: string; artwork?: string }
 interface RoomState {
   code: string; status: string; version: number; joinPath: string;
   nowPlaying: RoomTrack; handoff: Partial<RoomTrack>; upNext?: Partial<RoomTrack>; queue: RoomEntry[];
@@ -132,8 +132,9 @@ function render(state: RoomState) {
     const row = element("li"); row.dataset.entryId = entry.id;
     if (entry.artwork) { const image = element("img"); image.src = entry.artwork; image.alt = ""; image.loading = "lazy"; row.append(image); }
     const details = element("div", "", "room-entry-detail");
-    details.append(element("strong", entry.title), element("p", entry.artist), element("p", `Requested by ${entry.requester}`),
-      element("span", stateLabels[entry.state] || "Requested", `request-lifecycle ${entry.state}`));
+    details.append(element("strong", entry.title), element("p", entry.artist));
+    if (entry.requester) details.append(element("p", `Requested by ${entry.requester}`));
+    details.append(element("span", stateLabels[entry.state] || "Requested", `request-lifecycle ${entry.state}`));
     if (entry.locked) details.append(element("span", "Up Next · Locked", "request-lifecycle ready"));
     if (entry.error) details.append(element("p", entry.error, "message error"));
     row.append(details);
@@ -198,7 +199,7 @@ export async function showHostRooms(token: string) {
     const { room } = await call<{room: RoomState | null}>("/api/rooms/active");
     if (generation !== requestGeneration) return;
     if (room) { render(room); setupSearch(); watch(); return; }
-    roomPanel.append(element("p", "First start playing music in Plexamp and add at least one more song to Up Next. Your current and next songs are preserved during handoff.", "intro"));
+    roomPanel.append(element("p", "First start playing music in Plexamp and add at least one more song to Up Next. Your existing Plex queue is imported into the Room; current and Up Next stay protected.", "intro"));
     roomPanel.append(button("Start Room", async () => {
       connection.textContent = "Detecting active Plexamp playback…";
       try {

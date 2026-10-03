@@ -1,168 +1,140 @@
-# Rooms MVP
+# Rooms: shared Plex queue synchronization
 
-The host must start Plexamp playback before starting a Room, with at least one
-more song in Up Next. Open **Rooms** in Melodarr, then **Start Room**. The host
-must have a linked Plex account. If multiple Plexamp devices are playing under
-that account, stop the others before starting.
+Plexamp ⇄ PMS PlayQueue ⇄ Melodarr Room
 
-Melodarr manages the active Plex PlayQueue through Plex Media Server. Remote
-Plexamp clients may not show queue changes immediately; they naturally
-synchronize when playback advances to the next track. Playback controls stay
-in Plexamp. Rooms cannot start or restart an idle/exhausted player.
+A Room synchronizes Melodarr with the host's active Plex Media Server PlayQueue.
+PMS is authoritative for materialized songs and their order. Plexamp additions,
+removals, reorders, and Autoplay additions are reflected in Rooms; Melodarr
+requests and host edits are written back to PMS. Queue items are treated alike,
+with no source labels or fabricated requester information.
 
-The live current song and immediate next song are always protected. The initial
-next song is the startup handoff buffer; the rest of the original upcoming queue
-is removed. Every transition selects the new live Up Next item as locked. Room
-queue management starts after it. Hosts cannot move or remove it, or place a
-request ahead of it. Once the startup handoff starts playing, its saved ID is
-cleared permanently. It has no later special protection; only its actual live
-position can protect it. Keep playable songs queued before playback ends; pending
-requests do not prevent queue exhaustion.
+## Starting and using a Room
 
-Share the displayed code or copy its `/rooms/<code>` URL. Guests join with an
-optional name, search, and request songs without a Melodarr/Plex account.
-Blank names become Guest #1, Guest #2, etc. A returning guest can click Join
-again to reuse the room-scoped identity. Only the host can reorder, remove,
-retry synchronization, or end a Room. Ending leaves Plexamp and its queue
-running. Rooms remain active until explicitly ended.
+Start Plexamp playback with at least one more song in Up Next, open **Rooms**,
+and choose **Start Room**. The host needs a linked Plex account and exactly one
+active Plexamp device. A queue with just current A and next B is sufficient.
+Starting imports the existing upcoming queue without changing PMS: A remains
+Now Playing, B is **Up Next · Locked**, and C/D/E keep their PMS positions.
+Imported upcoming entries, including B, receive durable Room entry IDs, exact
+Plex queue item IDs/rating keys, safe title/artist/album metadata, and Ready
+state. A recording MBID or requester is not required.
+
+Share the Room code or `/rooms/<code>` URL. Guests join with an optional name,
+search, and request songs without Melodarr/Plex accounts. Blank names become
+Guest #1, Guest #2, etc.; returning guests reuse their scoped identity. Only
+the host can reorder, remove, retry synchronization, or end the Room. Ending
+leaves Plexamp and its queue running; Rooms remain active until ended.
+
+The current item comes from the original device's active Plexamp stream and
+recent PMS playback notification. Up Next is the first item immediately after
+it in the complete PMS queue. Both are protected from normal Melodarr edits.
+When the host changes Up Next in Plexamp, passive synchronization adopts and
+locks that new item. A consumed startup handoff ID stays cleared; legacy
+handoff/trim fields are compatibility data, never instructions to delete or
+restore the original queue suffix.
+
+Plexamp clients may display PMS writes when playback advances. Playback controls
+stay in Plexamp. Keep playable songs queued: pending requests cannot prevent
+exhaustion, and Rooms cannot start/restart an idle player.
+
+## Passive synchronization and saved writes
+
+The existing worker reconciles active Rooms every five seconds. Local development
+needs `python -m backend.worker` alongside the web app. Each pass resolves the
+host's current stream on the original device, loads the complete active PMS
+queue, verifies its identity, and updates playback/Up Next. Interrupted append
+journals are recovered before external changes are interpreted.
+
+With no outstanding Melodarr write, synchronization makes no PMS mutations:
+
+- New future queue item IDs become persisted Ready Room entries in PMS order.
+  A batch of Autoplay songs is handled like any other queue additions.
+- Still-upcoming materialized entries missing from PMS become tombstones and
+  are not re-added. Playback observation classifies current/played entries first,
+  so ordinary advancement does not become an external deletion.
+- Logical materialized positions follow PMS, including a changed Up Next.
+  Identical rating keys with distinct `playQueueItemID`s remain independent.
+  Existing MBIDs, guest IDs, and requesters stay on their exact queue instances.
+- Pending unmaterialized requests survive because absence from PMS is expected.
+- Changed state increments the Room revision, driving existing SSE snapshots.
+  An unchanged queue produces no new revision or PMS write.
+
+A Melodarr host reorder/remove persists logical order/tombstones and a
+`write_pending` journal flag. A newly ready request uses the same flag before
+materializing. These writes reload the live stream and complete queue before
+each PMS command, verify current/next, session, target, anchor, and expected
+queue IDs, and abort safely on a race. Appends retain `add_before` IDs until
+an exact new instance is recovered. Rating keys identify an interrupted append
+among new IDs; they never merge/remove ordinary queue entries.
+
+The final PMS read must confirm the complete expected sequence before entries
+are marked Ready and write intent is cleared. An ineffective move/delete or
+ambiguous interrupted append is an error. A follow-up passive pass is idempotent.
+Unknown items appearing during interrupted write recovery are preserved and
+cause a safe synchronization error instead of being deleted.
+
+`dirty`/`sync_error` alone never authorize restoring old Room order. A temporary
+observation failure therefore cannot create a fight with later Plexamp edits.
+Queue/server switches, duplicate item IDs, incomplete/unplayable PMS responses,
+unavailable notifications, and stale owned streams fail closed.
+
+The existing per-server/playQueue file lock serializes worker and request writes
+across processes. SQLite transactions protect persisted ordering and revisions
+without holding database writes during provider calls. Host APIs use optimistic
+revisions and re-observe the locked boundary before validating edits.
+
+PMS appends use `next=0` and may insert at the end of Plex's manual queue region.
+When that region is empty, the existing in-place initialization promotes the
+same Up Next instance after current, verifies all IDs/order/boundaries remain
+unchanged and the manual-region marker is confirmed, then appends. It never
+replaces the next item. Subsequent placement stays behind Up Next. With no next
+item, the first appended request becomes locked. The marker behavior still
+needs verification against the actual PMS version.
+
+## Persistence and acquisition
+
+`backend/room_storage.py` runs through the normal `storage.init_db` migration.
+The idempotent migration adds `rooms.write_pending` and `room_entries.album`.
+`recording_mbid` and `requester` now allow NULL. SQLite requires a transactional
+child-table rebuild to relax the old NOT NULL constraints; saved IDs, MBIDs,
+requesters, guest foreign keys, playback, tombstones, append journals, and the
+ordering index are retained. Legacy dirty Rooms with entries retain saved write
+intent on upgrade. No origin/source column or sentinel UUID is added.
+
+Missing songs still reserve a logical position and use the existing
+`recording_requests` lifecycle: Requested → Queued → Downloading → Waiting for
+Plex → Ready. The host sponsors guest acquisition through the existing request
+history and notification path. Removing a Room entry never cancels shared
+acquisition. The acquisition bridge continues during PMS outages. Already
+materialized songs use PMS readiness without depending on acquisition-cache
+availability. The frontend omits the requester line when no requester exists.
+PMS artwork URLs are not exposed to guests; safe album metadata is retained,
+while existing release-group artwork continues for known requests.
+
+### Pending ordering follow-up
+
+Pending requests retain their position before the next surviving materialized
+anchor, or at the tail. Normal late readiness fills that reserved position while
+it remains behind Up Next. If an external reorder changes the order of existing
+anchors while placeholders exist, synchronization preserves pending intent and
+reports an error without guessing a merged order or writing PMS. Likewise, a
+pending position ahead of a locked materialized entry cannot be filled ahead
+of it. Playback advancement may resolve the conflict; otherwise end the Room
+and start another. Comprehensive ordering for simultaneous pending downloads
+and external reorders remains a separate iteration. No acquisition state machine
+is added by this change.
 
 ## Implementation
 
 | Responsibility | Files |
 | --- | --- |
-| Durable room/guest/entry schema | `backend/room_storage.py`, invoked by `storage.init_db` |
-| Room permissions, logical order, reconciliation journal | `backend/services/rooms.py` |
-| Active-session discovery, PMS notification stream and REST queue adapter | `backend/services/plex_rooms.py` |
-| HTTP, guest capabilities, rate limits, SSE and artwork boundary | `backend/routes/rooms.py` |
-| Acquisition/playback reconciliation loop | `backend/workers/rooms.py`, registered by `backend/worker.py` |
-| Shared host/guest interface | `frontend/src/rooms.ts`, `frontend/src/style.css` |
-| Host and separate public guest documents | `frontend/static/index.html`, `frontend/static/room.html`, `backend/routes/pages.py` |
-
-Other wiring changes: `backend/application.py` registers the blueprint;
-`backend/security.py` delegates only guest join/add CSRF checks to that boundary;
-`backend/routes/discovery.py` exposes parameters on the existing search helper;
-`backend/requirements.txt` pins the WebSocket dependency; `frontend/src/app.ts`
-and `frontend/scripts/build.mjs` wire routing/lazy loading and asset builds.
-`README.md`, `docs/api.md`, and `.gitignore` publish this documentation.
-
-Coverage is added in `tests/test_rooms.py` and `frontend/tests/rooms.spec.ts`.
-`tests/test_backend.py` updates route/thread assertions, and
-`frontend/tests/fixture-server.mjs` plus
-`frontend/tests/primary-requests-navigation.spec.ts` accommodate the public
-document and the fifth navigation item. Together with the table above and
-this file, these are all 27 changed/added files.
-
-Session discovery matches the linked Plex **username** against `/status/sessions`
-`User.title`, never the server-local `User.id`. PMS WebSocket notifications must
-match both client identifier and the **current stream's** session key before
-their queue IDs are used. Each reconciliation re-resolves `/status/sessions`
-for the host on the Room's original Plexamp device; a stream key captured at
-startup is not reused as a permanent device identity. The notification's Plex
-rating key must also agree with the live session and queue item. See the
-[stream session reference](https://github.com/Tautulli/Tautulli/wiki/Tautulli-API-Reference)
-for the distinction between a current stream's session key and its device.
-Discovery has a bounded wait and rechecks the session. Recent notifications
-are required to mutate the queue safely; a queue switch requires ending and
-restarting the Room. Changing the configured PMS server also requires a restart.
-
-The adapter reuses Melodarr's requests/redirect protection rather than adding
-a parallel Plex library implementation. Queue REST semantics follow the
-[Python PlexAPI queue source](https://python-plexapi.readthedocs.io/en/latest/_modules/plexapi/playqueue.html).
-Only `websocket-client==1.9.0` is added to production requirements, which the
-existing Dockerfile installs. No Companion connection is used.
-PMS appends explicitly use `next=0`. Before appending when a next item exists,
-the complete queue must report a `playQueueLastAddedItemID` at or beyond it.
-Plex's [official PlayQueue API](https://developer.plex.tv/pms/) appends to the end
-of the manual region; an empty region would insert ahead of the protected next
-item. If that region is empty, Rooms first issues an in-place move of the same
-next queue instance after its existing current predecessor. It then reloads PMS
-and requires every queue item ID, its order, current/next IDs, and stream to stay
-unchanged, with the manual-region marker now at or beyond next. Only then can
-the request append. This bootstrap runs under the same mutation lock, recovers
-interrupted initialization, and is skipped once the manual region exists. A PMS
-response that does not confirm initialization stops the append with a saved
-synchronization error. No extra manual queueing step is normally needed. The
-marker change on an in-place move requires verification against the actual PMS
-version; automated tests model both confirmed and ineffective responses.
-If no upcoming item exists, the first appended Room item becomes locked immediately.
-
-## Persistence and acquisition
-
-The additive, idempotent migration adds `rooms`, `room_guests`, `room_entries`,
-`room_choices`, and `room_rate_limits`, with partial unique indexes enforcing
-one active Room per host and PMS queue. Existing databases migrate through the
-project's normal `init_db` runner; no separate migration command is needed.
-Existing Rooms tables also receive `next_item_id` and `up_next` columns through
-idempotent ALTER statements. These cache the observed boundary for display;
-mutations always resolve it again from live PMS playback.
-
-File locks shared across processes serialize each server/queue. SQLite
-transactions protect ordering and revisions, without holding database writes
-open during provider calls. Host edits use optimistic revision checks. Each
-duplicate request has its own entry ID and PMS queue item ID.
-
-Missing songs immediately reserve a logical queue position as Requested. The
-normal `recording_requests` service determines Requested/Queued/Downloading/
-Waiting for Plex/Ready states. **The host sponsors guest acquisition**, using
-the host's existing request history and notification semantics. The Room
-preserves the guest's requester name separately. Removing a Room entry never
-cancels shared acquisition.
-
-Production's existing background-worker runner reconciles active Rooms every
-five seconds. Local development needs `python -m backend.worker` alongside the
-web app, as for other background jobs. Playable songs are inserted in logical
-order after the live Up Next boundary; pending positions can fill later while
-they remain beyond that boundary. If a later materialized request reaches Up
-Next ahead of an earlier pending logical position, synchronization fails safely
-until playback advances or the host restarts the Room. It never inserts a late
-download ahead of an already locked item.
-Normal ticks observe PMS/local lifecycle state and avoid redundant queue writes.
-The acquisition bridge continues advancing requests during a PMS outage;
-playable copies wait for queue synchronization to recover.
-
-Manual **Retry synchronization** and the worker both call `rooms.reconcile`.
-They refresh the active PMS stream, reconsider all upcoming placeholders via
-the shared recording lifecycle, recover interrupted queue writes, and enforce
-the logical order after the current and immediate-next items. A newly inserted entry stays
-Waiting for Plex until a final PMS read confirms its queue item and position.
-The committed Room revision drives the existing SSE updates.
-
-The playback correction addresses two reproduced backend failures: matching
-every notification against the startup stream key left the old current/handoff
-state in use after a stream change; retaining a consumed handoff item ID allowed
-queue history to resurrect it as an anchor. Stream ownership/device matching is
-now refreshed before queue writes, and a consumed handoff is stored as an empty
-anchor. The dynamic Up Next correction adds the two display columns above. A changed PMS
-queue still requires ending the Room and starting another; it is never silently
-adopted or written using an older stream notification.
-
-The actual next item is the first complete PMS queue item immediately after the
-notification's current `playQueueItemID`. The current item's rating key must
-agree with the owned active stream. Host reorder/remove APIs enforce the boundary
-inside the same server/queue file lock used by worker reconciliation. Every PMS write
-reloads the full queue and live stream, checking both protected IDs, the stream
-key, the target, the move anchor, and the expected item sequence. Drift stops the
-pass with a persisted synchronization error. Invalid host attempts return 409;
-an inconsistent live/database boundary returns 502 without changing queue intent.
-
-After recovering append journals, the reconciler builds the expected suffix from
-active materialized Room entries by exact queue item ID. It removes every other
-item beyond Up Next, including foreign instances with the same recording or
-tracks interspersed between requests, then orders the Room instances. Unexpected
-current/next items and played history are preserved. A final read must confirm
-the entire suffix; an already correct queue receives no PMS mutations.
-
-Public snapshots expose allowlisted `upNext` track metadata and a per-entry
-`locked` flag. A matching Room entry is shown first with **Up Next · Locked**;
-all three controls are disabled, and the first unlocked entry cannot move above
-it. An unowned next song uses the existing track card. No PMS identifiers are
-exposed. The legacy `handoff` field remains only for startup compatibility.
-
-PMS and SQLite cannot share a transaction. Intent is committed first, removals
-use tombstones, and interrupted appends retain the pre-add queue IDs so retries
-can recover the exact new instance without duplicating it. Failures return an
-error and remain visible in room state. Ambiguous external edits fail closed
-and may require a host restart. The host can retry acquisition failures.
+| Schema and idempotent migration | `backend/room_storage.py` |
+| Shared queue synchronization and write journals | `backend/services/rooms.py` |
+| Owned stream discovery, notifications, PMS REST | `backend/services/plex_rooms.py` |
+| Permissions, guest capabilities, SSE and safe artwork | `backend/routes/rooms.py` |
+| Periodic acquisition/playback reconciliation | `backend/workers/rooms.py` |
+| Existing host/guest presentation | `frontend/src/rooms.ts` |
+| Regressions | `tests/test_rooms.py`, `frontend/tests/rooms.spec.ts` |
 
 ## HTTP routes
 
@@ -171,121 +143,85 @@ All routes are under `/api/rooms`; automation API keys grant no Room authority.
 | Method and path | Access / purpose |
 | --- | --- |
 | GET `/active` | Signed-in host's active Room |
-| POST `/api/rooms` (base path) | Signed-in host starts Room |
-| POST `/<code>/join` | Public, creates/reuses scoped guest identity |
-| GET `/<code>` | Host or joined guest, safe room state |
-| GET `/<code>/search?q=...` | Participant; reuses `/api/v1/search` track implementation |
-| POST `/<code>/entries` | Participant; body `{choiceId}` from that Room's search |
+| POST `/api/rooms` | Signed-in host starts Room |
+| POST `/<code>/join` | Public; creates/reuses scoped guest identity |
+| GET `/<code>` | Host or joined guest; safe state |
+| GET `/<code>/search?q=...` | Participant; existing track search |
+| POST `/<code>/entries` | Participant; opaque `{choiceId}` |
 | PUT `/<code>/order` | Host; `{entryIds, version}` for all upcoming entries |
 | DELETE `/<code>/entries/<entry_id>` | Host; `{version}` |
 | POST `/<code>/sync` | Host; retry saved intent/acquisition |
-| POST `/<code>/end` | Host; close Room without changing playback |
-| GET `/<code>/events` | Participant; SSE state updates and final closure |
-| GET `/<code>/artwork/<release-group-mbid>` | Participant; artwork for Room search/entries only |
+| POST `/<code>/end` | Host; close without changing playback |
+| GET `/<code>/events` | Participant; SSE updates and closure |
+| GET `/<code>/artwork/<release-group-mbid>` | Participant; scoped artwork |
 
-JSON mutation requests for join/entries/order/delete require
-`Content-Type: application/json` and `X-Room-Request: 1`. Host mutations require
-the existing `X-CSRF-Token`; guest additions require `X-Room-CSRF`, returned by
-join. The random guest capability is in an HttpOnly, SameSite=Lax cookie scoped
-to the Room API path. Production HTTPS installations should enable the existing
-`MELODARR_COOKIE_SECURE=true` setting.
+JSON join/entry/order/delete requests require `Content-Type: application/json`
+and `X-Room-Request: 1`. Host mutations require the existing `X-CSRF-Token`;
+guest additions require the `X-Room-CSRF` returned by join. The random guest
+capability is in an HttpOnly, SameSite=Lax cookie scoped to the Room API path.
+For HTTPS, enable the existing `MELODARR_COOKIE_SECURE=true` setting. Reverse
+proxies must preserve the public Host header or configure the Melodarr
+Application URL; Origin checks support upstream TLS termination. CORS is disabled.
 
-For reverse proxies, preserve the public Host header or configure the existing
-Melodarr Application URL setting. Origin checks support upstream TLS termination;
-the JSON/custom-header requirement and disabled CORS prevent browser cross-origin
-mutation requests.
+## Security and limits
 
-## Security and MVP limits
-
-- Codes contain ten cryptographically random characters (50 bits).
-  They are invite capabilities: anyone with a shared link can join that Room.
-  There is no public room listing. Lookup/join/search/mutation rates are limited.
-- Rate limits use durable SQLite counters for both peer IP and guest identity.
-  Forwarded IP headers are not trusted; guests behind one proxy/NAT share an
-  IP budget. Search permits 12 queries/person/minute and 25/IP/minute; requests
+- Codes contain ten cryptographically random characters (50 bits), with no public
+  listing. Anyone with the invite can join; lookup/join/search/mutations are limited.
+- Durable rate limits use peer IP and participant identity; forwarded IP headers
+  are not trusted. Search permits 12/person/minute and 25/IP/minute; requests
   permit 15/person/minute and 30/IP/minute. Join permits 10/IP/minute.
 - Guests receive allowlisted display data and opaque entry/search IDs. PMS
   credentials, device addresses, client/session/queue/item IDs, rating keys,
-  acquisition paths, automation keys and raw provider errors are never serialized.
-- Request bodies reject unknown fields. Choices and guest tokens are scoped
-  to one room. Guests cannot supply URLs, network addresses or Plex identifiers.
-  Server-only URLs use configured PMS settings and redirect rejection.
-- Cross-origin JSON mutations are rejected. Guest-only documents carry
-  `frame-ancestors 'none'`; Room responses use no-store and no-referrer.
-  SSE requires the same participant authorization as state reads and ends on
-  room closure. Guest credentials stop authorizing mutations after closure.
-- SSE uses bounded streams and at most six concurrent streams per process,
-  reserving Flask's remaining threads for ordinary requests. Extra browsers
-  retry with backoff. Reverse proxies must allow SSE and disable buffering.
-  Guest presence is reported as total guests joined, not live online presence.
-- QR codes, voting and guest reorder permissions are omitted. Upcoming Room
-  entries are capped at 200 and guests at 500. Queue reads must return the
-  complete PMS queue; very large/truncated queues are rejected.
-- A track transition can race a network command. The owned stream and complete
-  queue are checked immediately before each mutation, and boundary changes stop the
-  current reconciliation. Only room-requested upcoming items are reordered.
+  acquisition paths, automation keys, and raw provider errors are not serialized.
+- Bodies reject unknown fields; choices/tokens are scoped to one Room. Guests
+  cannot supply URLs, addresses, or Plex identifiers. Server URLs use configured
+  PMS settings and redirect rejection. Cross-origin JSON mutations are rejected.
+- Guest documents use `frame-ancestors 'none'`; Room responses use no-store and
+  no-referrer. SSE uses participant authorization, ends on closure, and allows
+  at most six bounded streams per process. Reverse proxies must disable buffering.
+- Guest presence counts guests joined, not online presence. Guest additions are
+  limited to 200 upcoming entries, guests to 500. Imported PMS items are retained;
+  host reorder validation uses the 10,000-item PMS queue window rather than the
+  guest request limit. Complete reads are required; truncated queues are rejected.
+- Playback can race a network command. Owned stream and complete queue are checked
+  before every mutation; changed protected boundaries stop the write. Voting, QR
+  codes, and guest reordering remain outside this iteration.
 
-## Validation results
+## Validation for this iteration
 
-- Full Python backend suite: **1,032 tests passed**, including **82 Rooms tests**.
-- Full Playwright browser suite: **194 tests passed**, including **10 Rooms tests**.
-- Frontend type checks (`pnpm run check`) and production build (`pnpm run build`)
-  passed.
-- Targeted Rooms backend suite: **82 tests passed**; the full browser suite includes
-  **10 Rooms tests**.
-- Ruff checks passed for all new Rooms Python modules and tests, plus the
-  repository-wide `E9,F63,F7,F82` checks. `git diff --check` passed.
-- Docker was unavailable in the development environment, so an image build
-  remains unverified. No dependency vulnerability scanner was run.
-- PMS and browser interactions were mocked in automated tests; real PMS and
-  remote/cellular Plexamp validation remains outstanding as listed below.
+| Check | Result |
+| --- | --- |
+| Targeted backend: `python -m unittest tests.test_rooms` | 98 passed |
+| Full backend: `python -m unittest discover -s tests -t . -v` | 1,048 passed |
+| Targeted browser: `pnpm run test:browser tests/rooms.spec.ts` | 13 passed |
+| Full browser: `pnpm run test:browser` | 197 passed |
+| Frontend: `pnpm run check`, `pnpm run build` | Passed |
+| Ruff on Rooms modules/tests; repository `E9,F63,F7,F82`; changed Python formatting | Passed |
+| `git diff --check` | Passed |
 
-Five focused pending-recording regression tests use the real indexed availability
-and recording lifecycle with mocked PMS transport. They cover manual retry from
-Waiting for Plex to Ready, insertion before an existing later song, saved queue
-item IDs, SSE updates, repeat reconciliation, independent duplicates, failures
-before/after append, and the worker's call to the same reconciliation helper.
-These tests pass with the current implementation; they do not establish the
-cause of a previously stuck entry on a separate running installation.
+Coverage replaces suffix-deletion expectations with adoption and adds 16 backend
+and three browser regressions for startup imports, external edits, duplicates,
+metadata, pending preservation, SSE/idempotence, write races, schema/journal
+upgrades, and host editing beyond the guest request limit. Existing acquisition,
+security, and concurrency regressions remain in the passing suites.
 
-Eight further regressions cover stream-key rotation past the handoff, permanent
-handoff consumption despite retained history, queue switching, stale recording
-notifications, failed/ineffective moves, and original-device/username ownership
-while refreshing paused or renewed streams. The initial three reproductions
-failed before the playback correction and pass afterward.
+## Real PMS/Plexamp acceptance checks
 
-The dynamic boundary correction adds 23 backend regressions covering API/service
-locks, legal future reordering, transition lock transfer, permanently consumed
-handoff IDs, foreign tails and interspersed duplicate recordings, idempotence,
-concurrent edit/reconcile, stale queue/stream/next observations, append boundary
-drift, missing/consumed manual queue regions, duplicate PMS IDs, and upgrades of
-an existing Rooms table. Six additional startup regressions and the revised two
-manual-region cases cover automatic initialization, consumed regions, exact
-order preservation, failure/retry, interrupted initialization, transition races,
-and concurrent first requests. The PMS fake models insertion at the manual-region
-end, even when that differs from the full queue tail. Three browser
-regressions cover locked host controls, legal reordering directly below Up Next,
-SSE lock transfer, and guest labels without queue controls.
+Backend tests mock PMS transport; browser tests use fixture snapshots. Before
+deployment, exercise live PMS with local and remote/cellular Plexamp:
 
-## Real Plex acceptance checks
-
-Unit tests mock PMS; browser tests use fixture state. Before deploying, validate
-with the configured PMS and a remote/cellular Plexamp client:
-
-1. Match different linked users and dynamically discovered devices; observe
-   notifications, including disconnect/reconnect and a track boundary at startup.
-2. Preserve current + next; verify later originals disappear and new songs are
-   adopted when Plexamp advances. Test append, late insertion, duplicate tracks,
-   reorder, and removal by queue item ID. Continue across several track/stream
-   transitions: the handoff must disappear and never reappear, Now Playing must
-   follow the live device, and queue management must follow its immediate next
-   item. Verify the new next Room row locks on each transition. Inject foreign
-   tracks at the tail and between future requests and confirm removal before
-   they reach Up Next; an unexpected next item must remain protected.
-3. Acquire a missing recording through Lidarr and Plex's existing scan/enrichment
-   lifecycle; confirm its reserved position fills after exact readiness.
-4. Interrupt PMS writes/connections and restart Melodarr; verify journal recovery,
-   safe error states, server/queue switching, and dynamic current/next protection.
-5. Verify SSE through the deployment's reverse proxy and HTTPS cookie settings.
-6. Exercise near-empty and exhausted queues; Room must warn and leave manual
-   playback/restart to the host. End Room while music continues.
+1. Start with A/B and A/B/C/D/E; confirm all IDs/order survive and B locks.
+2. Append single/batched songs, allow Autoplay, insert duplicates, remove only one
+   duplicate, reorder future items, and change Up Next in Plexamp. Confirm Rooms
+   converges without restorative PMS writes.
+3. Add/reorder/remove through Melodarr; verify PMS order, remote-client refresh
+   timing, and manual-region initialization on the deployed PMS version.
+4. Advance across stream keys, retain/prune history, pause/resume on the original
+   device, and disconnect/reconnect notifications. Switch queues/servers and
+   confirm safe errors. End a Room while music continues.
+5. Interrupt append/move/delete and restart Melodarr; verify recovery, protected
+   boundaries, and safe failure on ambiguous external changes during recovery.
+   Acquire a missing recording through Lidarr/Plex and verify late readiness and
+   the documented pending-order conflict.
+6. Verify SSE add/remove/reorder through the HTTPS proxy, scoped guest cookies,
+   near-empty warnings, and exhausted-player behavior.

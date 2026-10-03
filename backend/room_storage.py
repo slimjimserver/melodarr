@@ -15,7 +15,8 @@ def migrate(connection):
             now_playing TEXT NOT NULL DEFAULT '{}', handoff TEXT NOT NULL DEFAULT '{}',
             playback_state TEXT NOT NULL DEFAULT 'playing',
             warning INTEGER NOT NULL DEFAULT 0, sync_error TEXT,
-            dirty INTEGER NOT NULL DEFAULT 1, version INTEGER NOT NULL DEFAULT 1)""",
+            dirty INTEGER NOT NULL DEFAULT 1, write_pending INTEGER NOT NULL DEFAULT 0,
+            version INTEGER NOT NULL DEFAULT 1)""",
         "CREATE UNIQUE INDEX IF NOT EXISTS rooms_active_host ON rooms(host_user_id) WHERE status='active'",
         "CREATE UNIQUE INDEX IF NOT EXISTS rooms_active_queue ON rooms(server_id,queue_id) WHERE status='active'",
         """CREATE TABLE IF NOT EXISTS room_guests (
@@ -30,9 +31,9 @@ def migrate(connection):
         "CREATE INDEX IF NOT EXISTS room_choices_room ON room_choices(room_id,expires_at)",
         """CREATE TABLE IF NOT EXISTS room_entries (
             id TEXT PRIMARY KEY, room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
-            position INTEGER NOT NULL, recording_mbid TEXT NOT NULL,
-            title TEXT NOT NULL, artist TEXT NOT NULL, release_group_mbid TEXT,
-            requester TEXT NOT NULL, guest_id TEXT REFERENCES room_guests(id),
+            position INTEGER NOT NULL, recording_mbid TEXT,
+            title TEXT NOT NULL, artist TEXT NOT NULL, album TEXT NOT NULL DEFAULT '', release_group_mbid TEXT,
+            requester TEXT, guest_id TEXT REFERENCES room_guests(id),
             created_at REAL NOT NULL, state TEXT NOT NULL DEFAULT 'requested',
             playback TEXT NOT NULL DEFAULT 'upcoming' CHECK(playback IN ('upcoming','playing','played')),
             rating_key TEXT, queue_item_id TEXT, add_before TEXT,
@@ -50,3 +51,39 @@ def migrate(connection):
             connection.execute(
                 f"ALTER TABLE rooms ADD COLUMN {name} TEXT NOT NULL DEFAULT {default}"
             )
+    if "write_pending" not in columns:
+        connection.execute(
+            "ALTER TABLE rooms ADD COLUMN write_pending INTEGER NOT NULL DEFAULT 0"
+        )
+        # Old dirty Rooms with entries may contain interrupted host edits. Keep
+        # that saved intent separate from ordinary observation errors henceforth.
+        connection.execute(
+            "UPDATE rooms SET write_pending=1 WHERE dirty=1 AND EXISTS "
+            "(SELECT 1 FROM room_entries WHERE room_id=rooms.id)"
+        )
+    entry_columns = {
+        row[1]: row for row in connection.execute("PRAGMA table_info(room_entries)")
+    }
+    if entry_columns["recording_mbid"][3] or entry_columns["requester"][3]:
+        # SQLite cannot relax NOT NULL with ALTER COLUMN. Rebuild only this
+        # child table inside init_db's transaction, preserving every saved ID,
+        # acquisition, tombstone, and append journal. No table references it.
+        connection.execute("SAVEPOINT room_entries_materialized")
+        try:
+            connection.execute("ALTER TABLE room_entries RENAME TO room_entries_legacy")
+            connection.execute(statements[7])
+            names = ",".join(entry_columns)
+            connection.execute(
+                f"INSERT INTO room_entries ({names}) SELECT {names} FROM room_entries_legacy"
+            )
+            connection.execute("DROP TABLE room_entries_legacy")
+            connection.execute(statements[8])
+        except Exception:
+            connection.execute("ROLLBACK TO room_entries_materialized")
+            raise
+        finally:
+            connection.execute("RELEASE room_entries_materialized")
+    elif "album" not in entry_columns:
+        connection.execute(
+            "ALTER TABLE room_entries ADD COLUMN album TEXT NOT NULL DEFAULT ''"
+        )

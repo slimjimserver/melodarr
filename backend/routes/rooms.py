@@ -274,7 +274,7 @@ def reorder(code):
     order = payload.get("entryIds")
     if (
         not isinstance(order, list)
-        or len(order) > rooms.MAX_ENTRIES
+        or len(order) > plex_rooms.MAX_QUEUE_ITEMS
         or any(not isinstance(item, str) or len(item) > 40 for item in order)
     ):
         raise rooms.RoomError("Provide the upcoming Room entry IDs.")

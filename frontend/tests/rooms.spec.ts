@@ -43,7 +43,7 @@ test("host route shows startup instructions and actionable playback failure", as
   await expect(page.getByText(/No active Plexamp playback found/)).toBeVisible();
 });
 
-test("host preserves handoff, warns, and submits opaque reorder and removal IDs", async ({ page }) => {
+test("host shows Up Next, warns, and submits opaque reorder and removal IDs", async ({ page }) => {
   await host(page);
   await page.route("**/api/rooms/active", route => route.fulfill({ json: { room } }));
   await page.route("**/api/rooms/ABCDEFGHJK/order", async route => {
@@ -64,6 +64,75 @@ test("host preserves handoff, warns, and submits opaque reorder and removal IDs"
   await expect(page.locator(".room-queue li").first()).toContainText("Missing song");
   await page.getByRole("button", { name: "Remove Available song" }).click();
   await expect(page.locator(".room-queue li")).toHaveCount(1);
+});
+
+test("imported queue omits unknown requesters and keeps known guest attribution", async ({ page }) => {
+  await host(page);
+  const imported = { ...room, handoff: {}, upNext: { title: "Existing next", artist: "Artist" }, queue: [
+    { id: "plex-next", title: "Existing next", artist: "Artist", requester: null, state: "ready", locked: true },
+    { id: "plex-future", title: "Existing future", artist: "Artist", state: "ready" },
+    room.queue[0],
+  ] };
+  await events(page, imported);
+  await page.route("**/api/rooms/active", route => route.fulfill({ json: { room: imported } }));
+  await page.goto("/rooms");
+  const rows = page.locator(".room-queue li");
+  await expect(rows).toHaveCount(3);
+  await expect(rows.first()).toContainText("Up Next · Locked");
+  await expect(rows.first()).not.toContainText("Requested by");
+  await expect(rows.nth(1)).not.toContainText("Requested by");
+  await expect(rows.last()).toContainText("Requested by Guest #1");
+  await expect(page.getByRole("button", { name: "Remove Existing next" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Remove Existing future" })).toBeEnabled();
+  await expect(page.locator("#room-root")).not.toContainText(/Added by|Autoplay|Host-added|undefined|null/);
+});
+
+test("external SSE additions removals and reorders update queue and locked controls", async ({ page }) => {
+  await page.addInitScript(() => {
+    const Original = window.EventSource;
+    window.EventSource = class extends Original {
+      constructor(url: string | URL, options?: EventSourceInit) {
+        super(url, options);
+        (window as Window & { roomSource?: EventSource }).roomSource = this;
+      }
+    };
+  });
+  await host(page);
+  const initial = { ...room, handoff: {}, upNext: room.queue[0], queue: room.queue.map((entry, index) => ({ ...entry, locked: index === 0 })) };
+  await events(page, initial);
+  await page.route("**/api/rooms/active", route => route.fulfill({ json: { room: initial } }));
+  await page.goto("/rooms");
+  await expect(page.locator(".room-queue li")).toHaveCount(2);
+  const external = { id: "external", title: "New Plex song", artist: "Artist", requester: null, state: "ready", locked: false };
+  await page.evaluate(state => (window as Window & { roomSource?: EventSource }).roomSource?.dispatchEvent(
+    new MessageEvent("room", { data: JSON.stringify(state) }),
+  ), { ...initial, version: 4, queue: [...initial.queue, external] });
+  await expect(page.locator(".room-queue li").last()).toContainText("New Plex song");
+  await expect(page.locator(".room-queue li").last()).not.toContainText("Requested by");
+  await page.evaluate(state => (window as Window & { roomSource?: EventSource }).roomSource?.dispatchEvent(
+    new MessageEvent("room", { data: JSON.stringify(state) }),
+  ), { ...initial, version: 5, upNext: external, queue: [{ ...external, locked: true }, { ...initial.queue[0], locked: false }] });
+  await expect(page.locator(".room-queue li")).toHaveCount(2);
+  await expect(page.locator(".room-queue li").first()).toContainText("New Plex song");
+  await expect(page.locator(".room-queue li").first()).toContainText("Up Next · Locked");
+  await expect(page.getByText("Missing song", { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Remove New Plex song" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Remove Available song" })).toBeEnabled();
+});
+
+test("guest sees externally synchronized entries with optional requester and no controls", async ({ page }) => {
+  const synchronized = { ...room, handoff: {}, upNext: { title: "Plex next", artist: "Artist" }, queue: [
+    { id: "plex-next", title: "Plex next", artist: "Artist", state: "ready", locked: true },
+    { id: "plex-tail", title: "Plex tail", artist: "Artist", requester: null, state: "ready" },
+  ] };
+  await events(page, synchronized);
+  await page.route("**/api/rooms/ABCDEFGHJK/join", route => route.fulfill({ json: { room: synchronized, guest: { name: "Guest #1", csrfToken: "guest-csrf" } } }));
+  await page.goto("/rooms/ABCDEFGHJK");
+  await page.getByRole("button", { name: "Join Room" }).click();
+  await expect(page.locator(".room-queue li")).toHaveCount(2);
+  await expect(page.locator(".room-queue li").first()).toContainText("Up Next · Locked");
+  await expect(page.locator(".room-queue")).not.toContainText("Requested by");
+  await expect(page.getByRole("button", { name: /Remove|Move/ })).toHaveCount(0);
 });
 
 for (const width of [320, 390]) {

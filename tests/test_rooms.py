@@ -52,7 +52,7 @@ class FakePMS:
     server_id = "server"
 
     def __init__(self):
-        self.items = [item(i) for i in range(101, 105)]
+        self.items = [item(i) for i in range(101, 103)]
         self.current = "101"
         self.session_key = "9117"
         self.calls = []
@@ -210,6 +210,13 @@ class RoomTests(DatabaseTestCase):
             else [],
         }
 
+    def request_queue(self, state):
+        """Acquisition regressions assert the requested subset of the shared queue."""
+        return [entry for entry in state["queue"] if entry["requester"]]
+
+    def request_entries(self, room_id):
+        return [row for row in rooms.entries(room_id) if row["recording_mbid"]]
+
     def post(self, path, payload=None, client=None, headers=None):
         return (client or self.client).post(
             path,
@@ -261,6 +268,23 @@ class RoomTests(DatabaseTestCase):
         )
 
     def edit(self, room, path, payload, method="PUT"):
+        # The imported startup next is now a logical entry too. Requests-only
+        # reorder tests include that immutable prefix in the API's full order.
+        if "entryIds" in payload:
+            locked = [
+                entry["id"]
+                for entry in rooms.snapshot(room["code"])["queue"]
+                if entry["locked"] and not entry["requester"]
+            ]
+            payload = {
+                **payload,
+                "entryIds": [
+                    identity
+                    for identity in locked
+                    if identity not in payload["entryIds"]
+                ]
+                + payload["entryIds"],
+            }
         return self.client.open(
             f"/api/rooms/{room['code']}/{path}",
             method=method,
@@ -279,14 +303,34 @@ class RoomTests(DatabaseTestCase):
         self.assertIn("Start playback", response.get_json()["error"])
         self.assertIsNone(rooms.host_room(self.user["id"]))
 
-    def test_takeover_preserves_current_and_handoff(self):
+    def test_start_imports_entire_queue_and_locks_immediate_next(self):
+        self.pms.items = [item(i) for i in range(101, 106)]
+        original = deepcopy(self.pms.items)
         room = self.start()
-        self.assertEqual([i["playQueueItemID"] for i in self.pms.items], ["101", "102"])
+        self.assertEqual(self.pms.items, original)
+        self.assertEqual(self.pms.calls, [])
         self.assertEqual(room["nowPlaying"]["title"], "Song 101")
-        self.assertEqual(room["handoff"]["title"], "Song 102")
+        self.assertEqual(room["upNext"]["title"], "Song 102")
         self.assertEqual(
-            self.pms.calls, [("remove", "82606", "103"), ("remove", "82606", "104")]
+            [entry["title"] for entry in room["queue"]],
+            [f"Song {i}" for i in range(102, 106)],
         )
+        self.assertEqual(
+            [entry["locked"] for entry in room["queue"]], [True, False, False, False]
+        )
+        rows = rooms.entries(rooms.room_by_code(room["code"])["id"])
+        self.assertEqual(
+            [row["queue_item_id"] for row in rows], [str(i) for i in range(102, 106)]
+        )
+        self.assertTrue(
+            all(
+                row["state"] == "ready"
+                and row["recording_mbid"] is None
+                and row["requester"] is None
+                for row in rows
+            )
+        )
+        self.acquire.assert_not_called()
 
     def test_no_next_track_prevents_takeover(self):
         self.pms.items = [item(101)]
@@ -304,16 +348,18 @@ class RoomTests(DatabaseTestCase):
     def test_ready_materializes_and_duplicates_stay_distinct(self):
         room = self.add(self.start())
         room = self.add(room)
-        rows = rooms.entries(rooms.room_by_code(room["code"])["id"])
+        rows = self.request_entries(rooms.room_by_code(room["code"])["id"])
         self.assertEqual(len({r["id"] for r in rows}), 2)
         self.assertEqual(len({r["queue_item_id"] for r in rows}), 2)
         self.assertEqual({r["rating_key"] for r in rows}, {"500"})
-        self.assertEqual([r["state"] for r in room["queue"]], ["ready", "ready"])
+        self.assertEqual(
+            [r["state"] for r in self.request_queue(room)], ["ready", "ready"]
+        )
         self.acquire.assert_not_called()
 
     def test_reorder_duplicates_uses_queue_item_ids(self):
         room = self.add(self.add(self.start()))
-        rows = rooms.entries(rooms.room_by_code(room["code"])["id"])
+        rows = self.request_entries(rooms.room_by_code(room["code"])["id"])
         response = self.edit(
             room,
             "order",
@@ -324,23 +370,23 @@ class RoomTests(DatabaseTestCase):
             ("move", "82606", rows[1]["queue_item_id"], "102"), self.pms.calls
         )
         self.assertEqual(
-            [r["id"] for r in response.get_json()["room"]["queue"]],
+            [r["id"] for r in self.request_queue(response.get_json()["room"])],
             [r["id"] for r in reversed(rows)],
         )
 
     def test_remove_materialized_and_pending_does_not_cancel_acquisition(self):
         room = self.add(self.start())
-        identity = room["queue"][0]["id"]
+        identity = self.request_queue(room)[0]["id"]
         response = self.edit(
             room, f"entries/{identity}", {"version": room["version"]}, "DELETE"
         )
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.get_json()["room"]["queue"], [])
+        self.assertEqual(self.request_queue(response.get_json()["room"]), [])
         self.assertEqual(len(self.pms.items), 2)
         room = self.add(response.get_json()["room"], OTHER)
         response = self.edit(
             room,
-            f"entries/{room['queue'][0]['id']}",
+            f"entries/{self.request_queue(room)[0]['id']}",
             {"version": room["version"]},
             "DELETE",
         )
@@ -349,7 +395,7 @@ class RoomTests(DatabaseTestCase):
 
     def test_missing_placeholder_and_existing_acquisition_bridge(self):
         room = self.add(self.start(), OTHER)
-        self.assertEqual(room["queue"][0]["state"], "requested")
+        self.assertEqual(self.request_queue(room)[0]["state"], "requested")
         self.acquire.assert_not_called()
         self.states[OTHER] = self.lifecycle("queued", "501")
 
@@ -363,17 +409,21 @@ class RoomTests(DatabaseTestCase):
         self.acquire.side_effect = acquire
         worker.tick()
         self.acquire.assert_called_once()
-        self.assertEqual(rooms.snapshot(room["code"])["queue"][0]["state"], "queued")
+        self.assertEqual(
+            self.request_queue(rooms.snapshot(room["code"]))[0]["state"], "queued"
+        )
         self.states[OTHER] = self.lifecycle("downloading", "501")
         worker.tick()
         self.assertEqual(
-            rooms.snapshot(room["code"])["queue"][0]["state"], "downloading"
+            self.request_queue(rooms.snapshot(room["code"]))[0]["state"], "downloading"
         )
         self.states[OTHER] = self.lifecycle("waiting_for_plex", "501")
         worker.tick()
         self.states[OTHER] = self.lifecycle("ready", "501")
         worker.tick()
-        self.assertEqual(rooms.snapshot(room["code"])["queue"][0]["state"], "ready")
+        self.assertEqual(
+            self.request_queue(rooms.snapshot(room["code"]))[0]["state"], "ready"
+        )
         self.assertEqual(self.pms.items[-1]["ratingKey"], "501")
 
     def test_pending_position_materializes_before_later_ready_track(self):
@@ -435,7 +485,7 @@ class RoomTests(DatabaseTestCase):
             room = self.add(room, MISSING_RECORDING)
         room = self.add(room)
         self.assertEqual(
-            [entry["state"] for entry in room["queue"]],
+            [entry["state"] for entry in self.request_queue(room)],
             ["waiting_for_plex"] * copies + ["ready"],
         )
         availability = self.client.get(
@@ -443,7 +493,7 @@ class RoomTests(DatabaseTestCase):
         ).get_json()
         self.assertFalse(availability["available"])
         self.assertEqual(availability["tracks"], [])
-        rows = rooms.entries(rooms.room_by_code(room["code"])["id"])
+        rows = self.request_entries(rooms.room_by_code(room["code"])["id"])
         for row in rows[:copies]:
             self.assertEqual(row["recording_mbid"], MISSING_RECORDING)
             self.assertIsNone(row["queue_item_id"])
@@ -475,17 +525,19 @@ class RoomTests(DatabaseTestCase):
         self.addCleanup(response.close)
         iterator = iter(response.response)
         initial = json.loads(next(iterator).decode().split("data: ", 1)[1])
-        self.assertEqual(initial["queue"][0]["state"], "waiting_for_plex")
+        self.assertEqual(self.request_queue(initial)[0]["state"], "waiting_for_plex")
         self.index_pending_recording()
         retry = self.post(f"/api/rooms/{room['code']}/sync")
         self.assertEqual(retry.status_code, 200, retry.get_json())
         state = retry.get_json()["room"]
-        self.assertEqual([entry["state"] for entry in state["queue"]], ["ready"] * 2)
         self.assertEqual(
-            [entry["id"] for entry in state["queue"]],
-            [entry["id"] for entry in initial["queue"]],
+            [entry["state"] for entry in self.request_queue(state)], ["ready"] * 2
         )
-        rows = rooms.entries(rooms.room_by_code(room["code"])["id"])
+        self.assertEqual(
+            [entry["id"] for entry in self.request_queue(state)],
+            [entry["id"] for entry in self.request_queue(initial)],
+        )
+        rows = self.request_entries(rooms.room_by_code(room["code"])["id"])
         self.assertEqual(rows[0]["rating_key"], "270814")
         self.assertIsNotNone(rows[0]["queue_item_id"])
         self.assertIsNone(rows[0]["add_before"])
@@ -501,7 +553,7 @@ class RoomTests(DatabaseTestCase):
             self.assertEqual(next(iterator), b": heartbeat\n\n")
             update = json.loads(next(iterator).decode().split("data: ", 1)[1])
         self.assertGreater(update["version"], initial["version"])
-        self.assertEqual(update["queue"], state["queue"])
+        self.assertEqual(self.request_queue(update), self.request_queue(state))
         calls = deepcopy(self.pms.calls)
         retry = self.post(f"/api/rooms/{room['code']}/sync")
         self.assertEqual(retry.status_code, 200, retry.get_json())
@@ -511,13 +563,16 @@ class RoomTests(DatabaseTestCase):
         room = self.pending_indexed_recording_room()
         worker.tick()
         self.assertEqual(
-            rooms.snapshot(room["code"])["queue"][0]["state"], "waiting_for_plex"
+            self.request_queue(rooms.snapshot(room["code"]))[0]["state"],
+            "waiting_for_plex",
         )
         self.index_pending_recording()
         with patch.object(rooms, "reconcile", wraps=rooms.reconcile) as reconcile:
             worker.tick()
         reconcile.assert_called_once_with(room["code"], initiate=True)
-        self.assertEqual(rooms.snapshot(room["code"])["queue"][0]["state"], "ready")
+        self.assertEqual(
+            self.request_queue(rooms.snapshot(room["code"]))[0]["state"], "ready"
+        )
         self.assertEqual(
             [track["ratingKey"] for track in self.pms.items],
             ["101", "102", "270814", "500"],
@@ -531,7 +586,7 @@ class RoomTests(DatabaseTestCase):
         self.index_pending_recording()
         retry = self.post(f"/api/rooms/{room['code']}/sync")
         self.assertEqual(retry.status_code, 200, retry.get_json())
-        rows = rooms.entries(rooms.room_by_code(room["code"])["id"])
+        rows = self.request_entries(rooms.room_by_code(room["code"])["id"])
         self.assertEqual(len({row["id"] for row in rows}), 3)
         self.assertEqual(len({row["queue_item_id"] for row in rows}), 3)
         self.assertEqual([row["state"] for row in rows], ["ready"] * 3)
@@ -556,7 +611,7 @@ class RoomTests(DatabaseTestCase):
         self.pms.fail = "add"
         retry = self.post(f"/api/rooms/{room['code']}/sync")
         self.assertEqual(retry.status_code, 502)
-        row = rooms.entries(rooms.room_by_code(room["code"])["id"])[0]
+        row = self.request_entries(rooms.room_by_code(room["code"])["id"])[0]
         self.assertEqual(row["state"], "waiting_for_plex")
         self.assertIsNone(row["queue_item_id"])
         self.assertTrue(row["add_before"])
@@ -564,7 +619,9 @@ class RoomTests(DatabaseTestCase):
         self.pms.fail = None
         retry = self.post(f"/api/rooms/{room['code']}/sync")
         self.assertEqual(retry.status_code, 200, retry.get_json())
-        self.assertEqual(retry.get_json()["room"]["queue"][0]["state"], "ready")
+        self.assertEqual(
+            self.request_queue(retry.get_json()["room"])[0]["state"], "ready"
+        )
         self.assertEqual(
             [track["ratingKey"] for track in self.pms.items],
             ["101", "102", "270814", "500"],
@@ -578,12 +635,12 @@ class RoomTests(DatabaseTestCase):
         self.pms.fail = "after-add"
         retry = self.post(f"/api/rooms/{room['code']}/sync")
         self.assertEqual(retry.status_code, 502)
-        row = rooms.entries(rooms.room_by_code(room["code"])["id"])[0]
+        row = self.request_entries(rooms.room_by_code(room["code"])["id"])[0]
         self.assertEqual(row["state"], "waiting_for_plex")
         self.assertIsNone(row["queue_item_id"])
         retry = self.post(f"/api/rooms/{room['code']}/sync")
         self.assertEqual(retry.status_code, 200, retry.get_json())
-        rows = rooms.entries(rooms.room_by_code(room["code"])["id"])
+        rows = self.request_entries(rooms.room_by_code(room["code"])["id"])
         self.assertEqual(rows[0]["state"], "ready")
         self.assertEqual(
             [track["playQueueItemID"] for track in self.pms.items[2:]],
@@ -800,7 +857,7 @@ class RoomTests(DatabaseTestCase):
         self.assertFalse(any(thread.is_alive() for thread in threads))
         self.assertEqual(errors, [])
         self.assertEqual([r.status_code for r in responses], [201, 201])
-        rows = rooms.entries(rooms.room_by_code(room["code"])["id"])
+        rows = self.request_entries(rooms.room_by_code(room["code"])["id"])
         self.assertEqual([r["position"] for r in rows], [1, 2])
         self.assertEqual(
             [i["playQueueItemID"] for i in self.pms.items[2:]],
@@ -816,8 +873,8 @@ class RoomTests(DatabaseTestCase):
         self.assertEqual(response.status_code, 502)
         state = rooms.snapshot(room["code"])
         self.assertTrue(state["syncError"])
-        self.assertEqual(len(state["queue"]), 1)
-        self.assertEqual(state["queue"][0]["state"], "waiting_for_plex")
+        self.assertEqual(len(self.request_queue(state)), 1)
+        self.assertEqual(self.request_queue(state)[0]["state"], "waiting_for_plex")
         worker.tick()
         self.assertIsNone(rooms.snapshot(room["code"])["syncError"])
         self.assertEqual(len([c for c in self.pms.calls if c[0] == "add"]), 1)
@@ -826,13 +883,13 @@ class RoomTests(DatabaseTestCase):
     def test_failed_remove_and_reorder_keep_intent_for_reconciliation(self):
         room = self.add(self.add(self.start()))
         self.pms.fail = "move"
-        order = [r["id"] for r in reversed(room["queue"])]
+        order = [r["id"] for r in reversed(self.request_queue(room))]
         response = self.edit(
             room, "order", {"entryIds": order, "version": room["version"]}
         )
         self.assertEqual(response.status_code, 502)
         self.assertEqual(
-            [r["id"] for r in rooms.snapshot(room["code"])["queue"]], order
+            [r["id"] for r in self.request_queue(rooms.snapshot(room["code"]))], order
         )
         self.pms.fail = None
         room = rooms.reconcile(room["code"])
@@ -852,12 +909,12 @@ class RoomTests(DatabaseTestCase):
         self.pms.current = self.pms.items[2]["playQueueItemID"]
         worker.tick()
         state = rooms.snapshot(room["code"])
-        self.assertEqual(len(state["queue"]), 1)
+        self.assertEqual(len(self.request_queue(state)), 1)
         self.assertEqual(state["handoff"], {})
         self.assertEqual(
             self.edit(
                 state,
-                f"entries/{room['queue'][0]['id']}",
+                f"entries/{self.request_queue(room)[0]['id']}",
                 {"version": state["version"]},
                 "DELETE",
             ).status_code,
@@ -867,7 +924,7 @@ class RoomTests(DatabaseTestCase):
     def test_rotated_stream_session_clears_handoff_and_materializes_after_current(self):
         room = self.add(self.start(), OTHER)
         room = self.add(room)
-        ready_id = rooms.entries(rooms.room_by_code(room["code"])["id"])[1][
+        ready_id = self.request_entries(rooms.room_by_code(room["code"])["id"])[1][
             "queue_item_id"
         ]
         original_event = {
@@ -893,8 +950,8 @@ class RoomTests(DatabaseTestCase):
         state = response.get_json()["room"]
         self.assertEqual(state["handoff"], {})
         self.assertEqual(state["nowPlaying"]["title"], f"Song {ready_id}")
-        self.assertEqual(len(state["queue"]), 1)
-        rows = rooms.entries(rooms.room_by_code(room["code"])["id"])
+        self.assertEqual(len(self.request_queue(state)), 1)
+        rows = self.request_entries(rooms.room_by_code(room["code"])["id"])
         self.assertEqual(rows[1]["playback"], "playing")
         self.assertEqual(rows[0]["state"], "ready")
         self.assertEqual(
@@ -915,7 +972,7 @@ class RoomTests(DatabaseTestCase):
         self.pms.current = "102"
         worker.tick()
         self.assertEqual(rooms.snapshot(room["code"])["handoff"], {})
-        ready_id = rooms.entries(rooms.room_by_code(room["code"])["id"])[0][
+        ready_id = self.request_entries(rooms.room_by_code(room["code"])["id"])[0][
             "queue_item_id"
         ]
         self.pms.current = ready_id
@@ -929,7 +986,7 @@ class RoomTests(DatabaseTestCase):
         worker.tick()
         self.assertEqual(rooms.snapshot(room["code"])["handoff"], {})
         room = self.add(rooms.snapshot(room["code"]))
-        rows = rooms.entries(rooms.room_by_code(room["code"])["id"])
+        rows = self.request_entries(rooms.room_by_code(room["code"])["id"])
         self.assertEqual(
             [track["playQueueItemID"] for track in self.pms.items],
             ["101", ready_id, "102", rows[1]["queue_item_id"]],
@@ -943,14 +1000,15 @@ class RoomTests(DatabaseTestCase):
         self.pms.current = "102"
         room = rooms.reconcile(room["code"])
         self.pms.calls.clear()
-        return room, rooms.entries(rooms.room_by_code(room["code"])["id"])
+        return room, self.request_entries(rooms.room_by_code(room["code"])["id"])
 
     def test_live_current_next_and_three_future_entries(self):
         room, rows = self.protected_queue()
         self.assertEqual(room["nowPlaying"]["title"], "Song 102")
         self.assertEqual(room["upNext"]["title"], f"Song {rows[0]['queue_item_id']}")
         self.assertEqual(
-            [row["locked"] for row in room["queue"]], [True, False, False, False]
+            [row["locked"] for row in self.request_queue(room)],
+            [True, False, False, False],
         )
         self.assertEqual(room["handoff"], {})
 
@@ -964,7 +1022,7 @@ class RoomTests(DatabaseTestCase):
         self.assertIn("Up Next is locked", response.get_json()["error"])
         self.assertEqual(self.pms.calls, [])
         self.assertEqual(
-            [r["id"] for r in rooms.snapshot(room["code"])["queue"]],
+            [r["id"] for r in self.request_queue(rooms.snapshot(room["code"]))],
             [r["id"] for r in rows],
         )
 
@@ -976,7 +1034,7 @@ class RoomTests(DatabaseTestCase):
         self.assertEqual(response.status_code, 409)
         self.assertEqual(self.pms.calls, [])
         self.assertFalse(
-            rooms.entries(rooms.room_by_code(room["code"])["id"])[0]["removed"]
+            self.request_entries(rooms.room_by_code(room["code"])["id"])[0]["removed"]
         )
 
     def test_service_cannot_move_future_entry_ahead_of_next(self):
@@ -997,7 +1055,7 @@ class RoomTests(DatabaseTestCase):
         state = rooms.edit(
             room["code"], self.user["id"], order=order, version=room["version"]
         )
-        self.assertEqual([r["id"] for r in state["queue"]], order)
+        self.assertEqual([r["id"] for r in self.request_queue(state)], order)
         self.assertEqual(
             [i["playQueueItemID"] for i in self.pms.items][2:],
             [rows[n]["queue_item_id"] for n in (0, 3, 1, 2)],
@@ -1016,11 +1074,13 @@ class RoomTests(DatabaseTestCase):
         )
         self.assertEqual(response.status_code, 409)
         state = rooms.snapshot(room["code"])
-        self.assertEqual(state["queue"][0]["id"], rows[1]["id"])
-        self.assertTrue(state["queue"][0]["locked"])
+        self.assertEqual(self.request_queue(state)[0]["id"], rows[1]["id"])
+        self.assertTrue(self.request_queue(state)[0]["locked"])
         self.assertEqual(self.pms.calls, [])
 
-    def test_consumed_handoff_in_foreign_suffix_has_no_special_protection(self):
+    def test_consumed_handoff_repositioned_in_future_is_adopted_without_special_protection(
+        self,
+    ):
         room, rows = self.protected_queue()
         self.pms.current = rows[0]["queue_item_id"]
         handoff = next(i for i in self.pms.items if i["playQueueItemID"] == "102")
@@ -1028,39 +1088,52 @@ class RoomTests(DatabaseTestCase):
         self.pms.items.append(handoff)
         state = rooms.reconcile(room["code"])
         self.assertEqual(state["handoff"], {})
-        self.assertNotIn("102", [i["playQueueItemID"] for i in self.pms.items])
-        self.assertEqual(self.pms.calls, [("remove", "82606", "102")])
+        self.assertEqual(state["queue"][-1]["title"], "Song 102")
+        self.assertFalse(state["queue"][-1]["locked"])
+        self.assertEqual(self.pms.calls, [])
 
-    def test_foreign_pms_tail_is_removed(self):
+    def test_external_tail_and_autoplay_style_batch_are_adopted_in_order(self):
         room, _rows = self.protected_queue()
-        self.pms.items.extend([item(900), item(901)])
-        rooms.reconcile(room["code"])
+        self.pms.items.extend([item(900), item(901), item(902)])
+        state = rooms.reconcile(room["code"])
         self.assertEqual(
-            self.pms.calls, [("remove", "82606", "900"), ("remove", "82606", "901")]
+            [entry["title"] for entry in state["queue"]][-3:],
+            ["Song 900", "Song 901", "Song 902"],
+        )
+        self.assertEqual(self.pms.calls, [])
+        rows = rooms.entries(rooms.room_by_code(room["code"])["id"])
+        self.assertEqual(
+            [row["queue_item_id"] for row in rows][-3:], ["900", "901", "902"]
         )
 
-    def test_interspersed_foreign_track_with_same_rating_is_removed_by_instance(self):
+    def test_interspersed_external_duplicate_is_adopted_by_instance(self):
         room, rows = self.protected_queue()
         self.pms.items.insert(4, item(900, "500"))
-        rooms.reconcile(room["code"])
-        self.assertEqual(self.pms.calls, [("remove", "82606", "900")])
-        self.assertEqual(
-            [i["playQueueItemID"] for i in self.pms.items][2:],
-            [r["queue_item_id"] for r in rows],
-        )
+        state = rooms.reconcile(room["code"])
+        self.assertEqual(self.pms.calls, [])
+        expected = [
+            rows[0]["queue_item_id"],
+            rows[1]["queue_item_id"],
+            "900",
+            rows[2]["queue_item_id"],
+            rows[3]["queue_item_id"],
+        ]
+        active = rooms._active_entries(rooms.room_by_code(room["code"]))
+        self.assertEqual([row["queue_item_id"] for row in active], expected)
+        self.assertEqual(len({row["id"] for row in active}), 5)
+        self.assertEqual([entry["title"] for entry in state["queue"]][2], "Song 900")
 
-    def test_unexpected_next_and_current_are_preserved_while_suffix_is_owned(self):
-        room, rows = self.protected_queue()
+    def test_external_new_next_and_interspersed_song_are_adopted(self):
+        room, _rows = self.protected_queue()
         self.pms.items.insert(2, item(900))
         self.pms.items.insert(4, item(901))
+        original = deepcopy(self.pms.items)
         state = rooms.reconcile(room["code"])
         self.assertEqual(state["upNext"]["title"], "Song 900")
-        self.assertFalse(any(r["locked"] for r in state["queue"]))
-        self.assertEqual(
-            [i["playQueueItemID"] for i in self.pms.items],
-            ["101", "102", "900", *[r["queue_item_id"] for r in rows]],
-        )
-        self.assertEqual(self.pms.calls, [("remove", "82606", "901")])
+        self.assertEqual(state["queue"][0]["title"], "Song 900")
+        self.assertTrue(state["queue"][0]["locked"])
+        self.assertEqual(self.pms.items, original)
+        self.assertEqual(self.pms.calls, [])
 
     def test_correct_protected_queue_is_idempotent(self):
         room, _rows = self.protected_queue()
@@ -1083,7 +1156,8 @@ class RoomTests(DatabaseTestCase):
             self.pms.calls, [("remove", "82606", rows[2]["queue_item_id"])]
         )
         self.assertEqual(
-            [r["id"] for r in state["queue"]], [rows[n]["id"] for n in (0, 1, 3)]
+            [r["id"] for r in self.request_queue(state)],
+            [rows[n]["id"] for n in (0, 1, 3)],
         )
 
     def test_concurrent_edit_and_reconcile_share_protected_boundary(self):
@@ -1114,23 +1188,22 @@ class RoomTests(DatabaseTestCase):
             self.assertFalse(thread.is_alive())
         self.assertEqual(errors, [])
         self.assertEqual(
-            [r["id"] for r in rooms.snapshot(room["code"])["queue"]], order
+            [r["id"] for r in self.request_queue(rooms.snapshot(room["code"]))], order
         )
         self.assertEqual(
             self.pms.calls,
             [("move", "82606", rows[3]["queue_item_id"], rows[0]["queue_item_id"])],
         )
 
-    def test_next_drift_with_same_stream_stops_before_destructive_write(self):
-        room, _rows = self.protected_queue()
-        self.pms.items.append(item(900))
+    def test_next_drift_with_same_stream_stops_before_host_write(self):
+        room, rows = self.protected_queue()
         original_load = self.pms.load
         calls = 0
 
         def load(queue):
             nonlocal calls
             calls += 1
-            if calls == 2:
+            if calls == 3:
                 self.pms.items[2], self.pms.items[3] = (
                     self.pms.items[3],
                     self.pms.items[2],
@@ -1138,19 +1211,27 @@ class RoomTests(DatabaseTestCase):
             return original_load(queue)
 
         with patch.object(self.pms, "load", side_effect=load):
-            response = self.post(f"/api/rooms/{room['code']}/sync")
+            response = self.edit(
+                room,
+                "order",
+                {
+                    "entryIds": [rows[n]["id"] for n in (0, 3, 1, 2)],
+                    "version": room["version"],
+                },
+            )
         self.assertEqual(response.status_code, 502)
         self.assertIn("Up Next changed", rooms.snapshot(room["code"])["syncError"])
         self.assertEqual(self.pms.calls, [])
 
-    def test_logical_order_disagreement_fails_without_moving_locked_entry(self):
+    def test_external_reorder_adopts_new_up_next_without_writes(self):
         room, rows = self.protected_queue()
         self.pms.items[2], self.pms.items[3] = self.pms.items[3], self.pms.items[2]
-        response = self.post(f"/api/rooms/{room['code']}/sync")
-        self.assertEqual(response.status_code, 502)
-        state = rooms.snapshot(room["code"])
-        self.assertIn("disagrees with live Up Next", state["syncError"])
-        self.assertEqual(state["queue"][0]["id"], rows[1]["id"])
+        state = rooms.reconcile(room["code"])
+        self.assertIsNone(state["syncError"])
+        self.assertEqual(
+            [entry["id"] for entry in state["queue"]],
+            [rows[n]["id"] for n in (1, 0, 2, 3)],
+        )
         self.assertTrue(state["queue"][0]["locked"])
         self.assertEqual(self.pms.calls, [])
 
@@ -1190,23 +1271,29 @@ class RoomTests(DatabaseTestCase):
             )
         self.assertEqual(self.pms.calls, [])
 
-    def test_stream_transition_during_cleanup_stops_before_write(self):
+    def test_stream_transition_during_host_move_stops_before_write(self):
         room, rows = self.protected_queue()
-        self.pms.items.append(item(900))
         load = self.pms.load
         calls = 0
 
         def advance(queue):
             nonlocal calls
             calls += 1
-            if calls == 2:
+            if calls == 3:
                 self.pms.current = rows[0]["queue_item_id"]
                 self.pms.session_key = "9120"
                 self.event["sessionKey"] = "9120"
             return load(queue)
 
         with patch.object(self.pms, "load", side_effect=advance):
-            response = self.post(f"/api/rooms/{room['code']}/sync")
+            response = self.edit(
+                room,
+                "order",
+                {
+                    "entryIds": [rows[n]["id"] for n in (0, 3, 1, 2)],
+                    "version": room["version"],
+                },
+            )
         self.assertEqual(response.status_code, 502)
         self.assertTrue(rooms.snapshot(room["code"])["syncError"])
         self.assertEqual(self.pms.calls, [])
@@ -1226,7 +1313,7 @@ class RoomTests(DatabaseTestCase):
         self.assertEqual(response.status_code, 502)
         state = rooms.snapshot(room["code"])
         self.assertIn("Up Next changed", state["syncError"])
-        self.assertEqual(state["queue"][0]["state"], "waiting_for_plex")
+        self.assertEqual(self.request_queue(state)[0]["state"], "waiting_for_plex")
         self.assertEqual(self.pms.calls[-1], ("add", "82606", "500"))
         self.assertFalse(any(call[0] == "move" for call in self.pms.calls))
 
@@ -1236,7 +1323,7 @@ class RoomTests(DatabaseTestCase):
         self.pms.calls.clear()
         state = self.add(room)
         self.assertIsNone(state["syncError"])
-        self.assertEqual(state["queue"][0]["state"], "ready")
+        self.assertEqual(self.request_queue(state)[0]["state"], "ready")
         self.assertEqual(
             self.pms.calls, [("move", "82606", "102", "101"), ("add", "82606", "500")]
         )
@@ -1260,7 +1347,7 @@ class RoomTests(DatabaseTestCase):
                 ("add", "82606", "500"),
             ],
         )
-        self.assertTrue(state["queue"][0]["locked"])
+        self.assertTrue(self.request_queue(state)[0]["locked"])
         self.assertEqual(self.pms.items[2]["playQueueItemID"], rows[0]["queue_item_id"])
         self.assertEqual(
             [i["playQueueItemID"] for i in self.pms.items][2:],
@@ -1283,7 +1370,7 @@ class RoomTests(DatabaseTestCase):
         self.assertEqual(self.pms.calls, [])
         state = rooms.snapshot(room["code"])
         self.assertIn("did not confirm Room queue initialization", state["syncError"])
-        self.assertEqual(state["queue"][0]["state"], "waiting_for_plex")
+        self.assertEqual(self.request_queue(state)[0]["state"], "waiting_for_plex")
 
     def test_bootstrap_failure_retains_first_request_for_retry(self):
         self.pms.manual_end = "0"
@@ -1297,7 +1384,7 @@ class RoomTests(DatabaseTestCase):
         self.assertFalse(any(call[0] == "add" for call in self.pms.calls))
         self.pms.fail = None
         state = rooms.reconcile(room["code"])
-        self.assertEqual(state["queue"][0]["state"], "ready")
+        self.assertEqual(self.request_queue(state)[0]["state"], "ready")
         self.assertEqual(len([call for call in self.pms.calls if call[0] == "add"]), 1)
         self.assertEqual(
             [i["playQueueItemID"] for i in self.pms.items], ["101", "102", "201"]
@@ -1419,7 +1506,7 @@ class RoomTests(DatabaseTestCase):
         self.assertEqual(response.status_code, 502)
         self.assertIn("switched queues", rooms.snapshot(room["code"])["syncError"])
         self.assertEqual(self.pms.calls, calls)
-        row = rooms.entries(rooms.room_by_code(room["code"])["id"])[0]
+        row = self.request_entries(rooms.room_by_code(room["code"])["id"])[0]
         self.assertEqual(row["state"], "waiting_for_plex")
         self.assertIsNone(row["queue_item_id"])
 
@@ -1437,7 +1524,8 @@ class RoomTests(DatabaseTestCase):
         self.assertEqual(response.status_code, 502)
         self.assertEqual(self.pms.calls, calls)
         self.assertEqual(
-            rooms.snapshot(room["code"])["queue"][0]["state"], "waiting_for_plex"
+            self.request_queue(rooms.snapshot(room["code"]))[0]["state"],
+            "waiting_for_plex",
         )
 
     def test_late_materialization_is_not_ready_until_pms_confirms_its_position(self):
@@ -1446,19 +1534,22 @@ class RoomTests(DatabaseTestCase):
         self.pms.fail = "move"
         response = self.post(f"/api/rooms/{room['code']}/sync")
         self.assertEqual(response.status_code, 502)
-        row = rooms.entries(rooms.room_by_code(room["code"])["id"])[0]
+        row = self.request_entries(rooms.room_by_code(room["code"])["id"])[0]
         self.assertIsNotNone(row["queue_item_id"])
         self.assertEqual(row["state"], "waiting_for_plex")
         # Even a repeated lifecycle read must not prematurely advertise Ready.
         response = self.post(f"/api/rooms/{room['code']}/sync")
         self.assertEqual(response.status_code, 502)
         self.assertEqual(
-            rooms.snapshot(room["code"])["queue"][0]["state"], "waiting_for_plex"
+            self.request_queue(rooms.snapshot(room["code"]))[0]["state"],
+            "waiting_for_plex",
         )
         self.pms.fail = None
         response = self.post(f"/api/rooms/{room['code']}/sync")
         self.assertEqual(response.status_code, 200, response.get_json())
-        self.assertEqual(response.get_json()["room"]["queue"][0]["state"], "ready")
+        self.assertEqual(
+            self.request_queue(response.get_json()["room"])[0]["state"], "ready"
+        )
         self.assertEqual(
             [track["ratingKey"] for track in self.pms.items],
             ["101", "102", "501", "500"],
@@ -1475,10 +1566,12 @@ class RoomTests(DatabaseTestCase):
         self.assertEqual(response.status_code, 502)
         state = rooms.snapshot(room["code"])
         self.assertIn("did not confirm", state["syncError"])
-        self.assertEqual(state["queue"][0]["state"], "waiting_for_plex")
+        self.assertEqual(self.request_queue(state)[0]["state"], "waiting_for_plex")
         response = self.post(f"/api/rooms/{room['code']}/sync")
         self.assertEqual(response.status_code, 200, response.get_json())
-        self.assertEqual(response.get_json()["room"]["queue"][0]["state"], "ready")
+        self.assertEqual(
+            self.request_queue(response.get_json()["room"])[0]["state"], "ready"
+        )
 
     def test_exhaustion_warning_and_no_repeated_queue_writes(self):
         room = self.start()
@@ -1502,7 +1595,10 @@ class RoomTests(DatabaseTestCase):
             self.edit(
                 room,
                 "order",
-                {"entryIds": [r["id"] for r in room["queue"]], "version": -1},
+                {
+                    "entryIds": [r["id"] for r in self.request_queue(room)],
+                    "version": -1,
+                },
             ).status_code,
             409,
         )
@@ -1598,7 +1694,7 @@ class RoomTests(DatabaseTestCase):
             ) as release,
         ):
             room = self.add(self.start(), OTHER)
-            self.assertEqual(room["queue"][0]["state"], "requested")
+            self.assertEqual(self.request_queue(room)[0]["state"], "requested")
             worker.tick()
             release.assert_called_once()
             self.assertEqual(
@@ -1620,7 +1716,9 @@ class RoomTests(DatabaseTestCase):
                 }
             )
             worker.tick()
-            self.assertEqual(rooms.snapshot(room["code"])["queue"][0]["state"], "ready")
+            self.assertEqual(
+                self.request_queue(rooms.snapshot(room["code"]))[0]["state"], "ready"
+            )
             self.assertEqual(self.pms.items[-1]["ratingKey"], "501")
 
     def test_interrupted_add_can_be_removed_without_leaving_orphan(self):
@@ -1635,22 +1733,19 @@ class RoomTests(DatabaseTestCase):
         state = rooms.snapshot(room["code"])
         response = self.edit(
             state,
-            f"entries/{state['queue'][0]['id']}",
+            f"entries/{self.request_queue(state)[0]['id']}",
             {"version": state["version"]},
             "DELETE",
         )
         self.assertEqual(response.status_code, 200, response.get_json())
         self.assertEqual(len(self.pms.items), 2)
 
-    def test_initial_takeover_failure_persists_recoverable_room(self):
+    def test_start_requires_no_pms_mutation_even_if_writes_are_unavailable(self):
         self.pms.fail = "remove"
-        self.assertEqual(self.post("/api/rooms").status_code, 502)
-        room = rooms.host_room(self.user["id"])
-        self.assertTrue(room["syncError"])
-        self.pms.fail = None
-        worker.tick()
-        self.assertEqual(len(self.pms.items), 2)
-        self.assertIsNone(rooms.snapshot(room["code"])["syncError"])
+        room = self.start()
+        self.assertIsNone(room["syncError"])
+        self.assertEqual(self.pms.calls, [])
+        self.assertEqual([entry["title"] for entry in room["queue"]], ["Song 102"])
 
     def test_acquisition_continues_while_pms_is_unavailable(self):
         room = self.start()
@@ -1671,34 +1766,46 @@ class RoomTests(DatabaseTestCase):
             worker.tick()
             self.acquire.assert_called_once()
             state = rooms.snapshot(room["code"])
-            self.assertEqual(state["queue"][0]["state"], "queued")
+            self.assertEqual(self.request_queue(state)[0]["state"], "queued")
             self.assertTrue(state["syncError"])
             self.states[OTHER] = self.lifecycle("ready", "501")
             worker.tick()
             self.assertEqual(
-                rooms.snapshot(room["code"])["queue"][0]["state"], "waiting_for_plex"
+                self.request_queue(rooms.snapshot(room["code"]))[0]["state"],
+                "waiting_for_plex",
             )
         worker.tick()
-        self.assertEqual(rooms.snapshot(room["code"])["queue"][0]["state"], "ready")
+        self.assertEqual(
+            self.request_queue(rooms.snapshot(room["code"]))[0]["state"], "ready"
+        )
         self.assertEqual(self.pms.items[-1]["ratingKey"], "501")
 
-    def test_interrupted_handoff_advancement_does_not_delete_buffer(self):
-        self.pms.fail = "remove"
-        self.assertEqual(self.post("/api/rooms").status_code, 502)
-        self.pms.fail = None
+    def test_legacy_startup_trim_journal_is_retired_without_deleting_queue(self):
+        room = self.start()
+        self.pms.items.extend([item(103), item(104)])
+        with storage.db() as connection:
+            connection.execute(
+                "UPDATE rooms SET trim_ids=? WHERE code=?",
+                (json.dumps({"current": "101", "items": ["103", "104"]}), room["code"]),
+            )
         self.pms.current = "102"
-        calls = list(self.pms.calls)
-        worker.tick()
-        worker.tick()
-        self.assertEqual(self.pms.calls, calls)
-        self.assertIn("End this Room", rooms.host_room(self.user["id"])["syncError"])
+        state = rooms.reconcile(room["code"])
+        self.assertIsNone(state["syncError"])
+        self.assertEqual(state["handoff"], {})
+        self.assertEqual(
+            [entry["title"] for entry in state["queue"]], ["Song 103", "Song 104"]
+        )
+        self.assertEqual(self.pms.calls, [])
+        self.assertEqual(rooms.room_by_code(room["code"])["trim_ids"], "[]")
 
     def test_acquisition_failure_is_visible_and_retry_uses_shared_workflow(self):
         room = self.add(self.start(), OTHER)
         self.acquire.return_value = ({"error": "secret upstream data"}, 502)
         worker.tick()
         state = rooms.snapshot(room["code"])
-        self.assertIn("Acquisition request failed", state["queue"][0]["error"])
+        self.assertIn(
+            "Acquisition request failed", self.request_queue(state)[0]["error"]
+        )
         self.assertNotIn("secret", json.dumps(state))
         worker.tick()
         self.acquire.assert_called_once()
@@ -1746,6 +1853,383 @@ class RoomTests(DatabaseTestCase):
             ).status_code,
             401,
         )
+
+    def test_start_with_current_and_one_next_imports_locked_entry(self):
+        room = self.start()
+        self.assertEqual([entry["title"] for entry in room["queue"]], ["Song 102"])
+        self.assertTrue(room["queue"][0]["locked"])
+        self.assertEqual(self.pms.calls, [])
+
+    def test_single_external_append_persists_safe_metadata_without_acquisition_identity(
+        self,
+    ):
+        room = self.start()
+        self.pms.items.append(
+            {
+                **item(900),
+                "title": "T" * 400,
+                "originalTitle": "Track artist",
+                "parentTitle": "Album",
+                "thumb": "http://private/token=secret",
+                "secret": "secret",
+            }
+        )
+        worker.tick()
+        state = rooms.snapshot(room["code"])
+        self.assertGreater(state["version"], room["version"])
+        entry = state["queue"][-1]
+        self.assertEqual(
+            (
+                entry["title"],
+                entry["artist"],
+                entry["album"],
+                entry["requester"],
+                entry["state"],
+            ),
+            ("T" * 300, "Track artist", "Album", None, "ready"),
+        )
+        row = rooms.entries(rooms.room_by_code(room["code"])["id"])[-1]
+        self.assertEqual(
+            (row["queue_item_id"], row["rating_key"], row["recording_mbid"]),
+            ("900", "900", None),
+        )
+        self.assertNotIn("secret", json.dumps(state))
+        self.assertEqual(self.pms.calls, [])
+        self.acquire.assert_not_called()
+
+    def test_external_removal_of_imported_entry_is_tombstoned(self):
+        self.pms.items.extend([item(103), item(104)])
+        room = self.start()
+        original = rooms.entries(rooms.room_by_code(room["code"])["id"])
+        self.pms.items = [
+            track for track in self.pms.items if track["playQueueItemID"] != "103"
+        ]
+        state = rooms.reconcile(room["code"])
+        self.assertEqual(
+            [entry["title"] for entry in state["queue"]], ["Song 102", "Song 104"]
+        )
+        rows = {
+            row["id"]: row
+            for row in rooms.entries(rooms.room_by_code(room["code"])["id"])
+        }
+        self.assertTrue(rows[original[1]["id"]]["removed"])
+        self.assertEqual(rows[original[1]["id"]]["playback"], "upcoming")
+        self.assertEqual(self.pms.calls, [])
+
+    def test_external_removal_of_one_requested_duplicate_preserves_other_and_requester(
+        self,
+    ):
+        room, rows = self.protected_queue()
+        self.pms.items = [
+            track
+            for track in self.pms.items
+            if track["playQueueItemID"] != rows[2]["queue_item_id"]
+        ]
+        state = rooms.reconcile(room["code"])
+        self.assertEqual(
+            [entry["id"] for entry in state["queue"]],
+            [rows[n]["id"] for n in (0, 1, 3)],
+        )
+        stored = {
+            row["id"]: row
+            for row in rooms.entries(rooms.room_by_code(room["code"])["id"])
+        }
+        self.assertTrue(stored[rows[2]["id"]]["removed"])
+        self.assertFalse(stored[rows[3]["id"]]["removed"])
+        self.assertEqual(stored[rows[3]["id"]]["recording_mbid"], RECORDING)
+        self.assertEqual(stored[rows[3]["id"]]["requester"], self.user["username"])
+        self.assertEqual(self.pms.calls, [])
+
+    def test_external_future_reorder_matches_pms_and_is_idempotent(self):
+        room, rows = self.protected_queue()
+        self.pms.items.insert(3, self.pms.items.pop())
+        state = rooms.reconcile(room["code"])
+        self.assertEqual(
+            [entry["id"] for entry in state["queue"]],
+            [rows[n]["id"] for n in (0, 3, 1, 2)],
+        )
+        saved = rooms.entries(rooms.room_by_code(room["code"])["id"])
+        for _ in range(3):
+            repeated = rooms.reconcile(room["code"])
+            self.assertEqual(repeated, state)
+            self.assertEqual(
+                rooms.entries(rooms.room_by_code(room["code"])["id"]), saved
+            )
+        self.assertEqual(self.pms.calls, [])
+
+    def test_external_boundary_is_adopted_before_host_controls_validate(self):
+        room, rows = self.protected_queue()
+        self.pms.items[2], self.pms.items[3] = self.pms.items[3], self.pms.items[2]
+        response = self.edit(
+            room, f"entries/{rows[1]['id']}", {"version": room["version"]}, "DELETE"
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("Up Next is locked", response.get_json()["error"])
+        state = rooms.snapshot(room["code"])
+        self.assertEqual(state["queue"][0]["id"], rows[1]["id"])
+        self.assertTrue(state["queue"][0]["locked"])
+        self.assertEqual(self.pms.calls, [])
+
+    def test_normal_advancement_and_pruned_playing_item_are_not_external_removals(self):
+        room, rows = self.protected_queue()
+        self.pms.current = rows[0]["queue_item_id"]
+        rooms.reconcile(room["code"])
+        self.pms.items = [
+            track
+            for track in self.pms.items
+            if track["playQueueItemID"] != rows[0]["queue_item_id"]
+        ]
+        self.pms.current = rows[1]["queue_item_id"]
+        rooms.reconcile(room["code"])
+        saved = {
+            row["id"]: row
+            for row in rooms.entries(rooms.room_by_code(room["code"])["id"])
+        }
+        self.assertEqual(saved[rows[0]["id"]]["playback"], "played")
+        self.assertFalse(saved[rows[0]["id"]]["removed"])
+        self.assertEqual(saved[rows[1]["id"]]["playback"], "playing")
+        self.assertFalse(saved[rows[1]["id"]]["removed"])
+        self.assertEqual(self.pms.calls, [])
+
+    def test_pending_requests_survive_external_add_and_removal_then_materialize(self):
+        room = self.add(self.start(), OTHER)
+        pending_id = self.request_queue(room)[0]["id"]
+        self.pms.items.extend([item(900), item(901)])
+        state = rooms.reconcile(room["code"])
+        self.assertEqual(state["queue"][-1]["id"], pending_id)
+        self.pms.items = [
+            track for track in self.pms.items if track["playQueueItemID"] != "900"
+        ]
+        state = rooms.reconcile(room["code"])
+        self.assertEqual(state["queue"][-1]["id"], pending_id)
+        self.assertEqual(state["queue"][-1]["state"], "requested")
+        self.assertEqual(self.pms.calls, [])
+        self.states[OTHER] = self.lifecycle("ready", "501")
+        worker.tick()
+        state = rooms.snapshot(room["code"])
+        self.assertEqual(state["queue"][-1]["id"], pending_id)
+        self.assertEqual(state["queue"][-1]["state"], "ready")
+        self.assertEqual(
+            [track["ratingKey"] for track in self.pms.items],
+            ["101", "102", "901", "501"],
+        )
+
+    def test_external_reorder_with_pending_requests_fails_safely_and_retains_intent(
+        self,
+    ):
+        self.pms.items.extend([item(103), item(104)])
+        room = self.add(self.start(), OTHER)
+        before = rooms.entries(rooms.room_by_code(room["code"])["id"])
+        self.pms.items[-2], self.pms.items[-1] = self.pms.items[-1], self.pms.items[-2]
+        response = self.post(f"/api/rooms/{room['code']}/sync")
+        self.assertEqual(response.status_code, 502)
+        self.assertIn("pending requests", response.get_json()["error"])
+        self.assertEqual(rooms.entries(rooms.room_by_code(room["code"])["id"]), before)
+        self.assertEqual(self.pms.calls, [])
+        self.assertFalse(rooms.room_by_code(room["code"])["write_pending"])
+
+    def test_observation_error_does_not_turn_external_reorder_into_write_intent(self):
+        room, rows = self.protected_queue()
+        self.feed.latest.side_effect = None
+        self.feed.latest.return_value = None
+        worker.tick()
+        self.assertFalse(rooms.room_by_code(room["code"])["write_pending"])
+        self.feed.latest.side_effect = lambda session, **kwargs: {
+            **self.event,
+            "playQueueItemID": self.pms.current,
+            "ratingKey": self.pms.active_session(self.user)["rating_key"],
+        }
+        self.pms.items.insert(3, self.pms.items.pop())
+        state = rooms.reconcile(room["code"])
+        self.assertIsNone(state["syncError"])
+        self.assertEqual(
+            [entry["id"] for entry in state["queue"]],
+            [rows[n]["id"] for n in (0, 3, 1, 2)],
+        )
+        self.assertEqual(self.pms.calls, [])
+
+    def test_external_add_remove_reorder_emit_sse_and_unchanged_tick_has_no_event(self):
+        self.pms.items.extend([item(103), item(104)])
+        room = self.start()
+        client, _, _ = self.guest(room)
+        response = client.get(f"/api/rooms/{room['code']}/events", buffered=False)
+        self.addCleanup(response.close)
+        iterator = iter(response.response)
+        previous = json.loads(next(iterator).decode().split("data: ", 1)[1])
+        changes = (
+            lambda: self.pms.items.append(item(900)),
+            lambda: self.pms.items.pop(-2),
+            lambda: self.pms.items.insert(2, self.pms.items.pop()),
+        )
+        with patch.object(routes.time, "sleep"):
+            for change in changes:
+                change()
+                worker.tick()
+                self.assertEqual(next(iterator), b": heartbeat\n\n")
+                update = json.loads(next(iterator).decode().split("data: ", 1)[1])
+                self.assertGreater(update["version"], previous["version"])
+                self.assertEqual(update, rooms.snapshot(room["code"]))
+                previous = update
+            worker.tick()
+            self.assertEqual(next(iterator), b": heartbeat\n\n")
+            self.assertEqual(next(iterator), b": heartbeat\n\n")
+        self.assertEqual(self.pms.calls, [])
+
+    def test_external_suffix_change_during_host_write_stops_remaining_operations(self):
+        room, rows = self.protected_queue()
+        move = self.pms.move
+
+        def external_append(queue, identity, after):
+            move(queue, identity, after)
+            self.pms.items.append(item(900))
+
+        with patch.object(self.pms, "move", side_effect=external_append):
+            response = self.edit(
+                room,
+                "order",
+                {
+                    "entryIds": [rows[n]["id"] for n in (0, 3, 2, 1)],
+                    "version": room["version"],
+                },
+            )
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(len(self.pms.calls), 1)
+        self.assertEqual(self.pms.items[-1]["playQueueItemID"], "900")
+        self.assertTrue(rooms.room_by_code(room["code"])["write_pending"])
+
+    def test_migration_relaxes_legacy_identity_and_preserves_journals_and_foreign_keys(
+        self,
+    ):
+        with sqlite3.connect(":memory:") as connection:
+            connection.execute("PRAGMA foreign_keys=ON")
+            connection.execute("CREATE TABLE users(id INTEGER PRIMARY KEY)")
+            connection.execute("INSERT INTO users VALUES (1)")
+            room_storage.migrate(connection)
+            connection.execute("ALTER TABLE rooms DROP COLUMN write_pending")
+            entry_sql = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE name='room_entries'"
+            ).fetchone()[0]
+            connection.execute("DROP TABLE room_entries")
+            connection.execute(
+                entry_sql.replace(
+                    "recording_mbid TEXT", "recording_mbid TEXT NOT NULL"
+                ).replace("requester TEXT", "requester TEXT NOT NULL")
+            )
+            connection.execute("ALTER TABLE room_entries DROP COLUMN album")
+            connection.execute(
+                "INSERT INTO rooms(id,code,host_user_id,status,created_at,server_id,client_id,session_key,queue_id,current_item_id,handoff_item_id) VALUES ('old','OLD',1,'active',0,'s','c','stream','q','1','2')"
+            )
+            connection.execute(
+                "INSERT INTO room_guests VALUES ('guest','old','token','csrf','Name',0)"
+            )
+            connection.execute(
+                "INSERT INTO room_entries(id,room_id,position,recording_mbid,title,artist,requester,guest_id,created_at,rating_key,add_before,removed) VALUES ('request','old',1,?,'Song','Artist','Name','guest',0,'500','[1,2]',1)",
+                (RECORDING,),
+            )
+            before = connection.execute("SELECT * FROM room_entries").fetchone()
+            room_storage.migrate(connection)
+            room_storage.migrate(connection)
+            self.assertEqual(
+                connection.execute("SELECT * FROM room_entries").fetchone()[:6],
+                before[:6],
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT recording_mbid,requester,guest_id,rating_key,add_before,removed FROM room_entries"
+                ).fetchone(),
+                (RECORDING, "Name", "guest", "500", "[1,2]", 1),
+            )
+            self.assertEqual(
+                connection.execute("SELECT write_pending FROM rooms").fetchone(), (1,)
+            )
+            connection.execute(
+                "INSERT INTO room_entries(id,room_id,position,title,artist,created_at,state,rating_key,queue_item_id) VALUES ('adopted','old',2,'Plex song','Artist',0,'ready','900','900')"
+            )
+            self.assertEqual(
+                connection.execute("PRAGMA foreign_key_check").fetchall(), []
+            )
+            self.assertIn(
+                "room_entries_order",
+                [
+                    row[1]
+                    for row in connection.execute("PRAGMA index_list(room_entries)")
+                ],
+            )
+            connection.execute("DELETE FROM rooms WHERE id='old'")
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM room_entries").fetchone()[0], 0
+            )
+
+    def test_host_edit_uses_latest_observation_if_playback_advances_during_recovery_read(
+        self,
+    ):
+        room, rows = self.protected_queue()
+        original_event = self.feed.latest.side_effect
+        observations = 0
+        self.pms.current = rows[0]["queue_item_id"]
+
+        def advance_duplicate(session, **kwargs):
+            nonlocal observations
+            observations += 1
+            if observations == 2:
+                self.pms.current = rows[1]["queue_item_id"]
+            return original_event(session, **kwargs)
+
+        # Duplicate tracks retain the same rating key while the playing queue
+        # instance advances between the two recovery observations.
+        with patch.object(self.feed, "latest", side_effect=advance_duplicate):
+            response = self.edit(
+                room, f"entries/{rows[1]['id']}", {"version": room["version"]}, "DELETE"
+            )
+        self.assertEqual(response.status_code, 409)
+        saved = {
+            row["id"]: row
+            for row in rooms.entries(rooms.room_by_code(room["code"])["id"])
+        }
+        self.assertEqual(saved[rows[1]["id"]]["playback"], "playing")
+        self.assertFalse(saved[rows[1]["id"]]["removed"])
+        self.assertEqual(self.pms.calls, [])
+
+    def test_imported_queue_larger_than_guest_request_limit_can_still_be_reordered(
+        self,
+    ):
+        self.pms.items = [item(identity) for identity in range(101, 304)]
+        room = self.start()
+        self.assertEqual(len(room["queue"]), 202)
+        order = [entry["id"] for entry in room["queue"]]
+        order[-1], order[-2] = order[-2], order[-1]
+        response = self.edit(
+            room, "order", {"entryIds": order, "version": room["version"]}
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(
+            [entry["id"] for entry in response.get_json()["room"]["queue"]], order
+        )
+        self.assertEqual(len(self.pms.calls), 1)
+        self.assertEqual(self.pms.calls[0][0], "move")
+
+    def test_legacy_interrupted_append_recovers_with_unimported_startup_next(self):
+        room = self.start()
+        self.pms.fail = "after-add"
+        response = self.post(
+            f"/api/rooms/{room['code']}/entries", {"choiceId": self.choice(room)}
+        )
+        self.assertEqual(response.status_code, 502)
+        with storage.db() as connection:
+            # Previous versions kept the startup next only in Room fields.
+            connection.execute(
+                "DELETE FROM room_entries WHERE room_id=? AND queue_item_id='102'",
+                (rooms.room_by_code(room["code"])["id"],),
+            )
+        state = rooms.reconcile(room["code"])
+        self.assertIsNone(state["syncError"])
+        self.assertEqual(
+            [entry["title"] for entry in state["queue"]], ["Song 102", "Song 201"]
+        )
+        self.assertTrue(state["queue"][0]["locked"])
+        self.assertEqual(state["queue"][1]["requester"], self.user["username"])
+        self.assertEqual(self.pms.calls, [("add", "82606", "500")])
+        self.assertEqual(rooms.reconcile(room["code"]), state)
 
 
 class PMSProtocolTests(DatabaseTestCase):
