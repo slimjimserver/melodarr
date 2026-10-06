@@ -1431,12 +1431,12 @@
   ) {
     const card = document.createElement("article");
     card.className = "recommendation-card";
+    const artwork = document.createElement("div");
+    artwork.className = "recommendation-art";
     const fallback = document.createElement("div");
-    fallback.className = "recommendation-art recommendation-fallback";
-    let artwork: HTMLElement = fallback;
+    fallback.className = "recommendation-fallback";
     if (item.coverArt) {
       const image = document.createElement("img");
-      image.className = "recommendation-art";
       image.alt = "";
       image.loading = "lazy";
       image.decoding = "async";
@@ -1448,7 +1448,9 @@
         artworkUrl.searchParams.set("size", window.devicePixelRatio >= 2 ? "large" : "card");
       }
       loadArtworkWhenNear(image, artworkUrl.href, fallback);
-      artwork = image;
+      artwork.append(image);
+    } else {
+      artwork.append(fallback);
     }
     const personalized = Boolean(item.personalized);
     if (personalized) {
@@ -4399,7 +4401,7 @@
     button.disabled = true;
     results.setAttribute("aria-busy", "true");
     const placeholder = document.createElement("div");
-    placeholder.className = "recommendation-carousel";
+    placeholder.className = "recommendation-carousel recommendation-loading";
     placeholder.append(skeletonBlock("skeleton-art", 8));
     results.replaceChildren(placeholder);
     message.textContent = "Gathering a few recommendations for you…";

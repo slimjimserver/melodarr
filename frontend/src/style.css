@@ -306,13 +306,16 @@ h1 em { font-style: normal; }
 .recommendations-heading h2 { margin: 0; font-size: 27px; letter-spacing: -.04em; }
 .recommendation-row { min-width: 0; margin-top: 30px; content-visibility: auto; contain-intrinsic-size: auto 270px; }
 .recommendation-row h3 { margin: 0 0 12px; font-size: 17px; letter-spacing: -.02em; }
-.recommendation-carousel { display: flex; width: 100%; max-width: 100%; gap: 13px; overflow-x: auto; overflow-y: hidden; padding: 2px 2px 14px; scroll-snap-type: x proximity; scrollbar-color: var(--border-hover) transparent; -webkit-overflow-scrolling: touch; overscroll-behavior-x: contain; touch-action: pan-x pan-y pinch-zoom; }
+.recommendation-carousel { --recommendation-art-size: 154px; display: flex; width: 100%; max-width: 100%; gap: 13px; overflow-x: auto; overflow-y: hidden; padding: 2px 2px 14px; scroll-snap-type: x proximity; scrollbar-color: var(--border-hover) transparent; -webkit-overflow-scrolling: touch; overscroll-behavior-x: contain; touch-action: pan-x pan-y pinch-zoom; }
 .recommendation-carousel::-webkit-scrollbar { height: 7px; }
 .recommendation-carousel::-webkit-scrollbar-thumb { border-radius: 999px; background: var(--border-hover); }
-.recommendation-card { position: relative; display: grid; flex: 0 0 154px; gap: 8px; scroll-snap-align: start; cursor: pointer; outline: none; }
+.recommendation-card { position: relative; display: grid; flex: 0 0 var(--recommendation-art-size, 154px); gap: 8px; scroll-snap-align: start; cursor: pointer; outline: none; }
 .recommendation-open { display: grid; position: relative; min-width: 0; gap: 8px; border: 0; background: transparent; color: inherit; padding: 0; cursor: pointer; text-align: left; text-decoration: none; }
 .recommendation-open:focus-visible .recommendation-art { border-color: var(--accent-bright); box-shadow: 0 10px 25px rgba(68, 50, 38, .16), 0 0 0 2px rgba(168, 68, 45, .18); transform: translateY(-2px); }
-.recommendation-art { display: block; width: 154px; aspect-ratio: 1; border: 1px solid var(--border); border-radius: 12px; background: var(--background-elevated); object-fit: cover; transition: transform .2s var(--ease-out), border-color .2s var(--ease-out), box-shadow .2s var(--ease-out); }
+.recommendation-art, .skeleton-art { width: var(--recommendation-art-size, 154px); height: var(--recommendation-art-size, 154px); aspect-ratio: 1; overflow: hidden; border-radius: 12px; }
+.recommendation-art { position: relative; display: block; border: 1px solid var(--border); background: var(--background-elevated); transition: transform .2s var(--ease-out), border-color .2s var(--ease-out), box-shadow .2s var(--ease-out); }
+.recommendation-art > img, .recommendation-art > .recommendation-fallback { position: absolute; inset: 0; display: block; width: 100%; height: 100%; }
+.recommendation-art > img { object-fit: cover; }
 .recommendation-fallback { background: linear-gradient(135deg, #7f89ed, #252951 62%, #be6a9b); }
 .recommendation-source { display: flex; position: absolute; top: 8px; left: 8px; align-items: center; max-width: calc(100% - 16px); overflow: hidden; border: 1px solid rgba(255, 255, 255, .32); border-radius: 999px; background: rgba(55, 45, 39, .88); color: #fffaf4; padding: 3px 6px; white-space: nowrap; gap: 4px; font-size: 10px; font-weight: 700; }
 .recommendation-source > img { width: 13px; height: 13px; flex: none; object-fit: contain; }
@@ -514,7 +517,7 @@ h1 em { font-style: normal; }
 .skeleton::after { position: absolute; inset: 0; background: linear-gradient(90deg, transparent, rgba(255, 255, 255, .62) 50%, transparent); animation: skeleton-sweep 1.4s infinite; content: ""; }
 @keyframes skeleton-sweep { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
 .skeleton-card { height: 74px; }
-.skeleton-art { width: 154px; height: 154px; flex: 0 0 154px; border-radius: 12px; }
+.skeleton-art { flex: 0 0 var(--recommendation-art-size, 154px); border-radius: 12px; }
 
 .empty-state {
   display: grid;
@@ -917,8 +920,7 @@ details summary { margin-bottom: 17px; color: var(--accent-bright); cursor: poin
      page gutter, while their first card stays aligned with the heading. */
   .recommendations { width: 100%; margin-left: 0; transform: none; }
   .recommendation-carousel { margin: 0 -16px; padding-right: 16px; padding-left: 16px; scroll-padding-left: 16px; }
-  .recommendation-card { flex-basis: 132px; }
-  .recommendation-art, .skeleton-art { width: 132px; flex-basis: 132px; height: 132px; }
+  .recommendation-carousel { --recommendation-art-size: 132px; }
   .detail-heading { gap: 22px; }
   .detail-cover { width: min(280px, 100%); }
   .detail-cover.anime-cover { width: min(116px, 34vw); justify-self: start; border-radius: 12px; }
@@ -1406,8 +1408,8 @@ button,
 }
 
 /* Personal recommendations give the reason and decision controls room to breathe. */
-.recommendation-card[data-personal-recommendation] { flex-basis: 210px; align-content: start; cursor: default; }
-.recommendation-card[data-personal-recommendation] .recommendation-art { width: 100%; }
+.recommendation-card[data-personal-recommendation], .recommendation-loading { --recommendation-art-size: 210px; }
+.recommendation-card[data-personal-recommendation] { align-content: start; cursor: default; }
 .recommendation-card[data-personal-recommendation] .recommendation-info strong,
 .recommendation-card[data-personal-recommendation] .recommendation-info span { white-space: normal; }
 .recommendation-reason { margin: 0; color: var(--foreground-muted); font-size: 12px; line-height: 1.5; min-height: 54px; }
@@ -1419,8 +1421,7 @@ button,
 .recommendation-browse, .recommendation-outcomes { margin-top: 28px; border-top: 1px solid var(--border); padding-top: 20px; }
 .recommendation-browse summary, .recommendation-outcomes summary { cursor: pointer; min-height: 44px; align-content: center; }
 @media (max-width: 700px) {
-  .recommendation-card[data-personal-recommendation] { flex-basis: 176px; }
-  .recommendation-card[data-personal-recommendation] .recommendation-art { height: 176px; }
+  .recommendation-card[data-personal-recommendation], .recommendation-loading { --recommendation-art-size: 176px; }
 }
 
 .popular-albums { margin-top: 32px; }
