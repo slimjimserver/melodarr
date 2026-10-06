@@ -38,13 +38,12 @@ snapshot storage uses the same retention to survive expired-row cleanup, while
 its explicit `fetched_at` determines the shorter freshness window.
 
 Transport, HTTP, and incomplete-provider-response failures use only a **15-minute**
-identity backoff, never the seven-day unresolved mapping cache. Resolver version 3
-automatically retries older negative track/album identities (including version 2)
+identity backoff, never the seven-day unresolved mapping cache. Resolver version 4
+automatically retries older negative track/album identities (including version 3)
 and repairs older unresolved Top Tracks snapshots on the next Summary visit,
 bypassing old refresh leases. Successful identities and Wikipedia caches remain
 reusable. Identity repairs preserve the original daily track ordering and its
-`fetched_at`; no manual
-cache clear is required.
+`fetched_at`; no manual cache clear is required.
 
 Two lazy daemon workers share a bounded 32-job queue. Atomic SQLite leases
 coalesce refreshes across web processes and recover after 30 minutes if a
@@ -81,6 +80,15 @@ comments are allowed, while recognized conflicting years reject the fallback.
 Other edition text and recording-title/version rules are unchanged. Matching
 editions collapse by release-group MBID; equally ranked distinct groups remain
 unresolved. This fallback is recorded as `recording_album_remaster`.
+
+Within those relationship/title/artist ranks, a valid full Deezer album date
+(`YYYY-MM-DD`) ranks exact release-group `first-release-date` agreement first,
+exact release-date agreement next, and the existing year-only evidence last.
+Original group dates remain useful even when the containing release is a later
+remaster. Partial/invalid dates add no exact-date evidence, and primary release
+type (Album versus Single) adds no preference. Identical strongest scores across
+distinct groups still remain unresolved: year-only evidence cannot break an
+exact-date tie. Resolution-method labels are unchanged.
 
 Before committing, smoke-test a real configured MusicBrainz mirror, Wikipedia
 access, the Jhené Aiko/Sativa mapping, stale refreshes across application restarts,

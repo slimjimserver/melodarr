@@ -3,6 +3,7 @@
 import logging
 import re
 import time
+from datetime import date
 from urllib.parse import quote
 from uuid import UUID
 
@@ -29,7 +30,7 @@ SNAPSHOT_NAMESPACE = "artist-summary:snapshot-v1"
 IDENTITY_NAMESPACE = "artist-summary:identity-v1"
 STATE_NAMESPACE = "artist-summary:refresh-v1"
 # Preserve successful mappings; retry older negative results and snapshots once.
-RESOLVER_VERSION = 3
+RESOLVER_VERSION = 4
 
 
 def _id(value):
@@ -254,6 +255,21 @@ def _album_title_match(title, release):
     return 1
 
 
+def _release_date_match(album, release):
+    """Prefer exact original group dates, then edition dates; never expand partials."""
+    provider_date = str(album.get("release_date") or "")
+    if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", provider_date):
+        return 0
+    try:
+        date.fromisoformat(provider_date)
+    except ValueError:
+        return 0
+    # Remastered provider albums may still report the original album date.
+    if provider_date == (release.get("release-group") or {}).get("first-release-date"):
+        return 3
+    return 2 if provider_date == release.get("date") else 0
+
+
 def select_release_group(recording_mbid, track, releases, artist_mbid):
     """Titles compare only inside releases proven to contain this exact recording."""
     album = track.get("album") or {}
@@ -279,7 +295,8 @@ def select_release_group(recording_mbid, track, releases, artist_mbid):
             continue
         year = str(album.get("release_date") or "")[:4]
         year_match = bool(year and year == str(release.get("date") or group.get("first-release-date") or "")[:4])
-        score = (bool(direct), title_match, artist_match, year_match, not bool(secondary))
+        date_match = _release_date_match(album, release) or int(year_match)
+        score = (bool(direct), title_match, artist_match, date_match, not bool(secondary))
         if mbid not in candidates or score > candidates[mbid][0]:
             method = "recording_album_title" if title_match == 2 else "recording_album_remaster"
             candidates[mbid] = (score, "recording_deezer_album" if direct else method)

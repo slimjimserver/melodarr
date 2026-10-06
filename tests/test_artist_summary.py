@@ -29,6 +29,7 @@ SUN = "440f60e8-0b25-4ec4-abb1-c6beec624ab0"
 ABBEY = "9162580e-5df4-32de-80cc-f45a8d8a9b1d"
 ABBEY_US = "2e0542d1-5c0b-4600-ab77-64870cc619de"
 ABBEY_EUROPE = "d605cd91-5a6a-4bcb-89c6-e545dc313729"
+LET_IT_BE = "0cdc9b5b-b16b-4ff1-9f16-5b4ba76f1c17"
 
 
 def credit(name="Jhené Aiko", mbid=ARTIST):
@@ -68,6 +69,20 @@ def abbey_release(release_id=ABBEY_US, group_id=ABBEY, title="Abbey Road", disam
             "release-group": {"id": group_id, "title": title, "primary-type": "Album",
                               "artist-credit": [credit("The Beatles", BEATLES)], "secondary-types": []},
             "media": [{"tracks": [{"recording": {"id": SUN}}]}]}
+
+
+def let_it_be_track():
+    return {**beatles_track(), "id": 2, "title": "Let It Be (Remastered 2009)",
+            "title_short": "Let It Be", "isrc": "GBAYE0601713", "duration": 243,
+            "album": {"id": 2, "title": "Let It Be (Remastered)", "release_date": "1970-05-08"}}
+
+
+def let_it_be_release(group_id=GROUP, primary_type="Album", group_date="1970-05-08", release_date="2009-09-09"):
+    value = abbey_release(RELEASE, group_id, title="Let It Be")
+    value["date"] = release_date
+    value["release-group"].update({"primary-type": primary_type, "first-release-date": group_date})
+    value["media"][0]["tracks"][0]["recording"]["id"] = LET_IT_BE
+    return value
 
 
 class ArtistSummaryTests(DatabaseTestCase):
@@ -364,12 +379,124 @@ class ArtistSummaryTests(DatabaseTestCase):
     def test_album_remaster_matching_does_not_weaken_recording_version_matching(self):
         self.assertFalse(summary._title_matches(beatles_track(), {"title": "Here Comes The Sun", "disambiguation": "2009 stereo remaster"}))
 
+    def test_let_it_be_same_title_year_and_recording_resolve_by_full_group_date(self):
+        releases = [let_it_be_release(release_date="1970-05-08"),
+                    let_it_be_release(OTHER, "Single", "1970-03-06", "1970-03-06")]
+        for ordered in (releases, list(reversed(releases))):
+            self.assertEqual(summary.select_release_group(LET_IT_BE, let_it_be_track(), ordered, BEATLES),
+                             (GROUP, "recording_album_remaster"))
+
+    def test_let_it_be_remaster_uses_original_group_date_instead_of_edition_year(self):
+        releases = [let_it_be_release(), let_it_be_release(OTHER, "Single", "1970-03-06")]
+        self.assertEqual(summary.select_release_group(LET_IT_BE, let_it_be_track(), releases, BEATLES),
+                         (GROUP, "recording_album_remaster"))
+
+    def test_let_it_be_year_only_tie_remains_unresolved(self):
+        releases = [let_it_be_release(release_date="1970-05-08"),
+                    let_it_be_release(OTHER, "Single", "1970-03-06", "1970-03-06")]
+        for provider_date in ("1970", "1970-05", None):
+            details = let_it_be_track()
+            details["album"]["release_date"] = provider_date
+            with self.subTest(provider_date=provider_date):
+                self.assertEqual(summary.select_release_group(LET_IT_BE, details, releases, BEATLES), (None, "unresolved"))
+
+    def test_exact_release_date_outranks_year_only_when_group_full_date_is_missing(self):
+        details = let_it_be_track()
+        details["album"]["title"] = "Let It Be"
+        releases = [let_it_be_release(group_date="1970", release_date="1970-05-08"),
+                    let_it_be_release(OTHER, "Single", "1970", "1970-03-06")]
+        self.assertEqual(summary.select_release_group(LET_IT_BE, details, releases, BEATLES), (GROUP, "recording_album_title"))
+
+    def test_original_group_full_date_outranks_release_date_and_year_agreement(self):
+        releases = [let_it_be_release(), let_it_be_release(OTHER, "Single", "1970-03-06", "1970-05-08")]
+        self.assertEqual(summary.select_release_group(LET_IT_BE, let_it_be_track(), releases, BEATLES),
+                         (GROUP, "recording_album_remaster"))
+
+    def test_distinct_groups_with_identical_full_date_evidence_remain_unresolved(self):
+        for edition_date in ("2009-09-09", "1970-03-06"):
+            releases = [let_it_be_release(), let_it_be_release(OTHER, "Single", release_date=edition_date)]
+            for ordered in (releases, list(reversed(releases))):
+                with self.subTest(edition_date=edition_date, reversed=ordered[0] is releases[1]):
+                    self.assertEqual(summary.select_release_group(LET_IT_BE, let_it_be_track(), ordered, BEATLES), (None, "unresolved"))
+
+    def test_full_date_can_select_single_without_primary_type_preference(self):
+        details = let_it_be_track()
+        details["album"]["release_date"] = "1970-03-06"
+        releases = [let_it_be_release(), let_it_be_release(OTHER, "Single", "1970-03-06")]
+        self.assertEqual(summary.select_release_group(LET_IT_BE, details, releases, BEATLES), (OTHER, "recording_album_remaster"))
+
+    def test_exact_date_does_not_override_title_or_direct_relationship_precedence(self):
+        exact = let_it_be_release(OTHER, "Single", "1970-03-06")
+        exact["title"] = "Let It Be (Remastered)"
+        direct = let_it_be_release(OTHER, "Single", "1970-03-06")
+        direct["title"] = "Different title"
+        direct["release-group"]["title"] = "Different title"
+        direct["relations"] = [{"url": {"resource": "https://www.deezer.com/album/2"}}]
+        for candidate, method in ((exact, "recording_album_title"), (direct, "recording_deezer_album")):
+            with self.subTest(method=method):
+                self.assertEqual(summary.select_release_group(LET_IT_BE, let_it_be_track(), [let_it_be_release(), candidate], BEATLES),
+                                 (OTHER, method))
+
+    def test_invalid_or_non_full_dates_do_not_add_exact_date_evidence(self):
+        for provider_date in ("1970-02-30", "1970-13-08", "1970-5-08", "1970-05-08T00:00:00", "1970-05-08 "):
+            details = let_it_be_track()
+            details["album"]["release_date"] = provider_date
+            releases = [let_it_be_release(group_date=provider_date, release_date=provider_date),
+                        let_it_be_release(OTHER, "Single", "1970-03-06", "1970-03-06")]
+            with self.subTest(provider_date=provider_date):
+                self.assertEqual(summary.select_release_group(LET_IT_BE, details, releases, BEATLES), (None, "unresolved"))
+
+    @patch.object(summary, "resolve_recording", side_effect=AssertionError("Reuse the successful v3 recording identity"))
+    @patch.object(musicbrainz, "browse_releases_by_recording", return_value=[let_it_be_release(), let_it_be_release(OTHER, "Single", "1970-03-06")])
+    @patch.object(deezer, "top_tracks")
+    @patch.object(deezer, "track")
+    def test_v3_negative_group_retries_with_date_evidence_without_refreshing_daily_order(self, details, top, browse, resolve):
+        self.assertEqual(summary.RESOLVER_VERSION, 4)
+        api_cache.set_cache_document(summary.IDENTITY_NAMESPACE, "track:2", {
+            "complete": True, "resolver_version": 3, "isrc": "GBAYE0601713", "recording_mbid": LET_IT_BE,
+            "recording_resolution_method": "exact_isrc",
+        }, summary.RETENTION_TTL)
+        group_key = f"group:{LET_IT_BE}:2:let it be remastered"
+        api_cache.set_cache_document(summary.IDENTITY_NAMESPACE, group_key, {
+            "complete": False, "resolver_version": 3, "retry_at": time.time() + summary.UNRESOLVED_TTL,
+            "recording_mbid": LET_IT_BE, "release_group_mbid": None, "release_group_resolution_method": "unresolved",
+        }, summary.RETENTION_TTL)
+        old = {"fetched_at": time.time(), "resolver_version": 3, "entries": [{
+            **let_it_be_track(), "deezer_track_id": 2, "deezer_artist_id": 1, "position": 7,
+            "recording_mbid": LET_IT_BE, "release_group_mbid": None,
+        }]}
+        api_cache.set_cache_document(summary.SNAPSHOT_NAMESPACE, f"top_tracks:{BEATLES}", old, summary.RETENTION_TTL)
+        api_cache.set_cache_document(summary.SNAPSHOT_NAMESPACE, f"bio:{BEATLES}", {
+            "fetched_at": time.time(), "bio": {"text": "Beatles biography"},
+        }, summary.RETENTION_TTL)
+        api_cache.set_cache_document(summary.STATE_NAMESPACE, f"top_tracks:resolver-v3:{BEATLES}", {
+            "status": "pending", "pending_until": time.time() + worker.LEASE_TTL,
+        }, worker.LEASE_TTL)
+        with patch.object(worker, "Thread"), patch.object(worker, "jobs", Queue(maxsize=32)), patch.object(worker, "_started", False):
+            self.assertTrue(worker.request_summary(BEATLES)["pending"])
+            self.assertEqual(worker.jobs.get_nowait(), (BEATLES, "top_tracks"))
+        worker.process_job(BEATLES, "top_tracks")
+        repaired = summary.snapshot(BEATLES, "top_tracks")
+        self.assertEqual(repaired["resolver_version"], 4)
+        self.assertEqual(repaired["fetched_at"], old["fetched_at"])
+        self.assertEqual(repaired["entries"][0]["position"], 7)
+        self.assertEqual(repaired["entries"][0]["recording_mbid"], LET_IT_BE)
+        self.assertEqual(repaired["entries"][0]["release_group_mbid"], GROUP)
+        self.assertEqual(repaired["entries"][0]["release_group_resolution_method"], "recording_album_remaster")
+        mapping = api_cache.get_cache_document(summary.IDENTITY_NAMESPACE, group_key)
+        self.assertTrue(mapping["complete"])
+        self.assertEqual(mapping["resolver_version"], 4)
+        self.assertEqual(mapping["retry_at"], 0)
+        resolve.assert_not_called()
+        top.assert_not_called()
+        details.assert_not_called()
+        browse.assert_called_once_with(LET_IT_BE, priority="background", include_url_relations=True)
+
     @patch.object(summary, "resolve_recording", side_effect=AssertionError("Keep the successful recording identity"))
     @patch.object(musicbrainz, "browse_releases_by_recording", return_value=[abbey_release(), abbey_release(ABBEY_EUROPE, disambiguation="")])
     @patch.object(deezer, "top_tracks")
     @patch.object(deezer, "track")
     def test_v2_negative_group_and_snapshot_retry_while_recording_and_bio_are_preserved(self, details, top, browse, resolve):
-        self.assertEqual(summary.RESOLVER_VERSION, 3)
         api_cache.set_cache_document(summary.IDENTITY_NAMESPACE, "track:116348464", {
             "complete": True, "resolver_version": 2, "isrc": "GBAYE0601696", "recording_mbid": SUN,
             "recording_resolution_method": "exact_isrc",
@@ -396,7 +523,7 @@ class ArtistSummaryTests(DatabaseTestCase):
         self.assertEqual(repaired["entries"][0]["recording_mbid"], SUN)
         self.assertEqual(repaired["entries"][0]["release_group_mbid"], ABBEY)
         self.assertEqual(repaired["entries"][0]["release_group_resolution_method"], "recording_album_remaster")
-        self.assertEqual(repaired["resolver_version"], 3)
+        self.assertEqual(repaired["resolver_version"], summary.RESOLVER_VERSION)
         self.assertEqual(repaired["fetched_at"], old["fetched_at"])
         self.assertEqual(summary.snapshot(BEATLES, "bio"), bio)
         self.assertTrue(summary.fresh(repaired, "top_tracks"))
