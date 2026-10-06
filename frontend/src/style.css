@@ -129,6 +129,9 @@ body.room-guest main { display: block; padding-top: 32px; padding-bottom: 32px; 
 .room-requester { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--foreground-muted); font-size: 11px; line-height: 1.5; }
 .room-entry-controls { display: flex; gap: 4px; }
 #room-root .room-entry-controls button { display: grid; place-items: center; width: 32px; height: 36px; padding: 0; border-color: transparent; background: transparent; font-size: 18px; }
+.room-entry-more { position: relative; }
+.room-entry-menu { position: absolute; z-index: 5; top: calc(100% + 4px); right: 0; width: 164px; padding: 4px; border: 1px solid var(--border-hover); border-radius: 8px; background: var(--background-elevated); box-shadow: var(--shadow-artwork); }
+#room-root .room-entry-controls .room-entry-menu button { justify-items: start; width: 100%; height: auto; padding: 9px 10px; font-size: 12px; text-align: left; }
 .room-connection, .room-empty { color: var(--foreground-muted); font-size: 12px; line-height: 1.6; }
 .room-connection { min-height: 16px; margin: 8px 0; }
 .room-warning { padding: 10px 12px; border-radius: 8px; background: var(--requested-surface); color: var(--foreground-subtle); font-size: 12px; line-height: 1.5; }

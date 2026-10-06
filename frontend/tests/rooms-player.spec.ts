@@ -107,6 +107,8 @@ test("locked Up Next is subtly identified and all host controls stay disabled", 
   }
   await expect(page.getByRole("button", { name: "Move Requested song up" })).toBeDisabled();
   await expect(page.getByRole("button", { name: "Remove Requested song" })).toBeEnabled();
+  await expect(row.getByRole("button", { name: "More queue actions for Next song" })).toBeDisabled();
+  for (const control of await row.locator(".room-entry-menu button").all()) await expect(control).toBeDisabled();
 });
 
 test("host lifecycle pills retain acquisition detail while guest presentation only shows Requested and Ready", async ({ page }) => {
@@ -188,3 +190,113 @@ for (const width of [320, 390]) {
     });
   }
 }
+
+for (const width of [1280, 320, 390]) {
+  test(`queue shortcuts move one duplicate to just after locked Up Next and back to the bottom at ${width}px`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 850 });
+    const cocoa = { ...state.queue[1], id: "cocoa", title: "Cocoa Butter Kisses", state: "ready" };
+    const duplicate = { ...cocoa, id: "cocoa-duplicate" };
+    const snapshot = { ...state, queue: [...state.queue, duplicate, cocoa] };
+    await openRoom(page, snapshot);
+    let requests = 0;
+    await page.route(`**/api/rooms/${code}/order`, async route => {
+      const entryIds = requests === 0 ? ["locked", "cocoa", "pending", "empty", "cocoa-duplicate"]
+        : ["locked", "pending", "empty", "cocoa-duplicate", "cocoa"];
+      expect(route.request().method()).toBe("PUT");
+      expect(route.request().headers()["x-csrf-token"]).toBe("csrf-ada");
+      expect(route.request().postDataJSON()).toEqual({ entryIds, version: 3 + requests });
+      requests++;
+      await route.fulfill({ json: { room: { ...snapshot, version: 3 + requests, queue: entryIds.map(id => snapshot.queue.find(entry => entry.id === id)) } } });
+    });
+    const row = page.locator('[data-entry-id="cocoa"]'), more = row.getByRole("button", { name: "More queue actions for Cocoa Butter Kisses" });
+    await more.click();
+    const menu = row.getByRole("group", { name: "Queue shortcuts" });
+    await expect(menu).toBeVisible();
+    const box = (await menu.boundingBox())!;
+    expect(box.x).toBeGreaterThanOrEqual(0); expect(box.x + box.width).toBeLessThanOrEqual(width);
+    for (const action of await menu.getByRole("button").all()) {
+      const actionBox = (await action.boundingBox())!;
+      expect(actionBox.width).toBeGreaterThan(140); expect(actionBox.height).toBeLessThan(45);
+    }
+    await expect(row.getByRole("button", { name: "Move Cocoa Butter Kisses to bottom" })).toBeDisabled();
+    await row.getByRole("button", { name: "Move Cocoa Butter Kisses to top" }).click();
+    await expect(page.locator(".room-queue li").nth(1)).toHaveAttribute("data-entry-id", "cocoa");
+    await expect(menu).toBeHidden(); await expect(more).toBeFocused();
+    await more.click();
+    await expect(row.getByRole("button", { name: "Move Cocoa Butter Kisses to top" })).toBeDisabled();
+    await row.getByRole("button", { name: "Move Cocoa Butter Kisses to bottom" }).click();
+    await expect(page.locator(".room-queue li").last()).toHaveAttribute("data-entry-id", "cocoa");
+    await expect(page.locator(".room-queue li").first()).toHaveAttribute("data-entry-id", "locked");
+    await expect(page.locator(".room-queue li")).toHaveCount(5);
+    await expect(page.locator('[data-entry-id="cocoa-duplicate"]')).toContainText("Cocoa Butter Kisses");
+    expect(requests).toBe(2);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    if (width === 320) {
+      await more.click();
+      await page.screenshot({ path: "test-results/rooms-queue-shortcuts-mobile.png", fullPage: true });
+    }
+  });
+}
+
+test("Move to top uses the first Room row when protected Up Next is shown separately", async ({ page }) => {
+  const snapshot = { ...state, queue: state.queue.slice(1) };
+  await openRoom(page, snapshot);
+  await page.route(`**/api/rooms/${code}/order`, async route => {
+    expect(route.request().postDataJSON()).toEqual({ entryIds: ["empty", "pending"], version: 3 });
+    await route.fulfill({ json: { room: { ...snapshot, version: 4, queue: [...snapshot.queue].reverse() } } });
+  });
+  await page.getByRole("button", { name: "More queue actions for Uncovered song" }).click();
+  await page.getByRole("button", { name: "Move Uncovered song to top" }).click();
+  await expect(page.locator(".room-queue li").first()).toHaveAttribute("data-entry-id", "empty");
+  await expect(page.locator(".room-next-preview")).toContainText("Up Next · Locked");
+});
+
+test("queue shortcut menu toggles, dismisses with Escape or outside focus, and stays hidden for guests", async ({ page }) => {
+  await openRoom(page);
+  const more = page.getByRole("button", { name: "More queue actions for Uncovered song" });
+  const menu = page.locator('[data-entry-id="empty"] .room-entry-menu');
+  await more.focus(); await page.keyboard.press("Enter");
+  await expect(more).toHaveAttribute("aria-expanded", "true");
+  await page.keyboard.press("Tab");
+  await expect(page.getByRole("button", { name: "Move Uncovered song to top" })).toBeFocused();
+  await page.keyboard.press("Escape"); await expect(menu).toBeHidden(); await expect(more).toBeFocused();
+  await more.click(); await expect(menu).toBeVisible();
+  await more.click(); await expect(menu).toBeHidden();
+  await more.click(); await page.getByRole("searchbox").click(); await expect(menu).toBeHidden();
+  await openRoom(page, state, false);
+  await expect(page.locator(".room-entry-more")).toHaveCount(0);
+});
+
+test("an open shortcut menu closes and disables when SSE makes that song locked", async ({ page }) => {
+  await openRoom(page);
+  const more = page.getByRole("button", { name: "More queue actions for Uncovered song" });
+  await more.click();
+  const menu = page.locator('[data-entry-id="empty"] .room-entry-menu');
+  await expect(menu).toBeVisible();
+  await update(page, { ...state, version: 4, nowPlaying: state.upNext, upNext: state.queue[2], queue: [
+    { ...state.queue[2], locked: true }, state.queue[1],
+  ] });
+  await expect(more).toBeDisabled(); await expect(menu).toBeHidden();
+  await expect(more).toHaveAttribute("aria-expanded", "false");
+  for (const control of await menu.locator("button").all()) await expect(control).toBeDisabled();
+});
+
+test("a stale shortcut surfaces the existing version error and retries against refreshed state", async ({ page }) => {
+  await openRoom(page);
+  const refreshed = { ...state, version: 4 };
+  await page.route(`**/api/rooms/${code}`, route => route.fulfill({ json: { room: refreshed } }));
+  let requests = 0;
+  await page.route(`**/api/rooms/${code}/order`, async route => {
+    expect(route.request().postDataJSON()).toEqual({ entryIds: ["locked", "empty", "pending"], version: 3 + requests });
+    requests++;
+    if (requests === 1) await route.fulfill({ status: 409, json: { error: "The Room changed. Reload its queue and retry." } });
+    else await route.fulfill({ json: { room: { ...refreshed, version: 5, queue: [state.queue[0], state.queue[2], state.queue[1]] } } });
+  });
+  const more = page.getByRole("button", { name: "More queue actions for Uncovered song" });
+  await more.click(); await page.getByRole("button", { name: "Move Uncovered song to top" }).click();
+  await expect(page.getByText("The Room changed. Reload its queue and retry.")).toBeVisible();
+  await expect(page.locator(".room-queue li").last()).toHaveAttribute("data-entry-id", "empty");
+  await more.click(); await page.getByRole("button", { name: "Move Uncovered song to top" }).click();
+  await expect(page.locator(".room-queue li").nth(1)).toHaveAttribute("data-entry-id", "empty");
+  expect(requests).toBe(2);
+});

@@ -221,7 +221,7 @@ function createQueueRow(id: string) {
   const status = element("span", "", "request-lifecycle"), lock = element("span", "Up Next · Locked", "room-lock");
   const error = element("p"); meta.append(lock, status, requester); details.append(title, artist, meta, error);
   row.append(artwork.frame, details);
-  let controls: { up: HTMLButtonElement; down: HTMLButtonElement; remove: HTMLButtonElement } | undefined;
+  let controls: { up: HTMLButtonElement; down: HTMLButtonElement; remove: HTMLButtonElement; more: HTMLButtonElement; top: HTMLButtonElement; bottom: HTMLButtonElement; closeMenu: () => void } | undefined;
   if (host) {
     const group = element("div", "", "room-entry-controls"); group.setAttribute("role", "group"); group.setAttribute("aria-label", "Queue actions");
     const move = async (offset: number) => {
@@ -232,10 +232,38 @@ function createQueueRow(id: string) {
       await mutate("order", "PUT", { entryIds: order, version: state.version });
     };
     const up = button("↑", () => move(-1)), down = button("↓", () => move(1));
+    const shortcuts = element("div", "", "room-entry-more"), menu = element("div", "", "room-entry-menu");
+    menu.hidden = true; menu.id = `room-entry-menu-${id}`;
+    menu.setAttribute("role", "group"); menu.setAttribute("aria-label", "Queue shortcuts");
+    const more = element("button", "⋯"); more.type = "button";
+    more.addEventListener("click", () => {
+      menu.hidden = !menu.hidden; more.setAttribute("aria-expanded", String(!menu.hidden));
+    });
+    more.setAttribute("aria-controls", menu.id); more.setAttribute("aria-expanded", "false");
+    const closeMenu = () => { menu.hidden = true; more.setAttribute("aria-expanded", "false"); };
+    shortcuts.addEventListener("focusout", event => {
+      if (!shortcuts.contains(event.relatedTarget as Node | null)) closeMenu();
+    });
+    shortcuts.addEventListener("keydown", event => {
+      if (event.key === "Escape" && !menu.hidden) { event.preventDefault(); event.stopPropagation(); closeMenu(); more.focus(); }
+    });
+    const moveTo = async (destination: "top" | "bottom") => {
+      closeMenu(); more.focus();
+      const state = current!, index = state.queue.findIndex(entry => entry.id === id);
+      const firstEditable = state.queue.findIndex(entry => entry.locked) + 1;
+      if (index < firstEditable || index < 0 || state.queue[index].locked) return;
+      const target = destination === "top" ? firstEditable : state.queue.length - 1;
+      if (index === target) return;
+      const order = state.queue.map(entry => entry.id);
+      order.splice(index, 1); order.splice(target, 0, id);
+      await mutate("order", "PUT", { entryIds: order, version: state.version });
+    };
+    const top = button("Move to top", () => moveTo("top")), bottom = button("Move to bottom", () => moveTo("bottom"));
+    menu.append(top, bottom); shortcuts.append(more, menu);
     const remove = button("×", () => {
       if (current?.queue.some(entry => entry.id === id && !entry.locked)) return mutate(`entries/${id}`, "DELETE", { version: current.version });
     });
-    controls = { up, down, remove }; group.append(up, down, remove); row.append(group);
+    controls = { up, down, remove, more, top, bottom, closeMenu }; group.append(up, down, shortcuts, remove); row.append(group);
   }
   return { row, update(entry: RoomEntry, index: number, state: RoomState) {
     artwork.update(entry); setText(title, entry.title); setText(artist, entry.artist);
@@ -250,9 +278,17 @@ function createQueueRow(id: string) {
       controls.up.setAttribute("aria-label", `Move ${entry.title} up`); controls.up.title = "Move up";
       controls.down.setAttribute("aria-label", `Move ${entry.title} down`); controls.down.title = "Move down";
       controls.remove.setAttribute("aria-label", `Remove ${entry.title}`); controls.remove.title = "Remove from queue";
+      controls.more.setAttribute("aria-label", `More queue actions for ${entry.title}`); controls.more.title = "More queue actions";
+      controls.top.setAttribute("aria-label", `Move ${entry.title} to top`);
+      controls.bottom.setAttribute("aria-label", `Move ${entry.title} to bottom`);
       setDisabled(controls.up, !!entry.locked || index === 0 || !!state.queue[index-1]?.locked);
       setDisabled(controls.down, !!entry.locked || index === state.queue.length-1 || !!state.queue[index+1]?.locked);
       setDisabled(controls.remove, !!entry.locked);
+      const firstEditable = state.queue.findIndex(entry => entry.locked) + 1;
+      setDisabled(controls.top, !!entry.locked || index <= firstEditable);
+      setDisabled(controls.bottom, !!entry.locked || index < firstEditable || index === state.queue.length-1);
+      setDisabled(controls.more, !!entry.locked || controls.top.dataset.unavailable === "true" && controls.bottom.dataset.unavailable === "true");
+      if (controls.more.dataset.unavailable === "true") controls.closeMenu();
     }
   } };
 }
@@ -282,6 +318,7 @@ function render(state: RoomState) {
   if (showNext) { player.nextArtwork.update(state.upNext!); setText(player.nextTitle, state.upNext!.title!); setText(player.nextArtist, state.upNext!.artist || ""); }
   setText(player.count, `${state.queue.length + Number(showNext)} tracks`);
   player.empty.hidden = state.queue.length > 0 || showNext;
+  const focused = document.activeElement;
   const ids = new Set(state.queue.map(entry => entry.id));
   for (const [id, item] of queueRows) { if (!ids.has(id)) { item.row.remove(); queueRows.delete(id); } }
   state.queue.forEach((entry, index) => {
@@ -290,6 +327,7 @@ function render(state: RoomState) {
     item.update(entry, index, state);
     if (player!.list.children[index] !== item.row) player!.list.insertBefore(item.row, player!.list.children[index] || null);
   });
+  if (focused instanceof HTMLElement && focused.isConnected && document.activeElement === document.body) focused.focus({ preventScroll: true });
   searchPanel.hidden = false;
 }
 function setupSearch() {
@@ -329,7 +367,7 @@ export async function showHostRooms(token: string) {
     const { room } = await call<{room: RoomState | null}>("/api/rooms/active");
     if (generation !== requestGeneration) return;
     if (room) { render(room); setupSearch(); watch(); return; }
-    roomPanel.append(element("p", "First start playing music in Plexamp and add at least one more song to Up Next. Your existing Plex queue is imported into the Room; current and Up Next stay protected.", "intro"));
+    roomPanel.append(element("p", "The system will detect your current plex music sessions to connect to.", "intro"));
     const startRoom = async (sessionId?: string) => {
       connection.textContent = "Detecting active Plexamp playback…";
       try {

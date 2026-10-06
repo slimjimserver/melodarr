@@ -70,6 +70,21 @@ live item has an **Up Next · Locked** badge and disabled host controls. Unknown
 requesters are omitted. Guests keep Requested/Ready presentation and the same
 layout, without host controls or detailed acquisition errors.
 
+The host's three-dot queue menu offers **Move to top** and **Move to bottom**.
+Top places the selected entry immediately after the locked live Up Next song
+(or first in the Room list when Up Next is shown separately); bottom places it
+last. Each shortcut submits one full order through the existing versioned
+reorder API, preserving other entries' relative order and duplicate identities.
+Locked entries cannot use these actions, and an action is disabled when the
+entry is already at that end. The menu supports keyboard focus and Escape.
+
+Queue-shortcut validation adds seven browser regressions for top/bottom moves,
+duplicates, separate Up Next, keyboard dismissal, live lock changes, stale
+versions and mobile sizing: 49 Rooms browser tests, 233 full browser tests and
+five existing backend reorder regressions passed. Frontend typecheck,
+production build and `git diff --check` passed. Backend synchronization is
+unchanged, and no commits or pushes were made.
+
 Artwork identity resolves locally through `track_search_plex_tracks` using the
 Room server and rating key, then `albumRatingKey` and the Plex library cache's
 `releaseGroupsByRatingKey` album/thumbnail. The existing Plex library scan worker

@@ -38,7 +38,7 @@ test("host route shows startup instructions and actionable playback failure", as
   await page.route("**/api/rooms", route => route.fulfill({ status: 502, json: { error: "No active Plexamp playback found. Start playing music in Plexamp, make sure there is another song in Up Next, then try again." } }));
   await page.goto("/rooms");
   await expect(page.locator("#rooms")).toHaveClass(/active/);
-  await expect(page.getByText(/First start playing music in Plexamp/)).toBeVisible();
+  await expect(page.locator(".room-panel > .intro")).toHaveText("The system will detect your current plex music sessions to connect to.");
   await page.getByRole("button", { name: "Start Room", exact: true }).click();
   await expect(page.getByText(/No active Plexamp playback found/)).toBeVisible();
 });
