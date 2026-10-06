@@ -14,6 +14,7 @@ import requests
 from backend import storage
 from backend.routes import rooms as routes
 from backend.services import recording_requests, rooms
+from backend.services import plex_rooms
 from backend.services.plex_rooms import PMSQueue as RealPMSQueue
 from backend.workers import rooms as worker
 
@@ -492,9 +493,9 @@ class RoomHardeningTests(RoomTestCase):
         self.device_rows = []
         self.device_events = {}
         self.device_queues = {}
-        for client, key, queue_id, current, name, platform in (
-            ("phone", "801", "1001", 11, "Jeremy’s iPhone", "iOS"),
-            ("pc", "802", "1002", 21, "Apollo", "Windows"),
+        for client, key, queue_id, current, name, product, platform in (
+            ("phone", "801", "1001", 11, "Jeremy’s iPhone", "Plexamp", "iOS"),
+            ("pc", "802", "1002", 21, "Chrome", "Plex Web", "Web"),
         ):
             self.device_rows.append(
                 {
@@ -507,7 +508,7 @@ class RoomHardeningTests(RoomTestCase):
                     "Player": {
                         "machineIdentifier": client,
                         "title": name,
-                        "product": "Plexamp",
+                        "product": product,
                         "platform": platform,
                         "state": "playing",
                         "token": "provider-secret",
@@ -547,6 +548,242 @@ class RoomHardeningTests(RoomTestCase):
         self.assertEqual(response.status_code, 200, response.get_json())
         return response.get_json()["sessions"]
 
+    def test_plex_web_is_candidate_resolves_starts_and_reconciles_via_pms(self):
+        adapter = self.configure_devices()
+        self.device_rows = self.device_rows[1:]
+        candidates = adapter._session_candidates(self.user)
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0]["product"], "Plex Web")
+        # Exercise the same notification envelope consumed by the websocket.
+        events = plex_rooms.notification_rows(
+            json.dumps(
+                {
+                    "NotificationContainer": {
+                        "PlaySessionStateNotification": [self.device_events["pc"]]
+                    }
+                }
+            )
+        )
+        self.feed.latest.side_effect = lambda session, **kwargs: deepcopy(events[0])
+        choice = self.devices()[0]
+        self.assertEqual((choice["queueId"], choice["currentItemId"]), ("1002", "21"))
+        room = self.start()
+        stored = rooms.room_by_code(room["code"])
+        self.assertEqual((stored["client_id"], stored["queue_id"]), ("pc", "1002"))
+        self.assertEqual(room["nowPlaying"]["title"], "Song 21")
+        self.assertEqual(room["upNext"]["title"], "Song 22")
+        self.assertTrue(room["queue"][0]["locked"])
+        self.device_queues["1002"]["Metadata"].append(item(23))
+        self.device_queues["1002"]["playQueueTotalCount"] = 3
+        state = rooms.reconcile(room["code"])
+        self.assertEqual(
+            [entry["title"] for entry in state["queue"]], ["Song 22", "Song 23"]
+        )
+        self.assertIsNone(state["syncError"])
+        queue_reads = [
+            call
+            for call in adapter.call.call_args_list
+            if call.args[1] == "/playQueues/1002"
+        ]
+        self.assertTrue(queue_reads)
+        self.assertTrue(
+            all(
+                call.args[0] == "GET" and call.kwargs["own"] == 0
+                for call in queue_reads
+            )
+        )
+        self.acquire.assert_not_called()
+
+    def test_unknown_product_with_valid_music_queue_starts_without_allowlist(self):
+        self.configure_devices()
+        self.device_rows = self.device_rows[:1]
+        self.device_rows[0]["Player"].update(
+            product="Future Music Client", platform="Unknown OS"
+        )
+        self.assertEqual(self.devices()[0]["product"], "Future Music Client")
+        room = self.start()
+        diagnostic = self.client.get(
+            f"/api/rooms/{room['code']}/diagnostics"
+        ).get_json()
+        self.assertEqual(diagnostic["room"]["product"], "Future Music Client")
+        self.assertEqual(diagnostic["room"]["platform"], "Unknown OS")
+
+    def test_music_session_does_not_require_product_metadata(self):
+        self.configure_devices()
+        self.device_rows = self.device_rows[:1]
+        self.device_rows[0]["Player"].pop("product")
+        self.assertEqual(self.devices()[0]["product"], "")
+        self.assertEqual(rooms.room_by_code(self.start()["code"])["client_id"], "phone")
+
+    def test_no_queue_notification_cannot_start_and_is_omitted_from_picker(self):
+        self.configure_devices()
+        self.device_events.clear()
+        self.assertEqual(self.devices(), [])
+        response = self.post("/api/rooms")
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.get_json()["error"], plex_rooms.NO_ACTIVE_PLAYBACK)
+        self.assertIsNone(rooms.host_room(self.user["id"]))
+
+    def test_one_compatible_session_auto_selects_despite_unsupported_music_client(self):
+        self.configure_devices()
+        self.device_events.pop("phone")
+        self.assertEqual([choice["product"] for choice in self.devices()], ["Plex Web"])
+        room = self.start()
+        self.assertEqual(rooms.room_by_code(room["code"])["queue_id"], "1002")
+
+    def test_notification_identity_rating_and_state_are_required_for_compatibility(
+        self,
+    ):
+        for change in (
+            {"clientIdentifier": "another-client"},
+            {"sessionKey": "another-stream"},
+            {"playQueueID": None},
+            {"playQueueID": "not-numeric"},
+            {"playQueueItemID": None},
+            {"playQueueItemID": "not-numeric"},
+            {"ratingKey": None},
+            {"ratingKey": "999"},
+            {"state": "paused"},
+            {"state": "stopped"},
+        ):
+            with self.subTest(change=change):
+                adapter = self.configure_devices()
+                self.device_rows = self.device_rows[1:]
+                self.device_events["pc"].update(change)
+                self.assertEqual(self.devices(), [])
+                with self.assertRaises(plex_rooms.QueueError):
+                    adapter.discover(self.user)
+                self.assertIsNone(rooms.host_room(self.user["id"]))
+
+    def test_complete_music_queue_and_exact_current_item_are_required_for_picker(self):
+        for change in (
+            {"playQueueID": "999"},
+            {"playQueueTotalCount": 3},
+            {"Metadata": [item(21), item(21)]},
+            {"Metadata": [item(31), item(32)]},
+            {"Metadata": [item(21, 999), item(22)]},
+            {"Metadata": [{**item(21), "type": "movie"}, item(22)]},
+            {"Metadata": [{**item(21), "ratingKey": "invalid"}, item(22)]},
+            {"Metadata": [{**item(21), "playQueueItemID": "invalid"}, item(22)]},
+        ):
+            with self.subTest(change=change):
+                adapter = self.configure_devices()
+                self.device_rows = self.device_rows[1:]
+                self.device_queues["1002"].update(change)
+                self.assertEqual(self.devices(), [])
+                with self.assertRaises(plex_rooms.QueueError):
+                    adapter.discover(self.user)
+
+    def test_unreachable_queue_is_omitted_and_errors_remain_safe(self):
+        adapter = self.configure_devices()
+        original = adapter.call.side_effect
+
+        def unavailable(method, path, **params):
+            if path == "/playQueues/1002":
+                raise plex_rooms.QueueError(
+                    "private-plex-token provider-secret http://private-pms/"
+                )
+            return original(method, path, **params)
+
+        adapter.call.side_effect = unavailable
+        self.assertEqual([choice["clientId"] for choice in self.devices()], ["phone"])
+        self.device_rows = self.device_rows[1:]
+        response = self.post("/api/rooms")
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.get_json()["error"], plex_rooms.NO_ACTIVE_PLAYBACK)
+        self.assertNotIn("private", json.dumps(response.get_json()))
+
+    def test_selected_player_losing_queue_capability_never_falls_back(self):
+        self.configure_devices()
+        web = self.devices()[1]
+        self.device_events.pop("pc")
+        response = self.post("/api/rooms", {"sessionId": web["id"]})
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(
+            [choice["clientId"] for choice in response.get_json()["sessions"]],
+            ["phone"],
+        )
+        self.assertIsNone(rooms.host_room(self.user["id"]))
+
+    def test_unselected_plexamp_changes_do_not_alter_selected_web_room(self):
+        adapter = self.configure_devices()
+        web = self.devices()[1]
+        room = self.post("/api/rooms", {"sessionId": web["id"]}).get_json()["room"]
+        self.device_rows[0].update(sessionKey="901", ratingKey="31")
+        self.device_events["phone"].update(
+            sessionKey="901", ratingKey="31", playQueueID="2001", playQueueItemID="31"
+        )
+        self.device_queues["1001"]["Metadata"].reverse()
+        adapter.call.reset_mock()
+        worker.tick()
+        self.assertEqual(rooms.snapshot(room["code"]), room)
+        self.assertTrue(
+            all(
+                call.args[1] in {"/status/sessions", "/playQueues/1002"}
+                for call in adapter.call.call_args_list
+            )
+        )
+
+    def test_unselected_web_changes_do_not_alter_selected_plexamp_room(self):
+        self.configure_devices()
+        phone = self.devices()[0]
+        room = self.post("/api/rooms", {"sessionId": phone["id"]}).get_json()["room"]
+        self.device_rows[1].update(sessionKey="902", ratingKey="41")
+        self.device_events["pc"].update(
+            sessionKey="902", ratingKey="41", playQueueID="2002", playQueueItemID="41"
+        )
+        worker.tick()
+        self.assertEqual(rooms.snapshot(room["code"]), room)
+
+    def test_web_stream_rotation_and_pause_follow_original_client_only(self):
+        self.configure_devices()
+        web = self.devices()[1]
+        room = self.post("/api/rooms", {"sessionId": web["id"]}).get_json()["room"]
+        self.device_rows[1].update(sessionKey="804", ratingKey="22")
+        self.device_rows[1]["Player"]["state"] = "paused"
+        self.device_events["pc"].update(
+            sessionKey="804", ratingKey="22", playQueueItemID="22", state="paused"
+        )
+        self.device_queues["1002"].update(
+            playQueueTotalCount=3, Metadata=[item(21), item(22), item(23)]
+        )
+        worker.tick()
+        state = rooms.snapshot(room["code"])
+        self.assertEqual(state["playbackState"], "paused")
+        self.assertEqual(state["nowPlaying"]["title"], "Song 22")
+        self.assertEqual(state["upNext"]["title"], "Song 23")
+        self.assertTrue(state["queue"][0]["locked"])
+        stored = rooms.room_by_code(room["code"])
+        self.assertEqual(
+            (stored["client_id"], stored["session_key"], stored["queue_id"]),
+            ("pc", "804", "1002"),
+        )
+        self.assertIsNone(state["syncError"])
+
+    def test_selected_web_disappearing_never_switches_to_active_plexamp(self):
+        self.configure_devices()
+        web = self.devices()[1]
+        room = self.post("/api/rooms", {"sessionId": web["id"]}).get_json()["room"]
+        self.device_rows = self.device_rows[:1]
+        worker.tick()
+        state = rooms.snapshot(room["code"])
+        self.assertIn("original player", state["syncError"])
+        self.assertEqual(state["queue"], room["queue"])
+        self.assertEqual(rooms.room_by_code(room["code"])["client_id"], "pc")
+
+    def test_web_queue_switch_retains_original_binding_and_fails_cleanly(self):
+        self.configure_devices()
+        web = self.devices()[1]
+        room = self.post("/api/rooms", {"sessionId": web["id"]}).get_json()["room"]
+        self.device_events["pc"]["playQueueID"] = "2002"
+        response = self.post(f"/api/rooms/{room['code']}/sync")
+        self.assertEqual(response.status_code, 502)
+        self.assertIn(
+            "selected Plex player switched queues", response.get_json()["error"]
+        )
+        stored = rooms.room_by_code(room["code"])
+        self.assertEqual((stored["client_id"], stored["queue_id"]), ("pc", "1002"))
+
     def test_zero_and_single_eligible_session_keep_easy_start_workflow(self):
         self.configure_devices()
         self.device_rows.clear()
@@ -570,7 +807,10 @@ class RoomHardeningTests(RoomTestCase):
         self.assertIsNone(rooms.host_room(self.user["id"]))
         choices = self.devices()
         self.assertEqual(
-            [choice["deviceName"] for choice in choices], ["Jeremy’s iPhone", "Apollo"]
+            [choice["deviceName"] for choice in choices], ["Jeremy’s iPhone", "Chrome"]
+        )
+        self.assertEqual(
+            [choice["product"] for choice in choices], ["Plexamp", "Plex Web"]
         )
         for selected in choices:
             response = self.post("/api/rooms", {"sessionId": selected["id"]})
@@ -585,7 +825,10 @@ class RoomHardeningTests(RoomTestCase):
                 f"/api/rooms/{room['code']}/diagnostics"
             ).get_json()
             self.assertEqual(diagnostics["room"]["deviceName"], selected["deviceName"])
+            self.assertEqual(diagnostics["room"]["product"], selected["product"])
             self.assertEqual(diagnostics["room"]["platform"], selected["platform"])
+            for key in ("clientId", "sessionKey", "queueId"):
+                self.assertEqual(diagnostics["room"][key], selected[key])
             self.assertNotIn(CONFIG["token"], json.dumps(diagnostics))
             self.assertNotIn("provider-secret", json.dumps(diagnostics))
             rooms.end(room["code"], self.user["id"])
@@ -715,7 +958,10 @@ class RoomHardeningTests(RoomTestCase):
         phone = self.devices()[0]
         self.device_queues["1001"]["playQueueTotalCount"] = 3
         response = self.post("/api/rooms", {"sessionId": phone["id"]})
-        self.assertEqual(response.status_code, 502)
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(
+            [choice["clientId"] for choice in response.get_json()["sessions"]], ["pc"]
+        )
         self.assertIsNone(rooms.host_room(self.user["id"]))
 
     def test_sse_updates_project_guest_state_and_preserve_host_detail(self):

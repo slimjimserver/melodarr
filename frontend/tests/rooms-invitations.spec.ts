@@ -131,7 +131,7 @@ test("header contains all host actions, preserves their authorization, and remov
   const heading = page.locator(".room-heading");
   for (const name of ["Invite", "Retry synchronization", "End Room"]) await expect(heading.getByRole("button", { name, exact: true })).toBeVisible();
   await expect(page.locator(".room-actions, .room-note")).toHaveCount(0);
-  await expect(page.getByText("Playback stays in Plexamp. Queue changes refresh there when playback advances.")).toHaveCount(0);
+  await expect(page.getByText("Playback stays in the selected Plex player. Queue changes refresh there when playback advances.")).toHaveCount(0);
   await page.route(`**/api/rooms/${code}/sync`, async route => {
     expect(route.request().headers()["x-csrf-token"]).toBe("csrf-ada");
     await route.fulfill({ json: { room } });
@@ -142,7 +142,7 @@ test("header contains all host actions, preserves their authorization, and remov
     await route.fulfill({ json: { room: { ...room, status: "closed", version: 4 } } });
   });
   await heading.getByRole("button", { name: "End Room" }).click();
-  await expect(page.getByText("This Room has ended. Plexamp playback continues with its current queue.")).toBeVisible();
+  await expect(page.getByText("This Room has ended. Plex music playback continues with its current queue.")).toBeVisible();
 });
 
 test("sync failures retain error styling and only emphasize the secondary Retry action", async ({ page }) => {

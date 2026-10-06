@@ -4,9 +4,9 @@
 
 # Melodarr
 
-**Rooms:** Host a shared jukebox from `/rooms` after starting music in Plexamp
-with another song in Up Next. Guests use a public Room link to search/request
-tracks. Melodarr manages the active PMS queue; remote Plexamp queue changes
+**Rooms:** Host a shared jukebox from `/rooms` after starting music in a compatible
+Plex player with another song in Up Next. Guests use a public Room link to search/request
+tracks. Melodarr manages the active PMS queue; remote Plex player queue changes
 appear naturally when playback advances. See [Rooms MVP](docs/rooms.md).
 
 Melodarr is a self-hosted music discovery and request app for Lidarr. It gives users a friendly place to find artists, explore albums, get personal recommendations, and request new music without needing access to Lidarr itself.

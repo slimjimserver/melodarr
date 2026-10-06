@@ -199,7 +199,7 @@ def start():
     if selection is not None and (
         not isinstance(selection, str) or not re.fullmatch(r"[0-9a-f]{64}", selection)
     ):
-        raise rooms.RoomError("Choose an active Plexamp device.")
+        raise rooms.RoomError("Choose an active Plex music player.")
     return jsonify({"room": rooms.start(current_user(), session_id=selection)}), 201
 
 

@@ -14,7 +14,7 @@ import requests
 import websocket
 
 MAX_QUEUE_ITEMS = 10000
-NO_ACTIVE_PLAYBACK = "No active Plexamp playback found. Start playing music in Plexamp, make sure there is another song in Up Next, then try again."
+NO_ACTIVE_PLAYBACK = "No compatible active Plex music playback found. Start playing music in Plex and make sure there is another song in Up Next, then retry."
 
 if __package__ == "backend.services":
     from ..http_security import request_without_redirects
@@ -227,13 +227,14 @@ class PMSQueue:
                 continue
             if (
                 str(owner.get("title") or "").strip().casefold() == username
-                and str(player.get("product") or "").casefold() == "plexamp"
                 and player.get("state")
                 in ({"playing", "paused"} if allow_paused else {"playing"})
                 and item.get("type") == "track"
-                and player.get("machineIdentifier")
+                and isinstance(player.get("machineIdentifier"), str)
+                and player["machineIdentifier"].strip()
                 and (client_id is None or str(player["machineIdentifier"]) == client_id)
                 and item.get("sessionKey") is not None
+                and str(item["sessionKey"]).strip()
                 and str(item.get("ratingKey") or "").isdigit()
             ):
                 identity = (
@@ -264,12 +265,12 @@ class PMSQueue:
         if not candidates:
             if client_id is not None:
                 raise QueueError(
-                    "This Room's Plexamp playback is no longer active. Resume playback on its original device and retry."
+                    "This Room's Plex music playback is no longer active. Resume playback on its original player and retry."
                 )
             raise QueueError(NO_ACTIVE_PLAYBACK)
         if len(candidates) != 1:
             raise QueueError(
-                "Multiple active Plexamp sessions found. Stop playback on your other devices and retry."
+                "Multiple active Plex music sessions found. Stop playback on your other players and retry."
             )
         return {
             key: candidates[0][key]
@@ -283,78 +284,98 @@ class PMSQueue:
             json.dumps([self.server_id, session["client_id"]]).encode()
         ).hexdigest()
 
-    def _session_choices(self, candidates):
+    def _compatible_sessions(self, candidates, *, wait=0):
+        """Prove queue capability through PMS, within one notification wait budget."""
         notifications = feed(self.config)
-        choices = []
+        deadline = time.monotonic() + wait
+        compatible = []
         for session in candidates:
-            event = notifications.latest(session)
-            valid = (
+            event = notifications.latest(
+                session, wait=max(0, deadline - time.monotonic())
+            )
+            if not (
                 event
                 and matches(event, session)
                 and str(event.get("ratingKey") or "") == session["rating_key"]
                 and event.get("state") == session["state"]
-            )
-            choices.append(
-                {
-                    "id": self._selection_id(session),
-                    "clientId": session["client_id"],
-                    "sessionKey": session["session_key"],
-                    "deviceName": session["device_name"],
-                    "product": session["product"],
-                    "platform": session["platform"],
-                    "state": session["state"],
-                    "title": session["title"],
-                    "artist": session["artist"],
-                    "album": session["album"],
-                    "queueId": str(event["playQueueID"]) if valid else None,
-                    "currentItemId": str(event["playQueueItemID"]) if valid else None,
-                }
-            )
-        return choices
+            ):
+                continue
+            try:
+                queue = self.load(str(event["playQueueID"]))
+            except QueueError:
+                # Unsupported/unreachable queues never become selectable, and
+                # provider errors are not part of the session response.
+                continue
+            if not any(
+                str(item["playQueueItemID"]) == str(event["playQueueItemID"])
+                and str(item["ratingKey"]) == session["rating_key"]
+                for item in queue.get("Metadata", [])
+            ):
+                continue
+            compatible.append((session, event))
+        return compatible
+
+    def _session_choices(self, compatible):
+        return [
+            {
+                "id": self._selection_id(session),
+                "clientId": session["client_id"],
+                "sessionKey": session["session_key"],
+                "deviceName": session["device_name"],
+                "product": session["product"],
+                "platform": session["platform"],
+                "state": session["state"],
+                "title": session["title"],
+                "artist": session["artist"],
+                "album": session["album"],
+                "queueId": str(event["playQueueID"]),
+                "currentItemId": str(event["playQueueItemID"]),
+            }
+            for session, event in compatible
+        ]
 
     def sessions(self, user):
-        return self._session_choices(self._session_candidates(user))
+        return self._session_choices(
+            self._compatible_sessions(self._session_candidates(user))
+        )
 
     def discover(self, user, *, session_id=None):
-        notifications = feed(self.config)
         candidates = self._session_candidates(user)
+        compatible = self._compatible_sessions(candidates, wait=20)
         if session_id is not None:
             selected = [
-                candidate
-                for candidate in candidates
+                (candidate, event)
+                for candidate, event in compatible
                 if self._selection_id(candidate) == session_id
             ]
             if len(selected) != 1:
                 raise SessionSelectionError(
-                    "The selected Plexamp device is no longer available. Refresh devices and try again.",
-                    self._session_choices(candidates),
+                    "The selected Plex player is no longer available or has no usable music queue. Refresh players and retry.",
+                    self._session_choices(compatible),
                 )
-            candidate = selected[0]
-        elif len(candidates) > 1:
+            candidate, event = selected[0]
+        elif len(compatible) > 1:
             raise SessionSelectionError(
-                "Multiple active Plexamp sessions were found. Choose a device for this Room.",
-                self._session_choices(candidates),
+                "Multiple compatible Plex music sessions were found. Choose a player for this Room.",
+                self._session_choices(compatible),
             )
-        elif candidates:
-            candidate = candidates[0]
+        elif compatible:
+            candidate, event = compatible[0]
         else:
             # Keep the existing helpful zero-session error.
             raise QueueError(NO_ACTIVE_PLAYBACK)
         session = {
             key: candidate[key] for key in ("client_id", "session_key", "rating_key")
         }
-        event = notifications.latest(session, wait=20)
-        if not event or not matches(event, session) or event.get("state") != "playing":
-            raise QueueError(
-                "Plexamp's active queue could not be detected. Keep playback running and retry shortly."
-            )
         # Recheck ownership/session after the bounded notification wait.
         if self.active_session(user, client_id=session["client_id"]) != session:
             raise QueueError(
-                "Plexamp playback changed during startup. Retry the Room handoff."
+                "Plex music playback changed during startup. Retry the Room handoff."
             )
         if str(event.get("ratingKey") or "") != session["rating_key"]:
-            raise QueueError("Plexamp advanced during startup. Retry the Room handoff.")
+            raise QueueError(
+                "Plex playback advanced during startup. Retry the Room handoff."
+            )
         return {
             **session,
             "device_name": candidate["device_name"],
@@ -392,7 +413,7 @@ class PMSQueue:
             complete = False
         if not complete:
             raise QueueError(
-                "Plex returned an incomplete queue. Use a smaller Plexamp queue and retry."
+                "Plex returned an incomplete queue. Use a smaller Plex music queue and retry."
             )
         return result
 

@@ -298,7 +298,7 @@ function render(state: RoomState) {
   if (state.status === "closed") {
     stop(); connection.textContent = "Room ended";
     player = undefined; queueRows.clear();
-    roomPanel.replaceChildren(element("h2", `Room ${state.code}`), element("p", "This Room has ended. Plexamp playback continues with its current queue."));
+    roomPanel.replaceChildren(element("h2", `Room ${state.code}`), element("p", "This Room has ended. Plex music playback continues with its current queue."));
     searchPanel.hidden = true;
     if (host) roomPanel.append(button("Start another Room", () => showHostRooms(csrf)));
     return;
@@ -367,9 +367,9 @@ export async function showHostRooms(token: string) {
     const { room } = await call<{room: RoomState | null}>("/api/rooms/active");
     if (generation !== requestGeneration) return;
     if (room) { render(room); setupSearch(); watch(); return; }
-    roomPanel.append(element("p", "The system will detect your current plex music sessions to connect to.", "intro"));
+    roomPanel.append(element("p", "The system will detect your current Plex music sessions to connect to.", "intro"));
     const startRoom = async (sessionId?: string) => {
-      connection.textContent = "Detecting active Plexamp playback…";
+      connection.textContent = "Detecting active Plex music playback…";
       try {
         const { room } = await call<{room: RoomState}>("/api/rooms", "POST", sessionId ? { sessionId } : undefined);
         if (generation !== requestGeneration) return;
@@ -388,17 +388,17 @@ export async function showHostRooms(token: string) {
       roomPanel.querySelector(".room-device-picker")?.remove();
       const picker = element("section", "", "room-device-picker");
       const form = element("form"), devices = element("fieldset");
-      devices.append(element("legend", "Choose a Plexamp device"));
+      devices.append(element("legend", "Choose an active Plex music player / queue"));
       sessions.forEach((session) => {
         const label = element("label"), radio = element("input");
         radio.type = "radio"; radio.name = "sessionId"; radio.value = session.id; radio.required = true;
         const details = element("span");
-        details.append(element("strong", session.deviceName || session.product || "Plexamp device"),
+        details.append(element("strong", session.deviceName || session.product || "Plex player"),
           element("p", [session.product, session.platform].filter(Boolean).join(" · ")),
           element("p", `${session.state === "paused" ? "Paused" : "Playing"}: ${session.title}${session.artist ? ` — ${session.artist}` : ""}`));
         label.append(radio, details); devices.append(label);
       });
-      const submit = element("button", "Start Room on selected device"); submit.type = "submit"; submit.disabled = sessions.length === 0;
+      const submit = element("button", "Start Room on selected player"); submit.type = "submit"; submit.disabled = sessions.length === 0;
       form.append(devices, submit);
       form.addEventListener("submit", async (event) => {
         event.preventDefault(); submit.disabled = true; notify("");
@@ -407,11 +407,11 @@ export async function showHostRooms(token: string) {
         catch (error) { if (generation === requestGeneration) notify(error.message, "error"); }
         finally { submit.disabled = sessions.length === 0; }
       });
-      picker.append(form, button("Refresh devices", async () => {
+      picker.append(form, button("Refresh players", async () => {
         const response = await call<{sessions: RoomSession[]}>("/api/rooms/sessions");
         if (generation === requestGeneration) showDevices(response.sessions);
       }));
-      if (!sessions.length) picker.append(element("p", "No active Plexamp devices found. Start playback, then refresh devices."));
+      if (!sessions.length) picker.append(element("p", "No compatible active Plex music playback found. Start playing music in Plex and make sure there is another song in Up Next, then refresh players."));
       roomPanel.append(picker);
     };
     roomPanel.append(button("Start Room", () => startRoom()));

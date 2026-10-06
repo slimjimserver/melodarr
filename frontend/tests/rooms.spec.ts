@@ -35,42 +35,43 @@ async function guest(page: Page) {
 test("host route shows startup instructions and actionable playback failure", async ({ page }) => {
   await host(page);
   await page.route("**/api/rooms/active", route => route.fulfill({ json: { room: null } }));
-  await page.route("**/api/rooms", route => route.fulfill({ status: 502, json: { error: "No active Plexamp playback found. Start playing music in Plexamp, make sure there is another song in Up Next, then try again." } }));
+  await page.route("**/api/rooms", route => route.fulfill({ status: 502, json: { error: "No compatible active Plex music playback found. Start playing music in Plex and make sure there is another song in Up Next, then retry." } }));
   await page.goto("/rooms");
   await expect(page.locator("#rooms")).toHaveClass(/active/);
-  await expect(page.locator(".room-panel > .intro")).toHaveText("The system will detect your current plex music sessions to connect to.");
+  await expect(page.locator(".room-panel > .intro")).toHaveText("The system will detect your current Plex music sessions to connect to.");
   await page.getByRole("button", { name: "Start Room", exact: true }).click();
-  await expect(page.getByText(/No active Plexamp playback found/)).toBeVisible();
+  await expect(page.getByText(/No compatible active Plex music playback found/)).toBeVisible();
 });
 
 const sessions = [
   { id: "a".repeat(64), clientId: "phone", sessionKey: "801", deviceName: "Jeremy’s iPhone", product: "Plexamp", platform: "iOS", state: "playing", title: "Phone song", artist: "Artist" },
-  { id: "b".repeat(64), clientId: "pc", sessionKey: "802", deviceName: "Apollo", product: "Plexamp", platform: "Windows", state: "playing", title: "PC song", artist: "Artist" },
+  { id: "b".repeat(64), clientId: "pc", sessionKey: "802", deviceName: "Chrome", product: "Plex Web", platform: "Web", state: "playing", title: "Web song", artist: "Artist" },
 ];
 
-test("multiple active devices render a chooser and submit the selected session ID", async ({ page }) => {
+for (const selected of sessions) test(`Plexamp and Plex Web render distinct choices and select ${selected.product}`, async ({ page }) => {
   await host(page);
   await page.route("**/api/rooms/active", route => route.fulfill({ json: { room: null } }));
   let starts = 0;
   await page.route("**/api/rooms", async route => {
     starts++;
     if (starts === 1) {
-      await route.fulfill({ status: 409, json: { error: "Choose a device for this Room.", selectionRequired: true, sessions } });
+      await route.fulfill({ status: 409, json: { error: "Choose a Plex player for this Room.", selectionRequired: true, sessions } });
     } else {
-      expect(route.request().postDataJSON()).toEqual({ sessionId: sessions[0].id });
+      expect(route.request().postDataJSON()).toEqual({ sessionId: selected.id });
       await route.fulfill({ status: 201, json: { room } });
     }
   });
   await page.goto("/rooms");
   await page.getByRole("button", { name: "Start Room", exact: true }).click();
-  await expect(page.getByRole("group", { name: "Choose a Plexamp device" })).toBeVisible();
+  await expect(page.getByRole("group", { name: "Choose an active Plex music player / queue" })).toBeVisible();
   await expect(page.getByText("Plexamp · iOS", { exact: true })).toBeVisible();
-  await expect(page.getByText("Plexamp · Windows", { exact: true })).toBeVisible();
+  await expect(page.getByText("Plex Web · Web", { exact: true })).toBeVisible();
   await expect(page.getByText("Playing: Phone song — Artist", { exact: true })).toBeVisible();
+  await expect(page.getByText("Playing: Web song — Artist", { exact: true })).toBeVisible();
   await expect(page.getByRole("radio")).toHaveCount(2);
   expect(starts).toBe(1);
-  await page.getByRole("radio", { name: /Jeremy’s iPhone/ }).check();
-  await page.getByRole("button", { name: "Start Room on selected device" }).click();
+  await page.getByRole("radio", { name: new RegExp(selected.deviceName) }).check();
+  await page.getByRole("button", { name: "Start Room on selected player" }).click();
   await expect(page.locator(".room-queue li")).toHaveCount(2);
   await expect(page.getByRole("radio")).toHaveCount(0);
   expect(starts).toBe(2);
@@ -89,15 +90,15 @@ test("stale device selection refreshes choices without automatically starting an
   await page.goto("/rooms");
   await page.getByRole("button", { name: "Start Room", exact: true }).click();
   await page.getByRole("radio", { name: /Jeremy’s iPhone/ }).check();
-  await page.getByRole("button", { name: "Start Room on selected device" }).click();
+  await page.getByRole("button", { name: "Start Room on selected player" }).click();
   await expect(page.getByRole("radio")).toHaveCount(1);
-  await expect(page.getByRole("radio", { name: /Apollo/ })).toBeVisible();
+  await expect(page.getByRole("radio", { name: /Chrome/ })).toBeVisible();
   await expect(page.getByText("The selected device is no longer available.", { exact: true })).toBeVisible();
   expect(starts).toBe(2);
-  await page.getByRole("button", { name: "Refresh devices" }).click();
+  await page.getByRole("button", { name: "Refresh players" }).click();
   await expect(page.getByRole("radio")).toHaveCount(0);
-  await expect(page.getByRole("button", { name: "Start Room on selected device" })).toBeDisabled();
-  await expect(page.getByText(/No active Plexamp devices found/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "Start Room on selected player" })).toBeDisabled();
+  await expect(page.getByText(/No compatible active Plex music playback found/)).toBeVisible();
   expect(starts).toBe(2);
 });
 

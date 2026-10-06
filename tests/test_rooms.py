@@ -307,7 +307,7 @@ class RoomTests(RoomTestCase):
     def test_no_active_playback_creates_no_room(self):
         self.pms.discover = Mock(
             side_effect=plex_rooms.QueueError(
-                "No active Plexamp playback found. Start playback first."
+                "No compatible active Plex music playback found. Start playback first."
             )
         )
         response = self.post("/api/rooms")
@@ -2762,6 +2762,85 @@ class PMSProtocolTests(DatabaseTestCase):
         }
         self.user = {"plex_id": "123", "plex_username": "plex user"}
 
+    def test_music_candidates_accept_any_product_and_preserve_display_metadata(self):
+        for product, platform in (
+            ("Plexamp", "iOS"),
+            ("Plex Web", "Web"),
+            ("Another Plex Music Client", "Desktop"),
+        ):
+            with self.subTest(product=product):
+                session = deepcopy(self.session)
+                session.update(
+                    title="Current song", grandparentTitle="Artist", parentTitle="Album"
+                )
+                session["Player"].update(
+                    product=product, platform=platform, title="Player name"
+                )
+                with patch.object(
+                    self.pms, "call", return_value={"Metadata": [session]}
+                ):
+                    candidates = self.pms._session_candidates(self.user)
+                self.assertEqual(len(candidates), 1)
+                candidate = candidates[0]
+                self.assertEqual(
+                    (
+                        candidate["product"],
+                        candidate["platform"],
+                        candidate["device_name"],
+                    ),
+                    (product, platform, "Player name"),
+                )
+                self.assertEqual(
+                    (candidate["title"], candidate["artist"], candidate["album"]),
+                    ("Current song", "Artist", "Album"),
+                )
+
+    def test_ineligible_or_malformed_music_sessions_are_ignored(self):
+        for changes in (
+            {"type": "movie"},
+            {"type": "episode"},
+            {"User": {"title": "Someone else", "id": 123}},
+            {"User": []},
+            {"Player": []},
+            *(
+                {"Player": {**self.session["Player"], "machineIdentifier": value}}
+                for value in (None, "", "  ", 123, [])
+            ),
+            *({"sessionKey": value} for value in (None, "", "  ")),
+            *({"ratingKey": value} for value in (None, "", "invalid", "-1", "1.2")),
+            *(
+                {"Player": {**self.session["Player"], "state": value}}
+                for value in (None, "paused", "stopped", "buffering")
+            ),
+        ):
+            with (
+                self.subTest(changes=changes),
+                patch.object(
+                    self.pms,
+                    "call",
+                    return_value={"Metadata": [{**self.session, **changes}]},
+                ),
+            ):
+                self.assertEqual(self.pms._session_candidates(self.user), [])
+
+    def test_paused_semantics_apply_to_every_music_product(self):
+        for product in ("Plexamp", "Plex Web", "Another Music Client"):
+            with self.subTest(product=product):
+                session = deepcopy(self.session)
+                session["Player"].update(product=product, state="paused")
+                with patch.object(
+                    self.pms, "call", return_value={"Metadata": [session]}
+                ):
+                    self.assertEqual(self.pms._session_candidates(self.user), [])
+                    self.assertEqual(
+                        len(self.pms._session_candidates(self.user, allow_paused=True)),
+                        1,
+                    )
+                    current = self.pms.active_session(
+                        self.user, client_id="dynamic-client", allow_paused=True
+                    )
+                self.assertEqual(current["session_key"], "9117")
+
     def test_session_uses_username_not_server_local_user_id(self):
         other = {**self.session, "User": {"id": 123, "title": "Someone else"}}
         with patch.object(
@@ -2857,7 +2936,18 @@ class PMSProtocolTests(DatabaseTestCase):
             plex_rooms.matches({**event, "clientIdentifier": "other-client"}, session)
         )
         with (
-            patch.object(self.pms, "call", return_value={"Metadata": [self.session]}),
+            patch.object(
+                self.pms,
+                "call",
+                side_effect=lambda method, path, **params: (
+                    {"Metadata": [self.session]}
+                    if path == "/status/sessions"
+                    else {
+                        "playQueueID": "82606",
+                        "Metadata": [item(56423286, 77), item(56423287, 78)],
+                    }
+                ),
+            ),
             patch.object(
                 plex_rooms, "feed", return_value=Mock(latest=Mock(return_value=event))
             ),

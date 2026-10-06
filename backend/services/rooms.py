@@ -233,12 +233,13 @@ def start(user, *, session_id=None):
             )
             if index is None or index + 1 >= len(items):
                 raise RoomError(
-                    "Add at least one more song to Plexamp's Up Next, then retry starting your Room.",
+                    "Add at least one more song to the Plex player's Up Next, then retry starting your Room.",
                     409,
                 )
             if str(items[index].get("ratingKey") or "") != session["rating_key"]:
                 raise RoomError(
-                    "Plexamp advanced during startup. Retry starting the Room.", 409
+                    "Plex playback advanced during startup. Retry starting the Room.",
+                    409,
                 )
             room_id = str(uuid4())
             nonce, verifier = room_invites.create(room_id)
@@ -550,22 +551,22 @@ def playback_event(room, adapter):
     event = plex_rooms.feed(adapter.config).latest(session)
     if not event:
         raise plex_rooms.QueueError(
-            "PMS playback notifications are unavailable. Keep Plexamp playing and retry shortly."
+            "Plex music playback could not be resolved. Keep the selected Plex player playing and retry shortly."
         )
     if str(event.get("playQueueID")) != room["queue_id"]:
         raise plex_rooms.QueueError(
-            "Plexamp switched queues. End this Room and start another while playback is active."
+            "The selected Plex player switched queues. End this Room and start another while playback is active."
         )
     if (
         not plex_rooms.matches(event, session)
         or str(event.get("ratingKey") or "") != session["rating_key"]
     ):
         raise plex_rooms.QueueError(
-            "Plexamp playback changed while observing its queue. Retry shortly."
+            "Plex music playback changed while observing its queue. Retry shortly."
         )
     if event.get("state") not in {"playing", "paused"}:
         raise plex_rooms.QueueError(
-            "Plexamp playback is no longer active. Resume it on the Room's original device and retry."
+            "Plex music playback is no longer active. Resume it on the Room's original device and retry."
         )
     return event, session
 
@@ -585,12 +586,12 @@ def observe(room, adapter, queue):
         )
     if current not in ids:
         raise plex_rooms.QueueError(
-            "The playing item could not be found. Keep Plexamp playback active and retry."
+            "The playing item could not be found. Keep Plex music playback active and retry."
         )
     index = ids.index(current)
     if str(items[index].get("ratingKey") or "") != session["rating_key"]:
         raise plex_rooms.QueueError(
-            "Plexamp advanced while its queue was loading. Retry shortly."
+            "Plex playback advanced while its queue was loading. Retry shortly."
         )
     state = str(event["state"])
     now = json.dumps(_stored_track(items[index]))
@@ -882,7 +883,7 @@ def _recover_adds(room, queue):
         ]
         if len(candidates) > 1 or any(identity in claimed for identity in candidates):
             raise plex_rooms.QueueError(
-                "An interrupted Plex addition is ambiguous. Inspect Plexamp and restart the Room."
+                "An interrupted Plex addition is ambiguous. Inspect the selected Plex player and restart the Room."
             )
         if candidates or row["removed"]:
             identity = candidates[0] if candidates else None

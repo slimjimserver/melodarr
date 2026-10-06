@@ -1,19 +1,23 @@
 # Rooms: shared Plex queue synchronization
 
-Plexamp ⇄ PMS PlayQueue ⇄ Melodarr Room
+Plex music player ⇄ PMS PlayQueue ⇄ Melodarr Room
 
 A Room synchronizes Melodarr with the host's active Plex Media Server PlayQueue.
-PMS is authoritative for materialized songs and their order. Plexamp additions,
+PMS is authoritative for materialized songs and their order. Plex player additions,
 removals, reorders, and Autoplay additions are reflected in Rooms; Melodarr
 requests and host edits are written back to PMS. Queue items are treated alike,
 with no source labels or fabricated requester information.
 
 ## Starting and using a Room
 
-Start Plexamp playback with at least one more song in Up Next, open **Rooms**,
-and choose **Start Room**. The host needs a linked Plex account and active
-Plexamp playback. A single eligible device starts directly. When multiple
-devices are playing, choose the phone/computer whose queue the Room should use.
+Start music in a compatible Plex player with at least one more song in Up Next,
+open **Rooms**, and choose **Start Room**. The host needs a linked Plex account
+and active Plex music playback. Plexamp remains supported but is no longer
+required: Plex Web, Plex Desktop, or another music client is compatible when PMS
+exposes a valid music PlayQueue for its active session. Product names are display
+metadata, not an allowlist. Video sessions are excluded.
+A single compatible player starts directly. When multiple compatible players
+are playing, choose the player whose queue the Room should use.
 A queue with just current A and next B is sufficient.
 Starting imports the existing upcoming queue without changing PMS: A remains
 Now Playing, B is **Up Next · Locked**, and C/D/E keep their PMS positions.
@@ -32,19 +36,20 @@ Guests join with an optional name,
 search, and request songs without Melodarr/Plex accounts. Blank names become
 Guest #1, Guest #2, etc.; returning guests reuse their scoped identity. Only
 the host can reorder, remove, retry synchronization, or end the Room. Ending
-leaves Plexamp and its queue running; Rooms remain active until ended.
+leaves the selected Plex player and its queue running; Rooms remain active until
+ended.
 
-The current item comes from the original device's active Plexamp stream and
+The current item comes from the original player's active music stream and
 recent PMS playback notification. Up Next is the first item immediately after
 it in the complete PMS queue. Both are protected from normal Melodarr edits.
-When the host changes Up Next in Plexamp, passive synchronization adopts and
-locks that new item. A consumed startup handoff ID stays cleared; legacy
+When the host changes Up Next in the Plex player, passive synchronization adopts
+and locks that new item. A consumed startup handoff ID stays cleared; legacy
 handoff/trim fields are compatibility data, never instructions to delete or
 restore the original queue suffix.
 
-Plexamp clients may display PMS writes when playback advances. Playback controls
-stay in Plexamp. Keep playable songs queued: pending requests cannot prevent
-exhaustion, and Rooms cannot start/restart an idle player.
+Plex clients may display PMS writes when playback advances. Playback controls
+stay in the selected Plex player. Keep playable songs queued: pending requests
+cannot prevent exhaustion, and Rooms cannot start/restart an idle player.
 
 ## Player presentation and cached artwork
 
@@ -231,15 +236,28 @@ and exception traces are excluded. Older Rooms retain their original binding;
 device labels default to empty when they predate this migration.
 
 `GET /api/rooms/sessions` is read-only and requires a signed-in user. It lists
-only that user's playing Plexamp music sessions, with safe device labels,
-platform/product, track metadata and a stable server/device selection ID.
-Queue/current IDs are included when matching playback notifications are already
-available. Paused playback remains supported for an existing Room, as before.
+only that user's compatible playing Plex music sessions, with safe device labels,
+actual product/platform, title/artist/album, state, queue/current IDs, and an opaque
+stable server/client selection ID. For example, an iPhone can show `Plexamp · iOS`
+while Chrome shows `Plex Web · Web`; each choice identifies a separate queue.
+Paused playback remains supported for an existing Room, as before.
+
+Initial discovery requires the linked host's Plex username, `type == track`,
+playing state, a nonblank client `machineIdentifier`, a nonblank `sessionKey`,
+and a numeric `ratingKey`. PMS-local numeric user IDs do not identify the host.
+Compatibility then requires a recent connected PMS `PlaySessionStateNotification`
+matching that client, stream, rating key and state, with numeric `playQueueID`
+and `playQueueItemID`. `GET /playQueues/{id}` must load a complete music queue
+with unique item IDs and the exact current item/rating key. Sessions without a
+usable notification or queue are omitted; raw provider errors are never returned.
+Discovery is read-only. Startup retains its bounded notification wait and
+revalidates ownership and protected queue boundaries under the existing queue lock.
 
 `POST /api/rooms` accepts an optional JSON body `{"sessionId": "..."}`. With no
-selection, zero sessions produces the existing playback guidance, one starts
-directly, and multiple return HTTP 409 with `selectionRequired: true` and current
-choices. The minimal device picker submits the selected ID and can refresh via
+selection, zero compatible sessions produces generic Plex music playback
+guidance, one starts directly, and multiple return HTTP 409 with
+`selectionRequired: true` and current choices. The player/queue picker submits
+the selected ID and can refresh via
 the discovery endpoint. A stale selection returns refreshed choices and never
 falls back to a different device.
 
@@ -273,7 +291,7 @@ It changes neither persisted state nor revisions. Host responses and private
 diagnostics preserve full detail; reconciliation has one shared implementation.
 
 `dirty`/`sync_error` alone never authorize restoring old Room order. A temporary
-observation failure therefore cannot create a fight with later Plexamp edits.
+observation failure therefore cannot create a fight with later Plex player edits.
 Queue/server switches, duplicate item IDs, incomplete/unplayable PMS responses,
 unavailable notifications, and stale owned streams fail closed.
 
@@ -329,7 +347,7 @@ validation uses its materialized identity rather than the first database row.
 When a pending reservation lies before Up Next, `deferred_until` remembers that
 protected instance. The entry stays Requested/Queued/Downloading/Waiting for
 Plex or Ready · Waiting for queue according to the authoritative lifecycle.
-Worker ticks continue adopting Plexamp additions, removals, reorders, and Play
+Worker ticks continue adopting Plex player additions, removals, reorders, and Play
 Next. Once the boundary changes, the blocked pending group rebases just below
 new Up Next (or current if there is no next) and available entries materialize
 normally. This deliberately gives the live protected boundary priority over
@@ -368,7 +386,7 @@ source is introduced.
 | Permissions, guest capabilities, SSE and safe artwork | `backend/routes/rooms.py` |
 | Read-only host diagnostics | `backend/services/room_diagnostics.py` |
 | Periodic reconciliation and bounded maintenance | `backend/workers/rooms.py` |
-| Host/guest presentation and device picker | `frontend/src/rooms.ts` |
+| Host/guest presentation and player/queue picker | `frontend/src/rooms.ts` |
 | Regressions | `tests/test_rooms.py`, `tests/test_room_hardening.py`, `frontend/tests/rooms.spec.ts` |
 
 ## HTTP routes
@@ -378,7 +396,7 @@ All routes are under `/api/rooms`; automation API keys grant no Room authority.
 | Method and path | Access / purpose |
 | --- | --- |
 | GET `/active` | Signed-in host's active Room |
-| GET `/sessions` | Signed-in user discovers their active Plexamp devices |
+| GET `/sessions` | Signed-in user discovers their compatible active Plex music players/queues |
 | POST `/api/rooms` | Signed-in host starts Room; optional `{sessionId}` |
 | GET `/<code>/diagnostics` | That signed-in host only; read-only private diagnostics |
 | POST `/<code>/join` | Public; creates/reuses scoped guest identity |
@@ -510,14 +528,60 @@ the conventional Gunicorn config filename is exempted from `N999`.
 No commits or pushes were made. PMS synchronization decisions were unchanged;
 automated PMS coverage uses the existing transport mocks.
 
-## Real PMS/Plexamp acceptance checks
+## General music-session validation (2026-10-06)
+
+The former `player.product.casefold() == "plexamp"` gate is removed. The picker
+uses option A: only sessions with a validated PMS queue are returned. A selected
+player that disappears or loses queue capability returns refreshed compatible
+choices without falling back to another client. An incomplete queue discovered
+after selection therefore returns HTTP 409 rather than binding a Room.
+
+The mixed-client fixture models an iPhone running Plexamp and Chrome running
+Plex Web, each with its own session, notification, and queue. Plex Web is proven
+to become a candidate, resolve its exact current item, start automatically when
+it is the sole compatible session, import/lock Up Next, and adopt PMS additions
+through the existing adapter. Both clients can be selected independently.
+Diagnostics retains its existing allowlisted schema; assertions verify each
+client's ID, name, actual product/platform, session key, queue ID, and secret
+exclusion.
+
+Seventeen new backend tests cover product-independent eligibility, absent
+product metadata, malformed/missing identities, paused semantics, missing or
+mismatched notifications, inaccessible/incomplete/invalid queues, exact current
+item/rating validation, unsupported-session omission, selected-client loss,
+unrelated-player changes, stream rotation, and queue-switch rejection. The
+browser picker regression now runs once for Plexamp and once for Plex Web,
+adding one case and checking both product/platform labels and selection IDs.
+
+| Check | Result |
+| --- | --- |
+| Targeted PMS discovery and Room startup/hardening | 57 passed |
+| Full Rooms backend (all four Rooms test modules) | 194 passed |
+| Full backend (`python -m unittest discover -s tests -t .`) | 1,144 passed |
+| Rooms browser suite (all three Rooms specs) | 50 passed |
+| Full browser suite | 234 passed |
+| Frontend typecheck and production build | Passed |
+| Ruff on changed Python files; repository `E9,F63,F7,F82` | Passed |
+| Ruff formatting on all five changed Python files | Passed |
+| `git diff --check` | Passed |
+
+Validation uses Python 3.12.10, Node 22.17.0, mocked PMS transport and browser
+fixtures. No live client types were inspected or identified as incompatible;
+track sessions lacking a usable queue are modeled and rejected in tests.
+The PMS-authoritative synchronization, playback controls, acquisition, guest
+security, protected current/Up Next items, and stale-write checks are unchanged.
+Work began on pushed `develop` at `f6f5d0d`; no commits or pushes were made.
+
+## Real PMS/Plex music player acceptance checks
 
 Backend tests mock PMS transport; browser tests use fixture snapshots. Before
-deployment, exercise live PMS with local and remote/cellular Plexamp:
+deployment, exercise live PMS with Plexamp, Plex Web, and other available music
+clients, including local and remote/cellular playback. A track session alone
+does not prove queue compatibility; confirm its correlated queue is accessible:
 
 1. Start with A/B and A/B/C/D/E; confirm all IDs/order survive and B locks.
 2. Append single/batched songs, allow Autoplay, insert duplicates, remove only one
-   duplicate, reorder future items, and change Up Next in Plexamp. Confirm Rooms
+   duplicate, reorder future items, and change Up Next in the Plex player. Confirm Rooms
    converges without restorative PMS writes.
 3. Add/reorder/remove through Melodarr; verify PMS order, remote-client refresh
    timing, and manual-region initialization on the deployed PMS version.
