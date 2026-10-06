@@ -24,6 +24,11 @@ NICE = "01326a6d-7dc9-4bf3-a9a5-93ce9ba08ac5"
 GROUP = "11111111-1111-1111-1111-111111111111"
 OTHER = "22222222-2222-2222-2222-222222222222"
 RELEASE = "33333333-3333-3333-3333-333333333333"
+BEATLES = "b10bbbfc-cf9e-42e0-be17-e2c3e1d2600d"
+SUN = "440f60e8-0b25-4ec4-abb1-c6beec624ab0"
+ABBEY = "9162580e-5df4-32de-80cc-f45a8d8a9b1d"
+ABBEY_US = "2e0542d1-5c0b-4600-ab77-64870cc619de"
+ABBEY_EUROPE = "d605cd91-5a6a-4bcb-89c6-e545dc313729"
 
 
 def credit(name="Jhené Aiko", mbid=ARTIST):
@@ -47,6 +52,22 @@ def release(group_id=GROUP, recording_id=SATIVA, title="Trip", **changes):
     return {"id": RELEASE, "title": title, "status": "Official", "artist-credit": [credit()],
             "release-group": {"id": group_id, "title": title, "primary-type": "Album", "artist-credit": [credit()]},
             "media": [{"tracks": [{"recording": {"id": recording_id}}]}], **changes}
+
+
+def beatles_track(album_title="Abbey Road (Remastered)"):
+    return {"id": 116348464, "title": "Here Comes The Sun (Remastered 2009)",
+            "title_short": "Here Comes The Sun", "title_version": "(Remastered 2009)",
+            "isrc": "GBAYE0601696", "duration": 184, "artist": {"id": 1, "name": "The Beatles"},
+            "contributors": [{"name": "The Beatles", "role": "Main"}],
+            "album": {"id": 12047952, "title": album_title, "release_date": "2015-12-24"}}
+
+
+def abbey_release(release_id=ABBEY_US, group_id=ABBEY, title="Abbey Road", disambiguation="2009 stereo remaster"):
+    return {"id": release_id, "title": title, "disambiguation": disambiguation,
+            "date": "2009-09-09", "status": "Official", "artist-credit": [credit("The Beatles", BEATLES)],
+            "release-group": {"id": group_id, "title": title, "primary-type": "Album",
+                              "artist-credit": [credit("The Beatles", BEATLES)], "secondary-types": []},
+            "media": [{"tracks": [{"recording": {"id": SUN}}]}]}
 
 
 class ArtistSummaryTests(DatabaseTestCase):
@@ -259,6 +280,130 @@ class ArtistSummaryTests(DatabaseTestCase):
         direct = release(title="Trip Deluxe")
         direct["relations"] = [{"url": {"resource": "https://www.deezer.com/album/47175652"}}]
         self.assertEqual(summary.select_release_group(SATIVA, track(), [direct, release(OTHER)], ARTIST), (GROUP, "recording_deezer_album"))
+
+    def test_remaster_release_group_exact_normalized_title_is_unchanged(self):
+        self.assertEqual(summary.select_release_group(SUN, beatles_track("ÀBBEY ROAD"), [abbey_release()], BEATLES),
+                         (ABBEY, "recording_album_title"))
+
+    def test_deezer_remastered_album_matches_release_remaster_disambiguation(self):
+        self.assertEqual(summary.select_release_group(SUN, beatles_track(), [abbey_release()], BEATLES),
+                         (ABBEY, "recording_album_remaster"))
+
+    def test_remaster_year_and_word_order_are_equivalent(self):
+        for album in ("Abbey Road (Remastered 2009)", "Abbey Road (2009 Remaster)", "Abbey Road (Remaster 2009)"):
+            for comment in ("2009 stereo remaster", "remastered 2009", "stereo remaster 2009", "2009 remastered stereo"):
+                with self.subTest(album=album, comment=comment):
+                    self.assertEqual(summary.select_release_group(SUN, beatles_track(album), [abbey_release(disambiguation=comment)], BEATLES),
+                                     (ABBEY, "recording_album_remaster"))
+        self.assertEqual(summary.select_release_group(SUN, beatles_track("Abbey Road (Remastered 2009)"),
+                         [abbey_release(title="Abbey Road (2009 Remaster)")], BEATLES), (ABBEY, "recording_album_remaster"))
+
+    def test_remaster_match_does_not_require_release_disambiguation(self):
+        self.assertEqual(summary.select_release_group(SUN, beatles_track("Abbey Road (Remastered 2009)"),
+                         [abbey_release(disambiguation="")], BEATLES), (ABBEY, "recording_album_remaster"))
+
+    def test_multiple_remaster_editions_collapse_to_one_release_group(self):
+        releases = [abbey_release(), abbey_release(ABBEY_EUROPE, disambiguation="")]
+        for ordered in (releases, list(reversed(releases))):
+            self.assertEqual(summary.select_release_group(SUN, beatles_track(), ordered, BEATLES), (ABBEY, "recording_album_remaster"))
+
+    def test_equally_strong_remaster_matches_across_groups_remain_unresolved(self):
+        releases = [abbey_release(), abbey_release(ABBEY_EUROPE, OTHER, disambiguation="")]
+        for ordered in (releases, list(reversed(releases))):
+            self.assertEqual(summary.select_release_group(SUN, beatles_track(), ordered, BEATLES), (None, "unresolved"))
+
+    def test_exact_album_title_beats_remaster_fallback_even_with_later_date_match(self):
+        exact = abbey_release(ABBEY_EUROPE, OTHER, title="Abbey Road (Remastered)")
+        contextual = abbey_release()
+        contextual["date"] = "2015-12-24"
+        self.assertEqual(summary.select_release_group(SUN, beatles_track(), [contextual, exact], BEATLES), (OTHER, "recording_album_title"))
+
+    def test_direct_album_relationship_beats_exact_and_remaster_title_matches(self):
+        direct = abbey_release(ABBEY_EUROPE, OTHER, title="Different album title")
+        direct["relations"] = [{"url": {"resource": "https://www.deezer.com/album/12047952"}}]
+        exact = abbey_release(group_id=GROUP, title="Abbey Road (Remastered)")
+        self.assertEqual(summary.select_release_group(SUN, beatles_track(), [abbey_release(), exact, direct], BEATLES),
+                         (OTHER, "recording_deezer_album"))
+
+    def test_non_remaster_album_parentheses_and_other_versions_are_preserved(self):
+        for album in ("Abbey Road (Live)", "Abbey Road (Deluxe)", "Abbey Road (Remixed 2009)",
+                      "Abbey Road (Remastered Deluxe)", "Abbey Road (50th Anniversary Edition)",
+                      "Abbey Road (Live) (Remastered 2009)", "Abbey Road (Remastered 2009) (Live)",
+                      "Abbey Road (2009 Remastered 2015)", "Abbey Road Remastered 2009", "Abbey Road (Mono Remastered)"):
+            with self.subTest(album=album):
+                self.assertEqual(summary.select_release_group(SUN, beatles_track(album), [abbey_release()], BEATLES), (None, "unresolved"))
+
+    def test_explicit_remaster_year_conflicts_are_not_ignored(self):
+        conflicting = [abbey_release(disambiguation="2015 stereo remaster"),
+                       abbey_release(title="Abbey Road (Remastered 2015)", disambiguation="")]
+        conflicting[1]["release-group"]["title"] = "Abbey Road"
+        for candidate in conflicting:
+            with self.subTest(candidate=candidate["title"]):
+                self.assertEqual(summary.select_release_group(SUN, beatles_track("Abbey Road (Remastered 2009)"), [candidate], BEATLES),
+                                 (None, "unresolved"))
+
+    def test_remaster_fallback_preserves_recording_status_artist_and_compilation_guards(self):
+        wrong_recording = abbey_release()
+        wrong_recording["media"][0]["tracks"][0]["recording"]["id"] = NICE
+        wrong_artist = abbey_release()
+        wrong_artist["artist-credit"] = [credit("Other", OTHER)]
+        wrong_artist["release-group"]["artist-credit"] = [credit("Other", OTHER)]
+        rejected = [wrong_recording, wrong_artist]
+        for status in ("Bootleg", "Pseudo-release", "Withdrawn", "Cancelled"):
+            candidate = abbey_release()
+            candidate["status"] = status
+            rejected.append(candidate)
+        for secondary in ("Compilation", "DJ-mix", "Mixtape/Street"):
+            candidate = abbey_release()
+            candidate["release-group"]["secondary-types"] = [secondary]
+            rejected.append(candidate)
+        for candidate in rejected:
+            with self.subTest(status=candidate["status"], secondary=candidate["release-group"]["secondary-types"]):
+                self.assertEqual(summary.select_release_group(SUN, beatles_track(), [candidate], BEATLES), (None, "unresolved"))
+
+    def test_album_remaster_matching_does_not_weaken_recording_version_matching(self):
+        self.assertFalse(summary._title_matches(beatles_track(), {"title": "Here Comes The Sun", "disambiguation": "2009 stereo remaster"}))
+
+    @patch.object(summary, "resolve_recording", side_effect=AssertionError("Keep the successful recording identity"))
+    @patch.object(musicbrainz, "browse_releases_by_recording", return_value=[abbey_release(), abbey_release(ABBEY_EUROPE, disambiguation="")])
+    @patch.object(deezer, "top_tracks")
+    @patch.object(deezer, "track")
+    def test_v2_negative_group_and_snapshot_retry_while_recording_and_bio_are_preserved(self, details, top, browse, resolve):
+        self.assertEqual(summary.RESOLVER_VERSION, 3)
+        api_cache.set_cache_document(summary.IDENTITY_NAMESPACE, "track:116348464", {
+            "complete": True, "resolver_version": 2, "isrc": "GBAYE0601696", "recording_mbid": SUN,
+            "recording_resolution_method": "exact_isrc",
+        }, summary.RETENTION_TTL)
+        api_cache.set_cache_document(summary.IDENTITY_NAMESPACE, f"group:{SUN}:12047952:abbey road remastered", {
+            "complete": False, "resolver_version": 2, "retry_at": time.time() + summary.UNRESOLVED_TTL,
+            "recording_mbid": SUN, "release_group_mbid": None, "release_group_resolution_method": "unresolved",
+        }, summary.RETENTION_TTL)
+        old = {"fetched_at": time.time(), "resolver_version": 2, "entries": [{
+            **beatles_track(), "deezer_track_id": 116348464, "deezer_artist_id": 1, "position": 1,
+            "recording_mbid": SUN, "release_group_mbid": None,
+        }]}
+        bio = {"fetched_at": time.time(), "bio": {"text": "Beatles biography"}}
+        api_cache.set_cache_document(summary.SNAPSHOT_NAMESPACE, f"top_tracks:{BEATLES}", old, summary.RETENTION_TTL)
+        api_cache.set_cache_document(summary.SNAPSHOT_NAMESPACE, f"bio:{BEATLES}", bio, summary.RETENTION_TTL)
+        api_cache.set_cache_document(summary.STATE_NAMESPACE, f"top_tracks:resolver-v2:{BEATLES}", {
+            "status": "pending", "pending_until": time.time() + worker.LEASE_TTL,
+        }, worker.LEASE_TTL)
+        with patch.object(worker, "Thread"), patch.object(worker, "jobs", Queue(maxsize=32)), patch.object(worker, "_started", False):
+            self.assertTrue(worker.request_summary(BEATLES)["pending"])
+            self.assertEqual(worker.jobs.get_nowait(), (BEATLES, "top_tracks"))
+        worker.process_job(BEATLES, "top_tracks")
+        repaired = summary.snapshot(BEATLES, "top_tracks")
+        self.assertEqual(repaired["entries"][0]["recording_mbid"], SUN)
+        self.assertEqual(repaired["entries"][0]["release_group_mbid"], ABBEY)
+        self.assertEqual(repaired["entries"][0]["release_group_resolution_method"], "recording_album_remaster")
+        self.assertEqual(repaired["resolver_version"], 3)
+        self.assertEqual(repaired["fetched_at"], old["fetched_at"])
+        self.assertEqual(summary.snapshot(BEATLES, "bio"), bio)
+        self.assertTrue(summary.fresh(repaired, "top_tracks"))
+        resolve.assert_not_called()
+        top.assert_not_called()
+        details.assert_not_called()
+        browse.assert_called_once_with(SUN, priority="background", include_url_relations=True)
 
     @patch.object(musicbrainz, "browse_releases_by_recording", return_value=[release()])
     @patch.object(summary, "resolve_recording", return_value=(SATIVA, "isrc_artist_credit"))

@@ -38,11 +38,12 @@ snapshot storage uses the same retention to survive expired-row cleanup, while
 its explicit `fetched_at` determines the shorter freshness window.
 
 Transport, HTTP, and incomplete-provider-response failures use only a **15-minute**
-identity backoff, never the seven-day unresolved mapping cache. Resolver version 2
-automatically retries legacy negative track/album identities and repairs legacy
-unresolved Top Tracks snapshots on the next Summary visit, bypassing old refresh
-leases. Successful identities and Wikipedia caches remain reusable. Identity
-repairs preserve the original daily track ordering and its `fetched_at`; no manual
+identity backoff, never the seven-day unresolved mapping cache. Resolver version 3
+automatically retries older negative track/album identities (including version 2)
+and repairs older unresolved Top Tracks snapshots on the next Summary visit,
+bypassing old refresh leases. Successful identities and Wikipedia caches remain
+reusable. Identity repairs preserve the original daily track ordering and its
+`fetched_at`; no manual
 cache clear is required.
 
 Two lazy daemon workers share a bounded 32-job queue. Atomic SQLite leases
@@ -70,6 +71,16 @@ canonical artist credit, title/version, duration, and a unique result. Release
 groups are chosen only from releases verified to contain that exact recording;
 provider album relationships, album title, artist credit, date, and release
 context can break ties. Equal plausible groups remain informational.
+
+Release-group album matching ranks exact Deezer album relationships first, exact
+normalized release/group titles next, and controlled remaster equivalence last.
+The latter removes only a trailing parenthesis containing `remaster`/`remastered`
+and one optional four-digit year, in either order. Release disambiguation can
+supply compatible remaster-year evidence (including mono/stereo wording); empty
+comments are allowed, while recognized conflicting years reject the fallback.
+Other edition text and recording-title/version rules are unchanged. Matching
+editions collapse by release-group MBID; equally ranked distinct groups remain
+unresolved. This fallback is recorded as `recording_album_remaster`.
 
 Before committing, smoke-test a real configured MusicBrainz mirror, Wikipedia
 access, the Jhené Aiko/Sativa mapping, stale refreshes across application restarts,

@@ -28,8 +28,8 @@ RETENTION_TTL = 100 * 365 * 24 * 60 * 60
 SNAPSHOT_NAMESPACE = "artist-summary:snapshot-v1"
 IDENTITY_NAMESPACE = "artist-summary:identity-v1"
 STATE_NAMESPACE = "artist-summary:refresh-v1"
-# Preserve successful v1 mappings; retry old negative results and snapshots once.
-RESOLVER_VERSION = 2
+# Preserve successful mappings; retry older negative results and snapshots once.
+RESOLVER_VERSION = 3
 
 
 def _id(value):
@@ -206,11 +206,57 @@ def resolve_recording(track, artist_mbid):
     return select_recording(track, candidates, artist_mbid, fallback=True)
 
 
+def _remaster_year(value, *, allow_channels=False):
+    """Recognize only remaster(ed) and one optional year, in either order.
+
+    An empty string means a recognized remaster without a year; None means
+    unrelated edition text. Token order does not change the edition meaning.
+    Mono/stereo wording is allowed only when reading MusicBrainz comments.
+    """
+    tokens = track_search_index.normalize_text(value).split()
+    markers = [token for token in tokens if token in {"remaster", "remastered"}]
+    years = [token for token in tokens if re.fullmatch(r"[0-9]{4}", token)]
+    channels = [token for token in tokens if allow_channels and token in {"mono", "stereo"}]
+    if (len(markers) != 1 or len(years) > 1 or len(channels) > 1
+            or len(tokens) != len(markers) + len(years) + len(channels)):
+        return None
+    return years[0] if years else ""
+
+
+def _remaster_album_title(value):
+    """Remove only a recognized trailing remaster parenthesis from album titles."""
+    match = re.fullmatch(r"(.+?)\s*\(([^()]*)\)", str(value or "").strip())
+    if match:
+        year = _remaster_year(match[2])
+        if year is not None:
+            return track_search_index.normalize_text(match[1]), year
+    return track_search_index.normalize_text(value), None
+
+
+def _album_title_match(title, release):
+    """Rank exact titles above controlled remaster equivalence, without fuzziness."""
+    normalize = track_search_index.normalize_text
+    titles = [release.get("title"), (release.get("release-group") or {}).get("title")]
+    normalized_title = normalize(title)
+    if normalized_title and normalized_title in {normalize(value) for value in titles}:
+        return 2
+    base, year = _remaster_album_title(title)
+    if not base or year is None:
+        return 0
+    matching = [part for part in map(_remaster_album_title, titles) if part[0] == base]
+    if not matching:
+        return 0
+    # Missing comments are normal. Explicit, recognized remaster-year conflicts
+    # are contrary evidence; unrelated disambiguation text is not a title suffix.
+    evidence_years = [part[1] for part in matching] + [_remaster_year(release.get("disambiguation"), allow_channels=True)]
+    if year and any(candidate_year and candidate_year != year for candidate_year in evidence_years):
+        return 0
+    return 1
+
+
 def select_release_group(recording_mbid, track, releases, artist_mbid):
     """Titles compare only inside releases proven to contain this exact recording."""
-    normalize = track_search_index.normalize_text
     album = track.get("album") or {}
-    title = normalize(album.get("title"))
     candidates = {}
     for release in releases:
         if not any(_id((item.get("recording") or {}).get("id")) == recording_mbid
@@ -221,7 +267,7 @@ def select_release_group(recording_mbid, track, releases, artist_mbid):
         if not mbid or str(release.get("status") or "").casefold() in {"bootleg", "pseudo-release", "withdrawn", "cancelled"}:
             continue
         direct = album.get("id") and any(deezer.relationship_id(entity.get("relations"), "album") == int(album["id"]) for entity in (release, group))
-        title_match = title and title in {normalize(release.get("title")), normalize(group.get("title"))}
+        title_match = _album_title_match(album.get("title"), release)
         if not direct and not title_match:
             continue
         credit = group.get("artist-credit") or release.get("artist-credit") or []
@@ -233,9 +279,10 @@ def select_release_group(recording_mbid, track, releases, artist_mbid):
             continue
         year = str(album.get("release_date") or "")[:4]
         year_match = bool(year and year == str(release.get("date") or group.get("first-release-date") or "")[:4])
-        score = (bool(direct), bool(title_match), artist_match, year_match, not bool(secondary))
+        score = (bool(direct), title_match, artist_match, year_match, not bool(secondary))
         if mbid not in candidates or score > candidates[mbid][0]:
-            candidates[mbid] = (score, "recording_deezer_album" if direct else "recording_album_title")
+            method = "recording_album_title" if title_match == 2 else "recording_album_remaster"
+            candidates[mbid] = (score, "recording_deezer_album" if direct else method)
     if not candidates:
         return None, "unresolved"
     best = max(item[0] for item in candidates.values())
