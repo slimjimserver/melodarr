@@ -3,7 +3,9 @@ import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-import { extname, join, normalize } from "node:path";
+import { extname, join, normalize, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+import { createBenchmarkFixture } from "../perf/fixture-data.mjs";
 
 const root = process.cwd();
 const staticRoot = join(root, "static");
@@ -159,8 +161,9 @@ function staticPath(url) {
   return path.startsWith(rootPath) ? path : "";
 }
 
-const server = createServer(async (request, response) => {
+const fixtureHandler = async (request, response, benchmarkHandler) => {
   const url = new URL(request.url || "/", "http://127.0.0.1:4173");
+  if (benchmarkHandler?.(request, response, url)) return;
   if (url.pathname === "/health") return send(response, 200, { ok: true });
   if (url.pathname === "/__request-history" && request.method === "POST") {
     let body = "";
@@ -264,13 +267,25 @@ const server = createServer(async (request, response) => {
   if (url.pathname.startsWith("/static/") || url.pathname.startsWith("/icons/")) {
     const path = staticPath(url);
     if (path && existsSync(path)) {
-      response.writeHead(200, { "content-type": mimeTypes[extname(path)] || "application/octet-stream" });
+      response.writeHead(200, {
+        "content-type": mimeTypes[extname(path)] || "application/octet-stream",
+        ...(benchmarkHandler ? { "cache-control": "public, max-age=3600" } : {}),
+      });
       createReadStream(path).pipe(response);
       return;
     }
   }
   response.writeHead(200, { "content-type": "text/html" });
   response.end(await readFile(join(staticRoot, /^\/rooms\/[^/]+\/?$/.test(url.pathname) ? "room.html" : "index.html")));
-});
+};
 
-server.listen(4173, "127.0.0.1");
+export function createFixtureServer(options = {}) {
+  const benchmarkHandler = options.benchmark === true
+    ? createBenchmarkFixture({ artistDetail, releaseGroupDetail, send, iconsRoot })
+    : undefined;
+  return createServer((request, response) => fixtureHandler(request, response, benchmarkHandler));
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  createFixtureServer().listen(4173, "127.0.0.1");
+}

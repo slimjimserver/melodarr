@@ -5,7 +5,10 @@
   "scripts": {
     "build": "tsc --project tsconfig.json --noEmit && node scripts/build.mjs",
     "check": "tsc --project tsconfig.json --noEmit",
-    "test:browser": "node ./node_modules/@playwright/test/cli.js test"
+    "test:browser": "node ./node_modules/@playwright/test/cli.js test",
+    "benchmark:lte": "node perf/artist-request-benchmark.mjs",
+    "benchmark:lte:fixture": "node perf/artist-request-benchmark.mjs --fixture",
+    "test:benchmark": "node --test perf/*.test.mjs"
   },
   "devDependencies": {
     "@playwright/test": "1.63.0",
