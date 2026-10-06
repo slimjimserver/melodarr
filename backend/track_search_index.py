@@ -27,7 +27,8 @@ logger = logging.getLogger(__name__)
 # Version 6 adds alternate track-title keys without changing canonical titles.
 # Version 7 adds independently replaceable, complete artist track snapshots.
 # Version 8 adds Plex track availability and references into the shared MB cache.
-SCHEMA_VERSION = "8"
+# Version 9 adds references into canonical ISRC/recording documents, not copies.
+SCHEMA_VERSION = "9"
 PLEX_TRACK_COLUMNS = {
     "ratingKey": "rating_key", "key": "plex_key", "plexGuid": "plex_guid",
     "title": "title", "trackArtist": "track_artist", "albumArtist": "album_artist",
@@ -254,7 +255,17 @@ def initialize():
                 PRIMARY KEY (release_mbid, cache_key)
             ) WITHOUT ROWID
         """)
-    if row is not None and row["value"] in {"5", "6", "7"}:
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS track_search_recording_refs (
+                isrc TEXT NOT NULL, recording_mbid TEXT NOT NULL, cache_key TEXT NOT NULL,
+                PRIMARY KEY (isrc, recording_mbid, cache_key)
+            ) WITHOUT ROWID
+        """)
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_track_search_recording_ref "
+            "ON track_search_recording_refs (recording_mbid)"
+        )
+    if row is not None and row["value"] in {"5", "6", "7", "8"}:
         with cache_db() as connection:
             if row["value"] == "5":
                 _backfill_title_keys(connection)
@@ -970,6 +981,7 @@ def rebuild_from_cache():
         connection.execute("DELETE FROM track_search_plex_tracks")
         connection.execute("DELETE FROM track_search_plex_isrcs")
         connection.execute("DELETE FROM track_search_release_refs")
+        connection.execute("DELETE FROM track_search_recording_refs")
         _backfill_plex_tracks_and_release_refs(connection)
         _upsert_rows(
             connection,
@@ -1205,6 +1217,7 @@ def index_release(release, cache_key):
     )
     with cache_db() as connection:
         _add_release_ref(connection, release, cache_key)
+        _add_recording_refs(connection, release, cache_key)
         _upsert_rows(
             connection,
             artist_rows,
@@ -1529,11 +1542,93 @@ def _add_release_ref(connection, release, cache_key):
         )
 
 
+def _recording_entities(payload):
+    if not isinstance(payload, dict):
+        return []
+    recordings = list(payload.get("recordings") or [])
+    if "isrcs" in payload and _valid_mbid(payload.get("id")):
+        recordings.append(payload)
+    for release in [payload, *(payload.get("releases") or [])]:
+        for medium in release.get("media") or []:
+            for track in medium.get("tracks") or []:
+                recording = track.get("recording") or {}
+                recordings.append({
+                    **recording,
+                    "artist-credit": recording.get("artist-credit") or track.get("artist-credit") or [],
+                    "length": recording.get("length") or track.get("length"),
+                })
+    return [recording for recording in recordings if isinstance(recording, dict) and _valid_mbid(recording.get("id"))]
+
+
+def _add_recording_refs(connection, payload, key):
+    for recording in _recording_entities(payload):
+        codes = normalize_isrcs(recording.get("isrcs") or [payload.get("isrc")]) or [""]
+        connection.executemany(
+            "INSERT OR IGNORE INTO track_search_recording_refs VALUES (?, ?, ?)",
+            ((code, recording["id"].casefold(), key) for code in codes),
+        )
+
+
+def index_recording_document(payload, key):
+    """Reference ISRC lookups and recording documents in the shared metadata cache."""
+    if _index_writable():
+        with cache_db() as connection:
+            _add_recording_refs(connection, payload, key)
+
+
+def cached_recordings_by_isrc(isrc):
+    """Return local candidates and whether an exact ISRC lookup covers the full set.
+
+    A lone recording on a cached album is not evidence of ISRC uniqueness.
+    """
+    initialize()
+    with cache_db() as connection:
+        rows = connection.execute(
+            "SELECT DISTINCT c.value FROM track_search_recording_refs r JOIN api_cache c "
+            "ON c.cache_key = r.cache_key WHERE r.isrc = ? AND c.expires_at > ?",
+            (isrc, time.time()),
+        ).fetchall()
+    candidates, complete = {}, False
+    for row in rows:
+        try:
+            payload = json.loads(row["value"])
+        except (TypeError, ValueError):
+            continue
+        entities = _recording_entities(payload)
+        if payload.get("isrc") == isrc and payload.get("recording-count", len(entities)) == len(entities):
+            # Complete lookup takes precedence over partial album documents.
+            return entities, True
+        for recording in entities:
+            if isrc in normalize_isrcs(recording.get("isrcs")):
+                candidates[recording["id"]] = recording
+    return list(candidates.values()), complete
+
+
+def cached_recording_metadata(recording_mbid):
+    """Read full recording evidence from existing recording/release documents."""
+    initialize()
+    with cache_db() as connection:
+        rows = connection.execute(
+            "SELECT DISTINCT c.value FROM track_search_recording_refs r JOIN api_cache c "
+            "ON c.cache_key = r.cache_key WHERE r.recording_mbid = ? AND c.expires_at > ?",
+            (recording_mbid.casefold(), time.time()),
+        ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["value"])
+        except (TypeError, ValueError):
+            continue
+        for recording in _recording_entities(payload):
+            if recording["id"].casefold() == recording_mbid.casefold() and recording.get("artist-credit") and recording.get("length"):
+                return recording
+    return None
+
+
 def _backfill_plex_tracks_and_release_refs(connection):
     """Additive v8 migration: preserve all existing search and snapshot rows."""
     rows = connection.execute(
         "SELECT cache_key, value FROM api_cache WHERE "
-        "cache_key LIKE 'musicbrainz-metadata:%' OR cache_key LIKE 'plex-library:%'"
+        "cache_key LIKE 'musicbrainz-metadata:%' OR cache_key LIKE 'musicbrainz-search:%' OR cache_key LIKE 'plex-library:%'"
     )
     for row in rows:
         try:
@@ -1542,8 +1637,9 @@ def _backfill_plex_tracks_and_release_refs(connection):
             continue
         if not isinstance(payload, dict):
             continue
-        if row["cache_key"].startswith("musicbrainz-metadata:"):
+        if row["cache_key"].startswith(("musicbrainz-metadata:", "musicbrainz-search:")):
             _add_release_ref(connection, payload, row["cache_key"])
+            _add_recording_refs(connection, payload, row["cache_key"])
         elif payload.get("serverId"):
             _write_plex_tracks(connection, payload["serverId"], payload.get("tracks", []), replace=True)
 

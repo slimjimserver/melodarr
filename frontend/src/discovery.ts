@@ -968,6 +968,7 @@
       ...groups,
       ...(data.animeReleaseGroups || []),
       ...(data.trackSearchGroups || []),
+      ...(data.summaryReleaseGroups || []),
     ]
       .map((group: JsonObject) => [String(group.id), group])).values()];
   }
@@ -1332,6 +1333,12 @@
     const action = captureDetailActionContext();
     const button = releaseGroup.button;
     const previousLabel = button.textContent;
+    const peerButtons = [...$("#detail-results").querySelectorAll<HTMLElement>("[data-release-group-id]")]
+      .filter(card => card.dataset.releaseGroupId === releaseGroup.id)
+      .map(card => card.querySelector<HTMLButtonElement>(".release-group-request"))
+      .filter((peer): peer is HTMLButtonElement => Boolean(peer && peer !== button));
+    const previousPeers = peerButtons.map(peer => ({ peer, label: peer.textContent, disabled: peer.disabled }));
+    peerButtons.forEach(peer => { peer.disabled = true; peer.textContent = "Sending to Lidarr…"; });
     button.disabled = true;
     button.textContent = "Sending to Lidarr…";
     try {
@@ -1382,6 +1389,7 @@
       showToast(error.message, true);
       button.textContent = previousLabel;
       button.disabled = false;
+      previousPeers.forEach(({ peer, label, disabled }) => { peer.textContent = label; peer.disabled = disabled; });
     }
   }
 
@@ -2154,6 +2162,106 @@
     return card;
   }
 
+  function artistSummaryView(data: JsonObject) {
+    const element = document.createElement("section");
+    element.id = "artist-summary-view";
+    element.className = "artist-summary-view";
+    element.hidden = true;
+    const heading = document.createElement("h2");
+    heading.textContent = "Summary";
+    const status = document.createElement("p");
+    status.className = "message";
+    status.setAttribute("role", "status");
+    const body = document.createElement("div");
+    element.append(heading, status, body);
+    let loaded = false;
+    let loading = false;
+    let pending = false;
+    let polls = 0;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const action = captureDetailActionContext();
+
+    async function load() {
+      if (loading || (loaded && !pending) || element.hidden) return;
+      loading = true;
+      status.textContent = body.childElementCount ? "" : "Loading summary…";
+      try {
+        const summary = await getJson(`/api/music/artist/${encodeURIComponent(String(data.id))}/summary`, 30_000, detailSessionAbort.signal);
+        if (!element.isConnected || !isCurrentDetailAction(action)) return;
+        loaded = true;
+        pending = Boolean(summary.pending);
+        const canonical = new Map(artistReleaseGroups(data).map(group => [String(group.id), group]));
+        data.summaryReleaseGroups = (Object.values(summary.releaseGroups || {}) as JsonObject[]).map((incoming) => {
+          const existing = canonical.get(String(incoming.id));
+          if (existing) {
+            existing.coverArt ||= incoming.coverArt;
+            existing.title ||= incoming.title;
+            return existing;
+          }
+          canonical.set(String(incoming.id), incoming);
+          return incoming;
+        });
+        const fragment = document.createDocumentFragment();
+        if (summary.bio?.text) {
+          const bio = document.createElement("p");
+          bio.className = "artist-summary-bio";
+          bio.textContent = String(summary.bio.text);
+          fragment.append(bio);
+          if (/^https:\/\/[a-z0-9-]+\.wikipedia\.org\/wiki\//.test(String(summary.bio.sourceUrl || ""))) {
+            const source = document.createElement("a");
+            source.href = String(summary.bio.sourceUrl);
+            source.textContent = "Wikipedia";
+            source.target = "_blank";
+            source.rel = "noopener noreferrer";
+            fragment.append(source);
+          }
+        }
+        if (summary.topTracks?.length) {
+          const title = document.createElement("h3");
+          title.textContent = "Top Tracks";
+          const attribution = document.createElement("p");
+          attribution.className = "field-help";
+          attribution.textContent = "From Deezer";
+          const list = document.createElement("ol");
+          list.className = "artist-top-tracks";
+          summary.topTracks.forEach((track: JsonObject, index: number) => {
+            const row = document.createElement("li");
+            row.value = Number(track.position || index + 1);
+            const group = canonical.get(String(track.release_group_mbid));
+            const card = group ? createReleaseGroupCard(group) : createCard(String(track.title || "Untitled"), String(track.album?.title || ""));
+            card.classList.add("artist-top-track");
+            card.querySelector("h2")!.textContent = String(track.title || track.title_short || "Untitled");
+            const context = card.querySelector<HTMLParagraphElement>(".artist-info p")!;
+            context.textContent = String(group?.title || track.album?.title || "");
+            context.title = context.textContent;
+            const request = card.querySelector<HTMLButtonElement>(".release-group-request");
+            if (request?.textContent === "Request") request.textContent = "Request Album";
+            row.append(card);
+            list.append(row);
+          });
+          fragment.append(title, attribution, list);
+        }
+        body.replaceChildren(fragment);
+        applyArtistReleaseGroupAvailability(data, summary.releaseGroups || {});
+        if (incompleteArtistReleaseGroups(data).length) startDetailAvailability("artist", data);
+        status.replaceChildren();
+        if (!body.childElementCount) status.textContent = pending ? "Loading summary…" : "No summary available yet.";
+        if (pending && polls++ < 90) timer = setTimeout(() => void load(), 5_000);
+      } catch (error) {
+        if (!element.isConnected || !isCurrentDetailAction(action) || detailSessionAbort.signal.aborted) return;
+        status.textContent = body.childElementCount ? "" : "Summary is unavailable right now. ";
+        const retry = document.createElement("button");
+        retry.className = "secondary-action";
+        retry.textContent = "Retry";
+        retry.addEventListener("click", () => { loaded = false; void load(); });
+        status.append(retry);
+      } finally {
+        loading = false;
+      }
+    }
+    return { element, load, hide: () => { element.hidden = true; clearTimeout(timer); } };
+  }
+
   /**
    * Group a discography by primary release type, with secondary types opt-in.
    *
@@ -2250,6 +2358,7 @@
     releaseContent.id = "discography-release-view";
     releaseContent.className = "discography-release-view";
     const similar = similarArtistsView(String(data.id));
+    const artistSummary = artistSummaryView(data);
     similar.element.id = "similar-artists-view";
     const sections: Array<{
       element: HTMLDetailsElement;
@@ -2328,6 +2437,7 @@
         tools.hidden = false;
         releaseContent.hidden = false;
         similar.element.hidden = true;
+        artistSummary.hide();
         section.open = true;
         section.scrollIntoView({ behavior: "smooth", block: "start" });
       });
@@ -2462,6 +2572,7 @@
       tools.hidden = false;
       releaseContent.hidden = false;
       similar.element.hidden = true;
+      artistSummary.hide();
       animeSection.open = true;
       animeSection.scrollIntoView({ behavior: "smooth", block: "start" });
     });
@@ -2588,6 +2699,7 @@
     similarButton.setAttribute("aria-controls", similar.element.id);
     similarButton.setAttribute("aria-expanded", "false");
     similarButton.addEventListener("click", () => {
+      artistSummary.hide();
       tools.hidden = true;
       releaseContent.hidden = true;
       similar.element.hidden = false;
@@ -2600,8 +2712,26 @@
         similarButton.setAttribute("aria-expanded", "false");
       });
     });
-    sidebar.append(index, similarButton);
-    content.append(releaseContent, similar.element);
+    const summaryButton = document.createElement("button");
+    summaryButton.className = "discography-similar-nav artist-summary-nav";
+    summaryButton.type = "button";
+    summaryButton.textContent = "Summary";
+    summaryButton.setAttribute("aria-controls", artistSummary.element.id);
+    summaryButton.setAttribute("aria-expanded", "false");
+    summaryButton.addEventListener("click", () => {
+      tools.hidden = true;
+      releaseContent.hidden = true;
+      similar.element.hidden = true;
+      similarButton.setAttribute("aria-expanded", "false");
+      artistSummary.element.hidden = false;
+      summaryButton.setAttribute("aria-expanded", "true");
+      void artistSummary.load();
+    });
+    [...index.querySelectorAll("a"), similarButton].forEach(link => {
+      link.addEventListener("click", () => summaryButton.setAttribute("aria-expanded", "false"));
+    });
+    sidebar.append(summaryButton, index, similarButton);
+    content.append(releaseContent, similar.element, artistSummary.element);
     layout.append(sidebar, content);
     container.append(tools, layout);
     refreshSections();

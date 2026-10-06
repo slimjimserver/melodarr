@@ -34,6 +34,7 @@ if __package__ == "backend.routes":
     )
     from ..workers import artist_metadata as artist_metadata_worker
     from ..workers import similar_artists as similar_artist_worker
+    from ..workers import artist_summary as artist_summary_worker
 else:
     import detail_cache
     import track_search_index
@@ -61,6 +62,7 @@ else:
     )
     from workers import artist_metadata as artist_metadata_worker
     from workers import similar_artists as similar_artist_worker
+    from workers import artist_summary as artist_summary_worker
 
 
 blueprint = Blueprint("music", __name__)
@@ -1337,6 +1339,31 @@ def release_detail(mbid):
             return detail_cache.payload_response(cache_key, payload, generation)
     except requests.RequestException:
         return api_error("MusicBrainz could not load this release.", 502)
+
+
+@blueprint.get("/api/music/artist/<mbid>/summary")
+@login_required
+def artist_summary(mbid):
+    """Serve only cached supplements and canonical display/state; queue refreshes."""
+    try:
+        mbid = str(UUID(str(mbid)))
+    except (ValueError, TypeError, AttributeError):
+        return api_error("Invalid artist ID.", 400)
+    try:
+        payload = artist_summary_worker.request_summary(mbid)
+        group_ids = list(dict.fromkeys(
+            item["release_group_mbid"] for item in payload["topTracks"] if item.get("release_group_mbid")
+        ))
+        groups = track_search_index.cached_release_groups(group_ids) if group_ids else {}
+        status = _release_group_availability(group_ids) if group_ids else {}
+        payload["releaseGroups"] = {
+            group_id: {"id": group_id, "title": group.get("title"), "coverArt": release_group_cover_art(group_id), **status.get(group_id, {})}
+            for group_id, group in groups.items()
+        }
+        return jsonify(payload)
+    except Exception as exc:
+        current_app.logger.warning("Artist Summary unavailable: %s", type(exc).__name__)
+        return jsonify({"bio": None, "topTracks": [], "releaseGroups": {}, "pending": False})
 
 
 @blueprint.get("/api/music/artist/<mbid>/anime")

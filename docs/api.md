@@ -10,6 +10,72 @@ A machine-readable version of this contract is available in
 The session/guest Rooms API is documented separately in [`rooms.md`](rooms.md).
 Automation API keys do not authorize Room hosting or queue management.
 
+## Artist Summary (browser session)
+
+`GET /api/music/artist/{artistMbid}/summary` is supplemental, session authenticated,
+and requested only when the artist's Summary view is selected. The ordinary
+artist/discography response never fetches Deezer or Wikipedia. Invalid UUIDs
+return `400`; supplemental/cache/provider failures degrade to a `200` response.
+
+The response contains `bio` (plain lead text, `source`, `sourceUrl`, or null),
+ordered `topTracks`, canonical `releaseGroups` keyed by MBID, and `pending`.
+`sources.bio` and `sources.top_tracks` expose `pending`, `stale`, and `fetchedAt`.
+Each track keeps Deezer's original position, public track/contributor/album
+details, nullable recording and release-group MBIDs, and resolution provenance.
+Release-group display titles/artwork and live request state are joined from
+existing canonical metadata and availability; they are never stored as Deezer
+metadata. Request buttons use the existing release-group request endpoint.
+
+Snapshots and identity documents reuse `api_cache`, under the `artist-summary`
+namespace, visible/clearable through existing maintenance diagnostics. Top
+Tracks freshness is exactly **86,400 seconds**; successful Wikipedia biographies
+are fresh for **2,592,000 seconds (30 days)**. Stale successes remain stored and
+are returned immediately during on-demand revalidation. Failed refreshes retain
+those successes and back off for **15 minutes**. Missing Wikipedia sources and
+ambiguous identity mappings retry after **7 days**. Successful artist, recording,
+and album-context mappings have an effectively permanent **100-year retention**;
+snapshot storage uses the same retention to survive expired-row cleanup, while
+its explicit `fetched_at` determines the shorter freshness window.
+
+Transport, HTTP, and incomplete-provider-response failures use only a **15-minute**
+identity backoff, never the seven-day unresolved mapping cache. Resolver version 2
+automatically retries legacy negative track/album identities and repairs legacy
+unresolved Top Tracks snapshots on the next Summary visit, bypassing old refresh
+leases. Successful identities and Wikipedia caches remain reusable. Identity
+repairs preserve the original daily track ordering and its `fetched_at`; no manual
+cache clear is required.
+
+Two lazy daemon workers share a bounded 32-job queue. Atomic SQLite leases
+coalesce refreshes across web processes and recover after 30 minutes if a
+process exits. Deezer HTTP requests are sequential with at least 250 ms between
+starts, using 3.05-second connect/10-second read timeouts. MusicBrainz resolution
+uses its configured mirror, shared caches, and existing background pacing.
+
+Artist identities come exclusively from exact MusicBrainz Deezer/Wikipedia/
+Wikidata relationships; no fuzzy artist lookup is used. Wikipedia lead text is
+read using the [MediaWiki TextExtracts API](https://www.mediawiki.org/wiki/Extension:TextExtracts),
+and Wikidata sitelinks use [wbgetentities](https://www.mediawiki.org/wiki/Wikibase/API).
+Recording candidates come from a complete local or configured MusicBrainz ISRC
+lookup. Partial local album evidence is never treated as ISRC uniqueness.
+Remote ISRC lookups use `/isrc/{ISRC}?inc=artist-credits`. Release collections are
+consulted only when contributor/title/duration signals leave multiple candidates:
+complete cached collections first, then the existing recording-to-release browse
+helper. Unique ISRC and contributor matches need no recording-disambiguation
+release lookup. Once a recording is selected, the separate recording → releases
+→ release-group flow still supplies album/request context.
+Multiple candidates require contributor-set, title/version, duration (±5 seconds),
+or album-context evidence; a tied result stays unresolved. Recording search is
+allowed only for absent/empty ISRC results and requires exact contributors,
+canonical artist credit, title/version, duration, and a unique result. Release
+groups are chosen only from releases verified to contain that exact recording;
+provider album relationships, album title, artist credit, date, and release
+context can break ties. Equal plausible groups remain informational.
+
+Before committing, smoke-test a real configured MusicBrainz mirror, Wikipedia
+access, the Jhené Aiko/Sativa mapping, stale refreshes across application restarts,
+and real Lidarr request-state transitions. Automated tests mock external
+providers and submit acquisition actions only to the browser fixture.
+
 ## Authentication
 
 Melodarr generates an API key automatically on first start. An administrator

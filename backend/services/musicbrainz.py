@@ -454,20 +454,25 @@ def get(
 
 def browse_releases_by_recording(
     recording_id, *, priority="interactive", cache_ttl=None, force_refresh=False,
+    include_url_relations=False, cache_only=False,
 ):
     """Read every directly linked release, rejecting incomplete page sets.
 
     MusicBrainz can return fewer than limit releases because of its track
     budget. Only the actual number returned advances the offset.
+    Cache-only reads return None unless every page is already available.
     """
     recording_id = str(UUID(str(recording_id)))
     releases, seen, offset, expected_total = [], set(), 0, None
     while True:
         page = get(
-            "/release", RECORDING_RELEASE_INCLUDES, priority=priority,
+            "/release", RECORDING_RELEASE_INCLUDES + ("+url-rels" if include_url_relations else ""), priority=priority,
             recording=recording_id, limit=100, offset=offset,
             cache_ttl=cache_ttl, force_refresh=force_refresh,
+            **({"cache_only": True} if cache_only else {}),
         )
+        if page is None and cache_only:
+            return None
         try:
             total = page["release-count"]
             actual_offset = page.get("release-offset", offset)
