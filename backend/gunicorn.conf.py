@@ -8,6 +8,9 @@ timeout = 60
 preload_app = False
 control_socket_disable = True
 accesslog = "-"
+# Invitation query strings and incoming Referer headers can contain bearer
+# secrets. Keep method/path/status logging without either URL-bearing field.
+access_log_format = '%(h)s %(l)s %(u)s %(t)s "%(m)s %(U)s %(H)s" %(s)s %(b)s "%(a)s"'
 errorlog = "-"
 capture_output = True
 

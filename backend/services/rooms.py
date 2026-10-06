@@ -15,16 +15,17 @@ from uuid import UUID, uuid4
 if __package__ == "backend.services":
     from .. import storage, track_search_index
     from ..request_locks import request_lock
-    from . import plex_rooms, recording_requests, room_artwork
+    from . import plex_rooms, recording_requests, room_artwork, room_invites
 else:
     import storage
     import track_search_index
     from request_locks import request_lock
-    from services import plex_rooms, recording_requests, room_artwork
+    from services import plex_rooms, recording_requests, room_artwork, room_invites
 
 
 logger = logging.getLogger(__name__)
 CODE_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+CODE_ATTEMPTS = 20
 MAX_ENTRIES = 200
 CLOSED_ROOM_RETENTION_SECONDS = 7 * 24 * 60 * 60
 CHOICE_TTL_SECONDS = 60 * 60
@@ -40,10 +41,12 @@ class RoomError(Exception):
         self.status = status
 
 
-def room_by_code(code, *, active=False):
+def room_by_code(code, *, active=False, room_id=None):
     with storage.db() as connection:
         row = connection.execute(
-            "SELECT * FROM rooms WHERE code=?", (code.upper(),)
+            "SELECT * FROM rooms WHERE code=? AND (? IS NULL OR id=?) "
+            "ORDER BY status='active' DESC,created_at DESC,id LIMIT 1",
+            (code.upper(), room_id, room_id),
         ).fetchone()
     if not row:
         raise RoomError("Room not found or unavailable.", 404)
@@ -66,20 +69,25 @@ def entries(room_id):
 def host_room(user_id):
     with storage.db() as connection:
         row = connection.execute(
-            "SELECT code FROM rooms WHERE host_user_id=? AND status='active'",
+            "SELECT id,code FROM rooms WHERE host_user_id=? AND status='active'",
             (user_id,),
         ).fetchone()
-    return snapshot(row["code"]) if row else None
+    return snapshot(row["code"], room_id=row["id"]) if row else None
 
 
-def snapshot(code):
+def snapshot(code, *, room_id=None):
     # One consistent read transaction: revision and queue always describe the
     # same committed room state, even during concurrent guest requests.
     with storage.db() as connection:
         connection.execute("BEGIN")
-        room = connection.execute(
-            "SELECT * FROM rooms WHERE code=?", (code.upper(),)
-        ).fetchone()
+        room = (
+            connection.execute("SELECT * FROM rooms WHERE id=?", (room_id,)).fetchone()
+            if room_id
+            else connection.execute(
+                "SELECT * FROM rooms WHERE code=? ORDER BY status='active' DESC,created_at DESC,id LIMIT 1",
+                (code.upper(),),
+            ).fetchone()
+        )
         if not room:
             raise RoomError("Room not found or unavailable.", 404)
         rows = connection.execute(
@@ -233,45 +241,71 @@ def start(user, *, session_id=None):
                     "Plexamp advanced during startup. Retry starting the Room.", 409
                 )
             room_id = str(uuid4())
-            code = "".join(secrets.choice(CODE_ALPHABET) for _ in range(10))
-            try:
-                with storage.db() as connection:
-                    connection.execute(
-                        "INSERT INTO rooms(id,code,host_user_id,status,created_at,server_id,client_id,session_key,queue_id,"
-                        "current_item_id,handoff_item_id,trim_ids,now_playing,handoff,device_name,device_product,device_platform) "
-                        "VALUES (?,?,?,'active',?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (
-                            room_id,
-                            code,
-                            user["id"],
-                            time.time(),
-                            adapter.server_id,
-                            discovered["client_id"],
-                            discovered["session_key"],
-                            discovered["queue_id"],
-                            discovered["current_item_id"],
-                            str(items[index + 1]["playQueueItemID"]),
-                            "[]",
-                            json.dumps(_stored_track(items[index])),
-                            json.dumps(_stored_track(items[index + 1])),
-                            discovered.get("device_name", ""),
-                            discovered.get("product", ""),
-                            discovered.get("platform", ""),
-                        ),
-                    )
-            except sqlite3.IntegrityError:
+            nonce, verifier = room_invites.create(room_id)
+            for attempt in range(CODE_ATTEMPTS):
+                code = "".join(secrets.choice(CODE_ALPHABET) for _ in range(4))
+                try:
+                    with storage.db() as connection:
+                        connection.execute(
+                            "INSERT INTO rooms(id,code,host_user_id,status,created_at,server_id,client_id,session_key,queue_id,"
+                            "current_item_id,handoff_item_id,trim_ids,now_playing,handoff,device_name,device_product,device_platform,invite_nonce,invite_hash) "
+                            "VALUES (?,?,?,'active',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                            (
+                                room_id,
+                                code,
+                                user["id"],
+                                time.time(),
+                                adapter.server_id,
+                                discovered["client_id"],
+                                discovered["session_key"],
+                                discovered["queue_id"],
+                                discovered["current_item_id"],
+                                str(items[index + 1]["playQueueItemID"]),
+                                "[]",
+                                json.dumps(_stored_track(items[index])),
+                                json.dumps(_stored_track(items[index + 1])),
+                                discovered.get("device_name", ""),
+                                discovered.get("product", ""),
+                                discovered.get("platform", ""),
+                                nonce,
+                                verifier,
+                            ),
+                        )
+                    break
+                except sqlite3.IntegrityError as exc:
+                    if str(exc) != "UNIQUE constraint failed: rooms.code":
+                        raise RoomError(
+                            "This host or Plex queue already has an active Room. Reload Rooms.",
+                            409,
+                        ) from None
+            else:
                 raise RoomError(
-                    "This host or Plex queue already has an active Room. Reload Rooms.",
-                    409,
-                ) from None
-            sync_locked(room_by_code(code), adapter)
-            return snapshot(code)
+                    "Could not allocate a Room code. Retry starting the Room.", 503
+                )
+            sync_locked(room_by_code(code, room_id=room_id), adapter)
+            return snapshot(code, room_id=room_id)
 
 
-def join(code, name="", token=None):
-    room = room_by_code(code, active=True)
+def invite(room):
+    with storage.db() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        saved = connection.execute(
+            "SELECT * FROM rooms WHERE id=?", (room["id"],)
+        ).fetchone()
+        if not saved or saved["status"] != "active":
+            raise RoomError("This Room has ended.", 410)
+        token = room_invites.share(connection, saved)
+    if not token:
+        raise RoomError(
+            "Room invitations are unavailable. Restore the persistent server key.", 503
+        )
+    return f"/rooms/{room['code']}?invite={token}"
+
+
+def join(code, name="", token=None, *, invite_token=None, host=False, room_id=None):
+    room = room_by_code(code, active=True, room_id=room_id)
     with queue_lock(room):
-        room = room_by_code(code, active=True)
+        room = room_by_code(code, active=True, room_id=room["id"])
         with storage.db() as connection:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
@@ -284,6 +318,10 @@ def join(code, name="", token=None):
                     "name": existing["name"],
                     "csrfToken": existing["csrf_token"],
                 }, token
+            if not host and not room_invites.valid(room["invite_hash"], invite_token):
+                raise RoomError(
+                    "Use a valid invite link from the Room host to join.", 403
+                )
             count = connection.execute(
                 "SELECT COUNT(*) FROM room_guests WHERE room_id=?", (room["id"],)
             ).fetchone()[0]
@@ -364,10 +402,10 @@ def save_choices(room, results):
     return safe
 
 
-def add(code, choice_id, requester, guest_id=None):
-    room = room_by_code(code, active=True)
+def add(code, choice_id, requester, guest_id=None, *, room_id=None):
+    room = room_by_code(code, active=True, room_id=room_id)
     with queue_lock(room):
-        room = room_by_code(code, active=True)
+        room = room_by_code(code, active=True, room_id=room["id"])
         with storage.db() as connection:
             connection.execute("BEGIN IMMEDIATE")
             choice = connection.execute(
@@ -409,8 +447,8 @@ def add(code, choice_id, requester, guest_id=None):
             )
             connection.execute("UPDATE rooms SET dirty=1 WHERE id=?", (room["id"],))
             bump(connection, room["id"])
-        sync_locked(room_by_code(code))
-    return snapshot(code)
+        sync_locked(room_by_code(code, room_id=room["id"]))
+    return snapshot(code, room_id=room["id"])
 
 
 def edit(code, user_id, *, order=None, remove_id=None, version=None):
@@ -418,7 +456,7 @@ def edit(code, user_id, *, order=None, remove_id=None, version=None):
     if room["host_user_id"] != user_id:
         raise RoomError("Only this Room's host can manage its queue.", 403)
     with queue_lock(room):
-        room = room_by_code(code, active=True)
+        room = room_by_code(code, active=True, room_id=room["id"])
         if version != room["version"]:
             raise RoomError("The Room changed. Reload its queue and retry.", 409)
         adapter = plex_rooms.PMSQueue(storage.get_service("plex"))
@@ -479,8 +517,8 @@ def edit(code, user_id, *, order=None, remove_id=None, version=None):
                 (bool(intent), json.dumps(intent), room["id"]),
             )
             bump(connection, room["id"])
-        sync_locked(room_by_code(code), adapter)
-    return snapshot(code)
+        sync_locked(room_by_code(code, room_id=room["id"]), adapter)
+    return snapshot(code, room_id=room["id"])
 
 
 def end(code, user_id):
@@ -492,7 +530,7 @@ def end(code, user_id):
             "UPDATE rooms SET status='closed',closed_at=?,version=version+1 WHERE id=? AND status='active'",
             (time.time(), room["id"]),
         )
-    return snapshot(code)
+    return snapshot(code, room_id=room["id"])
 
 
 def playback_event(room, adapter):
@@ -1288,7 +1326,7 @@ def _sync(room, adapter, *, initiate=False):
 def reconcile(code, *, retry=False, initiate=False):
     room = room_by_code(code, active=True)
     with queue_lock(room):
-        room = room_by_code(code, active=True)
+        room = room_by_code(code, active=True, room_id=room["id"])
         if retry:
             with storage.db() as connection:
                 connection.execute(
@@ -1296,4 +1334,4 @@ def reconcile(code, *, retry=False, initiate=False):
                     (room["id"],),
                 )
         sync_locked(room, initiate=initiate)
-    return snapshot(code)
+    return snapshot(code, room_id=room["id"])

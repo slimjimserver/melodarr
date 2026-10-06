@@ -1,10 +1,70 @@
 """Additive, idempotent Rooms migration used by the existing init_db runner."""
 
+import re
+
+
+def prepare_code_migration(connection):
+    """Relax legacy code uniqueness before init_db opens a write transaction.
+
+    Rebuild the parent without renaming it first: child foreign keys keep their
+    original target. Foreign keys are disabled only for this atomic rebuild,
+    checked before commit, and restored even when the migration fails.
+    """
+    schema = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='rooms'"
+    ).fetchone()
+    if not schema or not re.search(
+        r"code\s+TEXT\s+NOT\s+NULL\s+UNIQUE", schema[0], re.IGNORECASE
+    ):
+        return
+    if connection.in_transaction:
+        raise RuntimeError("Room code migration must precede the startup transaction.")
+    dependent_sql = [
+        row[0]
+        for row in connection.execute(
+            "SELECT sql FROM sqlite_master WHERE tbl_name='rooms' "
+            "AND type IN ('index','trigger') AND sql IS NOT NULL"
+        )
+    ]
+    replacement = re.sub(
+        r"code\s+TEXT\s+NOT\s+NULL\s+UNIQUE",
+        "code TEXT NOT NULL",
+        schema[0],
+        flags=re.IGNORECASE,
+    )
+    replacement = re.sub(
+        r"CREATE TABLE(?: IF NOT EXISTS)?\s+[\"`\[]?rooms[\"`\]]?",
+        "CREATE TABLE rooms_code_migration",
+        replacement,
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(replacement)
+        connection.execute("INSERT INTO rooms_code_migration SELECT * FROM rooms")
+        connection.execute("DROP TABLE rooms")
+        connection.execute("ALTER TABLE rooms_code_migration RENAME TO rooms")
+        for statement in dependent_sql:
+            connection.execute(statement)
+        connection.execute(
+            "CREATE UNIQUE INDEX rooms_active_code ON rooms(code) WHERE status='active'"
+        )
+        if connection.execute("PRAGMA foreign_key_check").fetchone():
+            raise RuntimeError("Room code migration failed its foreign key check.")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.execute("PRAGMA foreign_keys=ON")
+
 
 def migrate(connection):
     statements = (
         """CREATE TABLE IF NOT EXISTS rooms (
-            id TEXT PRIMARY KEY, code TEXT NOT NULL UNIQUE,
+            id TEXT PRIMARY KEY, code TEXT NOT NULL,
             host_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             status TEXT NOT NULL CHECK(status IN ('active','closed')),
             created_at REAL NOT NULL, closed_at REAL,
@@ -46,10 +106,14 @@ def migrate(connection):
         "CREATE INDEX IF NOT EXISTS rooms_closed_retention ON rooms(closed_at,id) WHERE status='closed'",
         "CREATE INDEX IF NOT EXISTS room_choices_expiration ON room_choices(expires_at,id)",
         "CREATE INDEX IF NOT EXISTS room_rate_limits_window ON room_rate_limits(window)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS rooms_active_code ON rooms(code) WHERE status='active'",
     )
     for statement in statements:
         connection.execute(statement)
     columns = {row[1] for row in connection.execute("PRAGMA table_info(rooms)")}
+    for name in ("invite_nonce", "invite_hash"):
+        if name not in columns:
+            connection.execute(f"ALTER TABLE rooms ADD COLUMN {name} TEXT")
     for name, default in (("next_item_id", "''"), ("up_next", "'{}'")):
         if name not in columns:
             connection.execute(

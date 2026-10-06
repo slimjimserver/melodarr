@@ -252,11 +252,18 @@ class RoomTestCase(DatabaseTestCase):
         self.assertEqual(response.status_code, 201, response.get_json())
         return response.get_json()["room"]
 
+    def invite_token(self, room):
+        from urllib.parse import parse_qs, urlsplit
+
+        response = self.client.get(f"/api/rooms/{room['code']}/invite")
+        self.assertEqual(response.status_code, 200, response.get_json())
+        return parse_qs(urlsplit(response.get_json()["invitePath"]).query)["invite"][0]
+
     def guest(self, room, name=""):
         client = self.app.test_client()
         response = self.post(
             f"/api/rooms/{room['code']}/join",
-            {"name": name},
+            {"name": name, "invite": self.invite_token(room)},
             client,
             {"X-Room-Request": "1"},
         )
@@ -877,11 +884,21 @@ class RoomTests(RoomTestCase):
         client = self.app.test_client()
         path = f"/api/rooms/{room['code']}/join"
         headers = {"X-Room-Request": "1", "Origin": "https://localhost"}
-        self.assertEqual(self.post(path, {}, client, headers).status_code, 200)
+        self.assertEqual(
+            self.post(
+                path, {"invite": self.invite_token(room)}, client, headers
+            ).status_code,
+            200,
+        )
         headers["Origin"] = "https://public.example"
         self.assertEqual(self.post(path, {}, client, headers).status_code, 403)
         storage.save_service("melodarr", {"applicationUrl": "https://public.example"})
-        self.assertEqual(self.post(path, {}, client, headers).status_code, 200)
+        self.assertEqual(
+            self.post(
+                path, {"invite": self.invite_token(room)}, client, headers
+            ).status_code,
+            200,
+        )
         self.assertEqual(
             self.post(
                 path, {}, client, {**headers, "Sec-Fetch-Site": "cross-site"}

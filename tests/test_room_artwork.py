@@ -1,7 +1,8 @@
 """Artwork presentation uses local identities and the shared cache, never PMS renders."""
 
 # isort: skip_file
-# RoomTestCase establishes storage isolation before backend imports.
+# Storage isolation must precede every backend import.
+from ._test_environment import TEST_ROOT  # noqa: F401
 from .test_rooms import CONFIG, OTHER, RELEASE, RoomTestCase, item
 from .test_backend import Response
 

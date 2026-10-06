@@ -10,6 +10,10 @@
   "devDependencies": {
     "@playwright/test": "1.63.0",
     "esbuild": "0.28.2",
+    "jsqr": "1.4.0",
     "typescript": "7.0.2"
+  },
+  "dependencies": {
+    "qrcode-generator": "2.0.4"
   }
 }

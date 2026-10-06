@@ -26,7 +26,9 @@ resolve their recording MBID from the local library index using the Room's Plex
 server and the track's rating key. Synchronization also fills missing MBIDs on
 existing imports. Saved request MBIDs are preserved; unknown mappings stay `null`.
 
-Share the Room code or `/rooms/<code>` URL. Guests join with an optional name,
+Use **Invite** in the Room header to share its QR or copy the secure
+`/rooms/<code>?invite=<token>` URL. A code alone cannot admit a new guest.
+Guests join with an optional name,
 search, and request songs without Melodarr/Plex accounts. Blank names become
 Guest #1, Guest #2, etc.; returning guests reuse their scoped identity. Only
 the host can reorder, remove, retry synchronization, or end the Room. Ending
@@ -45,6 +47,20 @@ stay in Plexamp. Keep playable songs queued: pending requests cannot prevent
 exhaustion, and Rooms cannot start/restart an idle player.
 
 ## Player presentation and cached artwork
+
+Invite, Retry synchronization and End Room sit beside the compact Room heading,
+wrapping on narrow screens. End Room uses quiet destructive text; sync errors
+can emphasize Retry without coloring the whole header. Join/request successes
+use a short success line, genuine failures retain danger styling, and normal
+SSE connection status is hidden. There is no explanatory footer below the queue.
+
+The Invite dialog draws a 200–240px SVG QR locally with bundled
+`qrcode-generator` 2.0.4. It encodes exactly
+`window.location.origin + /rooms/<code>?invite=<token>`; the copy button uses the
+same URL. No external QR service receives it. Clipboard fallback exposes a
+selectable full link. The dialog supports keyboard dismissal and focus return.
+The guest captures the bootstrap token, removes it from the visible address
+with `replaceState`, and sends it only in the join JSON, never the SSE URL.
 
 Now Playing uses a responsive square cover with title, track artist and album.
 Desktop places a 280px cover beside the metadata; mobile stacks a cover up to
@@ -359,6 +375,7 @@ All routes are under `/api/rooms`; automation API keys grant no Room authority.
 | POST `/<code>/sync` | Host; retry saved intent/acquisition |
 | POST `/<code>/end` | Host; close without changing playback |
 | GET `/<code>/events` | Participant; SSE updates and closure |
+| GET `/<code>/invite` | Owning signed-in host; secure `invitePath`, no-store |
 | GET `/<code>/artwork/<release-group-mbid>` | Participant; scoped artwork |
 
 JSON start/join/entry/order/delete requests require `Content-Type: application/json`
@@ -371,8 +388,35 @@ Application URL; Origin checks support upstream TLS termination. CORS is disable
 
 ## Security and limits
 
-- Codes contain ten cryptographically random characters (50 bits), with no public
-  listing. Anyone with the invite can join; lookup/join/search/mutations are limited.
+- New codes contain four random uppercase characters from
+  `23456789ABCDEFGHJKLMNPQRSTUVWXYZ`. They identify a Room; they are not access
+  secrets. The database enforces active-code uniqueness; startup retries code
+  collisions up to 20 times and returns a safe 503 after exhaustion. Host/queue
+  conflicts retain their existing 409 behavior. Retained closed Rooms may share
+  a code with a new active Room; lookups prefer the active Room.
+- Each Room has a separate 256-bit invitation capability: a cryptographically
+  random 32-byte nonce is combined with the Room UUID using domain-separated
+  HMAC-SHA256 and the persistent server session key. The resulting 43-character
+  URL-safe token is not stored raw. Only its SHA256 verifier and nonce are saved;
+  recovering it for the host also requires the persistent server key. Keep that
+  key when restarting/restoring Melodarr. Changing it fails sharing safely
+  without silently replacing an active invitation.
+- Anonymous initial join requires a matching invite. Existing scoped guest
+  cookies continue to authenticate and rejoin without it; the authenticated
+  owning host may also join/access without it. Non-owner accounts cannot bypass
+  this check. Invitations never replace the guest identity or CSRF system.
+- Only the owner-only invite API returns the secure path. Ordinary host/guest
+  JSON, SSE and diagnostics omit token, nonce, verifier and full invite URL.
+  Production access logs omit queries and Referer; development Room access
+  logs redact queries, including encoded invite parameter names.
+- Existing active ten-character codes, UUIDs, queue bindings, entries and guest
+  credentials are preserved. Migration atomically rebuilds the legacy global
+  code constraint into an active-only index and checks all foreign keys before
+  commit; it neither rewrites codes nor initializes legacy invites. The first
+  owner Invite request initializes a legacy invite once; further requests and
+  restarts retain it. Old bare links no longer admit unjoined guests; the host
+  must share the new secure link. Authorized snapshots/SSE stay bound to their
+  original Room UUID, so reused codes cannot redirect an old guest stream.
 - Durable rate limits use peer IP and participant identity; forwarded IP headers
   are not trusted. Search permits 12/person/minute and 25/IP/minute; requests
   permit 15/person/minute and 30/IP/minute. Join permits 10/IP/minute.
@@ -391,8 +435,8 @@ Application URL; Origin checks support upstream TLS termination. CORS is disable
   host reorder validation uses the 10,000-item PMS queue window rather than the
   guest request limit. Complete reads are required; truncated queues are rejected.
 - Playback can race a network command. Owned stream and complete queue are checked
-  before every mutation; changed protected boundaries stop the write. Voting, QR
-  codes, and guest reordering remain outside this iteration.
+  before every mutation; changed protected boundaries stop the write. Voting
+  and guest reordering remain outside this iteration.
 
 ## Validation for this iteration
 
@@ -420,6 +464,36 @@ route-inventory assertion update does not reformat unrelated tests.
 Existing acquisition, duplicate identity, synchronization/write-race, migration,
 security, concurrency and recovery regressions remain in the suites. Live
 restart/recovery was already manually validated and was not redesigned.
+
+## Invitation and header polish validation
+
+| Check | Result |
+| --- | --- |
+| Focused invitation/security/migration backend tests | 21 passed |
+| Focused invitation plus test-filesystem isolation checks | 24 passed |
+| Full Rooms backend (`tests.test_rooms`, `test_room_hardening`, `test_room_artwork`, `test_room_invitations`) | 177 passed |
+| Full backend (`python -m unittest discover -s tests -t .`) | 1,127 passed |
+| Focused invite browser tests | 11 passed |
+| Full Rooms browser (`rooms.spec.ts`, `rooms-player.spec.ts`, `rooms-invitations.spec.ts`) | 42 passed |
+| Full browser suite | 226 passed |
+| Frontend typecheck and production build | Passed |
+| Ruff on touched backend modules and Rooms tests | Passed |
+| Repository `E9,F63,F7,F82` static checks | Passed |
+| Ruff formatting, with changed-range checks for legacy factory/storage/test inventory files | Passed |
+| `git diff --check` | Passed |
+
+The 21 new backend tests cover code/alphabet/collision behavior, bounded failure,
+closed-code reuse, hash storage, invite authorization and owner-only sharing,
+guest cookie/CSRF continuity, secret-free JSON/SSE/diagnostics/logs, stable restart
+and legacy invites, UUID binding for streams and completing requests, preserved
+migration children, and migration rollback. Eleven new browser tests decode the
+rendered QR with test-only `jsqr` 1.4.0, check exact secure copying and clipboard
+fallback, keyboard focus, guest success/error styling, header controls and mobile
+fit. The artwork test now explicitly imports the existing isolation bootstrap.
+The legacy `test_backend.py` retains its same 12 unrelated Ruff findings as HEAD;
+the conventional Gunicorn config filename is exempted from `N999`.
+No commits or pushes were made. PMS synchronization decisions were unchanged;
+automated PMS coverage uses the existing transport mocks.
 
 ## Real PMS/Plexamp acceptance checks
 

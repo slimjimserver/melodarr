@@ -139,7 +139,7 @@ test("host shows Up Next, warns, and submits opaque reorder and removal IDs", as
   await page.goto("/rooms");
   await expect(page.getByText("Buffer song", { exact: true })).toBeVisible();
   await expect(page.locator(".room-warning")).toContainText("almost empty");
-  await expect(page.getByLabel("Guest join URL")).toHaveValue("http://127.0.0.1:4173/rooms/ABCDEFGHJK");
+  await expect(page.locator(".room-heading").getByRole("button", { name: "Invite", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Move Missing song up" }).click();
   await expect(page.locator(".room-queue li").first()).toContainText("Missing song");
   await page.getByRole("button", { name: "Remove Available song" }).click();

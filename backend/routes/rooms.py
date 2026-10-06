@@ -91,7 +91,9 @@ def rate(action, maximum, *, identity=None):
 
 
 def code_room(code, *, active=False):
-    if not re.fullmatch(r"[23456789A-HJ-NP-Z]{10}", code.upper()):
+    if not re.fullmatch(
+        r"(?:[23456789A-HJ-NP-Z]{4}|[23456789A-HJ-NP-Z]{10})", code.upper()
+    ):
         raise rooms.RoomError("Room not found or unavailable.", 404)
     return rooms.room_by_code(code, active=active)
 
@@ -223,13 +225,22 @@ def diagnostics(code):
     return jsonify(room_diagnostics.inspect(room))
 
 
+@blueprint.get("/api/rooms/<code>/invite")
+@login_required
+@boundary
+def invite(code):
+    room = code_room(code, active=True)
+    owner(room)
+    return jsonify({"invitePath": rooms.invite(room)})
+
+
 @blueprint.post("/api/rooms/<code>/join")
 @guest_route
 @boundary
 def join(code):
     rate("join", 10)
     room = code_room(code, active=True)
-    payload = safe_json({"name"})
+    payload = safe_json({"name", "invite"})
     name = payload.get("name", "")
     if (
         not isinstance(name, str)
@@ -237,11 +248,21 @@ def join(code):
         or any(ord(character) < 32 for character in name)
     ):
         raise rooms.RoomError("Guest names must be text of 60 characters or fewer.")
-    guest, token = rooms.join(room["code"], name, request.cookies.get("room_guest"))
+    user = current_user()
+    guest, token = rooms.join(
+        room["code"],
+        name,
+        request.cookies.get("room_guest"),
+        invite_token=payload.get("invite"),
+        host=bool(user and user["id"] == room["host_user_id"]),
+        room_id=room["id"],
+    )
     response = jsonify(
         {
             "guest": guest,
-            "room": rooms.project_snapshot(rooms.snapshot(room["code"]), host=False),
+            "room": rooms.project_snapshot(
+                rooms.snapshot(room["code"], room_id=room["id"]), host=False
+            ),
         }
     )
     response.set_cookie(
@@ -265,7 +286,7 @@ def state(code):
     return jsonify(
         {
             "room": rooms.project_snapshot(
-                rooms.snapshot(room["code"]), host=person["host"]
+                rooms.snapshot(room["code"], room_id=room["id"]), host=person["host"]
             )
         }
     )
@@ -319,6 +340,7 @@ def add(code):
                     choice,
                     person["name"],
                     None if person["host"] else person["id"],
+                    room_id=room["id"],
                 ),
                 host=person["host"],
             )
@@ -402,7 +424,9 @@ def artwork(code, mbid):
             "UNION ALL SELECT 1 FROM room_entries WHERE room_id=? AND release_group_mbid=? LIMIT 1",
             (room["id"], mbid, time.time(), room["id"], mbid),
         ).fetchone()
-    if not allowed and not _has_artwork(rooms.snapshot(room["code"]), request.path):
+    if not allowed and not _has_artwork(
+        rooms.snapshot(room["code"], room_id=room["id"]), request.path
+    ):
         raise rooms.RoomError("Artwork unavailable.", 404)
     return cached_artwork(
         f"release-group-{mbid}",
@@ -426,7 +450,7 @@ def plex_artwork(code, cache_key):
     room = code_room(code)
     participant(room)
     if not re.fullmatch(r"plex-album-[0-9a-f]{64}", cache_key) or not _has_artwork(
-        rooms.snapshot(room["code"]), request.path
+        rooms.snapshot(room["code"], room_id=room["id"]), request.path
     ):
         raise rooms.RoomError("Artwork unavailable.", 404)
     return serve_cached_artwork(cache_key, size=request.args.get("size") or "thumb")
@@ -450,7 +474,8 @@ def events(code):
         try:
             while time.monotonic() < deadline:
                 state = rooms.project_snapshot(
-                    rooms.snapshot(room["code"]), host=person["host"]
+                    rooms.snapshot(room["code"], room_id=room["id"]),
+                    host=person["host"],
                 )
                 # Artwork can arrive from the library worker without a queue
                 # edit. Preserve queue versions while publishing additive art.

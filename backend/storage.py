@@ -935,6 +935,11 @@ def init_db():
     legacy_settings = {}
     legacy_lastfm_api_key = ""
     with db() as connection:
+        if __package__:
+            from .room_storage import prepare_code_migration
+        else:
+            from room_storage import prepare_code_migration
+        prepare_code_migration(connection)
         # WAL lets request threads read account and queue state while a
         # background worker commits unrelated updates.
         connection.execute("PRAGMA journal_mode = WAL")

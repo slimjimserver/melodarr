@@ -1,3 +1,5 @@
+import qrcode from "qrcode-generator";
+
 interface RoomTrack { title: string; artist: string; album?: string; artwork?: string; artworkFallback?: string }
 interface RoomEntry extends RoomTrack { id: string; recordingMbid?: string | null; requester?: string | null; state: string; locked?: boolean; error?: string }
 interface RoomState {
@@ -26,6 +28,47 @@ function element<K extends keyof HTMLElementTagNameMap>(tag: K, text = "", class
   node.className = className;
   return node;
 }
+function notify(text: string, kind: "info" | "success" | "error" = "info") {
+  message.textContent = text;
+  message.className = `message room-message ${kind}`;
+  message.setAttribute("role", kind === "error" ? "alert" : "status");
+}
+async function showInvite(opener: HTMLButtonElement) {
+  const requestGeneration = generation, roomCode = code;
+  const { invitePath } = await call<{ invitePath: string }>(`/api/rooms/${roomCode}/invite`);
+  if (generation !== requestGeneration || current?.status !== "active") return;
+  const url = new URL(invitePath, window.location.origin).href;
+  root.querySelector(".room-invite-dialog")?.remove();
+  const dialog = element("dialog", "", "room-invite-dialog");
+  dialog.setAttribute("aria-labelledby", "room-invite-title");
+  const title = element("h2", "Join Room"); title.id = "room-invite-title";
+  const close = button("×", () => dialog.close()); close.className = "room-invite-close";
+  close.setAttribute("aria-label", "Close invitation");
+  const qr = qrcode(0, "M"); qr.addData(url); qr.make();
+  // Draw the bundled generator's matrix locally. No URL-bearing image request,
+  // third-party service, or secret stored in a DOM attribute is necessary.
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  const size = qr.getModuleCount() + 8;
+  svg.setAttribute("viewBox", `0 0 ${size} ${size}`);
+  svg.setAttribute("role", "img"); svg.setAttribute("aria-label", `Scan to join Room ${roomCode}`);
+  svg.setAttribute("class", "room-invite-qr");
+  const path = document.createElementNS(svg.namespaceURI, "path");
+  let squares = "";
+  for (let row = 0; row < size - 8; row++) for (let col = 0; col < size - 8; col++) {
+    if (qr.isDark(row, col)) squares += `M${col + 4},${row + 4}h1v1h-1z`;
+  }
+  path.setAttribute("d", squares); path.setAttribute("fill", "#000"); svg.append(path);
+  const status = element("p", "", "room-invite-status"); status.setAttribute("role", "status");
+  const fallback = element("label", "Guest join URL", "room-invite-fallback"), input = element("input");
+  input.readOnly = true; input.value = url; fallback.append(input); fallback.hidden = true;
+  const copy = button("Copy Invite Link", async () => {
+    try { await navigator.clipboard.writeText(url); status.textContent = "Invite link copied."; }
+    catch { fallback.hidden = false; input.focus(); input.select(); status.textContent = "Select and copy the invite link."; }
+  });
+  dialog.append(close, title, svg, element("p", roomCode, "room-invite-code"), copy, status, fallback);
+  dialog.addEventListener("close", () => { dialog.remove(); if (opener.isConnected) opener.focus(); });
+  root.append(dialog); dialog.showModal();
+}
 function button(text: string, action: () => Promise<void> | void) {
   const node = element("button", text);
   node.type = "button";
@@ -33,8 +76,8 @@ function button(text: string, action: () => Promise<void> | void) {
     const actionGeneration = generation;
     node.dataset.busy = "true";
     node.disabled = true;
-    message.textContent = "";
-    try { await action(); } catch (error) { if (generation === actionGeneration) message.textContent = error.message; }
+    notify("");
+    try { await action(); } catch (error) { if (generation === actionGeneration) notify(error.message, "error"); }
     finally { delete node.dataset.busy; node.disabled = node.dataset.unavailable === "true"; }
   });
   return node;
@@ -56,6 +99,7 @@ async function call<T>(url: string, method = "GET", payload?: unknown): Promise<
 }
 function stop() {
   generation++;
+  root?.querySelector(".room-invite-dialog")?.remove();
   source?.close(); source = undefined;
   if (reconnect !== undefined) window.clearTimeout(reconnect);
   reconnect = undefined;
@@ -63,7 +107,7 @@ function stop() {
 function mount() {
   player = undefined; queueRows.clear();
   root.replaceChildren();
-  message = element("p", "", "message error"); message.setAttribute("role", "status");
+  message = element("p", "", "message room-message"); message.setAttribute("role", "status");
   connection = element("p", "", "room-connection");
   roomPanel = element("div", "", "room-panel");
   searchPanel = element("section", "", "room-search");
@@ -91,13 +135,13 @@ function watch() {
   source.addEventListener("room", (event) => {
     if (generation !== thisGeneration) return;
     retryDelay = 2000;
-    connection.textContent = "Room updates connected";
+    connection.textContent = "";
     render(JSON.parse((event as MessageEvent).data));
   });
   source.onerror = () => {
     source?.close();
     if (generation !== thisGeneration || current?.status === "closed") return;
-    connection.textContent = "Reconnecting to Room updates…";
+    connection.textContent = "Reconnecting…";
     reconnect = window.setTimeout(() => { if (generation === thisGeneration) watch(); }, retryDelay);
     retryDelay = Math.min(retryDelay * 2, 30000);
   };
@@ -146,16 +190,11 @@ function createPlayer() {
   const heading = element("div", "", "room-heading");
   const roomInfo = element("div"), name = element("h2"), guests = element("p"); roomInfo.append(name, guests); heading.append(roomInfo);
   if (host) {
-    const disclosure = element("details", "", "room-invite"), input = element("input"), label = element("label", "Guest join URL");
-    input.readOnly = true; label.append(input); disclosure.append(element("summary", "Invite link"), label); roomInfo.append(disclosure);
-    const invite = button("Copy Invite Link", async () => {
-      const url = new URL(current!.joinPath, window.location.origin).href;
-      try { await navigator.clipboard.writeText(url); message.textContent = "Invite link copied."; }
-      catch {
-        disclosure.open = true; input.focus(); input.select(); message.textContent = "Select and copy the invite link.";
-      }
-    });
-    heading.append(invite);
+    const actions = element("div", "", "room-header-actions");
+    const invite = button("Invite", () => showInvite(invite));
+    actions.append(invite, button("Retry synchronization", () => mutate("sync", "POST")));
+    const end = button("End Room", () => mutate("end", "POST")); end.classList.add("room-end"); actions.append(end);
+    heading.append(actions);
   }
   const hero = element("section", "", "room-now-playing"); hero.setAttribute("aria-label", "Now Playing");
   const artwork = createArtwork(true), metadata = element("div", "", "room-now-metadata");
@@ -172,12 +211,6 @@ function createPlayer() {
   const empty = element("p", "Search below to add the first Room song.", "room-empty");
   const list = element("ol", "", "room-queue"); list.setAttribute("aria-label", "Up Next queue");
   roomPanel.replaceChildren(heading, hero, warning, syncError, queueHeading, next, empty, list);
-  if (host) {
-    const actions = element("div", "", "room-actions");
-    actions.append(button("Retry synchronization", () => mutate("sync", "POST")), button("End Room", () => mutate("end", "POST")));
-    roomPanel.append(actions);
-  }
-  roomPanel.append(element("p", "Playback stays in Plexamp. Queue changes refresh there when playback advances.", "room-note"));
   return { name, guests, artwork, label, title, artist, album, warning, syncError, count, next, nextArtwork, nextTitle, nextArtist, empty, list };
 }
 function createQueueRow(id: string) {
@@ -236,8 +269,7 @@ function render(state: RoomState) {
   }
   player ||= createPlayer();
   setText(player.name, `Room ${state.code}`); setText(player.guests, `${state.guestCount} ${state.guestCount === 1 ? "guest" : "guests"}`);
-  const inviteInput = roomPanel.querySelector<HTMLInputElement>(".room-invite input");
-  if (inviteInput) inviteInput.value = new URL(state.joinPath, window.location.origin).href;
+  roomPanel.querySelector(".room-header-actions")?.classList.toggle("has-sync-error", !!state.syncError);
   player.artwork.update(state.nowPlaying);
   setText(player.label, state.playbackState === "playing" ? "NOW PLAYING" : `PLAYBACK ${state.playbackState.toUpperCase()}`);
   setText(player.title, state.nowPlaying.title || "No track detected");
@@ -267,7 +299,7 @@ function setupSearch() {
   const submit = element("button", "Search"); submit.type = "submit"; form.append(label, submit);
   const results = element("div", "", "room-search-results"); searchPanel.append(form, results);
   form.addEventListener("submit", async (event) => {
-    event.preventDefault(); submit.disabled = true; message.textContent = "";
+    event.preventDefault(); submit.disabled = true; notify("");
     const requestGeneration = generation; results.setAttribute("aria-busy", "true");
     try {
       const response = await call<{results: RoomChoice[]}>(`/api/rooms/${code}/search?q=${encodeURIComponent(input.value)}`);
@@ -282,11 +314,11 @@ function setupSearch() {
         const add = button("Request track", async () => {
           const requestGeneration = generation;
           await mutate("entries", "POST", { choiceId: choice.id });
-          if (generation === requestGeneration) message.textContent = `${choice.title} added to the Room.`;
+          if (generation === requestGeneration) notify(`${choice.title} added to the Room.`, "success");
         });
         add.setAttribute("aria-label", `Request ${choice.title}`); row.append(detail, add); results.append(row);
       });
-    } catch (error) { if (generation === requestGeneration) message.textContent = error.message; }
+    } catch (error) { if (generation === requestGeneration) notify(error.message, "error"); }
     finally { submit.disabled = false; results.removeAttribute("aria-busy"); }
   });
 }
@@ -307,7 +339,7 @@ export async function showHostRooms(token: string) {
       } catch (error) {
         if (generation !== requestGeneration) return;
         if (error instanceof RoomCallError && error.selectionRequired) {
-          showDevices(error.sessions); message.textContent = error.message; return;
+          showDevices(error.sessions); notify(error.message, "error"); return;
         }
         const response = await call<{room: RoomState | null}>("/api/rooms/active").catch(() => ({ room: null }));
         if (generation === requestGeneration && response.room) { render(response.room); setupSearch(); watch(); }
@@ -331,10 +363,10 @@ export async function showHostRooms(token: string) {
       const submit = element("button", "Start Room on selected device"); submit.type = "submit"; submit.disabled = sessions.length === 0;
       form.append(devices, submit);
       form.addEventListener("submit", async (event) => {
-        event.preventDefault(); submit.disabled = true; message.textContent = "";
+        event.preventDefault(); submit.disabled = true; notify("");
         const selection = new FormData(form).get("sessionId");
         try { if (typeof selection === "string") await startRoom(selection); }
-        catch (error) { if (generation === requestGeneration) message.textContent = error.message; }
+        catch (error) { if (generation === requestGeneration) notify(error.message, "error"); }
         finally { submit.disabled = sessions.length === 0; }
       });
       picker.append(form, button("Refresh devices", async () => {
@@ -345,21 +377,26 @@ export async function showHostRooms(token: string) {
       roomPanel.append(picker);
     };
     roomPanel.append(button("Start Room", () => startRoom()));
-  } catch (error) { if (generation === requestGeneration) message.textContent = error.message; }
+  } catch (error) { if (generation === requestGeneration) notify(error.message, "error"); }
 }
 window.addEventListener("melodarr-view-changed", (event) => { if ((event as CustomEvent).detail !== "rooms") stop(); });
 window.addEventListener("melodarr-signed-out", stop);
 window.addEventListener("pagehide", stop);
 if (root?.dataset.guest === "true") {
   mount(); code = window.location.pathname.split("/")[2]?.toUpperCase() || "";
+  const inviteToken = new URL(window.location.href).searchParams.get("invite");
+  if (inviteToken) {
+    const address = new URL(window.location.href); address.searchParams.delete("invite");
+    window.history.replaceState(window.history.state, "", address.pathname + address.search + address.hash);
+  }
   const form = element("form", "", "room-join"), label = element("label", "Your name (optional)");
   const name = element("input"); name.maxLength = 60; name.setAttribute("autocomplete", "nickname"); label.append(name);
   const submit = element("button", "Join Room"); submit.type = "submit"; form.append(label, submit); roomPanel.append(form);
   form.addEventListener("submit", async (event) => {
-    event.preventDefault(); submit.disabled = true; message.textContent = "";
+    event.preventDefault(); submit.disabled = true; notify("");
     try {
-      const response = await call<{room: RoomState; guest: {name: string; csrfToken: string}}>(`/api/rooms/${code}/join`, "POST", { name: name.value });
-      guestCsrf = response.guest.csrfToken; render(response.room); setupSearch(); watch(); message.textContent = `Joined as ${response.guest.name}`;
-    } catch (error) { message.textContent = error.message; submit.disabled = false; }
+      const response = await call<{room: RoomState; guest: {name: string; csrfToken: string}}>(`/api/rooms/${code}/join`, "POST", { name: name.value, ...(inviteToken ? { invite: inviteToken } : {}) });
+      guestCsrf = response.guest.csrfToken; render(response.room); setupSearch(); watch(); notify(`Joined as ${response.guest.name}`, "success");
+    } catch (error) { notify(error.message, "error"); submit.disabled = false; }
   });
 }
