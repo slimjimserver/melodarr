@@ -20,7 +20,12 @@ def relationship_id(relations, resource="artist"):
     """Accept one exact provider identity; conflicting relationships stay unknown."""
     ids = set()
     for relation in relations or []:
-        url = urlsplit(str((relation.get("url") or {}).get("resource") or ""))
+        if not isinstance(relation, dict) or not isinstance(relation.get("url"), dict):
+            continue
+        try:
+            url = urlsplit(str(relation["url"].get("resource") or ""))
+        except ValueError:
+            continue
         if url.scheme not in {"http", "https"} or url.hostname not in {"deezer.com", "www.deezer.com"}:
             continue
         match = re.fullmatch(rf"/(?:[a-z]{{2}}/)?{resource}/([1-9][0-9]*)/?", url.path)

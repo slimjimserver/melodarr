@@ -844,7 +844,7 @@
     return url.href;
   }
 
-  function addExternalLinks(container: Element, kind: DetailKind, id: string, spotify?: string, plexUrl = "", plexampUrl = "") {
+  function addExternalLinks(container: Element, kind: DetailKind, id: string, spotify?: string, deezerUrl = "", plexUrl = "", plexampUrl = "") {
     const links = document.createElement("div");
     links.className = "external-icons";
     const destinations = [
@@ -862,6 +862,14 @@
         mobile ? "Open in Spotify" : "Open on Spotify",
         "external-link-spotify",
         !mobile,
+      ));
+    }
+    if (kind === "artist" && deezerUrl) {
+      links.append(createServiceIconLink(
+        deezerUrl,
+        "/icons/deezer.svg",
+        "Open on Deezer",
+        "external-link-deezer",
       ));
     }
     if (plexUrl) {
@@ -949,6 +957,7 @@
       kind,
       data.id,
       data.spotify,
+      data.deezer,
       plexLinks.url,
       plexLinks.plexampUrl,
     );

@@ -20,6 +20,7 @@ if __package__ == "backend.routes":
     from ..services import (
         anime_artist_links,
         anime_theme_links,
+        deezer,
         lastfm,
         lidarr,
         musicbrainz,
@@ -48,6 +49,7 @@ else:
     from services import (
         anime_artist_links,
         anime_theme_links,
+        deezer,
         lastfm,
         lidarr,
         musicbrainz,
@@ -864,6 +866,7 @@ def _artist_detail_payload(mbid, priority, force_refresh=False, cache_only=False
     for group in groups:
         sections.setdefault(" + ".join([group["type"], *group["secondaryTypes"]]), []).append(group)
     spotify = _spotify_relation_url(data.get("relations", []))
+    deezer_artist_id = deezer.relationship_id(data.get("relations"))
     plex_artist = _plex_artist(mbid)
     lidarr_artist = lidarr.cached_artist_availability().get(mbid)
     return {
@@ -875,6 +878,7 @@ def _artist_detail_payload(mbid, priority, force_refresh=False, cache_only=False
         "lifeSpan": data.get("life-span", {}),
         "genres": [genre.get("name") for genre in data.get("genres", [])],
         "spotify": spotify,
+        "deezer": f"https://www.deezer.com/artist/{deezer_artist_id}" if deezer_artist_id else "",
         "coverArtLarge": data.get("coverArtLarge", "") if library_only else artist_large_cover_art(data["id"]),
         "availableInPlex": bool(plex_artist),
         "availableInLidarr": bool(lidarr_artist),
@@ -949,6 +953,7 @@ def _lidarr_artist_detail_payload(mbid):
         "lifeSpan": {},
         "genres": artist.get("genres") or [],
         "spotify": "",
+        "deezer": "",
         "coverArtLarge": artist_large_cover_art(mbid),
         "availableInPlex": bool(plex_artist),
         "availableInLidarr": True,
