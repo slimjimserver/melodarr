@@ -30,6 +30,12 @@ ABBEY = "9162580e-5df4-32de-80cc-f45a8d8a9b1d"
 ABBEY_US = "2e0542d1-5c0b-4600-ab77-64870cc619de"
 ABBEY_EUROPE = "d605cd91-5a6a-4bcb-89c6-e545dc313729"
 LET_IT_BE = "0cdc9b5b-b16b-4ff1-9f16-5b4ba76f1c17"
+DRAKE = "55555555-5555-5555-5555-555555555555"
+HEADLINES = "263560ff-c9da-4498-8da5-1800241f8799"
+HEADLINES_SHORT = "53e58043-b6aa-4dd5-b103-3e69f102efac"
+LIFE_REMIX = "5e7a3a47-3df6-4ae7-a60d-fb212758ad81"
+LIFE_ORIGINAL = "4670caff-59d1-4a26-b26c-35491059756d"
+RUBBER_SOUL = "66666666-6666-6666-6666-666666666666"
 
 
 def credit(name="Jhené Aiko", mbid=ARTIST):
@@ -85,6 +91,40 @@ def let_it_be_release(group_id=GROUP, primary_type="Album", group_date="1970-05-
     return value
 
 
+def headlines_track():
+    return {"id": 3, "title": "Headlines (Explicit Version)", "title_short": "Headlines",
+            "title_version": "(Explicit Version)", "duration": 236, "isrc": "USCM51100290",
+            "artist": {"id": 3, "name": "Drake"}, "contributors": [{"name": "Drake", "role": "Main"}],
+            "album": {"id": 3, "title": "Take Care (Deluxe)"}}
+
+
+def headlines_recordings():
+    return [{"id": mbid, "title": "Headlines", "disambiguation": comment, "length": length,
+             "artist-credit": [credit("Drake", DRAKE)]}
+            for mbid, comment, length in ((HEADLINES, "explicit", 235986), (HEADLINES_SHORT, "", 214746))]
+
+
+def life_track():
+    return {**beatles_track(), "id": 4, "title": "In My Life (Remastered 2009)", "title_short": "In My Life",
+            "duration": 145, "isrc": "GBAYE0601489",
+            "album": {"id": 4, "title": "Rubber Soul (Remastered 2009)", "release_date": "2015-12-24"}}
+
+
+def life_recordings():
+    return [{"id": mbid, "title": "In My Life", "disambiguation": comment, "length": length,
+             "artist-credit": [credit("The Beatles", BEATLES)]}
+            for mbid, comment, length in ((LIFE_REMIX, "1987 remix", 147000), (LIFE_ORIGINAL, "original stereo studio mix", 146000))]
+
+
+def rubber_release(recording_id=LIFE_REMIX, comment="2009 stereo remaster", release_date="2015-12-24"):
+    value = abbey_release(RELEASE if recording_id == LIFE_REMIX else ABBEY_EUROPE,
+                          RUBBER_SOUL, title="Rubber Soul", disambiguation=comment)
+    value["date"] = release_date
+    value["release-group"]["first-release-date"] = "1965-12-03"
+    value["media"][0]["tracks"][0]["recording"]["id"] = recording_id
+    return value
+
+
 class ArtistSummaryTests(DatabaseTestCase):
     def save_snapshot(self, source="top_tracks", age=0, **changes):
         value = {"fetched_at": time.time() - age, "resolver_version": summary.RESOLVER_VERSION,
@@ -133,6 +173,232 @@ class ArtistSummaryTests(DatabaseTestCase):
         for delta in (-5000, 5000):
             self.assertEqual(summary.select_recording(track(), [recording(SOLO, length=310000), recording(length=276000 + delta)], ARTIST), (SATIVA, "isrc_title_duration"))
         self.assertIsNone(summary.select_recording(track(), [recording(SOLO, length=310000), recording(length=281001)], ARTIST)[0])
+
+    @patch.object(musicbrainz, "browse_releases_by_recording")
+    @patch.object(musicbrainz, "get", return_value={"recordings": headlines_recordings()})
+    def test_headlines_explicit_base_title_and_duration_resolve_before_album_context(self, get, browse):
+        self.assertEqual(summary.resolve_recording(headlines_track(), DRAKE), (HEADLINES, "isrc_title_duration"))
+        get.assert_called_once_with("/isrc/USCM51100290", "artist-credits", priority="background")
+        browse.assert_not_called()
+
+    def test_explicit_version_and_explicit_have_narrow_semantic_equivalence(self):
+        for version in ("(Explicit Version)", "Explicit"):
+            for comment in ("explicit", "Explicit Version"):
+                with self.subTest(version=version, comment=comment):
+                    self.assertTrue(summary._title_matches({**headlines_track(), "title_version": version},
+                                                          {**headlines_recordings()[0], "disambiguation": comment}))
+        for comment in ("", "clean", "non explicit", "explicit remix", "explicitly edited"):
+            self.assertFalse(summary._title_matches(headlines_track(), {**headlines_recordings()[0], "disambiguation": comment}))
+        self.assertTrue(summary._title_matches({**headlines_track(), "title_short": None},
+                                              {**headlines_recordings()[0], "title": "Headlines (Explicit Version)", "disambiguation": ""}))
+
+    def test_headlines_short_recording_fails_existing_duration_tolerance(self):
+        explicit, short = headlines_recordings()
+        self.assertTrue(summary._duration_matches(headlines_track(), explicit))
+        self.assertFalse(summary._duration_matches(headlines_track(), short))
+
+    def test_arbitrary_recording_version_text_is_not_fuzzily_matched(self):
+        details = {**headlines_track(), "title_version": "(Radio Version)"}
+        self.assertFalse(summary._title_matches(details, {**headlines_recordings()[0], "disambiguation": "radio edit"}))
+        self.assertFalse(summary._title_matches(headlines_track(), {**headlines_recordings()[0], "title": "Other", "disambiguation": "explicit"}))
+
+    def test_multi_isrc_requires_exact_contributors_and_canonical_artist(self):
+        for credits in ([], [credit("The Beatles", OTHER)], [credit("Other", BEATLES)]):
+            candidates = life_recordings()
+            for candidate in candidates:
+                candidate["artist-credit"] = credits
+            self.assertEqual(summary.select_recording(life_track(), candidates, BEATLES), (None, "unresolved"))
+
+    def test_in_my_life_remaster_is_not_recording_mix_identity_and_duration_stays_tied(self):
+        candidates = life_recordings()
+        for candidate in candidates:
+            self.assertTrue(summary._title_matches(life_track(), candidate, allow_mastering=True))
+            self.assertTrue(summary._duration_matches(life_track(), candidate))
+            self.assertFalse(summary._title_matches(life_track(), candidate))
+        mbid, method, remaining = summary._recording_selection(life_track(), candidates, BEATLES)
+        self.assertEqual((mbid, method), (None, "unresolved"))
+        self.assertEqual({candidate["id"] for candidate in remaining}, {LIFE_REMIX, LIFE_ORIGINAL})
+
+    @patch.object(musicbrainz, "get", return_value={"recordings": life_recordings()})
+    def test_in_my_life_resolves_by_exact_recording_remaster_release_context(self, get):
+        def browse(mbid, **kwargs):
+            if kwargs.get("cache_only"):
+                return None
+            return [rubber_release()] if mbid == LIFE_REMIX else [rubber_release(LIFE_ORIGINAL, "", "1965-12-03")]
+        with patch.object(musicbrainz, "browse_releases_by_recording", side_effect=browse) as read:
+            self.assertEqual(summary.resolve_recording(life_track(), BEATLES), (LIFE_REMIX, "isrc_album_context"))
+        self.assertEqual({call.args[0] for call in read.call_args_list}, {LIFE_REMIX, LIFE_ORIGINAL})
+        self.assertTrue(all(call.kwargs.get("cache_only") for call in read.call_args_list[:4]))
+        get.assert_called_once_with("/isrc/GBAYE0601489", "artist-credits", priority="background")
+
+    def test_partial_embedded_isrc_releases_are_not_proof_of_unique_recording_context(self):
+        candidates = life_recordings()
+        candidates[0]["releases"] = [rubber_release()]
+        def browse(mbid, **kwargs):
+            self.assertTrue(kwargs["cache_only"])
+            return [rubber_release(mbid)]
+        with patch.object(musicbrainz, "get", return_value={"recordings": candidates}), patch.object(musicbrainz, "browse_releases_by_recording", side_effect=browse) as read:
+            self.assertEqual(summary.resolve_recording(life_track(), BEATLES), (None, "unresolved"))
+        self.assertEqual(read.call_count, 2)
+
+    def test_remaster_release_evidence_is_stronger_than_date_alone(self):
+        for comment in ("2009 stereo remaster", "remastered"):
+            candidates = life_recordings()
+            candidates[0]["releases"] = [rubber_release(comment=comment, release_date="2009-09-09")]
+            candidates[1]["releases"] = [rubber_release(LIFE_ORIGINAL, "", "2015-12-24")]
+            self.assertEqual(summary.select_recording(life_track(), candidates, BEATLES), (LIFE_REMIX, "isrc_album_context"))
+
+    def test_album_date_can_break_equally_supported_recording_remaster_context(self):
+        candidates = life_recordings()
+        candidates[0]["releases"] = [rubber_release()]
+        candidates[1]["releases"] = [rubber_release(LIFE_ORIGINAL, "2009 stereo remaster", "2009-09-09")]
+        self.assertEqual(summary.select_recording(life_track(), candidates, BEATLES), (LIFE_REMIX, "isrc_album_context"))
+
+    def test_equally_strong_recording_context_never_guesses_from_order_or_release_count(self):
+        candidates = life_recordings()
+        candidates[0]["releases"] = [rubber_release()]
+        candidates[1]["releases"] = [rubber_release(LIFE_ORIGINAL)] * 12
+        for ordered in (candidates, list(reversed(candidates))):
+            self.assertEqual(summary.select_recording(life_track(), ordered, BEATLES), (None, "unresolved"))
+
+    def test_recording_album_context_preserves_containment_status_artist_and_compilation_guards(self):
+        bad = [rubber_release(LIFE_ORIGINAL)]
+        for status in ("Bootleg", "Pseudo-release", "Withdrawn", "Cancelled"):
+            candidate = rubber_release()
+            candidate["status"] = status
+            bad.append(candidate)
+        for secondary in ("Compilation", "DJ-mix", "Mixtape/Street"):
+            candidate = rubber_release()
+            candidate["release-group"]["secondary-types"] = [secondary]
+            bad.append(candidate)
+        wrong_artist = rubber_release()
+        wrong_artist["artist-credit"] = [credit("Other", OTHER)]
+        wrong_artist["release-group"]["artist-credit"] = [credit("Other", OTHER)]
+        bad.append(wrong_artist)
+        bad.append(rubber_release(comment="2015 stereo remaster"))
+        for candidate in bad:
+            candidates = life_recordings()
+            candidates[0]["releases"] = [candidate]
+            self.assertEqual(summary.select_recording(life_track(), candidates, BEATLES), (None, "unresolved"))
+
+    @patch.object(musicbrainz, "get", return_value={"recordings": life_recordings()})
+    def test_recording_context_hydrates_missing_exact_track_identities(self, get):
+        def browse(mbid, **kwargs):
+            candidate = rubber_release(mbid, "2009 stereo remaster" if mbid == LIFE_REMIX else "", "2015-12-24" if mbid == LIFE_REMIX else "1965-12-03")
+            candidate.pop("media")
+            return [candidate]
+        def detail(mbid, **kwargs):
+            return rubber_release() if mbid == RELEASE else rubber_release(LIFE_ORIGINAL, "", "1965-12-03")
+        with patch.object(musicbrainz, "browse_releases_by_recording", side_effect=browse), patch.object(musicbrainz, "release_track_metadata", side_effect=detail) as hydrate:
+            self.assertEqual(summary.resolve_recording(life_track(), BEATLES), (LIFE_REMIX, "isrc_album_context"))
+        self.assertEqual(hydrate.call_count, 2)
+
+    @patch.object(musicbrainz, "get", return_value={"recordings": life_recordings()})
+    @patch.object(musicbrainz, "release_track_metadata", side_effect=AssertionError("Exact recording containment is already proven"))
+    def test_known_recording_containment_needs_no_unrelated_medium_hydration(self, hydrate, get):
+        def browse(mbid, **kwargs):
+            candidate = rubber_release(mbid, "2009 stereo remaster" if mbid == LIFE_REMIX else "", "2015-12-24" if mbid == LIFE_REMIX else "1965-12-03")
+            candidate["media"].append({"tracks": []})
+            return [candidate]
+        with patch.object(musicbrainz, "browse_releases_by_recording", side_effect=browse):
+            self.assertEqual(summary.resolve_recording(life_track(), BEATLES), (LIFE_REMIX, "isrc_album_context"))
+        hydrate.assert_not_called()
+
+    @patch.object(musicbrainz, "get", return_value={"recordings": life_recordings()})
+    def test_recording_context_http_failures_use_short_retry_and_can_recover(self, get):
+        for status in (400, 500):
+            api_cache.delete_cache_namespace(summary.IDENTITY_NAMESPACE)
+            response = requests.Response()
+            response.status_code = status
+            def failed_browse(mbid, **kwargs):
+                if kwargs.get("cache_only"):
+                    return None
+                raise requests.HTTPError(response=response)
+            with patch.object(musicbrainz, "browse_releases_by_recording", side_effect=failed_browse):
+                with self.assertRaises(requests.HTTPError):
+                    summary.resolve_track(life_track(), BEATLES)
+            cached = api_cache.get_cache_document(summary.IDENTITY_NAMESPACE, "track:4")
+            self.assertTrue(cached["provider_failure"])
+            self.assertLessEqual(cached["retry_at"] - time.time(), summary.RETRY_TTL)
+            def recovered_browse(mbid, **kwargs):
+                return [rubber_release()] if mbid == LIFE_REMIX else [rubber_release(LIFE_ORIGINAL, "", "1965-12-03")]
+            with patch.object(summary.time, "time", return_value=time.time() + summary.RETRY_TTL + 1), patch.object(musicbrainz, "browse_releases_by_recording", side_effect=recovered_browse):
+                value = summary.resolve_track(life_track(), BEATLES)
+            self.assertEqual(value["recording_mbid"], LIFE_REMIX)
+            self.assertEqual(value["recording_resolution_method"], "isrc_album_context")
+            self.assertEqual(value["release_group_mbid"], RUBBER_SOUL)
+
+    @patch.object(musicbrainz, "get", return_value={"recordings": life_recordings()})
+    def test_incomplete_recording_context_is_provider_failure_not_durable_unresolved(self, get):
+        incomplete = rubber_release()
+        incomplete.pop("media")
+        with patch.object(musicbrainz, "browse_releases_by_recording", return_value=[incomplete]), patch.object(musicbrainz, "release_track_metadata", return_value=incomplete):
+            with self.assertRaises(requests.RequestException):
+                summary.resolve_track(life_track(), BEATLES)
+        value = api_cache.get_cache_document(summary.IDENTITY_NAMESPACE, "track:4")
+        self.assertTrue(value["provider_failure"])
+        self.assertLessEqual(value["retry_at"] - time.time(), summary.RETRY_TTL)
+
+    @patch.object(musicbrainz, "get", return_value={"recordings": life_recordings()})
+    @patch.object(musicbrainz, "release_track_metadata")
+    def test_oversized_incomplete_recording_context_uses_provider_backoff_without_unbounded_hydration(self, hydrate, get):
+        incomplete = rubber_release()
+        incomplete.pop("media")
+        with patch.object(musicbrainz, "browse_releases_by_recording", return_value=[incomplete] * 51):
+            with self.assertRaises(requests.RequestException):
+                summary.resolve_track(life_track(), BEATLES)
+        hydrate.assert_not_called()
+        self.assertTrue(api_cache.get_cache_document(summary.IDENTITY_NAMESPACE, "track:4")["provider_failure"])
+
+    @patch.object(musicbrainz, "get", return_value={"recordings": headlines_recordings()})
+    @patch.object(deezer, "top_tracks")
+    @patch.object(deezer, "track")
+    def test_v4_negative_recording_retries_without_refetching_order_or_successful_identities(self, details, top, get):
+        self.assertEqual(summary.RESOLVER_VERSION, 5)
+        api_cache.set_cache_document(summary.IDENTITY_NAMESPACE, "track:3", {
+            "complete": False, "resolver_version": 4, "retry_at": time.time() + summary.UNRESOLVED_TTL,
+            "isrc": "USCM51100290", "recording_mbid": None, "recording_resolution_method": "unresolved",
+        }, summary.RETENTION_TTL)
+        success = {"complete": True, "resolver_version": 4, "isrc": "USCM51100290",
+                   "recording_mbid": HEADLINES, "recording_resolution_method": "exact_isrc"}
+        api_cache.set_cache_document(summary.IDENTITY_NAMESPACE, "track:5", success, summary.RETENTION_TTL)
+        known = {**headlines_track(), "id": 5, "deezer_track_id": 5, "position": 2,
+                 "recording_mbid": HEADLINES, "release_group_mbid": GROUP}
+        old = {"fetched_at": time.time(), "resolver_version": 4, "entries": [
+            {**headlines_track(), "deezer_track_id": 3, "deezer_artist_id": 3, "position": 1,
+             "recording_mbid": None, "release_group_mbid": None}, known,
+        ]}
+        api_cache.set_cache_document(summary.SNAPSHOT_NAMESPACE, f"top_tracks:{DRAKE}", old, summary.RETENTION_TTL)
+        api_cache.set_cache_document(summary.SNAPSHOT_NAMESPACE, f"bio:{DRAKE}", {
+            "fetched_at": time.time(), "bio": {"text": "Drake biography"},
+        }, summary.RETENTION_TTL)
+        api_cache.set_cache_document(summary.STATE_NAMESPACE, f"top_tracks:resolver-v4:{DRAKE}", {
+            "status": "pending", "pending_until": time.time() + worker.LEASE_TTL,
+        }, worker.LEASE_TTL)
+        album = release(recording_id=HEADLINES, title="Take Care (Deluxe)")
+        album["artist-credit"] = [credit("Drake", DRAKE)]
+        album["release-group"]["artist-credit"] = [credit("Drake", DRAKE)]
+        with patch.object(worker, "Thread"), patch.object(worker, "jobs", Queue(maxsize=32)), patch.object(worker, "_started", False):
+            self.assertTrue(worker.request_summary(DRAKE)["pending"])
+            self.assertEqual(worker.jobs.get_nowait(), (DRAKE, "top_tracks"))
+        with patch.object(musicbrainz, "browse_releases_by_recording", return_value=[album]) as browse:
+            worker.process_job(DRAKE, "top_tracks")
+        repaired = summary.snapshot(DRAKE, "top_tracks")
+        self.assertEqual(repaired["resolver_version"], 5)
+        self.assertEqual(repaired["fetched_at"], old["fetched_at"])
+        self.assertEqual([entry["deezer_track_id"] for entry in repaired["entries"]], [3, 5])
+        self.assertEqual(repaired["entries"][1], known)
+        self.assertEqual(repaired["entries"][0]["recording_mbid"], HEADLINES)
+        self.assertEqual(repaired["entries"][0]["recording_resolution_method"], "isrc_title_duration")
+        self.assertEqual(api_cache.get_cache_document(summary.IDENTITY_NAMESPACE, "track:5"), success)
+        cached = api_cache.get_cache_document(summary.IDENTITY_NAMESPACE, "track:3")
+        self.assertTrue(cached["complete"])
+        self.assertEqual(cached["resolver_version"], 5)
+        self.assertEqual(cached["retry_at"], 0)
+        get.assert_called_once_with("/isrc/USCM51100290", "artist-credits", priority="background")
+        browse.assert_called_once_with(HEADLINES, priority="background", include_url_relations=True)
+        top.assert_not_called()
+        details.assert_not_called()
 
     def test_fallback_requires_credit_primary_artist_title_version_and_duration(self):
         self.assertEqual(summary.select_recording(track(), [recording()], ARTIST, fallback=True), (SATIVA, "fallback_search"))
@@ -451,7 +717,6 @@ class ArtistSummaryTests(DatabaseTestCase):
     @patch.object(deezer, "top_tracks")
     @patch.object(deezer, "track")
     def test_v3_negative_group_retries_with_date_evidence_without_refreshing_daily_order(self, details, top, browse, resolve):
-        self.assertEqual(summary.RESOLVER_VERSION, 4)
         api_cache.set_cache_document(summary.IDENTITY_NAMESPACE, "track:2", {
             "complete": True, "resolver_version": 3, "isrc": "GBAYE0601713", "recording_mbid": LET_IT_BE,
             "recording_resolution_method": "exact_isrc",
@@ -477,7 +742,7 @@ class ArtistSummaryTests(DatabaseTestCase):
             self.assertEqual(worker.jobs.get_nowait(), (BEATLES, "top_tracks"))
         worker.process_job(BEATLES, "top_tracks")
         repaired = summary.snapshot(BEATLES, "top_tracks")
-        self.assertEqual(repaired["resolver_version"], 4)
+        self.assertEqual(repaired["resolver_version"], summary.RESOLVER_VERSION)
         self.assertEqual(repaired["fetched_at"], old["fetched_at"])
         self.assertEqual(repaired["entries"][0]["position"], 7)
         self.assertEqual(repaired["entries"][0]["recording_mbid"], LET_IT_BE)
@@ -485,7 +750,7 @@ class ArtistSummaryTests(DatabaseTestCase):
         self.assertEqual(repaired["entries"][0]["release_group_resolution_method"], "recording_album_remaster")
         mapping = api_cache.get_cache_document(summary.IDENTITY_NAMESPACE, group_key)
         self.assertTrue(mapping["complete"])
-        self.assertEqual(mapping["resolver_version"], 4)
+        self.assertEqual(mapping["resolver_version"], summary.RESOLVER_VERSION)
         self.assertEqual(mapping["retry_at"], 0)
         resolve.assert_not_called()
         top.assert_not_called()

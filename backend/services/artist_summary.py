@@ -30,7 +30,7 @@ SNAPSHOT_NAMESPACE = "artist-summary:snapshot-v1"
 IDENTITY_NAMESPACE = "artist-summary:identity-v1"
 STATE_NAMESPACE = "artist-summary:refresh-v1"
 # Preserve successful mappings; retry older negative results and snapshots once.
-RESOLVER_VERSION = 4
+RESOLVER_VERSION = 5
 
 
 def _id(value):
@@ -76,14 +76,30 @@ def contributor_names(track):
     return _names(contributors or [track.get("artist") or {}])
 
 
-def _title_matches(track, recording):
+def _artist_credited(credits, artist_mbid):
+    return artist_mbid in {_id((item.get("artist") or {}).get("id"))
+                           for item in credits or [] if isinstance(item, dict)}
+
+
+def _title_matches(track, recording, *, allow_mastering=False):
+    """Compare the base title separately from narrowly recognized version evidence."""
     normalize = track_search_index.normalize_text
     title = normalize(recording.get("title"))
+    base = normalize(track.get("title_short") or track.get("title"))
+    full = normalize(track.get("title"))
+    if not base or title not in {base, full}:
+        return False
     version = normalize(track.get("title_version"))
-    titles = {normalize(track.get("title")), normalize(" ".join([track.get("title_short") or track.get("title") or "", track.get("title_version") or ""]))} - {""}
-    if version:
-        return title in titles and version in normalize(f"{recording.get('title', '')} {recording.get('disambiguation', '')}")
-    return bool(title and title in titles)
+    if not version:
+        return True
+    if _remaster_year(version) is not None:
+        # ISRC linkage constrains candidates; mastering can describe releases.
+        # Unlinked fallback search retains the stricter full-title requirement.
+        return allow_mastering or (title == full and version in normalize(f"{recording.get('title', '')} {recording.get('disambiguation', '')}"))
+    versions = {"explicit", "explicit version"} if version in {"explicit", "explicit version"} else {version}
+    return (normalize(recording.get("disambiguation")) in versions
+            or title in {f"{base} {value}" for value in versions}
+            or (title == full and any(title.endswith(f" {value}") for value in versions)))
 
 
 def _duration_matches(track, recording):
@@ -94,7 +110,7 @@ def _duration_matches(track, recording):
         return False
 
 
-def _recording_selection(track, candidates, artist_mbid, *, fallback=False):
+def _recording_selection(track, candidates, artist_mbid, *, fallback=False, release_context=True):
     """Resolve only a unique strongest candidate, never provider/search ordering."""
     candidates = list({_id(item.get("id")): item for item in candidates if _id(item.get("id"))}.values())
     if not candidates:
@@ -102,32 +118,66 @@ def _recording_selection(track, candidates, artist_mbid, *, fallback=False):
     if len(candidates) == 1 and not fallback:
         return _id(candidates[0]["id"]), "exact_isrc", []
     names = contributor_names(track)
-    exact_credit = [item for item in candidates if names and _names(item.get("artist-credit")) == names]
+    exact_credit = [item for item in candidates if names and _names(item.get("artist-credit")) == names
+                    and _artist_credited(item.get("artist-credit"), artist_mbid)]
     if fallback:
-        valid = [item for item in exact_credit if _title_matches(track, item) and _duration_matches(track, item)
-                 and artist_mbid in {_id((credit.get("artist") or {}).get("id")) for credit in item.get("artist-credit") or [] if isinstance(credit, dict)}]
+        valid = [item for item in exact_credit if _title_matches(track, item) and _duration_matches(track, item)]
         return (_id(valid[0]["id"]), "fallback_search", []) if len(valid) == 1 else (None, "unresolved", [])
     if exact_credit:
         candidates = exact_credit
         if len(candidates) == 1:
             return _id(candidates[0]["id"]), "isrc_artist_credit", []
-    elif names and all(_names(item.get("artist-credit")) for item in candidates):
+    else:
         return None, "unresolved", []
-    titled = [item for item in candidates if _title_matches(track, item)]
-    # A title alone is too weak when contributor credits are unavailable.
+    titled = [item for item in candidates if _title_matches(track, item, allow_mastering=True)]
     timed = [item for item in titled if _duration_matches(track, item)]
     if len(timed) == 1:
         return _id(timed[0]["id"]), "isrc_title_duration", []
-    album = track_search_index.normalize_text((track.get("album") or {}).get("title"))
-    contextual = [item for item in timed if album and any(
-        album in {track_search_index.normalize_text(release.get("title")), track_search_index.normalize_text((release.get("release-group") or {}).get("title"))}
-        for release in item.get("releases") or []
-    )]
-    return (_id(contextual[0]["id"]), "isrc_album_context", []) if len(contextual) == 1 else (None, "unresolved", timed)
+    if not release_context:
+        return None, "unresolved", timed
+    contextual = [(item, _recording_context_score(track, item, artist_mbid)) for item in timed]
+    contextual = [(item, score) for item, score in contextual if score is not None]
+    if contextual:
+        best = max(score for _, score in contextual)
+        winners = [item for item, score in contextual if score == best]
+        if len(winners) == 1:
+            return _id(winners[0]["id"]), "isrc_album_context", []
+    return None, "unresolved", timed
 
 
 def select_recording(track, candidates, artist_mbid, *, fallback=False):
     return _recording_selection(track, candidates, artist_mbid, fallback=fallback)[:2]
+
+
+def _hydrate_recording_releases(releases, recording_mbid):
+    """Verify missing track identities with the existing bounded release helper."""
+    def missing(release):
+        if any(_id((item.get("recording") or {}).get("id")) == recording_mbid
+               for medium in release.get("media") or [] for item in medium.get("tracks") or []):
+            return False
+        return not release.get("media") or any(
+            not medium.get("tracks") or any(not _id((item.get("recording") or {}).get("id")) for item in medium["tracks"])
+            for medium in release["media"]
+        )
+
+    if len(releases) > 50 and any(missing(release) for release in releases):
+        exc = requests.RequestException("Incomplete release context exceeds hydration budget")
+        exc.artist_summary_resource = "/release"
+        raise exc
+    hydrated = []
+    for release in releases:
+        if missing(release):
+            release_id = _id(release.get("id"))
+            path = f"/release/{release_id}"
+            release = _mb_call(path, musicbrainz.release_track_metadata, release_id, priority="background")
+            if _id(release.get("id")) != release_id or missing(release):
+                exc = requests.RequestException("Incomplete recording release track identities")
+                exc.artist_summary_resource = path
+                raise exc
+        hydrated.append(release)
+    cached = track_search_index.cached_release_groups((release.get("release-group") or {}).get("id") for release in hydrated)
+    return [{**release, "release-group": {**cached.get((release.get("release-group") or {}).get("id"), {}), **(release.get("release-group") or {})}}
+            for release in hydrated]
 
 
 def _album_context_candidates(candidates):
@@ -148,7 +198,7 @@ def _album_context_candidates(candidates):
         if releases is None:
             releases = _mb_call("/release", musicbrainz.browse_releases_by_recording, mbid,
                                 priority="background", include_url_relations=True)
-        hydrated.append({**candidate, "releases": releases})
+        hydrated.append({**candidate, "releases": _hydrate_recording_releases(releases, mbid)})
     return hydrated
 
 
@@ -174,7 +224,9 @@ def resolve_recording(track, artist_mbid):
                 raise exc
             track_search_index.index_recording_document(value, musicbrainz.metadata_cache_key(path, inc))
         if candidates:
-            mbid, method, remaining = _recording_selection(track, candidates, artist_mbid)
+            # Embedded releases can be partial; compare complete browsed/cached
+            # collections only after credit/title/duration checks remain tied.
+            mbid, method, remaining = _recording_selection(track, candidates, artist_mbid, release_context=False)
             if mbid or len(remaining) < 2 or not track_search_index.normalize_text((track.get("album") or {}).get("title")):
                 return mbid, method
             return select_recording(track, _album_context_candidates(remaining), artist_mbid)
@@ -270,36 +322,67 @@ def _release_date_match(album, release):
     return 2 if provider_date == release.get("date") else 0
 
 
+def _release_candidate(recording_mbid, track, release, artist_mbid):
+    """Shared exact-containment/artist/status guards and existing group scoring."""
+    album = track.get("album") or {}
+    if not any(_id((item.get("recording") or {}).get("id")) == recording_mbid
+               for medium in release.get("media") or [] for item in medium.get("tracks") or []):
+        return None
+    group = release.get("release-group") or {}
+    mbid = _id(group.get("id"))
+    if not mbid or str(release.get("status") or "").casefold() in {"bootleg", "pseudo-release", "withdrawn", "cancelled"}:
+        return None
+    direct = album.get("id") and any(deezer.relationship_id(entity.get("relations"), "album") == int(album["id"]) for entity in (release, group))
+    title_match = _album_title_match(album.get("title"), release)
+    if not direct and not title_match:
+        return None
+    artist_match = _artist_credited(group.get("artist-credit") or release.get("artist-credit"), artist_mbid)
+    if not direct and not artist_match:
+        return None
+    secondary = {str(item).casefold() for item in group.get("secondary-types") or []}
+    if not direct and secondary.intersection({"compilation", "dj-mix", "mixtape/street"}):
+        return None
+    year = str(album.get("release_date") or "")[:4]
+    year_match = bool(year and year == str(release.get("date") or group.get("first-release-date") or "")[:4])
+    date_match = _release_date_match(album, release) or int(year_match)
+    score = (bool(direct), title_match, artist_match, date_match, not bool(secondary))
+    method = "recording_album_title" if title_match == 2 else "recording_album_remaster"
+    return mbid, score, "recording_deezer_album" if direct else method
+
+
+def _recording_context_score(track, recording, artist_mbid):
+    """Compare each recording's strongest compatible release, never release count."""
+    requested_year = _remaster_year(track.get("title_version"))
+    if requested_year is None:
+        requested_year = _remaster_album_title((track.get("album") or {}).get("title"))[1]
+    scores = []
+    for release in recording.get("releases") or []:
+        candidate = _release_candidate(_id(recording["id"]), track, release, artist_mbid)
+        if candidate is None or not candidate[1][2]:
+            continue
+        remaster = 0
+        if requested_year is not None:
+            group = release.get("release-group") or {}
+            years = [_remaster_album_title(value)[1] for value in (release.get("title"), group.get("title"))]
+            years.append(_remaster_year(release.get("disambiguation"), allow_channels=True))
+            if requested_year and any(year and year != requested_year for year in years):
+                continue
+            remaster = 2 if requested_year and requested_year in years else int(any(year is not None for year in years))
+        score = candidate[1]
+        scores.append((*score[:3], remaster, *score[3:]))
+    return max(scores) if scores else None
+
+
 def select_release_group(recording_mbid, track, releases, artist_mbid):
     """Titles compare only inside releases proven to contain this exact recording."""
-    album = track.get("album") or {}
     candidates = {}
     for release in releases:
-        if not any(_id((item.get("recording") or {}).get("id")) == recording_mbid
-                   for medium in release.get("media") or [] for item in medium.get("tracks") or []):
+        candidate = _release_candidate(recording_mbid, track, release, artist_mbid)
+        if candidate is None:
             continue
-        group = release.get("release-group") or {}
-        mbid = _id(group.get("id"))
-        if not mbid or str(release.get("status") or "").casefold() in {"bootleg", "pseudo-release", "withdrawn", "cancelled"}:
-            continue
-        direct = album.get("id") and any(deezer.relationship_id(entity.get("relations"), "album") == int(album["id"]) for entity in (release, group))
-        title_match = _album_title_match(album.get("title"), release)
-        if not direct and not title_match:
-            continue
-        credit = group.get("artist-credit") or release.get("artist-credit") or []
-        artist_match = artist_mbid in {_id((item.get("artist") or {}).get("id")) for item in credit if isinstance(item, dict)}
-        if not direct and not artist_match:
-            continue
-        secondary = {str(item).casefold() for item in group.get("secondary-types") or []}
-        if not direct and secondary.intersection({"compilation", "dj-mix", "mixtape/street"}):
-            continue
-        year = str(album.get("release_date") or "")[:4]
-        year_match = bool(year and year == str(release.get("date") or group.get("first-release-date") or "")[:4])
-        date_match = _release_date_match(album, release) or int(year_match)
-        score = (bool(direct), title_match, artist_match, date_match, not bool(secondary))
+        mbid, score, method = candidate
         if mbid not in candidates or score > candidates[mbid][0]:
-            method = "recording_album_title" if title_match == 2 else "recording_album_remaster"
-            candidates[mbid] = (score, "recording_deezer_album" if direct else method)
+            candidates[mbid] = (score, method)
     if not candidates:
         return None, "unresolved"
     best = max(item[0] for item in candidates.values())

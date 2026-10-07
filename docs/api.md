@@ -38,8 +38,8 @@ snapshot storage uses the same retention to survive expired-row cleanup, while
 its explicit `fetched_at` determines the shorter freshness window.
 
 Transport, HTTP, and incomplete-provider-response failures use only a **15-minute**
-identity backoff, never the seven-day unresolved mapping cache. Resolver version 4
-automatically retries older negative track/album identities (including version 3)
+identity backoff, never the seven-day unresolved mapping cache. Resolver version 5
+automatically retries older negative track/album identities (including version 4)
 and repairs older unresolved Top Tracks snapshots on the next Summary visit,
 bypassing old refresh leases. Successful identities and Wikipedia caches remain
 reusable. Identity repairs preserve the original daily track ordering and its
@@ -71,13 +71,31 @@ groups are chosen only from releases verified to contain that exact recording;
 provider album relationships, album title, artist credit, date, and release
 context can break ties. Equal plausible groups remain informational.
 
+Ambiguous ISRC candidates require exact contributor names and canonical artist
+credit. Deezer `title_short` supplies the base title when available; recording
+version evidence is compared separately. Only `Explicit Version`/`explicit`
+receive semantic equivalence; other version wording needs exact normalized
+evidence. Narrow remaster wording is mastering context for ISRC-linked recordings,
+so it need not appear in the recording title or mix disambiguation. Unlinked
+fallback search retains the strict remaster title/version requirement.
+One surviving candidate within ±5 seconds resolves as `isrc_title_duration`.
+Remaining ties compare each recording's strongest eligible release containing
+that exact recording: direct album relationship, title match, canonical artist,
+compatible remaster evidence (specified year above unqualified remaster above
+missing evidence), then the existing date/context ranks. Explicit conflicting
+remaster years reject that release. Cached release collections are reused before
+remote browse; missing track identities use bounded release-detail hydration.
+One strongest recording resolves as `isrc_album_context`; equal recording scores
+remain unresolved regardless of release count or provider order. Release-group
+selection runs separately afterward and retains its existing scoring.
+
 Release-group album matching ranks exact Deezer album relationships first, exact
 normalized release/group titles next, and controlled remaster equivalence last.
 The latter removes only a trailing parenthesis containing `remaster`/`remastered`
 and one optional four-digit year, in either order. Release disambiguation can
 supply compatible remaster-year evidence (including mono/stereo wording); empty
 comments are allowed, while recognized conflicting years reject the fallback.
-Other edition text and recording-title/version rules are unchanged. Matching
+Other album edition text remains unchanged. Matching
 editions collapse by release-group MBID; equally ranked distinct groups remain
 unresolved. This fallback is recorded as `recording_album_remaster`.
 
