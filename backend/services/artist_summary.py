@@ -30,7 +30,7 @@ SNAPSHOT_NAMESPACE = "artist-summary:snapshot-v1"
 IDENTITY_NAMESPACE = "artist-summary:identity-v1"
 STATE_NAMESPACE = "artist-summary:refresh-v1"
 # Preserve successful mappings; retry older negative results and snapshots once.
-RESOLVER_VERSION = 5
+RESOLVER_VERSION = 6
 
 
 def _id(value):
@@ -276,33 +276,45 @@ def _remaster_year(value, *, allow_channels=False):
     return years[0] if years else ""
 
 
-def _remaster_album_title(value):
-    """Remove only a recognized trailing remaster parenthesis from album titles."""
+def _album_edition_title(value):
+    """Recognize only a trailing remaster or deluxe album qualifier."""
     match = re.fullmatch(r"(.+?)\s*\(([^()]*)\)", str(value or "").strip())
     if match:
         year = _remaster_year(match[2])
         if year is not None:
-            return track_search_index.normalize_text(match[1]), year
-    return track_search_index.normalize_text(value), None
+            return track_search_index.normalize_text(match[1]), "remaster", year
+        if track_search_index.normalize_text(match[2]) in {"deluxe", "deluxe edition", "deluxe version"}:
+            return track_search_index.normalize_text(match[1]), "deluxe", None
+    return track_search_index.normalize_text(value), None, None
+
+
+def _remaster_album_title(value):
+    """Keep remaster-only evidence separate from other album editions."""
+    base, edition, year = _album_edition_title(value)
+    return (base, year) if edition == "remaster" else (track_search_index.normalize_text(value), None)
 
 
 def _album_title_match(title, release):
-    """Rank exact titles above controlled remaster equivalence, without fuzziness."""
+    """Rank exact titles above controlled edition equivalence, without fuzziness."""
     normalize = track_search_index.normalize_text
     titles = [release.get("title"), (release.get("release-group") or {}).get("title")]
     normalized_title = normalize(title)
     if normalized_title and normalized_title in {normalize(value) for value in titles}:
         return 2
-    base, year = _remaster_album_title(title)
-    if not base or year is None:
+    base, edition, year = _album_edition_title(title)
+    if not base or edition is None:
         return 0
-    matching = [part for part in map(_remaster_album_title, titles) if part[0] == base]
-    if not matching:
-        return 0
-    # Missing comments are normal. Explicit, recognized remaster-year conflicts
-    # are contrary evidence; unrelated disambiguation text is not a title suffix.
-    evidence_years = [part[1] for part in matching] + [_remaster_year(release.get("disambiguation"), allow_channels=True)]
-    if year and any(candidate_year and candidate_year != year for candidate_year in evidence_years):
+    if edition == "remaster":
+        # Preserve remaster-only parsing, including other meaningful base text.
+        matching = [part for part in map(_remaster_album_title, titles) if part[0] == base]
+        if not matching:
+            return 0
+        # Missing comments are normal; recognized year conflicts are contrary
+        # evidence. Unrelated disambiguation text is not a title suffix.
+        evidence_years = [part[1] for part in matching] + [_remaster_year(release.get("disambiguation"), allow_channels=True)]
+        if year and any(candidate_year and candidate_year != year for candidate_year in evidence_years):
+            return 0
+    elif not any(part[0] == base and part[1] in {None, edition} for part in map(_album_edition_title, titles)):
         return 0
     return 1
 
@@ -346,7 +358,9 @@ def _release_candidate(recording_mbid, track, release, artist_mbid):
     year_match = bool(year and year == str(release.get("date") or group.get("first-release-date") or "")[:4])
     date_match = _release_date_match(album, release) or int(year_match)
     score = (bool(direct), title_match, artist_match, date_match, not bool(secondary))
-    method = "recording_album_title" if title_match == 2 else "recording_album_remaster"
+    method = "recording_album_title" if title_match == 2 else (
+        "recording_album_remaster" if _album_edition_title(album.get("title"))[1] == "remaster" else "recording_album_edition"
+    )
     return mbid, score, "recording_deezer_album" if direct else method
 
 

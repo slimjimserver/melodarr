@@ -38,8 +38,8 @@ snapshot storage uses the same retention to survive expired-row cleanup, while
 its explicit `fetched_at` determines the shorter freshness window.
 
 Transport, HTTP, and incomplete-provider-response failures use only a **15-minute**
-identity backoff, never the seven-day unresolved mapping cache. Resolver version 5
-automatically retries older negative track/album identities (including version 4)
+identity backoff, never the seven-day unresolved mapping cache. Resolver version 6
+automatically retries older negative track/album identities (including version 5)
 and repairs older unresolved Top Tracks snapshots on the next Summary visit,
 bypassing old refresh leases. Successful identities and Wikipedia caches remain
 reusable. Identity repairs preserve the original daily track ordering and its
@@ -90,14 +90,22 @@ remain unresolved regardless of release count or provider order. Release-group
 selection runs separately afterward and retains its existing scoring.
 
 Release-group album matching ranks exact Deezer album relationships first, exact
-normalized release/group titles next, and controlled remaster equivalence last.
-The latter removes only a trailing parenthesis containing `remaster`/`remastered`
-and one optional four-digit year, in either order. Release disambiguation can
-supply compatible remaster-year evidence (including mono/stereo wording); empty
-comments are allowed, while recognized conflicting years reject the fallback.
-Other album edition text remains unchanged. Matching
-editions collapse by release-group MBID; equally ranked distinct groups remain
-unresolved. This fallback is recorded as `recording_album_remaster`.
+normalized release/group titles next, and controlled edition equivalence last.
+The latter recognizes only a final parenthesized remaster or deluxe qualifier,
+and requires the same normalized base album title. Remaster qualifiers contain
+`remaster`/`remastered` and one optional four-digit year, in either order. Release
+disambiguation can supply compatible remaster-year evidence (including mono/stereo
+wording); empty comments are allowed, while recognized conflicting years reject
+the fallback.
+Deluxe qualifiers are limited to `Deluxe`, `Deluxe Edition`, and `Deluxe Version`;
+these can match each other or the unqualified release/group base title. Different
+qualifier families are not equated. Live, acoustic, anniversary, expanded, remix,
+and other parenthetical text remains part of the title. Recording-title/version
+matching and remaster-year rules are unchanged. Matching editions collapse by
+release-group MBID; equally ranked distinct groups remain unresolved. Remaster
+fallback retains `recording_album_remaster`; deluxe fallback
+uses `recording_album_edition`. Exact-title and direct-relationship methods are
+unchanged.
 
 Within those relationship/title/artist ranks, a valid full Deezer album date
 (`YYYY-MM-DD`) ranks exact release-group `first-release-date` agreement first,
@@ -106,7 +114,7 @@ Original group dates remain useful even when the containing release is a later
 remaster. Partial/invalid dates add no exact-date evidence, and primary release
 type (Album versus Single) adds no preference. Identical strongest scores across
 distinct groups still remain unresolved: year-only evidence cannot break an
-exact-date tie. Resolution-method labels are unchanged.
+exact-date tie. Date evidence does not change the relationship/title method label.
 
 Before committing, smoke-test a real configured MusicBrainz mirror, Wikipedia
 access, the Jhené Aiko/Sativa mapping, stale refreshes across application restarts,

@@ -36,6 +36,9 @@ HEADLINES_SHORT = "53e58043-b6aa-4dd5-b103-3e69f102efac"
 LIFE_REMIX = "5e7a3a47-3df6-4ae7-a60d-fb212758ad81"
 LIFE_ORIGINAL = "4670caff-59d1-4a26-b26c-35491059756d"
 RUBBER_SOUL = "66666666-6666-6666-6666-666666666666"
+ARIANA = "f4fdbb4c-e4b7-47a0-b83b-d91bbfcfa387"
+PROBLEM = "051da081-084d-448d-aa84-8bfdfd2e3c27"
+MY_EVERYTHING = "77777777-7777-7777-7777-777777777777"
 
 
 def credit(name="Jhené Aiko", mbid=ARTIST):
@@ -123,6 +126,22 @@ def rubber_release(recording_id=LIFE_REMIX, comment="2009 stereo remaster", rele
     value["release-group"]["first-release-date"] = "1965-12-03"
     value["media"][0]["tracks"][0]["recording"]["id"] = recording_id
     return value
+
+
+def problem_track():
+    return {"id": 6, "title": "Problem", "title_short": "Problem", "title_version": "",
+            "duration": 194, "isrc": "USUM71405403", "artist": {"id": 6, "name": "Ariana Grande"},
+            "contributors": [{"name": "Ariana Grande", "role": "Main"}, {"name": "Iggy Azalea", "role": "Featured"}],
+            "album": {"id": 8435726, "title": "My Everything (Deluxe)", "release_date": "2014-08-25"}}
+
+
+def my_everything_release(title="My Everything", group_id=MY_EVERYTHING, release_id=RELEASE):
+    return {"id": release_id, "title": title, "status": "Official", "date": "2014-08-25",
+            "artist-credit": [credit("Ariana Grande", ARIANA)],
+            "release-group": {"id": group_id, "title": "My Everything", "primary-type": "Album",
+                              "first-release-date": "2014-08-25", "secondary-types": [],
+                              "artist-credit": [credit("Ariana Grande", ARIANA)]},
+            "media": [{"tracks": [{"recording": {"id": PROBLEM}}]}]}
 
 
 class ArtistSummaryTests(DatabaseTestCase):
@@ -354,7 +373,6 @@ class ArtistSummaryTests(DatabaseTestCase):
     @patch.object(deezer, "top_tracks")
     @patch.object(deezer, "track")
     def test_v4_negative_recording_retries_without_refetching_order_or_successful_identities(self, details, top, get):
-        self.assertEqual(summary.RESOLVER_VERSION, 5)
         api_cache.set_cache_document(summary.IDENTITY_NAMESPACE, "track:3", {
             "complete": False, "resolver_version": 4, "retry_at": time.time() + summary.UNRESOLVED_TTL,
             "isrc": "USCM51100290", "recording_mbid": None, "recording_resolution_method": "unresolved",
@@ -384,7 +402,7 @@ class ArtistSummaryTests(DatabaseTestCase):
         with patch.object(musicbrainz, "browse_releases_by_recording", return_value=[album]) as browse:
             worker.process_job(DRAKE, "top_tracks")
         repaired = summary.snapshot(DRAKE, "top_tracks")
-        self.assertEqual(repaired["resolver_version"], 5)
+        self.assertEqual(repaired["resolver_version"], summary.RESOLVER_VERSION)
         self.assertEqual(repaired["fetched_at"], old["fetched_at"])
         self.assertEqual([entry["deezer_track_id"] for entry in repaired["entries"]], [3, 5])
         self.assertEqual(repaired["entries"][1], known)
@@ -393,7 +411,7 @@ class ArtistSummaryTests(DatabaseTestCase):
         self.assertEqual(api_cache.get_cache_document(summary.IDENTITY_NAMESPACE, "track:5"), success)
         cached = api_cache.get_cache_document(summary.IDENTITY_NAMESPACE, "track:3")
         self.assertTrue(cached["complete"])
-        self.assertEqual(cached["resolver_version"], 5)
+        self.assertEqual(cached["resolver_version"], summary.RESOLVER_VERSION)
         self.assertEqual(cached["retry_at"], 0)
         get.assert_called_once_with("/isrc/USCM51100290", "artist-credits", priority="background")
         browse.assert_called_once_with(HEADLINES, priority="background", include_url_relations=True)
@@ -562,6 +580,159 @@ class ArtistSummaryTests(DatabaseTestCase):
         direct["relations"] = [{"url": {"resource": "https://www.deezer.com/album/47175652"}}]
         self.assertEqual(summary.select_release_group(SATIVA, track(), [direct, release(OTHER)], ARTIST), (GROUP, "recording_deezer_album"))
 
+    def test_problem_deluxe_matches_unqualified_album_title(self):
+        self.assertEqual(summary._album_title_match(problem_track()["album"]["title"], {"title": "My Everything"}), 1)
+        self.assertEqual(summary.select_release_group(PROBLEM, problem_track(), [my_everything_release()], ARIANA),
+                         (MY_EVERYTHING, "recording_album_edition"))
+
+    def test_problem_deluxe_matches_deluxe_edition_album_title(self):
+        self.assertEqual(summary._album_title_match(problem_track()["album"]["title"], {"title": "My Everything (deluxe edition)"}), 1)
+        self.assertEqual(summary.select_release_group(PROBLEM, problem_track(), [my_everything_release("My Everything (deluxe edition)")], ARIANA),
+                         (MY_EVERYTHING, "recording_album_edition"))
+
+    def test_problem_deluxe_matches_deluxe_version_album_title(self):
+        self.assertEqual(summary._album_title_match(problem_track()["album"]["title"], {"title": "My Everything (deluxe version)"}), 1)
+        self.assertEqual(summary.select_release_group(PROBLEM, problem_track(), [my_everything_release("My Everything (deluxe version)")], ARIANA),
+                         (MY_EVERYTHING, "recording_album_edition"))
+
+    def test_supported_deluxe_qualifiers_are_equivalent_only_on_the_same_base_title(self):
+        for qualifier in ("Deluxe", "Deluxe Edition", "Deluxe Version"):
+            details = problem_track()
+            details["album"]["title"] = f"My Everything ({qualifier})"
+            for mb_qualifier in (None, "Deluxe", "deluxe edition", "deluxe version"):
+                title = "My Everything" if mb_qualifier is None else f"My Everything ({mb_qualifier})"
+                candidate = my_everything_release(title)
+                candidate["release-group"]["title"] = title
+                exact = track_search_index.normalize_text(title) == track_search_index.normalize_text(details["album"]["title"])
+                with self.subTest(qualifier=qualifier, mb_qualifier=mb_qualifier):
+                    self.assertEqual(summary.select_release_group(PROBLEM, details, [candidate], ARIANA),
+                                     (MY_EVERYTHING, "recording_album_title" if exact else "recording_album_edition"))
+        self.assertEqual(summary._album_title_match("My Everything (Deluxe)", {"title": "Other Album (Deluxe Edition)"}), 0)
+
+    def test_exact_album_title_outranks_deluxe_equivalence_and_stronger_date_evidence(self):
+        exact = my_everything_release("My Everything (Deluxe)", OTHER)
+        exact["date"] = "2015-01-01"
+        exact["release-group"]["first-release-date"] = "2014-08-22"
+        self.assertEqual(summary.select_release_group(PROBLEM, problem_track(), [my_everything_release(), exact], ARIANA),
+                         (OTHER, "recording_album_title"))
+
+    def test_direct_album_relationship_outranks_exact_and_deluxe_equivalent_titles(self):
+        direct = my_everything_release("Different Album", OTHER)
+        direct["release-group"]["title"] = "Different Album"
+        direct["relations"] = [{"url": {"resource": "https://www.deezer.com/album/8435726"}}]
+        exact = my_everything_release("My Everything (Deluxe)", GROUP)
+        self.assertEqual(summary.select_release_group(PROBLEM, problem_track(), [my_everything_release(), exact, direct], ARIANA),
+                         (OTHER, "recording_deezer_album"))
+
+    def test_unsupported_album_qualifiers_and_meaningful_base_parentheses_are_preserved(self):
+        for title in ("My Everything (Live)", "My Everything (Acoustic)", "My Everything (Anniversary Edition)",
+                      "My Everything (Expanded Edition)", "My Everything (Remix)", "My Everything (Deluxe Expanded Edition)",
+                      "My Everything (Deluxe 2014)", "My Everything (Live) (Deluxe)", "My Everything (Deluxe) (Live)",
+                      "My Everything (Deluxe (Edition))", "My Everything Deluxe", "My Everything (Deluxe Remastered 2009)"):
+            details = problem_track()
+            details["album"]["title"] = title
+            with self.subTest(title=title):
+                self.assertEqual(summary.select_release_group(PROBLEM, details, [my_everything_release()], ARIANA), (None, "unresolved"))
+
+    def test_deluxe_does_not_strip_unsupported_musicbrainz_qualifiers_or_equate_remasters(self):
+        for qualifier in ("Live", "Acoustic", "Anniversary Edition", "Expanded Edition", "Remix", "Remastered 2009"):
+            self.assertEqual(summary._album_title_match("My Everything (Deluxe)", {"title": f"My Everything ({qualifier})"}), 0)
+        self.assertEqual(summary._album_title_match("My Everything (Remastered 2009)", {"title": "My Everything (Deluxe)"}), 0)
+
+    def test_multiple_deluxe_editions_collapse_to_one_release_group(self):
+        releases = [my_everything_release(title, release_id=release_id) for title, release_id in
+                    (("My Everything", RELEASE), ("My Everything (deluxe edition)", OTHER), ("My Everything (deluxe version)", GROUP))]
+        for ordered in (releases, list(reversed(releases))):
+            self.assertEqual(summary.select_release_group(PROBLEM, problem_track(), ordered, ARIANA), (MY_EVERYTHING, "recording_album_edition"))
+
+    def test_equally_strong_deluxe_matches_across_release_groups_remain_unresolved(self):
+        releases = [my_everything_release("My Everything (deluxe edition)"), my_everything_release("My Everything (deluxe version)", OTHER)]
+        for ordered in (releases, list(reversed(releases))):
+            self.assertEqual(summary.select_release_group(PROBLEM, problem_track(), ordered, ARIANA), (None, "unresolved"))
+
+    def test_deluxe_equivalence_preserves_containment_status_artist_and_compilation_guards(self):
+        wrong_recording = my_everything_release()
+        wrong_recording["media"][0]["tracks"][0]["recording"]["id"] = NICE
+        wrong_artist = my_everything_release()
+        wrong_artist["artist-credit"] = [credit("Other", OTHER)]
+        wrong_artist["release-group"]["artist-credit"] = [credit("Other", OTHER)]
+        rejected = [wrong_recording, wrong_artist]
+        for status in ("Bootleg", "Pseudo-release", "Withdrawn", "Cancelled"):
+            candidate = my_everything_release()
+            candidate["status"] = status
+            rejected.append(candidate)
+        for secondary in ("Compilation", "DJ-mix", "Mixtape/Street"):
+            candidate = my_everything_release()
+            candidate["release-group"]["secondary-types"] = [secondary]
+            rejected.append(candidate)
+        for candidate in rejected:
+            self.assertEqual(summary.select_release_group(PROBLEM, problem_track(), [candidate], ARIANA), (None, "unresolved"))
+
+    def test_deluxe_album_equivalence_does_not_relax_recording_version_matching(self):
+        details = {**problem_track(), "title_version": "(Deluxe)"}
+        candidate = {"title": "Problem", "disambiguation": ""}
+        for allow_mastering in (False, True):
+            self.assertFalse(summary._title_matches(details, candidate, allow_mastering=allow_mastering))
+        self.assertEqual(summary._remaster_album_title("My Everything (Deluxe)"), ("my everything deluxe", None))
+
+    def test_remaster_base_can_still_contain_meaningful_deluxe_text_without_year_conflicts(self):
+        details = problem_track()
+        details["album"]["title"] = "My Everything (Deluxe) (Remastered 2009)"
+        candidate = my_everything_release("My Everything (Deluxe)")
+        candidate["disambiguation"] = "2009 stereo remaster"
+        self.assertEqual(summary.select_release_group(PROBLEM, details, [candidate], ARIANA), (MY_EVERYTHING, "recording_album_remaster"))
+        candidate["disambiguation"] = "2015 stereo remaster"
+        self.assertEqual(summary.select_release_group(PROBLEM, details, [candidate], ARIANA), (None, "unresolved"))
+
+    @patch.object(summary, "resolve_recording", side_effect=AssertionError("Preserve the successful Problem recording"))
+    @patch.object(musicbrainz, "browse_releases_by_recording", return_value=[my_everything_release(), my_everything_release("My Everything (deluxe edition)", release_id=OTHER)])
+    @patch.object(deezer, "top_tracks")
+    @patch.object(deezer, "track")
+    def test_v5_negative_deluxe_group_retries_without_refetching_recording_bio_or_order(self, details, top, browse, resolve):
+        self.assertEqual(summary.RESOLVER_VERSION, 6)
+        recording_cache = {"complete": True, "resolver_version": 5, "isrc": "USUM71405403",
+                           "recording_mbid": PROBLEM, "recording_resolution_method": "isrc_artist_credit"}
+        api_cache.set_cache_document(summary.IDENTITY_NAMESPACE, "track:6", recording_cache, summary.RETENTION_TTL)
+        group_key = f"group:{PROBLEM}:8435726:my everything deluxe"
+        api_cache.set_cache_document(summary.IDENTITY_NAMESPACE, group_key, {
+            "complete": False, "resolver_version": 5, "retry_at": time.time() + summary.UNRESOLVED_TTL,
+            "recording_mbid": PROBLEM, "release_group_mbid": None, "release_group_resolution_method": "unresolved",
+        }, summary.RETENTION_TTL)
+        known = {"deezer_track_id": 7, "position": 2, "title": "Known track", "recording_mbid": PROBLEM, "release_group_mbid": MY_EVERYTHING}
+        old = {"fetched_at": time.time(), "resolver_version": 5, "entries": [
+            {**problem_track(), "deezer_track_id": 6, "deezer_artist_id": 6, "position": 1,
+             "recording_mbid": PROBLEM, "release_group_mbid": None}, known,
+        ]}
+        bio = {"fetched_at": time.time(), "bio": {"text": "Ariana Grande biography"}}
+        api_cache.set_cache_document(summary.SNAPSHOT_NAMESPACE, f"top_tracks:{ARIANA}", old, summary.RETENTION_TTL)
+        api_cache.set_cache_document(summary.SNAPSHOT_NAMESPACE, f"bio:{ARIANA}", bio, summary.RETENTION_TTL)
+        api_cache.set_cache_document(summary.STATE_NAMESPACE, f"top_tracks:resolver-v5:{ARIANA}", {
+            "status": "pending", "pending_until": time.time() + worker.LEASE_TTL,
+        }, worker.LEASE_TTL)
+        with patch.object(worker, "Thread"), patch.object(worker, "jobs", Queue(maxsize=32)), patch.object(worker, "_started", False):
+            self.assertTrue(worker.request_summary(ARIANA)["pending"])
+            self.assertEqual(worker.jobs.get_nowait(), (ARIANA, "top_tracks"))
+        worker.process_job(ARIANA, "top_tracks")
+        repaired = summary.snapshot(ARIANA, "top_tracks")
+        self.assertEqual(repaired["resolver_version"], 6)
+        self.assertEqual(repaired["fetched_at"], old["fetched_at"])
+        self.assertEqual([entry["deezer_track_id"] for entry in repaired["entries"]], [6, 7])
+        self.assertEqual(repaired["entries"][1], known)
+        self.assertEqual(repaired["entries"][0]["recording_mbid"], PROBLEM)
+        self.assertEqual(repaired["entries"][0]["recording_resolution_method"], "isrc_artist_credit")
+        self.assertEqual(repaired["entries"][0]["release_group_mbid"], MY_EVERYTHING)
+        self.assertEqual(repaired["entries"][0]["release_group_resolution_method"], "recording_album_edition")
+        self.assertEqual(summary.snapshot(ARIANA, "bio"), bio)
+        self.assertEqual(api_cache.get_cache_document(summary.IDENTITY_NAMESPACE, "track:6"), recording_cache)
+        mapping = api_cache.get_cache_document(summary.IDENTITY_NAMESPACE, group_key)
+        self.assertTrue(mapping["complete"])
+        self.assertEqual(mapping["resolver_version"], 6)
+        self.assertEqual(mapping["retry_at"], 0)
+        resolve.assert_not_called()
+        top.assert_not_called()
+        details.assert_not_called()
+        browse.assert_called_once_with(PROBLEM, priority="background", include_url_relations=True)
+
     def test_remaster_release_group_exact_normalized_title_is_unchanged(self):
         self.assertEqual(summary.select_release_group(SUN, beatles_track("ÀBBEY ROAD"), [abbey_release()], BEATLES),
                          (ABBEY, "recording_album_title"))
@@ -606,8 +777,8 @@ class ArtistSummaryTests(DatabaseTestCase):
         self.assertEqual(summary.select_release_group(SUN, beatles_track(), [abbey_release(), exact, direct], BEATLES),
                          (OTHER, "recording_deezer_album"))
 
-    def test_non_remaster_album_parentheses_and_other_versions_are_preserved(self):
-        for album in ("Abbey Road (Live)", "Abbey Road (Deluxe)", "Abbey Road (Remixed 2009)",
+    def test_unrecognized_album_parentheses_and_other_versions_are_preserved(self):
+        for album in ("Abbey Road (Live)", "Abbey Road (Remixed 2009)",
                       "Abbey Road (Remastered Deluxe)", "Abbey Road (50th Anniversary Edition)",
                       "Abbey Road (Live) (Remastered 2009)", "Abbey Road (Remastered 2009) (Live)",
                       "Abbey Road (2009 Remastered 2015)", "Abbey Road Remastered 2009", "Abbey Road (Mono Remastered)"):
