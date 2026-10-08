@@ -2128,6 +2128,20 @@
     return group;
   }
 
+  function createReleaseCard(...args: Parameters<typeof createCard>) {
+    const card = createCard(...args);
+    card.classList.add("release-card");
+    let content = card.querySelector<HTMLElement>(".card-open");
+    if (!content) {
+      content = document.createElement("div");
+      content.append(...Array.from(card.childNodes));
+      card.append(content);
+    }
+    content.classList.add("release-card-content");
+    card.querySelector(".artist-info p")!.classList.add("release-group-metadata");
+    return card;
+  }
+
   function createReleaseGroupCard(group: JsonObject) {
     if (group.localOnly) {
       const card = createCard(releaseGroupDisplayTitle(group), String(group.date || ""));
@@ -2136,7 +2150,7 @@
       }
       return card;
     }
-    const card = createCard(
+    const card = createReleaseCard(
       releaseGroupDisplayTitle(group),
       [group.date, ...(group.animeNames || []), ...(group.secondaryTypes || []), group.disambiguation]
         .filter(Boolean)
@@ -2171,6 +2185,76 @@
     return card;
   }
 
+  function createBiographyCard(bio: JsonObject, artistId: string) {
+    const card = document.createElement("section");
+    card.className = "artist-biography-card";
+    const header = document.createElement("div");
+    header.className = "artist-biography-heading";
+    const title = document.createElement("h3");
+    title.id = `artist-biography-heading-${artistId}`;
+    title.textContent = "Biography";
+    card.setAttribute("aria-labelledby", title.id);
+    const attribution = document.createElement("span");
+    attribution.className = "artist-biography-source";
+    const mark = document.createElement("span");
+    mark.className = "wikipedia-mark";
+    mark.setAttribute("aria-hidden", "true");
+    attribution.append(mark, "From Wikipedia");
+    header.append(title, attribution);
+
+    const rawText = String(bio.text);
+    let text = rawText.trim().replace(/\s+/g, " ");
+    // The current API caps its extract at 1,000 code points. A capped final
+    // token may be incomplete; keep the original payload and display a clean
+    // excerpt instead. Wikipedia remains the source for the full biography.
+    const capped = Array.from(rawText).length === 1000 && !/[.!?…][\p{Pe}\p{Pf}"']*$/u.test(text);
+    if (capped) text = text.replace(/(?:\s+|^)\S*$/, "").replace(/[\s,;:–—-]+$/, "") + "…";
+    const words = text.split(/\s+/);
+    let preview = "";
+    for (const word of words) {
+      if (preview && preview.length + word.length + 1 > 380) break;
+      preview += (preview ? " " : "") + word;
+    }
+    const expandable = preview.length < text.length;
+    if (expandable) preview = preview.replace(/[\s,;:.…–—-]+$/, "") + "…";
+    const paragraph = document.createElement("p");
+    paragraph.id = `artist-biography-text-${artistId}`;
+    paragraph.className = "artist-summary-bio";
+    paragraph.textContent = expandable ? preview : text;
+    const footer = document.createElement("div");
+    footer.className = "artist-biography-footer";
+    if (expandable) {
+      const toggle = document.createElement("button");
+      toggle.type = "button";
+      toggle.className = "secondary-action artist-biography-toggle";
+      toggle.textContent = "Show more";
+      toggle.setAttribute("aria-expanded", "false");
+      toggle.setAttribute("aria-controls", paragraph.id);
+      toggle.addEventListener("click", () => {
+        const expanded = toggle.getAttribute("aria-expanded") !== "true";
+        toggle.setAttribute("aria-expanded", String(expanded));
+        toggle.textContent = expanded ? "Show less" : "Show more";
+        paragraph.textContent = expanded ? text : preview;
+      });
+      footer.append(toggle);
+    }
+    if (/^https:\/\/[a-z0-9-]+\.wikipedia\.org\/wiki\//.test(String(bio.sourceUrl || ""))) {
+      const source = document.createElement("a");
+      source.href = String(bio.sourceUrl);
+      source.textContent = "Wikipedia";
+      source.target = "_blank";
+      source.rel = "noopener noreferrer";
+      source.title = "Read the full biography on Wikipedia";
+      const external = document.createElement("span");
+      external.setAttribute("aria-hidden", "true");
+      external.textContent = " ↗";
+      source.append(external);
+      footer.append(source);
+    }
+    card.append(header, paragraph, footer);
+    return card;
+  }
+
   function artistSummaryView(data: JsonObject) {
     const element = document.createElement("section");
     element.id = "artist-summary-view";
@@ -2185,8 +2269,11 @@
     element.append(heading, status, body);
     const biography = document.createElement("div");
     const trackSection = document.createElement("div");
+    trackSection.className = "artist-summary-tracks";
     const list = document.createElement("ol");
     list.className = "artist-top-tracks";
+    list.setAttribute("role", "list");
+    list.setAttribute("aria-label", "Top Tracks from Deezer");
     const rows = new Map<string, { element: HTMLLIElement; signature: string }>();
     let biographySignature = "";
     let loaded = false;
@@ -2232,18 +2319,7 @@
           biographySignature = nextBiography;
           biography.replaceChildren();
           if (summary.bio?.text) {
-            const bio = document.createElement("p");
-            bio.className = "artist-summary-bio";
-            bio.textContent = String(summary.bio.text);
-            biography.append(bio);
-            if (/^https:\/\/[a-z0-9-]+\.wikipedia\.org\/wiki\//.test(String(summary.bio.sourceUrl || ""))) {
-              const source = document.createElement("a");
-              source.href = String(summary.bio.sourceUrl);
-              source.textContent = "Wikipedia";
-              source.target = "_blank";
-              source.rel = "noopener noreferrer";
-              biography.append(source);
-            }
+            biography.append(createBiographyCard(summary.bio, String(data.id)));
           }
         }
         if (biography.childElementCount && !biography.isConnected) body.prepend(biography);
@@ -2269,7 +2345,7 @@
               Boolean(track.pending), group?.id, group?.title, group?.coverArt || track.coverArt]);
             if (signature !== existing?.signature) {
               const card = group ? createReleaseGroupCard(group)
-                : createCard(String(track.title || "Untitled"), String(track.album?.title || ""), undefined, track.coverArt || "");
+                : createReleaseCard(String(track.title || "Untitled"), String(track.album?.title || ""), undefined, track.coverArt || "");
               card.classList.add("artist-top-track");
               card.dataset.summaryPending = String(Boolean(track.pending));
               card.querySelector("h2")!.textContent = String(track.title || track.title_short || "Untitled");
@@ -2282,7 +2358,7 @@
               if (request?.textContent === "Request") request.textContent = "Request Album";
               if (track.pending) {
                 const matching = document.createElement("span");
-                matching.className = "field-help artist-top-track-status";
+                matching.className = "release-card-state artist-top-track-status";
                 matching.textContent = "Finding album…";
                 card.append(matching);
               }
