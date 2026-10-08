@@ -38,7 +38,7 @@ PROGRESS_TTL = 30 * 60
 # Shared across Summary jobs, rather than a new pool for every artist.
 _resolution_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="summary-identity")
 # Preserve successful mappings; retry older negative results and snapshots once.
-RESOLVER_VERSION = 6
+RESOLVER_VERSION = 7
 
 
 @contextmanager
@@ -312,29 +312,56 @@ def _remaster_album_title(value):
     return (base, year) if edition == "remaster" else (track_search_index.normalize_text(value), None)
 
 
+def _album_number_spacing(value):
+    """Album-only key: join ASCII letters/digits across whitespace, nothing else."""
+    normalized = track_search_index.normalize_text(value)
+    return re.sub(r"(?<=[a-z]) (?=[0-9])|(?<=[0-9]) (?=[a-z])", "", normalized)
+
+
+def _album_edition_matches(title, release, compare):
+    """Apply the same controlled edition/year rules with a given base-title key."""
+    titles = [release.get("title"), (release.get("release-group") or {}).get("title")]
+    base, edition, year = _album_edition_title(title)
+    if not base or edition is None:
+        return False
+    base = compare(base)
+    if edition == "remaster":
+        # Preserve remaster-only parsing, including other meaningful base text.
+        matching = [part for part in map(_remaster_album_title, titles) if compare(part[0]) == base]
+        if not matching:
+            return False
+        # Missing comments are normal; recognized year conflicts are contrary
+        # evidence. Unrelated disambiguation text is not a title suffix.
+        evidence_years = [part[1] for part in matching] + [_remaster_year(release.get("disambiguation"), allow_channels=True)]
+        if year and any(candidate_year and candidate_year != year for candidate_year in evidence_years):
+            return False
+    elif not any(compare(part[0]) == base and part[1] in {None, edition} for part in map(_album_edition_title, titles)):
+        return False
+    return True
+
+
 def _album_title_match(title, release):
-    """Rank exact titles above controlled edition equivalence, without fuzziness."""
+    """Rank exact (2), controlled edition (1), then number-spacing fallback (0.5)."""
     normalize = track_search_index.normalize_text
     titles = [release.get("title"), (release.get("release-group") or {}).get("title")]
     normalized_title = normalize(title)
     if normalized_title and normalized_title in {normalize(value) for value in titles}:
         return 2
-    base, edition, year = _album_edition_title(title)
-    if not base or edition is None:
+    if _album_edition_matches(title, release, normalize):
+        return 1
+    base, edition, _ = _album_edition_title(title)
+    if not base:
         return 0
-    if edition == "remaster":
-        # Preserve remaster-only parsing, including other meaningful base text.
-        matching = [part for part in map(_remaster_album_title, titles) if part[0] == base]
-        if not matching:
-            return 0
-        # Missing comments are normal; recognized year conflicts are contrary
-        # evidence. Unrelated disambiguation text is not a title suffix.
-        evidence_years = [part[1] for part in matching] + [_remaster_year(release.get("disambiguation"), allow_channels=True)]
-        if year and any(candidate_year and candidate_year != year for candidate_year in evidence_years):
-            return 0
-    elif not any(part[0] == base and part[1] in {None, edition} for part in map(_album_edition_title, titles)):
-        return 0
-    return 1
+    if edition is None:
+        # Unrecognized qualifiers stay in the full title; never normalize the
+        # qualifier into a recognized edition or strip it to obtain a match.
+        spaced = _album_number_spacing(base)
+        if any(part[1] is None and _album_number_spacing(part[0]) == spaced
+               for part in map(_album_edition_title, titles)):
+            return 0.5
+    elif _album_edition_matches(title, release, _album_number_spacing):
+        return 0.5
+    return 0
 
 
 def _release_date_match(album, release):
@@ -376,9 +403,12 @@ def _release_candidate(recording_mbid, track, release, artist_mbid):
     year_match = bool(year and year == str(release.get("date") or group.get("first-release-date") or "")[:4])
     date_match = _release_date_match(album, release) or int(year_match)
     score = (bool(direct), title_match, artist_match, date_match, not bool(secondary))
-    method = "recording_album_title" if title_match == 2 else (
-        "recording_album_remaster" if _album_edition_title(album.get("title"))[1] == "remaster" else "recording_album_edition"
-    )
+    if title_match == 2:
+        method = "recording_album_title"
+    elif title_match == 0.5:
+        method = "recording_album_number_spacing"
+    else:
+        method = "recording_album_remaster" if _album_edition_title(album.get("title"))[1] == "remaster" else "recording_album_edition"
     return mbid, score, "recording_deezer_album" if direct else method
 
 

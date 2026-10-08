@@ -689,7 +689,7 @@ class ArtistSummaryTests(DatabaseTestCase):
     @patch.object(deezer, "top_tracks")
     @patch.object(deezer, "track")
     def test_v5_negative_deluxe_group_retries_without_refetching_recording_bio_or_order(self, details, top, browse, resolve):
-        self.assertEqual(summary.RESOLVER_VERSION, 6)
+        self.assertGreater(summary.RESOLVER_VERSION, 5)
         recording_cache = {"complete": True, "resolver_version": 5, "isrc": "USUM71405403",
                            "recording_mbid": PROBLEM, "recording_resolution_method": "isrc_artist_credit"}
         api_cache.set_cache_document(summary.IDENTITY_NAMESPACE, "track:6", recording_cache, summary.RETENTION_TTL)
@@ -714,7 +714,7 @@ class ArtistSummaryTests(DatabaseTestCase):
             self.assertEqual(worker.jobs.get_nowait(), (ARIANA, "top_tracks"))
         worker.process_job(ARIANA, "top_tracks")
         repaired = summary.snapshot(ARIANA, "top_tracks")
-        self.assertEqual(repaired["resolver_version"], 6)
+        self.assertEqual(repaired["resolver_version"], summary.RESOLVER_VERSION)
         self.assertEqual(repaired["fetched_at"], old["fetched_at"])
         self.assertEqual([entry["deezer_track_id"] for entry in repaired["entries"]], [6, 7])
         self.assertEqual(repaired["entries"][1], known)
@@ -726,7 +726,7 @@ class ArtistSummaryTests(DatabaseTestCase):
         self.assertEqual(api_cache.get_cache_document(summary.IDENTITY_NAMESPACE, "track:6"), recording_cache)
         mapping = api_cache.get_cache_document(summary.IDENTITY_NAMESPACE, group_key)
         self.assertTrue(mapping["complete"])
-        self.assertEqual(mapping["resolver_version"], 6)
+        self.assertEqual(mapping["resolver_version"], summary.RESOLVER_VERSION)
         self.assertEqual(mapping["retry_at"], 0)
         resolve.assert_not_called()
         top.assert_not_called()

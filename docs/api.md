@@ -56,8 +56,8 @@ snapshot storage uses the same retention to survive expired-row cleanup, while
 its explicit `fetched_at` determines the shorter freshness window.
 
 Transport, HTTP, and incomplete-provider-response failures use only a **15-minute**
-identity backoff, never the seven-day unresolved mapping cache. Resolver version 6
-automatically retries older negative track/album identities (including version 5)
+identity backoff, never the seven-day unresolved mapping cache. Resolver version 7
+automatically retries older negative track/album identities (including version 6)
 and repairs older unresolved Top Tracks snapshots on the next Summary visit,
 bypassing old refresh leases. Successful identities and Wikipedia caches remain
 reusable. Identity repairs preserve the original daily track ordering and its
@@ -118,8 +118,9 @@ remain unresolved regardless of release count or provider order. Release-group
 selection runs separately afterward and retains its existing scoring.
 
 Release-group album matching ranks exact Deezer album relationships first, exact
-normalized release/group titles next, and controlled edition equivalence last.
-The latter recognizes only a final parenthesized remaster or deluxe qualifier,
+normalized release/group titles next, then controlled edition equivalence, then
+the album-only letter/number-spacing fallback.
+Controlled edition equivalence recognizes only a final parenthesized remaster or deluxe qualifier,
 and requires the same normalized base album title. Remaster qualifiers contain
 `remaster`/`remastered` and one optional four-digit year, in either order. Release
 disambiguation can supply compatible remaster-year evidence (including mono/stereo
@@ -134,6 +135,20 @@ release-group MBID; equally ranked distinct groups remain unresolved. Remaster
 fallback retains `recording_album_remaster`; deluxe fallback
 uses `recording_album_edition`. Exact-title and direct-relationship methods are
 unchanged.
+
+The spacing fallback removes a normalized space only between an ASCII letter
+(`a`–`z`) and digit (`0`–`9`), in either direction: `LP2`/`LP 2`, `Vol2`/`Vol 2`,
+and `Part3`/`Part 3` compare equally. Other word boundaries and digit/digit spaces
+remain intact. It compares full unqualified titles or the base titles inside the
+same controlled edition rules; it never rewrites edition qualifiers or relaxes
+remaster-year conflicts. This weaker match uses `recording_album_number_spacing`
+and still requires exact recording containment, eligible status, canonical artist
+credit, and the existing compilation restrictions. It applies only to release/
+album context, including ambiguous-recording album evidence; recording titles,
+global search normalization, and identity cache keys are unchanged. Release-group
+deduplication and conservative ties still apply. For example, Eminem's
+`The Marshall Mathers LP2 (Deluxe)` matches `The Marshall Mathers LP 2 (deluxe)`
+only after compatible deluxe parsing and this base-title comparison.
 
 Within those relationship/title/artist ranks, a valid full Deezer album date
 (`YYYY-MM-DD`) ranks exact release-group `first-release-date` agreement first,
