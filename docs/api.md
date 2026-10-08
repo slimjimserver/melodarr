@@ -26,6 +26,24 @@ Release-group display titles/artwork and live request state are joined from
 existing canonical metadata and availability; they are never stored as Deezer
 metadata. Request buttons use the existing release-group request endpoint.
 
+Biography and Top Tracks publish independently. Cold loads expose Deezer's
+ordered rows before identity resolution finishes, with additive per-track
+`pending` and `details_pending` booleans. Pending rows are informational:
+nullable MBIDs and `"pending"` resolution methods are not resolved identities.
+Details and recording/group identities update without changing ordering.
+Completed, unresolved, and provider-failure rows have `pending: false`; unresolved
+rows never get guessed request targets. Optional row `coverArt` is a validated
+public Deezer cover-CDN fallback; canonical release-group artwork still wins.
+
+Aggregate/source `pending` remains true while refresh jobs run, even with useful
+partial content. `sources.top_tracks.progressRevision` identifies partial updates.
+`fetchedAt` and `stale` still describe the retained completed snapshot; partial
+work does not extend freshness. Temporary progressive documents are scoped to
+the active refresh lease and stored separately from retained successes.
+The browser polls at 350 ms initially, backs off to a 2-second cap, resets on
+progress, and stops on completion or when hidden. At most 90 automatic follow-up
+polls are scheduled per view; fresh cached views use one request without polling.
+
 Snapshots and identity documents reuse `api_cache`, under the `artist-summary`
 namespace, visible/clearable through existing maintenance diagnostics. Top
 Tracks freshness is exactly **86,400 seconds**; successful Wikipedia biographies
@@ -50,6 +68,16 @@ coalesce refreshes across web processes and recover after 30 minutes if a
 process exits. Deezer HTTP requests are sequential with at least 250 ms between
 starts, using 3.05-second connect/10-second read timeouts. MusicBrainz resolution
 uses its configured mirror, shared caches, and existing background pacing.
+Two shared identity-resolution workers overlap independent tracks; per-identity
+cache locks coalesce duplicate recording/album-context work. Valid cached
+identities publish before queuing resolver work, even when both workers are busy.
+Deezer detail fetching remains sequential with its existing pacing. INFO logs labelled
+`Artist Summary timing` report biography, top-list/detail fetches, recording/group
+resolution, total refresh, and first/final publication durations in milliseconds.
+The container sends these records to Gunicorn's error-log destination at its
+configured log level (INFO by default), without raising unrelated logger levels.
+Only generated stage labels and public artist/track/refresh identifiers are
+logged; URLs, credentials, and provider tokens are excluded.
 
 Artist identities come exclusively from exact MusicBrainz Deezer/Wikipedia/
 Wikidata relationships; no fuzzy artist lookup is used. Wikipedia lead text is

@@ -5,6 +5,7 @@ import logging
 import time
 from queue import Queue
 from threading import Lock, Thread
+from uuid import uuid4
 
 if __package__ == "backend.workers":
     from ..api_cache import _cache_operation, document_cache_key, get_cache_document, set_cache_document
@@ -27,7 +28,7 @@ def _state(artist_mbid, source):
 def _claim(artist_mbid, source):
     """SQLite compare-and-set prevents duplicate work across web processes."""
     now = time.time()
-    state = {"status": "pending", "pending_until": now + LEASE_TTL}
+    state = {"status": "pending", "pending_until": now + LEASE_TTL, "refresh_id": uuid4().hex}
     key = document_cache_key(service.STATE_NAMESPACE, service.refresh_state_key(artist_mbid, source))
 
     def claim(connection):
@@ -43,10 +44,12 @@ def _claim(artist_mbid, source):
 
 def request_summary(artist_mbid):
     global _started
-    values, pending = {}, {}
+    values, pending, sources = {}, {}, {}
     for source in ("bio", "top_tracks"):
         values[source] = service.snapshot(artist_mbid, source)
-        if not service.fresh(values[source], source):
+        state = _state(artist_mbid, source)
+        active = state.get("status") == "pending" and state.get("pending_until", 0) > time.time()
+        if not service.fresh(values[source], source) and not active:
             with _start_lock:
                 if not jobs.full() and _claim(artist_mbid, source):
                     jobs.put_nowait((artist_mbid, source))
@@ -55,22 +58,29 @@ def request_summary(artist_mbid):
                         for index in range(2):
                             Thread(target=run, name=f"artist-summary-{index}", daemon=True).start()
                         _started = True
-        state = _state(artist_mbid, source)
+            state = _state(artist_mbid, source)
         pending[source] = state.get("status") == "pending" and state.get("pending_until", 0) > time.time()
         if not pending[source]:
             values[source] = service.snapshot(artist_mbid, source)
+        completed = values[source]
+        sources[source] = {
+            "pending": pending[source], "stale": bool(completed and not service.fresh(completed, source)),
+            "fetchedAt": (completed or {}).get("fetched_at"),
+        }
+        if source == "top_tracks" and pending[source]:
+            progress = service.progress_snapshot(artist_mbid, state.get("refresh_id"))
+            if progress is not None:
+                values[source] = progress
+                sources[source]["progressRevision"] = progress.get("revision")
     return {
         "bio": (values["bio"] or {}).get("bio"),
         "topTracks": (values["top_tracks"] or {}).get("entries") or [],
-        "pending": any(pending.values()), "sources": {
-            source: {"pending": pending[source], "stale": bool(values[source] and not service.fresh(values[source], source)),
-                     "fetchedAt": (values[source] or {}).get("fetched_at")}
-            for source in values
-        },
+        "pending": any(pending.values()), "sources": sources,
     }
 
 
 def process_job(artist_mbid, source):
+    refresh_id = _state(artist_mbid, source).get("refresh_id")
     try:
         if not service.fresh(service.snapshot(artist_mbid, source), source):
             (service.refresh_bio if source == "bio" else service.refresh_top_tracks)(artist_mbid)
@@ -81,7 +91,8 @@ def process_job(artist_mbid, source):
         logger.warning("Artist Summary %s refresh failed: %s", source, type(exc).__name__)
         state, ttl = {"status": "failed"}, service.RETRY_TTL
     try:
-        set_cache_document(service.STATE_NAMESPACE, service.refresh_state_key(artist_mbid, source), state, ttl)
+        service.publish_for_refresh(service.STATE_NAMESPACE, service.refresh_state_key(artist_mbid, source), state, ttl,
+                                    artist_mbid, source, refresh_id)
     except Exception as exc:
         logger.warning("Artist Summary refresh state failed: %s", type(exc).__name__)
 

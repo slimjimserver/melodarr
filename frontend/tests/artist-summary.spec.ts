@@ -150,3 +150,139 @@ for (const width of [1280, 700, 390, 320]) {
     await expect(page.locator("#artist-summary-view .release-group-request").first()).toBeVisible();
   });
 }
+
+async function pauseSummaryClock(page: Page) {
+  await page.clock.install({ time: new Date("2026-10-07T12:00:00Z") });
+  await openArtist(page);
+  await page.clock.pauseAt(new Date("2026-10-07T13:00:00Z"));
+  await page.evaluate(() => {
+    const original = window.setTimeout.bind(window);
+    const delays: number[] = [];
+    (window as any).summaryPollDelays = delays;
+    window.setTimeout = ((handler: TimerHandler, timeout?: number, ...args: any[]) => {
+      if (timeout !== undefined && timeout >= 350 && timeout <= 2000) delays.push(timeout);
+      return original(handler, timeout, ...args);
+    }) as typeof window.setTimeout;
+  });
+}
+
+async function expectPollsScheduled(page: Page, count: number) {
+  await expect.poll(() => page.evaluate(() => (window as any).summaryPollDelays.length)).toBe(count);
+}
+
+test("progressive rows stay ordered and other tracks become actionable before a slow identity", async ({ page }) => {
+  let reads = 0;
+  const ordered = [tracks[2], tracks[1], tracks[0]].map((track, index) => ({ ...track, position: index + 1 }));
+  await page.route("**/api/music/artist/fixture-artist/summary", route => {
+    reads++;
+    return route.fulfill({ json: {
+      bio: reads < 3 ? null : bio,
+      topTracks: ordered.map((track, index) => ({ ...track, artist: { name: "Provider Artist" },
+        pending: reads === 1 || (reads === 2 && index === 0),
+      })),
+      releaseGroups: { [group.id]: group }, pending: reads < 3,
+    } });
+  });
+  await pauseSummaryClock(page);
+  await page.getByRole("button", { name: "Summary", exact: true }).click();
+  const rows = page.locator("#artist-summary-view .artist-top-tracks li");
+  await expect(rows.locator("h2")).toHaveText(["Unresolved", "Nothing Nice to Say", "Sativa"]);
+  await expect(rows.locator(".artist-top-track-status")).toHaveCount(3);
+  await expect(rows.getByRole("button")).toHaveCount(0);
+  await expect(rows.last()).toContainText("Provider Artist · Provider Album");
+  await expectPollsScheduled(page, 1);
+  await page.clock.runFor(350);
+  await expect(rows.getByRole("button", { name: "Request Album" })).toHaveCount(2);
+  await expect(rows.first().locator(".artist-top-track-status")).toHaveCount(1);
+  await expectPollsScheduled(page, 2);
+  await rows.last().evaluate(element => { (window as any).retainedSummaryCard = element.firstElementChild; });
+  await page.clock.runFor(350);
+  await expect(page.locator(".artist-summary-bio")).toHaveText(bio.text);
+  await expect(rows.locator(".artist-top-track-status")).toHaveCount(0);
+  await expect(rows.locator("h2")).toHaveText(["Unresolved", "Nothing Nice to Say", "Sativa"]);
+  await expect(rows).toHaveCount(3);
+  await expect(rows.first().getByRole("button")).toHaveCount(0);
+  expect(await rows.last().evaluate(element => element.firstElementChild === (window as any).retainedSummaryCard)).toBe(true);
+  await page.clock.runFor(10000);
+  expect(reads).toBe(3);
+});
+
+test("polling backs off, caps, resets on source progress, and stops when complete", async ({ page }) => {
+  let reads = 0;
+  await page.route("**/api/music/artist/fixture-artist/summary", route => {
+    reads++;
+    return route.fulfill({ json: {
+      bio: reads >= 8 ? bio : null, topTracks: [], pending: reads < 9,
+      sources: { bio: { pending: reads < 8 }, top_tracks: { pending: reads < 9 } },
+    } });
+  });
+  await pauseSummaryClock(page);
+  await page.getByRole("button", { name: "Summary", exact: true }).click();
+  const delays = [350, 525, 788, 1182, 1773, 2000, 2000, 350];
+  for (let index = 0; index < delays.length; index++) {
+    await expectPollsScheduled(page, index + 1);
+    expect(await page.evaluate(() => (window as any).summaryPollDelays)).toEqual(delays.slice(0, index + 1));
+    await page.clock.runFor(delays[index] - 1);
+    expect(reads).toBe(index + 1);
+    await page.clock.runFor(1);
+    await expect.poll(() => reads).toBe(index + 2);
+  }
+  await expect(page.locator(".artist-summary-bio")).toHaveText(bio.text);
+  await page.clock.runFor(30000);
+  expect(reads).toBe(9);
+});
+
+test("a pending source still polls when the aggregate flag is absent, and hiding cancels it", async ({ page }) => {
+  let reads = 0;
+  await page.route("**/api/music/artist/fixture-artist/summary", route => {
+    reads++;
+    return route.fulfill({ json: { bio, topTracks: [], sources: { top_tracks: { pending: true } } } });
+  });
+  await pauseSummaryClock(page);
+  await page.getByRole("button", { name: "Summary", exact: true }).click();
+  await expectPollsScheduled(page, 1);
+  await page.locator(".discography-nav").getByRole("link", { name: "Albums", exact: true }).click();
+  await page.clock.runFor(10000);
+  expect(reads).toBe(1);
+  await page.getByRole("button", { name: "Summary", exact: true }).click();
+  await expectPollsScheduled(page, 2);
+  expect(reads).toBe(2);
+  await page.clock.runFor(525);
+  await expectPollsScheduled(page, 3);
+  expect(reads).toBe(3);
+});
+
+test("warm cached Summary uses one request across repeated tab visits", async ({ page }) => {
+  let reads = 0;
+  await page.route("**/api/music/artist/fixture-artist/summary", route => {
+    reads++;
+    return route.fulfill({ json: { bio, topTracks: tracks, releaseGroups: { [group.id]: group }, pending: false } });
+  });
+  await pauseSummaryClock(page);
+  await page.getByRole("button", { name: "Summary", exact: true }).click();
+  await expect(page.locator("#artist-summary-view li")).toHaveCount(3);
+  await page.locator(".discography-nav").getByRole("link", { name: "Albums", exact: true }).click();
+  await page.getByRole("button", { name: "Summary", exact: true }).click();
+  await page.clock.runFor(180000);
+  expect(reads).toBe(1);
+  await expectPollsScheduled(page, 0);
+});
+
+test("pending work has a finite polling budget", async ({ page }) => {
+  let reads = 0;
+  await page.route("**/api/music/artist/fixture-artist/summary", route => {
+    reads++;
+    return route.fulfill({ json: { bio, topTracks: [], pending: true } });
+  });
+  await pauseSummaryClock(page);
+  await page.getByRole("button", { name: "Summary", exact: true }).click();
+  await expectPollsScheduled(page, 1);
+  for (let index = 1; index <= 90; index++) {
+    await page.clock.runFor(2000);
+    await expect.poll(() => reads).toBe(index + 1);
+    if (index < 90) await expectPollsScheduled(page, index + 1);
+  }
+  await page.clock.runFor(180000);
+  expect(reads).toBe(91);
+  await expectPollsScheduled(page, 90);
+});

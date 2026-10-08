@@ -2183,22 +2183,39 @@
     status.setAttribute("role", "status");
     const body = document.createElement("div");
     element.append(heading, status, body);
+    const biography = document.createElement("div");
+    const trackSection = document.createElement("div");
+    const list = document.createElement("ol");
+    list.className = "artist-top-tracks";
+    const rows = new Map<string, { element: HTMLLIElement; signature: string }>();
+    let biographySignature = "";
     let loaded = false;
     let loading = false;
     let pending = false;
     let polls = 0;
+    let pollDelay = 350;
+    let progressSignature = "";
     let timer: ReturnType<typeof setTimeout> | undefined;
     const action = captureDetailActionContext();
 
     async function load() {
       if (loading || (loaded && !pending) || element.hidden) return;
+      clearTimeout(timer);
       loading = true;
-      status.textContent = body.childElementCount ? "" : "Loading summary…";
+      status.textContent = biography.childElementCount || rows.size ? "" : "Loading summary…";
       try {
         const summary = await getJson(`/api/music/artist/${encodeURIComponent(String(data.id))}/summary`, 30_000, detailSessionAbort.signal);
         if (!element.isConnected || !isCurrentDetailAction(action)) return;
         loaded = true;
-        pending = Boolean(summary.pending);
+        pending = Boolean(summary.pending)
+          || (Object.values(summary.sources || {}) as JsonObject[]).some(source => source.pending)
+          || (summary.topTracks || []).some((track: JsonObject) => track.pending);
+        const nextProgress = JSON.stringify([summary.bio, summary.sources, (summary.topTracks || []).map((track: JsonObject) => [
+          track.position, track.deezer_track_id, track.title, track.pending, track.details_pending,
+          track.recording_mbid, track.release_group_mbid,
+        ])]);
+        if (nextProgress !== progressSignature) pollDelay = 350;
+        progressSignature = nextProgress;
         const canonical = new Map(artistReleaseGroups(data).map(group => [String(group.id), group]));
         data.summaryReleaseGroups = (Object.values(summary.releaseGroups || {}) as JsonObject[]).map((incoming) => {
           const existing = canonical.get(String(incoming.id));
@@ -2210,59 +2227,95 @@
           canonical.set(String(incoming.id), incoming);
           return incoming;
         });
-        const fragment = document.createDocumentFragment();
-        if (summary.bio?.text) {
-          const bio = document.createElement("p");
-          bio.className = "artist-summary-bio";
-          bio.textContent = String(summary.bio.text);
-          fragment.append(bio);
-          if (/^https:\/\/[a-z0-9-]+\.wikipedia\.org\/wiki\//.test(String(summary.bio.sourceUrl || ""))) {
-            const source = document.createElement("a");
-            source.href = String(summary.bio.sourceUrl);
-            source.textContent = "Wikipedia";
-            source.target = "_blank";
-            source.rel = "noopener noreferrer";
-            fragment.append(source);
+        const nextBiography = JSON.stringify(summary.bio || null);
+        if (nextBiography !== biographySignature) {
+          biographySignature = nextBiography;
+          biography.replaceChildren();
+          if (summary.bio?.text) {
+            const bio = document.createElement("p");
+            bio.className = "artist-summary-bio";
+            bio.textContent = String(summary.bio.text);
+            biography.append(bio);
+            if (/^https:\/\/[a-z0-9-]+\.wikipedia\.org\/wiki\//.test(String(summary.bio.sourceUrl || ""))) {
+              const source = document.createElement("a");
+              source.href = String(summary.bio.sourceUrl);
+              source.textContent = "Wikipedia";
+              source.target = "_blank";
+              source.rel = "noopener noreferrer";
+              biography.append(source);
+            }
           }
         }
+        if (biography.childElementCount && !biography.isConnected) body.prepend(biography);
         if (summary.topTracks?.length) {
-          const title = document.createElement("h3");
-          title.textContent = "Top Tracks";
-          const attribution = document.createElement("p");
-          attribution.className = "field-help";
-          attribution.textContent = "From Deezer";
-          const list = document.createElement("ol");
-          list.className = "artist-top-tracks";
+          if (!trackSection.childElementCount) {
+            const title = document.createElement("h3");
+            title.textContent = "Top Tracks";
+            const attribution = document.createElement("p");
+            attribution.className = "field-help";
+            attribution.textContent = "From Deezer";
+            trackSection.append(title, attribution, list);
+            body.append(trackSection);
+          }
+          const activeKeys = new Set<string>();
           summary.topTracks.forEach((track: JsonObject, index: number) => {
-            const row = document.createElement("li");
+            const key = `${track.position || index + 1}:${track.deezer_track_id ?? index}`;
+            activeKeys.add(key);
+            const existing = rows.get(key);
+            const row = existing?.element || document.createElement("li");
             row.value = Number(track.position || index + 1);
-            const group = canonical.get(String(track.release_group_mbid));
-            const card = group ? createReleaseGroupCard(group) : createCard(String(track.title || "Untitled"), String(track.album?.title || ""));
-            card.classList.add("artist-top-track");
-            card.querySelector("h2")!.textContent = String(track.title || track.title_short || "Untitled");
-            const context = card.querySelector<HTMLParagraphElement>(".artist-info p")!;
-            context.textContent = String(group?.title || track.album?.title || "");
-            context.title = context.textContent;
-            const request = card.querySelector<HTMLButtonElement>(".release-group-request");
-            if (request?.textContent === "Request") request.textContent = "Request Album";
-            row.append(card);
-            list.append(row);
+            const group = track.pending ? undefined : canonical.get(String(track.release_group_mbid));
+            const signature = JSON.stringify([track.title, track.title_short, track.album?.title, track.artist?.name,
+              Boolean(track.pending), group?.id, group?.title, group?.coverArt || track.coverArt]);
+            if (signature !== existing?.signature) {
+              const card = group ? createReleaseGroupCard(group)
+                : createCard(String(track.title || "Untitled"), String(track.album?.title || ""), undefined, track.coverArt || "");
+              card.classList.add("artist-top-track");
+              card.dataset.summaryPending = String(Boolean(track.pending));
+              card.querySelector("h2")!.textContent = String(track.title || track.title_short || "Untitled");
+              const context = card.querySelector<HTMLParagraphElement>(".artist-info p")!;
+              context.textContent = track.pending
+                ? [track.artist?.name, track.album?.title].filter(Boolean).join(" · ")
+                : String(group?.title || track.album?.title || "");
+              context.title = context.textContent;
+              const request = card.querySelector<HTMLButtonElement>(".release-group-request");
+              if (request?.textContent === "Request") request.textContent = "Request Album";
+              if (track.pending) {
+                const matching = document.createElement("span");
+                matching.className = "field-help artist-top-track-status";
+                matching.textContent = "Finding album…";
+                card.append(matching);
+              }
+              row.replaceChildren(card);
+              rows.set(key, { element: row, signature });
+            }
+            // Move only when needed; stable rows keep artwork and focused buttons.
+            if (list.children[index] !== row) list.insertBefore(row, list.children[index] || null);
           });
-          fragment.append(title, attribution, list);
+          for (const [key, row] of rows) {
+            if (!activeKeys.has(key)) { row.element.remove(); rows.delete(key); }
+          }
+        } else {
+          rows.clear();
+          list.replaceChildren();
+          trackSection.replaceChildren();
+          trackSection.remove();
         }
-        body.replaceChildren(fragment);
         applyArtistReleaseGroupAvailability(data, summary.releaseGroups || {});
         if (incompleteArtistReleaseGroups(data).length) startDetailAvailability("artist", data);
         status.replaceChildren();
-        if (!body.childElementCount) status.textContent = pending ? "Loading summary…" : "No summary available yet.";
-        if (pending && polls++ < 90) timer = setTimeout(() => void load(), 5_000);
+        if (!biography.childElementCount && !rows.size) status.textContent = pending ? "Loading summary…" : "No summary available yet.";
+        if (pending && !element.hidden && polls++ < 90) {
+          timer = setTimeout(() => void load(), pollDelay);
+          pollDelay = Math.min(2_000, Math.round(pollDelay * 1.5));
+        }
       } catch (error) {
         if (!element.isConnected || !isCurrentDetailAction(action) || detailSessionAbort.signal.aborted) return;
-        status.textContent = body.childElementCount ? "" : "Summary is unavailable right now. ";
+        status.textContent = biography.childElementCount || rows.size ? "" : "Summary is unavailable right now. ";
         const retry = document.createElement("button");
         retry.className = "secondary-action";
         retry.textContent = "Retry";
-        retry.addEventListener("click", () => { loaded = false; void load(); });
+        retry.addEventListener("click", () => { loaded = false; polls = 0; pollDelay = 350; void load(); });
         status.append(retry);
       } finally {
         loading = false;

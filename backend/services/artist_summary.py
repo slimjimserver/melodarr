@@ -1,21 +1,25 @@
 """Supplemental snapshots and explainable identities; canonical metadata stays in MB."""
 
+import json
 import logging
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, wait
+from contextlib import contextmanager
 from datetime import date
-from urllib.parse import quote
-from uuid import UUID
+from threading import Lock
+from urllib.parse import quote, urlsplit
+from uuid import UUID, uuid4
 
 import requests
 
 if __package__ == "backend.services":
     from .. import track_search_index
-    from ..api_cache import get_cache_document, set_cache_document
+    from ..api_cache import _cache_operation, cache_document_lock, document_cache_key, get_cache_document, set_cache_document
     from . import deezer, musicbrainz, wikipedia
 else:
     import track_search_index
-    from api_cache import get_cache_document, set_cache_document
+    from api_cache import _cache_operation, cache_document_lock, document_cache_key, get_cache_document, set_cache_document
     from services import deezer, musicbrainz, wikipedia
 
 logger = logging.getLogger(__name__)
@@ -29,8 +33,22 @@ RETENTION_TTL = 100 * 365 * 24 * 60 * 60
 SNAPSHOT_NAMESPACE = "artist-summary:snapshot-v1"
 IDENTITY_NAMESPACE = "artist-summary:identity-v1"
 STATE_NAMESPACE = "artist-summary:refresh-v1"
+PROGRESS_NAMESPACE = "artist-summary:progress-v1"
+PROGRESS_TTL = 30 * 60
+# Shared across Summary jobs, rather than a new pool for every artist.
+_resolution_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="summary-identity")
 # Preserve successful mappings; retry older negative results and snapshots once.
 RESOLVER_VERSION = 6
+
+
+@contextmanager
+def _timed(stage, artist_mbid, track_id=None):
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        logger.info("Artist Summary timing stage=%s artist_mbid=%s deezer_track_id=%s duration_ms=%.1f",
+                    stage, artist_mbid, track_id, (time.perf_counter() - started) * 1000)
 
 
 def _id(value):
@@ -440,7 +458,7 @@ def artist_relations(artist_mbid):
     return value
 
 
-def resolve_track(track, artist_mbid):
+def _cached_recording_identity(track):
     track_id = int(track["id"])
     recording = _identity(f"track:{track_id}")
     code = _isrc(track)
@@ -448,6 +466,13 @@ def resolve_track(track, artist_mbid):
         # A changed explicit ISRC is contrary identity evidence, not an ordinary
         # ordering refresh. Re-resolve this track instead of perpetuating it.
         recording = None
+    return recording
+
+
+def _recording_identity(track, artist_mbid):
+    track_id = int(track["id"])
+    recording = _cached_recording_identity(track)
+    code = _isrc(track)
     if recording is None:
         try:
             mbid, method = resolve_recording(track, artist_mbid)
@@ -461,11 +486,43 @@ def resolve_track(track, artist_mbid):
             "source": "deezer", "deezer_track_id": track_id, "isrc": code or None,
             "recording_mbid": mbid, "recording_resolution_method": method,
         }, mbid)
+    return recording
+
+
+def _group_identity_key(track, recording):
+    album = track.get("album") or {}
+    return f"group:{recording['recording_mbid']}:{album.get('id')}:{track_search_index.normalize_text(album.get('title'))}"
+
+
+def _cached_summary_mapping(track):
+    """Publish reusable identities without waiting behind uncached resolutions."""
+    recording = _cached_recording_identity(track)
+    if recording is None:
+        return None
     result = {**recording, "release_group_mbid": None, "release_group_resolution_method": "unresolved"}
     if not recording.get("recording_mbid"):
         return result
+    mapping = _identity(_group_identity_key(track, recording))
+    return {**result, **mapping} if mapping is not None else None
+
+
+def resolve_track(track, artist_mbid, *, on_recording=None):
+    track_id = int(track["id"])
+    with _timed("recording_resolution", artist_mbid, track_id), \
+            cache_document_lock(IDENTITY_NAMESPACE, f"track:{track_id}"):
+        recording = _recording_identity(track, artist_mbid)
+    result = {**recording, "release_group_mbid": None, "release_group_resolution_method": "unresolved"}
+    if not recording.get("recording_mbid"):
+        return result
+    if on_recording:
+        on_recording({**result, "release_group_resolution_method": "pending"})
+    key = _group_identity_key(track, recording)
+    with _timed("release_group_resolution", artist_mbid, track_id), cache_document_lock(IDENTITY_NAMESPACE, key):
+        return _release_group_identity(track, artist_mbid, recording, result, key)
+
+
+def _release_group_identity(track, artist_mbid, recording, result, key):
     album = track.get("album") or {}
-    key = f"group:{recording['recording_mbid']}:{album.get('id')}:{track_search_index.normalize_text(album.get('title'))}"
     mapping = _identity(key)
     if mapping is None:
         try:
@@ -507,7 +564,7 @@ def resolve_track(track, artist_mbid):
 
 
 def _ordering_fresh(value):
-    return bool(value and value.get("fetched_at", 0) + TOP_TRACKS_TTL > time.time())
+    return bool(value and not value.get("pending") and value.get("fetched_at", 0) + TOP_TRACKS_TTL > time.time())
 
 
 def _identity_retry_due(value, entry):
@@ -524,8 +581,10 @@ def refresh_state_key(artist_mbid, source):
     return f"{prefix}:{artist_mbid}"
 
 
-def _summary_mapping(details, artist_mbid):
+def _summary_mapping(details, artist_mbid, on_recording=None):
     try:
+        if on_recording is not None:
+            return resolve_track(details, artist_mbid, on_recording=on_recording)
         return resolve_track(details, artist_mbid)
     except Exception as exc:
         _log_failure("Artist Summary identity resolution failed", details, exc)
@@ -533,43 +592,151 @@ def _summary_mapping(details, artist_mbid):
                                   "recording_resolution_method": "unresolved", "release_group_resolution_method": "unresolved"})
 
 
-def _track_entry(details, mapping, track_id, position, artist_id):
+def _provider_cover(details):
+    """Allow only public Deezer cover CDN metadata for informational rows."""
+    album = details.get("album") or {}
+    for source in (album.get("cover_small"), album.get("cover")):
+        try:
+            url = urlsplit(str(source or ""))
+            if (url.scheme == "https" and url.hostname == "cdn-images.dzcdn.net" and not url.port
+                    and not url.username and not url.password and not url.query and not url.fragment
+                    and url.path.startswith("/images/cover/")):
+                return str(source)
+        except ValueError:
+            continue
+    return None
+
+
+def _track_entry(details, mapping, track_id, position, artist_id, *, pending=False, details_pending=False):
     album = details.get("album") or {}
     return {
         **mapping, "position": position, "source": "deezer", "deezer_artist_id": artist_id,
+        "pending": pending, "details_pending": details_pending, "coverArt": _provider_cover(details),
         "deezer_track_id": track_id, "deezer_album_id": album.get("id"), "isrc": details.get("isrc"),
         **{key: details.get(key) for key in ("title", "title_short", "title_version", "artist", "contributors", "duration", "rank")},
         "album": {key: album.get(key) for key in ("id", "title", "release_date")},
     }
 
 
-def _repair_top_tracks(artist_mbid, previous):
+def progress_snapshot(artist_mbid, refresh_id):
+    if not refresh_id:
+        return None
+    return get_cache_document(PROGRESS_NAMESPACE, f"top_tracks:{artist_mbid}:{refresh_id}")
+
+
+def publish_for_refresh(namespace, document_id, value, ttl, artist_mbid, source, refresh_id):
+    """Fence final/state writes atomically against a replacement refresh lease."""
+    if not refresh_id:
+        set_cache_document(namespace, document_id, value, ttl)
+        return True
+    now = time.time()
+    state_key = document_cache_key(STATE_NAMESPACE, refresh_state_key(artist_mbid, source))
+
+    def publish(connection):
+        return connection.execute(
+            "INSERT INTO api_cache (cache_key, value, expires_at) "
+            "SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM api_cache WHERE cache_key = ? "
+            "AND expires_at > ? AND json_extract(value, '$.refresh_id') = ?) "
+            "ON CONFLICT(cache_key) DO UPDATE SET value=excluded.value, expires_at=excluded.expires_at",
+            (document_cache_key(namespace, document_id), json.dumps(value), now + ttl, state_key, now, refresh_id),
+        ).rowcount == 1
+
+    return _cache_operation(publish, locked_default=False, description="publish supplemental refresh")
+
+
+class _TopTracksProgress:
+    """Serialize row updates without replacing the retained completed snapshot."""
+
+    def __init__(self, artist_mbid, previous, entries, started):
+        self.artist_mbid, self.previous, self.started = artist_mbid, previous, started
+        state = get_cache_document(STATE_NAMESPACE, refresh_state_key(artist_mbid, "top_tracks")) or {}
+        self.lease_id = state.get("refresh_id") if state.get("status") == "pending" else None
+        self.refresh_id = self.lease_id or uuid4().hex
+        self.entries, self.lock, self.revision = list(entries), Lock(), 0
+        self.publish()
+
+    def publish(self, index=None, entry=None):
+        with self.lock:
+            if index is not None:
+                self.entries[index] = entry
+            self.revision += 1
+            set_cache_document(PROGRESS_NAMESPACE, f"top_tracks:{self.artist_mbid}:{self.refresh_id}", {
+                "entries": self.entries, "pending": True, "refresh_id": self.refresh_id,
+                "revision": self.revision,
+            }, PROGRESS_TTL)
+            if self.revision == 1:
+                logger.info("Artist Summary timing stage=first_top_tracks_snapshot artist_mbid=%s refresh_id=%s duration_ms=%.1f rows=%s",
+                            self.artist_mbid, self.refresh_id, (time.perf_counter() - self.started) * 1000, len(self.entries))
+
+    def resolve(self, index, details, track_id, position, artist_id):
+        def recording_ready(mapping):
+            self.publish(index, _track_entry(details, mapping, track_id, position, artist_id, pending=True))
+        mapping = _summary_mapping(details, self.artist_mbid, recording_ready)
+        self.publish(index, _track_entry(details, mapping, track_id, position, artist_id))
+
+    def reuse(self, index, details, track_id, position, artist_id):
+        with _timed("identity_cache_lookup", self.artist_mbid, track_id):
+            mapping = _cached_summary_mapping(details)
+        if mapping is None:
+            return False
+        self.publish(index, _track_entry(details, mapping, track_id, position, artist_id))
+        return True
+
+    def finish(self, **metadata):
+        value = {**self.previous, **metadata, "entries": self.entries, "resolver_version": RESOLVER_VERSION}
+        # An expired/reclaimed lease must not publish an old refresh's final data.
+        if not publish_for_refresh(SNAPSHOT_NAMESPACE, f"top_tracks:{self.artist_mbid}", value, RETENTION_TTL,
+                                   self.artist_mbid, "top_tracks", self.lease_id):
+            return value
+        logger.info("Artist Summary timing stage=final_top_tracks_snapshot artist_mbid=%s refresh_id=%s duration_ms=%.1f rows=%s",
+                    self.artist_mbid, self.refresh_id, (time.perf_counter() - self.started) * 1000, len(self.entries))
+        return value
+
+
+def _pending_mapping():
+    return {"recording_mbid": None, "release_group_mbid": None,
+            "recording_resolution_method": "pending", "release_group_resolution_method": "pending"}
+
+
+def _repair_top_tracks(artist_mbid, previous, started):
     """Repair identities without extending/refetching the daily provider ordering."""
-    entries = []
-    for entry in previous.get("entries") or []:
-        if not _identity_retry_due(previous, entry):
-            entries.append(entry)
-            continue
-        track_id = int(entry["deezer_track_id"])
-        details = {**entry, "id": track_id}
-        if entry.get("details_missing") or not entry.get("duration") or not (entry.get("contributors") or entry.get("artist")):
-            try:
-                details = deezer.track(track_id)
-            except Exception as exc:
-                _log_failure("Artist Summary track detail failed", details, exc)
-                entries.append(_provider_failure({**entry, "details_missing": True}))
+    entries = previous.get("entries") or []
+    progress = _TopTracksProgress(artist_mbid, previous, [
+        {**entry, "pending": True} if _identity_retry_due(previous, entry) else entry for entry in entries
+    ], started)
+    futures = []
+    try:
+        for index, entry in enumerate(entries):
+            if not _identity_retry_due(previous, entry):
                 continue
-        mapping = _summary_mapping(details, artist_mbid)
-        entries.append(_track_entry(details, mapping, track_id, entry["position"], entry.get("deezer_artist_id")))
-    value = {**previous, "entries": entries, "resolver_version": RESOLVER_VERSION, "identity_refreshed_at": time.time()}
-    set_cache_document(SNAPSHOT_NAMESPACE, f"top_tracks:{artist_mbid}", value, RETENTION_TTL)
-    return value
+            track_id = int(entry["deezer_track_id"])
+            details = {**entry, "id": track_id}
+            if entry.get("details_missing") or not entry.get("duration") or not (entry.get("contributors") or entry.get("artist")):
+                try:
+                    with _timed("deezer_track_detail", artist_mbid, track_id):
+                        details = deezer.track(track_id)
+                except Exception as exc:
+                    _log_failure("Artist Summary track detail failed", details, exc)
+                    progress.publish(index, _provider_failure({**entry, "details_missing": True, "pending": False}))
+                    continue
+            if not progress.reuse(index, details, track_id, entry["position"], entry.get("deezer_artist_id")):
+                futures.append(_resolution_executor.submit(progress.resolve, index, details, track_id, entry["position"], entry.get("deezer_artist_id")))
+    finally:
+        wait(futures)
+    for future in futures:
+        future.result()
+    return progress.finish(identity_refreshed_at=time.time())
 
 
 def refresh_top_tracks(artist_mbid):
+    with _timed("refresh_top_tracks", artist_mbid):
+        return _refresh_top_tracks(artist_mbid, time.perf_counter())
+
+
+def _refresh_top_tracks(artist_mbid, started):
     previous = snapshot(artist_mbid, "top_tracks") or {}
     if _ordering_fresh(previous) and any(_identity_retry_due(previous, entry) for entry in previous.get("entries") or []):
-        return _repair_top_tracks(artist_mbid, previous)
+        return _repair_top_tracks(artist_mbid, previous, started)
     identity = _identity(f"artist:{artist_mbid}")
     if identity is None:
         artist = artist_relations(artist_mbid)
@@ -578,40 +745,55 @@ def refresh_top_tracks(artist_mbid):
             "artist_mbid": artist_mbid, "deezer_artist_id": artist_id, "method": "musicbrainz_relationship" if artist_id else "unresolved",
         }, artist_id)
     artist_id = identity.get("deezer_artist_id")
-    entries = []
+    entries, ordered = [], []
     if artist_id:
-        previous_entries = {str(item.get("deezer_track_id")): item for item in previous.get("entries") or []}
-        for position, item in enumerate(deezer.top_tracks(artist_id), 1):
+        with _timed("deezer_top_tracks", artist_mbid):
+            top_tracks = deezer.top_tracks(artist_id)
+        for position, item in enumerate(top_tracks, 1):
             try:
                 track_id = int(item["id"])
                 if track_id <= 0:
                     raise ValueError
             except (TypeError, KeyError, ValueError):
                 continue
-            details_missing = False
+            ordered.append((position, track_id, item))
+            entries.append(_track_entry(item, _pending_mapping(), track_id, position, artist_id, pending=True, details_pending=True))
+    progress = _TopTracksProgress(artist_mbid, previous, entries, started)
+    futures = []
+    try:
+        previous_entries = {str(item.get("deezer_track_id")): item for item in previous.get("entries") or []}
+        for index, (position, track_id, item) in enumerate(ordered):
             try:
-                details = deezer.track(track_id)
+                with _timed("deezer_track_detail", artist_mbid, track_id):
+                    details = deezer.track(track_id)
             except Exception as exc:
                 _log_failure("Artist Summary track detail failed", {**item, "id": track_id}, exc)
                 if str(track_id) in previous_entries:
-                    entries.append(_provider_failure({**previous_entries[str(track_id)], "position": position, "details_missing": True}))
+                    progress.publish(index, _provider_failure({**previous_entries[str(track_id)], "position": position,
+                                                               "details_missing": True, "pending": False}))
                     continue
-                details = item
-                details_missing = True
-            # Never guess from the reduced top-list object when track details fail.
-            if details_missing:
+                # Never guess identities from the reduced top-list object.
                 mapping = _provider_failure({"recording_mbid": None, "release_group_mbid": None,
                                              "recording_resolution_method": "unresolved", "release_group_resolution_method": "unresolved",
                                              "details_missing": True})
-            else:
-                mapping = _summary_mapping(details, artist_mbid)
-            entries.append(_track_entry(details, mapping, track_id, position, artist_id))
-    document = {"fetched_at": time.time(), "entries": entries, "provider": "deezer", "resolver_version": RESOLVER_VERSION}
-    set_cache_document(SNAPSHOT_NAMESPACE, f"top_tracks:{artist_mbid}", document, RETENTION_TTL)
-    return document
+                progress.publish(index, _track_entry(item, mapping, track_id, position, artist_id))
+                continue
+            progress.publish(index, _track_entry(details, _pending_mapping(), track_id, position, artist_id, pending=True))
+            if not progress.reuse(index, details, track_id, position, artist_id):
+                futures.append(_resolution_executor.submit(progress.resolve, index, details, track_id, position, artist_id))
+    finally:
+        wait(futures)
+    for future in futures:
+        future.result()
+    return progress.finish(fetched_at=time.time(), provider="deezer")
 
 
 def refresh_bio(artist_mbid):
+    with _timed("refresh_bio", artist_mbid):
+        return _refresh_bio(artist_mbid)
+
+
+def _refresh_bio(artist_mbid):
     value = wikipedia.bio(artist_relations(artist_mbid).get("relations"))
     previous = snapshot(artist_mbid, "bio")
     if not value and previous and previous.get("bio"):

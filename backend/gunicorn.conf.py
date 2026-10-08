@@ -1,5 +1,7 @@
 """Gunicorn production configuration for Melodarr's single-container runtime."""
 
+import logging
+
 bind = "0.0.0.0:5056"
 workers = 1
 worker_class = "gthread"
@@ -18,6 +20,15 @@ capture_output = True
 def post_worker_init(worker):
     """Start exactly one recommendation loop after the web worker is ready."""
     from backend.worker import start_background_thread
+
+    # Service loggers otherwise fall back to WARNING and drop timing records.
+    # Reuse Gunicorn's stderr destination without changing other logger levels.
+    summary_logger = logging.getLogger("backend.services.artist_summary")
+    gunicorn_logger = logging.getLogger("gunicorn.error")
+    if gunicorn_logger.handlers:
+        summary_logger.handlers = list(gunicorn_logger.handlers)
+        summary_logger.setLevel(gunicorn_logger.level)
+        summary_logger.propagate = False
 
     start_background_thread()
     worker.log.info("Background workers started")
