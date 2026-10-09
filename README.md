@@ -68,6 +68,18 @@ reuse the existing acquisition machinery with an explicit automation origin and
 no fake user account. Track search includes compact local recording state in
 one response; ordinary searches do not initiate acquisitions.
 
+## Building from source
+
+Local `docker build` commands use Docker Hub for the official Node and Python
+base images. The GitHub workflows use the same image tags from Docker's official
+repositories on Amazon ECR Public to avoid Docker Hub throttling on shared
+runners. They still publish Melodarr to Docker Hub after the image tests pass.
+To use that registry for a local build too:
+
+```sh
+docker build --build-arg BASE_IMAGE_REGISTRY=public.ecr.aws/docker/library --tag melodarr-local .
+```
+
 ## Environment variables
 
 The included Docker Compose setup does not require any extra environment variables. By default, it keeps the main database and metadata cache under the persistent `/app/data` mount.

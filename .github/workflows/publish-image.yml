@@ -36,7 +36,13 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Build image
-        run: docker build --build-arg "MELODARR_VERSION=$GITHUB_REF_NAME" --file Dockerfile --tag "$IMAGE_NAME:$GITHUB_SHA" .
+        # Base-image pulls need no Docker Hub credentials or shared-IP quota.
+        run: |
+          docker build \
+            --build-arg BASE_IMAGE_REGISTRY=public.ecr.aws/docker/library \
+            --build-arg "MELODARR_VERSION=$GITHUB_REF_NAME" \
+            --file Dockerfile \
+            --tag "$IMAGE_NAME:$GITHUB_SHA" .
 
       - name: Test image
         run: docker run --rm "$IMAGE_NAME:$GITHUB_SHA" python -m unittest discover -s tests -t . -v
