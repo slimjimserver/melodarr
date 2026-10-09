@@ -16,11 +16,11 @@ import requests
 if __package__ == "backend.services":
     from .. import track_search_index
     from ..api_cache import _cache_operation, cache_document_lock, document_cache_key, get_cache_document, set_cache_document
-    from . import deezer, musicbrainz, wikipedia
+    from . import deezer, deezer_artist, musicbrainz, wikipedia
 else:
     import track_search_index
     from api_cache import _cache_operation, cache_document_lock, document_cache_key, get_cache_document, set_cache_document
-    from services import deezer, musicbrainz, wikipedia
+    from services import deezer, deezer_artist, musicbrainz, wikipedia
 
 logger = logging.getLogger(__name__)
 TOP_TRACKS_TTL = 24 * 60 * 60
@@ -607,8 +607,18 @@ def _identity_retry_due(value, entry):
 
 def refresh_state_key(artist_mbid, source):
     # Old top-track leases/backoffs must not block the one-time resolver repair.
-    prefix = f"{source}:resolver-v{RESOLVER_VERSION}" if source == "top_tracks" else source
+    prefix = f"{source}:resolver-v{RESOLVER_VERSION}:deezer-v{deezer_artist.SELECTION_VERSION}" if source == "top_tracks" else source
     return f"{prefix}:{artist_mbid}"
+
+
+def artist_selection_refresh_needed(artist_mbid, value):
+    legacy = get_cache_document(IDENTITY_NAMESPACE, f"artist:{artist_mbid}")
+    return deezer_artist.refresh_needed(artist_mbid, value or {}, legacy=legacy)
+
+
+def artist_selection_marker(artist_mbid):
+    selection = deezer_artist.cached_selection(artist_mbid)
+    return {"artist_id": selection.get("deezer_artist_id"), "candidate_ids": selection.get("candidate_ids")}
 
 
 def _summary_mapping(details, artist_mbid, on_recording=None):
@@ -765,20 +775,47 @@ def refresh_top_tracks(artist_mbid):
 
 def _refresh_top_tracks(artist_mbid, started):
     previous = snapshot(artist_mbid, "top_tracks") or {}
-    if _ordering_fresh(previous) and any(_identity_retry_due(previous, entry) for entry in previous.get("entries") or []):
+    selection_needed = artist_selection_refresh_needed(artist_mbid, previous)
+    if (_ordering_fresh(previous) and any(_identity_retry_due(previous, entry) for entry in previous.get("entries") or [])
+            and not selection_needed):
         return _repair_top_tracks(artist_mbid, previous, started)
-    identity = _identity(f"artist:{artist_mbid}")
-    if identity is None:
-        artist = artist_relations(artist_mbid)
-        artist_id = deezer.relationship_id(artist.get("relations"))
-        identity = _save_identity(f"artist:{artist_mbid}", {
-            "artist_mbid": artist_mbid, "deezer_artist_id": artist_id, "method": "musicbrainz_relationship" if artist_id else "unresolved",
-        }, artist_id)
+    prior_selection = deezer_artist.cached_selection(artist_mbid)
+    identity = deezer_artist.select(artist_mbid, loader=artist_relations)
     artist_id = identity.get("deezer_artist_id")
+    prefetched_top = None
+    if not artist_id and identity.get("provider_failure"):
+        candidates = identity.get("candidate_ids") or []
+        if (len(candidates) != 1 or candidates[0] not in (prior_selection.get("invalid_ids") or [])
+                or prior_selection.get("retry_at", 0) > time.time()):
+            raise requests.RequestException("Deezer artist selection is awaiting provider recovery")
+        # A sole known-missing profile must prove recovery. Reuse the normal
+        # Top Tracks call, without adding a fan-count lookup for single relations.
+        with _timed("deezer_top_tracks", artist_mbid):
+            prefetched_top = (candidates[0], deezer.top_tracks(candidates[0]))
+        identity = deezer_artist.confirm_single_profile(artist_mbid, candidates[0])
+        artist_id = identity.get("deezer_artist_id")
+        if not artist_id:
+            raise requests.RequestException("Deezer artist relationships changed during recovery")
+    selection_metadata = {"artist_mbid": artist_mbid, "deezer_artist_id": artist_id,
+                          "deezer_selection_version": deezer_artist.SELECTION_VERSION,
+                          "deezer_selection_expires_at": identity.get("expires_at", 0),
+                          "deezer_selection_retry_at": identity.get("retry_at", 0)}
+    if (selection_needed and _ordering_fresh(previous) and artist_id == deezer_artist.snapshot_artist_id(previous)
+            and (artist_id or not previous.get("entries"))):
+        previous = {**previous, **selection_metadata}
+        if any(_identity_retry_due(previous, entry) for entry in previous.get("entries") or []):
+            return _repair_top_tracks(artist_mbid, previous, started)
+        return _TopTracksProgress(artist_mbid, previous, previous.get("entries") or [], started).finish()
     entries, ordered = [], []
     if artist_id:
-        with _timed("deezer_top_tracks", artist_mbid):
-            top_tracks = deezer.top_tracks(artist_id)
+        if prefetched_top is not None and prefetched_top[0] == artist_id:
+            top_tracks = prefetched_top[1]
+        else:
+            with _timed("deezer_top_tracks", artist_mbid):
+                identity, top_tracks = _deezer_top_tracks(artist_mbid, identity)
+            artist_id = identity["deezer_artist_id"]
+            selection_metadata.update(deezer_artist_id=artist_id, deezer_selection_expires_at=identity.get("expires_at", 0),
+                                      deezer_selection_retry_at=identity.get("retry_at", 0))
         for position, item in enumerate(top_tracks, 1):
             try:
                 track_id = int(item["id"])
@@ -815,7 +852,21 @@ def _refresh_top_tracks(artist_mbid, started):
         wait(futures)
     for future in futures:
         future.result()
-    return progress.finish(fetched_at=time.time(), provider="deezer")
+    return progress.finish(fetched_at=time.time(), provider="deezer", **selection_metadata)
+
+
+def _deezer_top_tracks(artist_mbid, identity):
+    """At most one retry if invalid-profile recovery selects a different artist."""
+    for attempt in range(2):
+        artist_id = identity["deezer_artist_id"]
+        try:
+            return identity, deezer.top_tracks(artist_id)
+        except deezer.ArtistUnavailable:
+            deezer_artist.invalidate(artist_mbid, artist_id)
+            replacement = deezer_artist.select(artist_mbid, loader=artist_relations)
+            if attempt or not replacement.get("deezer_artist_id") or replacement["deezer_artist_id"] == artist_id:
+                raise
+            identity = replacement
 
 
 def refresh_bio(artist_mbid):
@@ -837,10 +888,13 @@ def snapshot(artist_mbid, source):
     return get_cache_document(SNAPSHOT_NAMESPACE, f"{source}:{artist_mbid}")
 
 
-def fresh(value, source):
+def fresh(value, source, *, artist_mbid=None):
     if not value:
         return False
     if source == "top_tracks":
-        return _ordering_fresh(value) and not any(_identity_retry_due(value, entry) for entry in value.get("entries") or [])
+        return (_ordering_fresh(value)
+                and not any(_identity_retry_due(value, entry) for entry in value.get("entries") or [])
+                and not ((artist_mbid or value.get("artist_mbid"))
+                         and artist_selection_refresh_needed(artist_mbid or value["artist_mbid"], value)))
     ttl = BIO_TTL if value.get("bio") else UNRESOLVED_TTL
     return value.get("fetched_at", 0) + ttl > time.time()

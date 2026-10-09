@@ -25,7 +25,7 @@ def _state(artist_mbid, source):
     return get_cache_document(service.STATE_NAMESPACE, service.refresh_state_key(artist_mbid, source)) or {}
 
 
-def _claim(artist_mbid, source):
+def _claim(artist_mbid, source, *, selection_changed=False):
     """SQLite compare-and-set prevents duplicate work across web processes."""
     now = time.time()
     state = {"status": "pending", "pending_until": now + LEASE_TTL, "refresh_id": uuid4().hex}
@@ -35,8 +35,8 @@ def _claim(artist_mbid, source):
         return connection.execute(
             "INSERT INTO api_cache (cache_key, value, expires_at) VALUES (?, ?, ?) "
             "ON CONFLICT(cache_key) DO UPDATE SET value=excluded.value, expires_at=excluded.expires_at "
-            "WHERE api_cache.expires_at <= ?",
-            (key, json.dumps(state), now + LEASE_TTL, now),
+            "WHERE api_cache.expires_at <= ? OR (? AND json_extract(api_cache.value, '$.status') != 'pending')",
+            (key, json.dumps(state), now + LEASE_TTL, now, int(selection_changed)),
         ).rowcount == 1
 
     return _cache_operation(claim, locked_default=False, description="claim supplemental refresh")
@@ -49,9 +49,13 @@ def request_summary(artist_mbid):
         values[source] = service.snapshot(artist_mbid, source)
         state = _state(artist_mbid, source)
         active = state.get("status") == "pending" and state.get("pending_until", 0) > time.time()
-        if not service.fresh(values[source], source) and not active:
+        if not service.fresh(values[source], source, artist_mbid=artist_mbid) and not active:
+            selection_changed = source == "top_tracks" and service.artist_selection_refresh_needed(artist_mbid, values[source])
+            if (selection_changed and state.get("status") == "failed"
+                    and state.get("deezer_selection") == service.artist_selection_marker(artist_mbid)):
+                selection_changed = False  # This provider failure already tried the current identity.
             with _start_lock:
-                if not jobs.full() and _claim(artist_mbid, source):
+                if not jobs.full() and _claim(artist_mbid, source, selection_changed=selection_changed):
                     jobs.put_nowait((artist_mbid, source))
                     if not _started:
                         # Each provider can complete while the other's chain runs.
@@ -64,7 +68,7 @@ def request_summary(artist_mbid):
             values[source] = service.snapshot(artist_mbid, source)
         completed = values[source]
         sources[source] = {
-            "pending": pending[source], "stale": bool(completed and not service.fresh(completed, source)),
+            "pending": pending[source], "stale": bool(completed and not service.fresh(completed, source, artist_mbid=artist_mbid)),
             "fetchedAt": (completed or {}).get("fetched_at"),
         }
         if source == "top_tracks" and pending[source]:
@@ -82,14 +86,20 @@ def request_summary(artist_mbid):
 def process_job(artist_mbid, source):
     refresh_id = _state(artist_mbid, source).get("refresh_id")
     try:
-        if not service.fresh(service.snapshot(artist_mbid, source), source):
+        if not service.fresh(service.snapshot(artist_mbid, source), source, artist_mbid=artist_mbid):
             (service.refresh_bio if source == "bio" else service.refresh_top_tracks)(artist_mbid)
         state, ttl = {"status": "complete"}, service.RETRY_TTL
+        if source == "top_tracks" and service.artist_selection_refresh_needed(artist_mbid, service.snapshot(artist_mbid, source)):
+            # A relationship/selection change during an active refresh must get
+            # another turn rather than wait behind the completed job's backoff.
+            ttl = 0
     except Exception as exc:
         # Preserve the previous successful document and avoid logging provider
         # payloads, arbitrary URLs, or credentials from the configured MB mirror.
         logger.warning("Artist Summary %s refresh failed: %s", source, type(exc).__name__)
         state, ttl = {"status": "failed"}, service.RETRY_TTL
+    if source == "top_tracks":
+        state["deezer_selection"] = service.artist_selection_marker(artist_mbid)
     try:
         service.publish_for_refresh(service.STATE_NAMESPACE, service.refresh_state_key(artist_mbid, source), state, ttl,
                                     artist_mbid, source, refresh_id)

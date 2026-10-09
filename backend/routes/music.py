@@ -20,7 +20,7 @@ if __package__ == "backend.routes":
     from ..services import (
         anime_artist_links,
         anime_theme_links,
-        deezer,
+        deezer_artist,
         lastfm,
         lidarr,
         musicbrainz,
@@ -49,7 +49,7 @@ else:
     from services import (
         anime_artist_links,
         anime_theme_links,
-        deezer,
+        deezer_artist,
         lastfm,
         lidarr,
         musicbrainz,
@@ -866,7 +866,7 @@ def _artist_detail_payload(mbid, priority, force_refresh=False, cache_only=False
     for group in groups:
         sections.setdefault(" + ".join([group["type"], *group["secondaryTypes"]]), []).append(group)
     spotify = _spotify_relation_url(data.get("relations", []))
-    deezer_artist_id = deezer.relationship_id(data.get("relations"))
+    deezer_artist_id = deezer_artist.select(mbid, data).get("deezer_artist_id")
     plex_artist = _plex_artist(mbid)
     lidarr_artist = lidarr.cached_artist_availability().get(mbid)
     return {

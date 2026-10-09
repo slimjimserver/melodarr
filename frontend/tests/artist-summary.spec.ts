@@ -10,11 +10,12 @@ const tracks = [
 ];
 const bio = { text: "A short artist biography.", sourceUrl: "https://en.wikipedia.org/wiki/Artist" };
 
-async function openArtist(page: Page, canonicalGroup = group) {
+async function openArtist(page: Page, canonicalGroup = group, artistLinks: { spotify?: string; deezer?: string } = {}) {
   await page.route("**/api/artwork/**", route => route.fulfill({ path: "icons/melodarr-512.png", contentType: "image/png" }));
   // Canonical display metadata wins over provider album context.
   await page.route("**/api/music/artist/fixture-artist", route => route.fulfill({ json: {
     id: "fixture-artist", name: "Fixture Artist", sections: { Album: [{ ...canonicalGroup, type: "Album", date: "2026-01-01" }] },
+    ...artistLinks,
   } }));
   await page.route("**/api/music/artist/fixture-artist/availability*", route => route.fulfill({ json: { settled: true, releaseGroups: {} } }));
   await page.goto("/artists/fixture-artist");
@@ -22,6 +23,21 @@ async function openArtist(page: Page, canonicalGroup = group) {
   await page.locator("#login-form").getByLabel("Password").fill("fixture-password");
   await page.getByRole("button", { name: "Sign in" }).click();
   await expect(page.locator(".artist-discography")).toBeVisible();
+}
+
+for (const width of [1280, 390]) {
+  test(`selected Deezer artist uses the existing external link alongside Spotify at ${width}px`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 850 });
+    const spotify = "https://open.spotify.com/artist/fixture-artist";
+    const deezer = "https://www.deezer.com/artist/384236";
+    await openArtist(page, group, { spotify, deezer });
+    const deezerLink = page.getByRole("link", { name: "Open on Deezer", exact: true });
+    await expect(deezerLink).toBeVisible();
+    await expect(deezerLink).toHaveAttribute("href", deezer);
+    await expect(deezerLink).toHaveAttribute("target", "_blank");
+    await expect(deezerLink.locator("img")).toHaveAttribute("src", "/icons/deezer.svg");
+    await expect(page.locator(".external-link-spotify")).toHaveAttribute("href", spotify);
+  });
 }
 
 test("summary is lazy and slow supplements leave artist navigation usable", async ({ page }) => {

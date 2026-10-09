@@ -15,7 +15,7 @@ from unittest.mock import Mock, patch
 import requests
 
 from backend import api_cache
-from backend.services import artist_summary as summary, deezer, musicbrainz, wikipedia
+from backend.services import artist_summary as summary, deezer, deezer_artist, musicbrainz, wikipedia
 from backend.workers import artist_summary as worker
 from tests.test_artist_summary import ARTIST, GROUP, SATIVA, release, track
 from tests.test_backend import DatabaseTestCase
@@ -40,9 +40,11 @@ class ArtistSummaryProgressTests(DatabaseTestCase):
     def refresh(self, items, resolve=None, details=None, gates=(), bio=True):
         if bio:
             self.save("bio", bio={"text": "Biography"})
-        api_cache.set_cache_document(summary.IDENTITY_NAMESPACE, f"artist:{ARTIST}", {
-            "complete": True, "deezer_artist_id": 42,
-        }, summary.RETENTION_TTL)
+        api_cache.set_cache_document(deezer_artist.SELECTION_NAMESPACE, ARTIST, {
+            "complete": True, "verified": True, "deezer_artist_id": 42,
+            "selection_version": deezer_artist.SELECTION_VERSION, "candidate_ids": [42],
+            "expires_at": time.time() + deezer_artist.SELECTION_TTL, "retry_at": 0,
+        }, deezer_artist.SELECTION_TTL)
         with patch.object(worker, "jobs", Queue(maxsize=32)), patch.object(worker, "_started", True), \
                 patch.object(deezer, "top_tracks", return_value=items), \
                 patch.object(deezer, "track", side_effect=details or track):

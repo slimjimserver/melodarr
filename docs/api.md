@@ -79,6 +79,42 @@ configured log level (INFO by default), without raising unrelated logger levels.
 Only generated stage labels and public artist/track/refresh identifiers are
 logged; URLs, credentials, and provider tokens are excluded.
 
+Deezer artist selection uses the same MusicBrainz `/artist/{mbid}` document
+(`aliases+url-rels+genres`) as the artist-detail Spotify link. MusicBrainz's
+90-day metadata cache and original relationship data are unchanged. Valid Deezer
+artist URLs (including country prefixes) are deduplicated by positive artist ID.
+One unique relationship selects immediately without a Deezer artist-detail call.
+For multiple relationships, the paced public `/artist/{id}` client reads every
+candidate's `nb_fan`; the uniquely highest valid numeric count is definitive.
+Names, album/track counts, and URL order never break ties or override fan counts.
+Missing/invalid counts and provider failures do not count as zero; a tied highest
+count remains unresolved.
+
+Derived selections live in `deezer-artist:selection-v1` for 90 days, rather than
+the old permanent Summary artist mapping. Candidate counts are cached separately
+in `deezer-artist:fans-v1` for seven days and reused across artists. Successful
+selections revalidate at 90 days or immediately when the validated relationship
+ID set changes; reordering/duplicate URLs do not cause redundant work. On a
+candidate failure, a previously verified selection still in the relationship set
+can remain usable during a 15-minute retry backoff, without renewing its verified
+90-day expiry. With no reliable previous selection, the artist remains unresolved.
+Ties/no relationships retry after seven days; relationship changes bypass that
+negative result. Known missing/wrong selected profiles invalidate the derived
+selection and trigger reevaluation; they cannot remain outage fallbacks. A known
+missing sole profile must prove recovery through its normal Top Tracks request;
+this adds no single-relationship fan lookup and uses the same retry backoff.
+
+The existing artist-detail `deezer` field exposes the canonical selected URL next
+to `spotify`, using the existing frontend icon/link conventions. Summary Top
+Tracks use that same selection. Selection changes make the retained 24-hour
+ordering stale and trigger the existing progressive refresh without invalidating
+recording/release-group identities or Wikipedia. When selection revalidation
+keeps the same artist, still-fresh daily ordering is retained. Fan failures preserve completed
+Summary snapshots and existing provider backoff. Artist-selection version 1
+ignores old ambiguous permanent mappings and uses a new refresh-lease suffix,
+so deployment recovery needs no cache clear. Recording resolver version 7 and
+Deezer album relationship matching are unchanged.
+
 Artist identities come exclusively from exact MusicBrainz Deezer/Wikipedia/
 Wikidata relationships; no fuzzy artist lookup is used. Wikipedia lead text is
 read using the [MediaWiki TextExtracts API](https://www.mediawiki.org/wiki/Extension:TextExtracts),

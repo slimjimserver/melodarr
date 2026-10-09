@@ -1,5 +1,6 @@
 """Read-only Deezer public API. No account, credentials, or private endpoints."""
 
+import math
 import re
 import time
 from threading import Lock
@@ -14,6 +15,33 @@ else:
 
 _lock = Lock()
 _next_request_at = 0.0
+
+
+class ArtistUnavailable(requests.RequestException):
+    """The requested public artist profile no longer identifies this artist."""
+
+
+def artist_relationship_ids(relations):
+    """Validate artist authorities, then reuse the existing Deezer URL parser."""
+    ids = set()
+    for relation in relations or []:
+        resource = ((relation.get("url") or {}).get("resource")
+                    if isinstance(relation, dict) and isinstance(relation.get("url"), dict) else None)
+        if not isinstance(resource, str) or any(character.isspace() or ord(character) < 32 or ord(character) == 127
+                                                for character in resource):
+            continue
+        try:
+            url = urlsplit(resource)
+            port = url.port
+        except ValueError:
+            continue
+        if (url.username is not None or url.password is not None
+                or port not in (None, 443 if url.scheme == "https" else 80)):
+            continue
+        artist_id = relationship_id([relation])
+        if artist_id:
+            ids.add(artist_id)
+    return sorted(ids)
 
 
 def relationship_id(relations, resource="artist"):
@@ -37,7 +65,7 @@ def relationship_id(relations, resource="artist"):
 def get(path, **params):
     """Bound and pace all requests, including HTTP-200 provider error objects."""
     global _next_request_at
-    if not re.fullmatch(r"/(?:artist/[1-9][0-9]*/top|track/[1-9][0-9]*)", path):
+    if not re.fullmatch(r"/(?:artist/[1-9][0-9]*(?:/top)?|track/[1-9][0-9]*)", path):
         raise ValueError("Unsupported public Deezer resource")
     with _lock:
         time.sleep(max(0, _next_request_at - time.monotonic()))
@@ -46,13 +74,40 @@ def get(path, **params):
             f"https://api.deezer.com{path}", params=params,
             headers={"User-Agent": USER_AGENT}, timeout=(3.05, 10), allow_redirects=False,
         )
+        if response.status_code in {404, 410} and path.startswith("/artist/"):
+            raise ArtistUnavailable("Deezer artist profile is unavailable", response=response)
         response.raise_for_status()
         if 300 <= response.status_code < 400:
             raise requests.RequestException("Deezer redirected the public API request")
         value = response.json()
+        if (isinstance(value, dict) and isinstance(value.get("error"), dict)
+                and value["error"].get("code") == 800 and path.startswith("/artist/")):
+            raise ArtistUnavailable("Deezer artist profile is unavailable", response=response)
         if not isinstance(value, dict) or "error" in value:
             raise requests.RequestException("Deezer returned an API error")
         return value
+
+
+def valid_artist_id(value):
+    return ((isinstance(value, int) and not isinstance(value, bool) and value > 0)
+            or (isinstance(value, str) and re.fullmatch(r"[1-9][0-9]*", value) is not None))
+
+
+def validate_artist(value, artist_id):
+    """Reject wrong profiles and absent, nonnumeric, or nonfinite fan counts."""
+    if not isinstance(value, dict) or not valid_artist_id(value.get("id")) or int(value["id"]) != int(artist_id):
+        raise ArtistUnavailable("Deezer returned the wrong artist identity")
+    fans = value.get("nb_fan")
+    if (isinstance(fans, bool) or not isinstance(fans, (int, float))
+            or fans < 0 or (isinstance(fans, float) and not math.isfinite(fans))):
+        raise requests.RequestException("Deezer omitted a valid numeric artist fan count")
+    return value
+
+
+def artist(artist_id):
+    if not valid_artist_id(artist_id):
+        raise ValueError("Invalid public Deezer artist ID")
+    return validate_artist(get(f"/artist/{int(artist_id)}"), artist_id)
 
 
 def top_tracks(artist_id):

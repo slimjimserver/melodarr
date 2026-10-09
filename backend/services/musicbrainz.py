@@ -16,7 +16,7 @@ from pykakasi import kakasi
 logger = logging.getLogger(__name__)
 
 if __package__ == "backend.services":
-    from ..api_cache import cache_key, cached_json_get
+    from ..api_cache import _fresh_cache_value, cache_key, cached_json_get
     from ..config import (
         COVER_ART_ARCHIVE_URL,
         MUSICBRAINZ_METADATA_CACHE_TTL,
@@ -27,7 +27,7 @@ if __package__ == "backend.services":
     )
     from ..storage import get_service
 else:  # Support the existing `python backend/app.py` entry point.
-    from api_cache import cache_key, cached_json_get
+    from api_cache import _fresh_cache_value, cache_key, cached_json_get
     from config import (
         COVER_ART_ARCHIVE_URL,
         MUSICBRAINZ_METADATA_CACHE_TTL,
@@ -657,6 +657,11 @@ def metadata_cache_key(path, inc, **extra):
     """Return the persistent key used by a MusicBrainz metadata request."""
     record = metadata_cache_record(path, inc, None, **extra)
     return cache_key(record["namespace"], record["url"], record["params"])
+
+
+def cached_artist_metadata(artist_mbid):
+    """Peek at the normal artist-detail relationship document without a request."""
+    return _fresh_cache_value(metadata_cache_key(f"/artist/{quote(artist_mbid)}", "aliases+url-rels+genres"))
 
 
 def test_connection(values):
