@@ -803,9 +803,16 @@ class RoomHardeningTests(RoomTestCase):
         self.configure_devices()
         response = self.post("/api/rooms")
         self.assertEqual(response.status_code, 409)
-        self.assertTrue(response.get_json()["selectionRequired"])
+        selection = response.get_json()
+        self.assertTrue(selection["selectionRequired"])
+        self.assertEqual(
+            selection["error"],
+            "Multiple compatible Plex music sessions were found. "
+            "Choose a player for this Room.",
+        )
         self.assertIsNone(rooms.host_room(self.user["id"]))
         choices = self.devices()
+        self.assertEqual(selection["sessions"], choices)
         self.assertEqual(
             [choice["deviceName"] for choice in choices], ["Jeremy’s iPhone", "Chrome"]
         )
@@ -839,7 +846,14 @@ class RoomHardeningTests(RoomTestCase):
         self.device_rows = self.device_rows[1:]
         response = self.post("/api/rooms", {"sessionId": phone["id"]})
         self.assertEqual(response.status_code, 409)
-        self.assertEqual(response.get_json()["sessions"][0]["clientId"], "pc")
+        selection = response.get_json()
+        self.assertTrue(selection["selectionRequired"])
+        self.assertEqual(
+            selection["error"],
+            "The selected Plex player is no longer available or has no usable "
+            "music queue. Refresh players and retry.",
+        )
+        self.assertEqual(selection["sessions"][0]["clientId"], "pc")
         self.assertIsNone(rooms.host_room(self.user["id"]))
 
     def test_session_discovery_and_selection_exclude_other_users_video_and_paused(self):

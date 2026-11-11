@@ -415,6 +415,8 @@ JSON start/join/entry/order/delete requests require `Content-Type: application/j
 and `X-Room-Request: 1`. Host mutations require the existing `X-CSRF-Token`;
 guest additions require the `X-Room-CSRF` returned by join. The random guest
 capability is in an HttpOnly, SameSite=Lax cookie scoped to the Room API path.
+The cookie expires seven days after issuance. Rejoining uses the existing
+cookie and its original expiry.
 For HTTPS, enable the existing `MELODARR_COOKIE_SECURE=true` setting. Reverse
 proxies must preserve the public Host header or configure the Melodarr
 Application URL; Origin checks support upstream TLS termination. CORS is disabled.

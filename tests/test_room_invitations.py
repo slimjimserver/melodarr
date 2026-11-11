@@ -148,10 +148,17 @@ class RoomInvitationTests(RoomTestCase):
         self.assertEqual(joined.status_code, 200)
         self.assertIn("HttpOnly", joined.headers["Set-Cookie"])
         self.assertIn("SameSite=Lax", joined.headers["Set-Cookie"])
+        self.assertIn("Max-Age=604800", joined.headers["Set-Cookie"])
+        cookie_path = f"/api/rooms/{room['code']}"
+        original_cookie = client.get_cookie("room_guest", path=cookie_path)
         first = joined.get_json()["guest"]
         repeated = self.anonymous_join(room, client=client)
         self.assertEqual(repeated.status_code, 200)
         self.assertEqual(repeated.get_json()["guest"], first)
+        self.assertNotIn("Set-Cookie", repeated.headers)
+        self.assertEqual(
+            client.get_cookie("room_guest", path=cookie_path), original_cookie
+        )
         self.assertEqual(client.get(f"/api/rooms/{room['code']}").status_code, 200)
         self.add(
             room,

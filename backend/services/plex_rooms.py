@@ -6,6 +6,7 @@ existing redirect-rejecting HTTP client. Notification tokens stay in headers.
 
 import json
 import time
+from enum import Enum, auto
 from hashlib import sha256
 from threading import Condition, Event, Thread
 from urllib.parse import urlsplit, urlunsplit
@@ -28,9 +29,15 @@ class QueueError(Exception):
     """Safe, actionable error; never wrap provider exception strings."""
 
 
+class SessionSelectionReason(Enum):
+    PLAYER_UNAVAILABLE = auto()
+    MULTIPLE_PLAYERS = auto()
+
+
 class SessionSelectionError(QueueError):
-    def __init__(self, message, sessions):
-        super().__init__(message)
+    def __init__(self, reason, sessions):
+        super().__init__(reason.name)
+        self.reason = reason
         self.sessions = sessions
 
 
@@ -350,13 +357,13 @@ class PMSQueue:
             ]
             if len(selected) != 1:
                 raise SessionSelectionError(
-                    "The selected Plex player is no longer available or has no usable music queue. Refresh players and retry.",
+                    SessionSelectionReason.PLAYER_UNAVAILABLE,
                     self._session_choices(compatible),
                 )
             candidate, event = selected[0]
         elif len(compatible) > 1:
             raise SessionSelectionError(
-                "Multiple compatible Plex music sessions were found. Choose a player for this Room.",
+                SessionSelectionReason.MULTIPLE_PLAYERS,
                 self._session_choices(compatible),
             )
         elif compatible:

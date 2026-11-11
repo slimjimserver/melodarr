@@ -56,8 +56,18 @@ def boundary(view):
         except rooms.RoomError as exc:
             return api_error(str(exc), exc.status)
         except plex_rooms.SessionSelectionError as exc:
+            if exc.reason is plex_rooms.SessionSelectionReason.PLAYER_UNAVAILABLE:
+                message = (
+                    "The selected Plex player is no longer available or has no usable "
+                    "music queue. Refresh players and retry."
+                )
+            else:
+                message = (
+                    "Multiple compatible Plex music sessions were found. "
+                    "Choose a player for this Room."
+                )
             return jsonify(
-                {"error": str(exc), "selectionRequired": True, "sessions": exc.sessions}
+                {"error": message, "selectionRequired": True, "sessions": exc.sessions}
             ), 409
         except plex_rooms.QueueError as exc:
             return api_error(str(exc), 502)
@@ -249,7 +259,7 @@ def join(code):
     ):
         raise rooms.RoomError("Guest names must be text of 60 characters or fewer.")
     user = current_user()
-    guest, token = rooms.join(
+    guest, new_token = rooms.join(
         room["code"],
         name,
         request.cookies.get("room_guest"),
@@ -265,15 +275,16 @@ def join(code):
             ),
         }
     )
-    response.set_cookie(
-        "room_guest",
-        token,
-        httponly=True,
-        secure=current_app.config["SESSION_COOKIE_SECURE"],
-        samesite="Lax",
-        path=f"/api/rooms/{room['code']}",
-        max_age=7 * 24 * 60 * 60,
-    )
+    if new_token is not None:
+        response.set_cookie(
+            "room_guest",
+            new_token,
+            httponly=True,
+            secure=current_app.config["SESSION_COOKIE_SECURE"],
+            samesite="Lax",
+            path=f"/api/rooms/{room['code']}",
+            max_age=7 * 24 * 60 * 60,
+        )
     return response
 
 

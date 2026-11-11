@@ -304,6 +304,7 @@ def invite(room):
 
 
 def join(code, name="", token=None, *, invite_token=None, host=False, room_id=None):
+    """Return the guest and a cookie token only when creating a new guest."""
     room = room_by_code(code, active=True, room_id=room_id)
     with queue_lock(room):
         room = room_by_code(code, active=True, room_id=room["id"])
@@ -318,7 +319,7 @@ def join(code, name="", token=None, *, invite_token=None, host=False, room_id=No
                     "id": existing["id"],
                     "name": existing["name"],
                     "csrfToken": existing["csrf_token"],
-                }, token
+                }, None
             if not host and not room_invites.valid(room["invite_hash"], invite_token):
                 raise RoomError(
                     "Use a valid invite link from the Room host to join.", 403
