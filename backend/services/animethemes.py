@@ -1,15 +1,12 @@
 """Cached AnimeThemes API access and response normalization."""
 
-from urllib.parse import quote
-
 if __package__ == "backend.services":
-    from ..api_cache import cached_json_get
-    from ..config import USER_AGENT
+    from . import _animethemes_graphql as graphql
 else:  # Support the existing `python backend/app.py` entry point.
-    from api_cache import cached_json_get
-    from config import USER_AGENT
+    from services import _animethemes_graphql as graphql
 
 
+# Retained only for reading old request-history cache documents.
 _ANIMETHEMES_URL = "https://api.animethemes.moe"
 _SEARCH_CACHE_TTL = 6 * 60 * 60
 _DETAIL_CACHE_TTL = 24 * 60 * 60
@@ -19,7 +16,6 @@ _DETAIL_INCLUDE = (
     "animethemes.animethemeentries,"
     "images,resources,series"
 )
-_SERIES_INCLUDE = "anime.images,anime.animethemes"
 _MAX_SEARCH_LIMIT = 50
 _MAX_QUERY_LENGTH = 200
 _MAX_SLUG_LENGTH = 200
@@ -262,13 +258,7 @@ def search(query, limit=25):
     """Search AnimeThemes and return normalized anime summaries."""
     query = _validate_query(query)
     limit = _validate_limit(limit)
-    data = cached_json_get(
-        f"{_ANIMETHEMES_URL}/search",
-        params={"q": query, "limit": limit, "include[anime]": "images"},
-        headers={"User-Agent": USER_AGENT},
-        namespace="animethemes-search",
-        ttl=_SEARCH_CACHE_TTL,
-    )
+    data = graphql.search(query, limit, ttl=_SEARCH_CACHE_TTL)
     search_payload = data.get("search") if isinstance(data, dict) else None
     anime_items = (
         search_payload.get("anime") if isinstance(search_payload, dict) else []
@@ -283,13 +273,7 @@ def search(query, limit=25):
 def detail(slug):
     """Return one normalized anime and its opening/ending metadata."""
     slug = _validate_slug(slug)
-    data = cached_json_get(
-        f"{_ANIMETHEMES_URL}/anime/{quote(slug, safe='')}",
-        params={"include": _DETAIL_INCLUDE},
-        headers={"User-Agent": USER_AGENT},
-        namespace="animethemes-detail",
-        ttl=_DETAIL_CACHE_TTL,
-    )
+    data = graphql.detail(slug, ttl=_DETAIL_CACHE_TTL)
     anime = data.get("anime") if isinstance(data, dict) else None
     if isinstance(anime, dict):
         # Retain only known names in application storage; Requests search never
@@ -305,13 +289,7 @@ def detail(slug):
 def series_detail(slug):
     """Return one normalized AnimeThemes series and its related anime."""
     slug = _validate_series_slug(slug)
-    data = cached_json_get(
-        f"{_ANIMETHEMES_URL}/series/{quote(slug, safe='')}",
-        params={"include": _SERIES_INCLUDE},
-        headers={"User-Agent": USER_AGENT},
-        namespace="animethemes-series",
-        ttl=_SERIES_CACHE_TTL,
-    )
+    data = graphql.series_detail(slug, ttl=_SERIES_CACHE_TTL)
     series = data.get("series") if isinstance(data, dict) else None
     return _normalize_series_detail(series) if isinstance(series, dict) else None
 
@@ -319,14 +297,7 @@ def series_detail(slug):
 def artist_detail(slug, *, force_refresh=False):
     """Return every song/theme performance for one AnimeThemes artist."""
     slug = _validate_slug(slug)
-    data = cached_json_get(
-        f"{_ANIMETHEMES_URL}/artist/{quote(slug, safe='')}",
-        params={"include": "songs.animethemes.anime.images"},
-        headers={"User-Agent": USER_AGENT},
-        namespace="animethemes-artist",
-        force_refresh=force_refresh,
-        ttl=_DETAIL_CACHE_TTL,
-    )
+    data = graphql.artist_detail(slug, force_refresh=force_refresh, ttl=_DETAIL_CACHE_TTL)
     artist = data.get("artist") if isinstance(data, dict) else None
     if not isinstance(artist, dict):
         return None

@@ -111,8 +111,10 @@ def _backfill_catalog_anime_names(connection):
     """Rebuild reusable anime names without consulting request snapshots or HTTP."""
     if __package__:
         from .api_cache import cache_db
+        from .services import animethemes
     else:
         from api_cache import cache_db
+        from services import animethemes
     for row in connection.execute("SELECT DISTINCT anime_slug, anime_name FROM anime_theme_release_group_links"):
         save_names(connection, "anime", row["anime_slug"], [row["anime_slug"], row["anime_name"]], catalog=True)
     with cache_db() as cached:
@@ -128,7 +130,7 @@ def _backfill_catalog_anime_names(connection):
                 payload = json.loads(row[0])
             except (TypeError, ValueError):
                 continue
-            anime = payload.get("anime") if isinstance(payload, dict) else None
+            anime = animethemes.graphql.cached_anime(payload)
             if isinstance(anime, dict) and anime.get("slug"):
                 save_names(connection, "anime", anime["slug"], [anime["slug"], *_names(anime)], catalog=True)
 
@@ -349,6 +351,7 @@ def capture(connection, request_id, *, metadata=(), row=None, strict=False, cach
                         includes = ("", "aliases", "aliases+url-rels+genres", "aliases+artist-credits+url-rels")
                         cache_keys.update(cached.metadata_keys(kind, entity_id, includes))
                     else:
+                        cache_keys.add(animethemes.graphql.anime_cache_key(entity_id))
                         cache_keys.add(cache_key(
                             "animethemes-detail", f"{animethemes._ANIMETHEMES_URL}/anime/{quote(entity_id, safe='')}",
                             {"include": animethemes._DETAIL_INCLUDE},
@@ -368,7 +371,7 @@ def capture(connection, request_id, *, metadata=(), row=None, strict=False, cach
                     if not isinstance(payload, dict):
                         continue
                     if key.startswith("animethemes-detail:"):
-                        anime = payload.get("anime") or {}
+                        anime = animethemes.graphql.cached_anime(payload)
                         if isinstance(anime, dict):
                             add("anime", anime.get("slug"), cached.names(anime))
                     else:

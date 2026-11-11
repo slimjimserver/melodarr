@@ -41,6 +41,12 @@ Browse popular artists from Last.fm or check Apple Music's current Top 100 album
 
 Search AnimeThemes for openings and endings, see where each song appears in a series, and follow related anime. Melodarr matches those songs to MusicBrainz releases so they can be requested through Lidarr, with administrator review when a match needs a second look.
 
+Anime discovery uses the public GraphQL API at `https://graphql.animethemes.moe/`.
+No AnimeThemes API key or additional configuration is needed. Search results are
+cached for six hours, and anime, series, and artist details for 24 hours. Existing
+AnimeThemes IDs and saved song mappings continue to work after the migration
+from the deprecated JSON API.
+
 ### Know what is already in your library
 
 Connect Plex to browse the artists and albums you already own, open them directly in Plex, and keep duplicates out of recommendations and requests.

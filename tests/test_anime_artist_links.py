@@ -88,7 +88,7 @@ class ArtistLinksTests(unittest.TestCase):
             {"id": 1, "title": "Professionalism", "animethemes": [opening, opening]},
             {"id": 2, "title": "BEYOND", "animethemes": [ending]},
             {"id": 3, "title": "Wild Side", "animethemes": [beastars]}]}}
-        with patch.object(animethemes, "cached_json_get", return_value=payload):
+        with patch.object(animethemes.graphql, "artist_detail", return_value=payload):
             result = animethemes.artist_detail("ali")
         self.assertEqual(len(result["anime"]), 2)
         self.assertEqual([p["themeLabel"] for p in result["anime"][0]["performances"]], ["Opening 1", "Ending 2"])

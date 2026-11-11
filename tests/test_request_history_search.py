@@ -236,12 +236,12 @@ class RequestHistorySearchTests(DatabaseTestCase):
     def test_anime_aliases_known_before_or_after_request_survive_cache_cleanup(self):
         anime = {"slug": "boku_no_kokoro_no_yabai_yatsu", "name": "僕の心のヤバイやつ",
                  "synonyms": ["The Dangers in My Heart"]}
-        with patch("backend.services.animethemes.cached_json_get", return_value={"anime": anime}):
+        with patch("backend.services.animethemes.graphql.detail", return_value={"anime": anime}):
             animethemes.detail(anime["slug"])
         self.add_album(anime_slug=anime["slug"], anime_name=anime["name"])
         self.assertEqual(self.ids(self.search("Dangers in My Heart")), {self.album_id})
         anime["synonyms"].append("Known later title")
-        with patch("backend.services.animethemes.cached_json_get", return_value={"anime": anime}):
+        with patch("backend.services.animethemes.graphql.detail", return_value={"anime": anime}):
             animethemes.detail(anime["slug"])
         with cache_db() as connection:
             connection.execute("DELETE FROM api_cache")
@@ -337,6 +337,32 @@ class RequestHistorySearchTests(DatabaseTestCase):
         for query in ("The Dangers in My Heart", "Boku no Kokoro no Yabai Yatsu", "僕の心のヤバイやつ"):
             with self.subTest(query=query):
                 self.assertEqual(self.ids(self.search(query)), {self.album_id})
+
+    def test_graphql_anime_cache_titles_are_captured_without_http(self):
+        slug = "boku_no_kokoro_no_yabai_yatsu"
+        self.cache_document(animethemes.graphql.anime_cache_key(slug), {"data": {"entity": {
+            "id": 4025, "slug": slug,
+            "title": {"romaji": "Boku no Kokoro no Yabai Yatsu", "english": "The Dangers in My Heart", "native": "僕の心のヤバイやつ"},
+        }}})
+        self.add_album(anime_slug=slug, anime_name="僕の心のヤバイやつ")
+        with cache_db() as connection:
+            connection.execute("DELETE FROM api_cache")
+        for query in ("The Dangers in My Heart", "Boku no Kokoro no Yabai Yatsu", "僕の心のヤバイやつ"):
+            with self.subTest(query=query):
+                self.assertEqual(self.ids(self.search(query)), {self.album_id})
+
+    def test_anime_alias_backfill_reads_graphql_cache_without_http(self):
+        self.add_album(anime_slug="shared-anime", anime_name="Row name")
+        self.cache_document(animethemes.graphql.anime_cache_key("shared-anime"), {"data": {"entity": {
+            "id": 1, "slug": "shared-anime", "title": {"romaji": "Catalog Romaji", "english": "Trusted GraphQL Title"},
+        }}})
+        self.cache_document("animethemes-detail:malformed-graphql", {"data": []})
+        with db() as connection:
+            connection.execute("DELETE FROM request_history_search_migrations")
+            connection.execute("DELETE FROM request_history_search_aliases WHERE entity_kind = 'anime'")
+        init_db()
+        self.assertEqual(self.ids(self.search("Trusted GraphQL Title")), {self.album_id})
+        self.assertEqual(self.ids(self.search("Catalog Romaji")), {self.album_id})
 
     def test_migration_backfills_only_local_names_and_is_idempotent(self):
         track_search_index.index_artist({"id": self.artist_id, "name": "羊文学", "aliases": [{"name": "Hitsuji Bungaku"}]})
