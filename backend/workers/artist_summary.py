@@ -25,18 +25,21 @@ def _state(artist_mbid, source):
     return get_cache_document(service.STATE_NAMESPACE, service.refresh_state_key(artist_mbid, source)) or {}
 
 
-def _claim(artist_mbid, source, *, selection_changed=False):
+def _claim(artist_mbid, source, *, selection_changed=False, previous_refresh_id=None):
     """SQLite compare-and-set prevents duplicate work across web processes."""
     now = time.time()
     state = {"status": "pending", "pending_until": now + LEASE_TTL, "refresh_id": uuid4().hex}
     key = document_cache_key(service.STATE_NAMESPACE, service.refresh_state_key(artist_mbid, source))
 
     def claim(connection):
+        # A selection change can bypass backoff only for the observed generation.
         return connection.execute(
             "INSERT INTO api_cache (cache_key, value, expires_at) VALUES (?, ?, ?) "
             "ON CONFLICT(cache_key) DO UPDATE SET value=excluded.value, expires_at=excluded.expires_at "
-            "WHERE api_cache.expires_at <= ? OR (? AND json_extract(api_cache.value, '$.status') != 'pending')",
-            (key, json.dumps(state), now + LEASE_TTL, now, int(selection_changed)),
+            "WHERE api_cache.expires_at <= ? OR (? "
+            "AND json_extract(api_cache.value, '$.status') != 'pending' "
+            "AND json_extract(api_cache.value, '$.refresh_id') IS ?)",
+            (key, json.dumps(state), now + LEASE_TTL, now, int(selection_changed), previous_refresh_id),
         ).rowcount == 1
 
     return _cache_operation(claim, locked_default=False, description="claim supplemental refresh")
@@ -46,8 +49,9 @@ def request_summary(artist_mbid):
     global _started
     values, pending, sources = {}, {}, {}
     for source in ("bio", "top_tracks"):
-        values[source] = service.snapshot(artist_mbid, source)
+        # The worker publishes its snapshot before completing the lease.
         state = _state(artist_mbid, source)
+        values[source] = service.snapshot(artist_mbid, source)
         active = state.get("status") == "pending" and state.get("pending_until", 0) > time.time()
         if not service.fresh(values[source], source, artist_mbid=artist_mbid) and not active:
             selection_changed = source == "top_tracks" and service.artist_selection_refresh_needed(artist_mbid, values[source])
@@ -55,7 +59,10 @@ def request_summary(artist_mbid):
                     and state.get("deezer_selection") == service.artist_selection_marker(artist_mbid)):
                 selection_changed = False  # This provider failure already tried the current identity.
             with _start_lock:
-                if not jobs.full() and _claim(artist_mbid, source, selection_changed=selection_changed):
+                if not jobs.full() and _claim(
+                    artist_mbid, source, selection_changed=selection_changed,
+                    previous_refresh_id=state.get("refresh_id"),
+                ):
                     jobs.put_nowait((artist_mbid, source))
                     if not _started:
                         # Each provider can complete while the other's chain runs.
@@ -100,6 +107,8 @@ def process_job(artist_mbid, source):
         state, ttl = {"status": "failed"}, service.RETRY_TTL
     if source == "top_tracks":
         state["deezer_selection"] = service.artist_selection_marker(artist_mbid)
+    if refresh_id:
+        state["refresh_id"] = refresh_id
     try:
         service.publish_for_refresh(service.STATE_NAMESPACE, service.refresh_state_key(artist_mbid, source), state, ttl,
                                     artist_mbid, source, refresh_id)

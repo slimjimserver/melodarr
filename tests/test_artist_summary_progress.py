@@ -115,6 +115,59 @@ class ArtistSummaryProgressTests(DatabaseTestCase):
                 self.assertFalse(worker.request_summary(ARTIST)["pending"])
                 claim.assert_not_called()
 
+    def test_poll_does_not_requeue_refresh_completed_before_state_read(self):
+        self.save("bio", bio={"text": "Biography"})
+        deezer_artist.select(ARTIST, {"relations": [
+            {"url": {"resource": "https://www.deezer.com/artist/42"}},
+        ]})
+        self.assertTrue(worker._claim(ARTIST, "top_tracks"))
+        read_state = worker._state
+        lease = read_state(ARTIST, "top_tracks")
+        entries = [{"title": "Finished track"}]
+
+        def state_after_completion(artist_mbid, source):
+            state = read_state(artist_mbid, source)
+            if source != "top_tracks" or state != lease:
+                return state
+            self.save(source, deezer_artist_id=42, entries=entries)
+            self.assertTrue(summary.publish_for_refresh(
+                summary.STATE_NAMESPACE, summary.refresh_state_key(ARTIST, source),
+                {"status": "complete", "refresh_id": lease["refresh_id"]},
+                summary.RETRY_TTL, ARTIST, source, lease["refresh_id"],
+            ))
+            return read_state(artist_mbid, source)
+
+        with patch.object(worker, "_state", side_effect=state_after_completion), \
+                patch.object(worker, "jobs", Queue(maxsize=32)), patch.object(worker, "_started", True):
+            value = worker.request_summary(ARTIST)
+            self.assertFalse(value["pending"])
+            self.assertEqual(value["topTracks"], entries)
+            self.assertTrue(worker.jobs.empty())
+
+    def test_poll_does_not_requeue_refresh_completed_before_claim(self):
+        self.save("bio", bio={"text": "Biography"})
+        deezer_artist.select(ARTIST, {"relations": [
+            {"url": {"resource": "https://www.deezer.com/artist/42"}},
+        ]})
+        claim = worker._claim
+
+        def claim_after_other_refresh(artist_mbid, source, **kwargs):
+            self.assertTrue(claim(artist_mbid, source))
+            with patch.object(deezer, "top_tracks", return_value=[track(9)]), \
+                    patch.object(deezer, "track", side_effect=track), \
+                    patch.object(summary, "resolve_track", return_value={
+                        "recording_mbid": SATIVA, "release_group_mbid": GROUP,
+                    }):
+                worker.process_job(artist_mbid, source)
+            return claim(artist_mbid, source, **kwargs)
+
+        with patch.object(worker, "_claim", side_effect=claim_after_other_refresh), \
+                patch.object(worker, "jobs", Queue(maxsize=32)), patch.object(worker, "_started", True):
+            value = worker.request_summary(ARTIST)
+            self.assertFalse(value["pending"])
+            self.assertEqual([row["deezer_track_id"] for row in value["topTracks"]], [9])
+            self.assertTrue(worker.jobs.empty())
+
     def test_biography_can_publish_while_top_tracks_are_pending(self):
         gate = Event()
 
