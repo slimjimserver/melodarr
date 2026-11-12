@@ -132,11 +132,15 @@ for (const width of [1280, 700, 390, 320]) {
       const metadata = card.querySelector(".release-group-metadata")!.getBoundingClientRect();
       const button = card.querySelector(".release-group-request")!.getBoundingClientRect();
       const title = card.querySelector("h2")!.getBoundingClientRect();
-      return { metadata: { top: metadata.top, right: metadata.right, left: metadata.left },
-        button: { bottom: button.bottom, right: button.right, left: button.left },
+      return { metadata: { top: metadata.top, bottom: metadata.bottom, right: metadata.right, left: metadata.left },
+        button: { top: button.top, bottom: button.bottom, right: button.right, left: button.left },
         title: { left: title.left, right: title.right } };
     });
-    if (width <= 700) {
+    if (width <= 360) {
+      expect(bounds.button.top).toBeGreaterThanOrEqual(bounds.metadata.bottom);
+      expect(bounds.metadata.right).toBeCloseTo(bounds.button.right, 0);
+      expect(bounds.metadata.left).toBeCloseTo(bounds.title.left, 0);
+    } else if (width <= 700) {
       expect(bounds.metadata.top).toBeGreaterThanOrEqual(bounds.button.bottom);
       expect(bounds.metadata.right).toBeCloseTo(bounds.button.right, 0);
       expect(bounds.metadata.left).toBeCloseTo(bounds.title.left, 0);

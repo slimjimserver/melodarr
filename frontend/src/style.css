@@ -68,7 +68,101 @@ header, main, .auth-view { position: relative; z-index: 1; }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; scroll-behavior: auto !important; transition-duration: .01ms !important; } }
 
 [hidden] { display: none !important; }
-body:not(.authenticated) header, body:not(.authenticated) main, body:not(.authenticated) .tab-bar { display: none; }
+body.room-guest main { display: block; padding-top: 32px; padding-bottom: 32px; max-width: 920px; margin-inline: auto; }
+#rooms, #room-root { max-width: 864px; margin-inline: auto; min-width: 0; }
+#rooms > h1, .room-guest main > h1 { font-size: 26px; line-height: 1.2; letter-spacing: -.04em; }
+#rooms > .eyebrow, .room-guest main > .eyebrow { color: var(--accent-bright); margin-bottom: 8px; }
+.room-panel { margin-block: 16px 28px; }
+.room-search { margin-block: 32px; padding-top: 24px; border-top: 1px solid var(--border); }
+.room-heading, .room-search-form { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
+.room-heading { justify-content: space-between; margin-bottom: 28px; }
+.room-heading h2 { margin: 0 0 4px; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
+.room-heading p { margin: 0; color: var(--foreground-muted); font-size: 12px; }
+.room-heading input { width: 100%; }
+.room-heading > div { min-width: 0; }
+.room-header-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+#room-root .room-end { color: var(--danger); border-color: transparent; background: transparent; }
+.room-header-actions.has-sync-error button:nth-child(2) { border-color: var(--accent); }
+.room-invite-dialog { position: fixed; width: min(360px, calc(100vw - 32px)); max-height: calc(100dvh - 32px); box-sizing: border-box; overflow: auto; padding: 28px; border: 1px solid var(--border-hover); border-radius: 16px; background: var(--background-elevated); color: var(--foreground); text-align: center; }
+.room-invite-dialog::backdrop { background: rgb(0 0 0 / .65); }
+.room-invite-dialog h2 { margin: 0 0 20px; font-size: 20px; }
+#room-root .room-invite-close { position: absolute; top: 8px; right: 8px; padding: 4px 10px; font-size: 20px; background: transparent; border-color: transparent; }
+.room-invite-qr { display: block; width: min(240px, 100%); aspect-ratio: 1; margin-inline: auto; background: white; border-radius: 4px; shape-rendering: crispEdges; }
+.room-invite-code { margin: 16px 0; font-size: 26px; font-weight: 650; letter-spacing: .16em; overflow-wrap: anywhere; }
+.room-invite-status { color: var(--foreground-muted); font-size: 12px; }
+.room-invite-status:empty { display: none; }
+.room-invite-fallback { display: grid; gap: 8px; font-size: 12px; text-align: left; }
+.room-invite-fallback input { width: 100%; min-width: 0; }
+#room-root .room-message { min-height: 0; margin: 8px 0; font-size: 12px; }
+#room-root .room-message.success { color: var(--success); }
+#room-root .room-message:empty, .room-connection:empty { display: none; }
+#room-root button { border: 1px solid var(--border-hover); border-radius: 8px; background: var(--surface); color: var(--foreground); cursor: pointer; font: inherit; font-size: 12px; padding: 9px 12px; }
+#room-root button:hover:enabled { background: var(--surface-hover); border-color: var(--accent); }
+#room-root button:disabled { cursor: default; opacity: .4; }
+#room-root :is(button, input):focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 3px; }
+.room-now-playing { display: grid; grid-template-columns: minmax(0, 280px) minmax(0, 1fr); align-items: center; gap: clamp(24px, 5vw, 48px); margin-bottom: 36px; }
+.room-artwork { position: relative; display: grid; place-items: center; flex: none; width: 60px; aspect-ratio: 1; overflow: hidden; border-radius: 8px; background: linear-gradient(145deg, var(--accent-glow), var(--surface-solid)); color: var(--accent-bright); }
+.room-artwork img { position: absolute; inset: 0; display: block; width: 100%; height: 100%; object-fit: cover; }
+.room-artwork:not(.has-artwork) img { opacity: 0; }
+.room-artwork-placeholder { font-size: 28px; opacity: .65; }
+.room-artwork.has-artwork .room-artwork-placeholder { visibility: hidden; }
+.room-now-playing > .room-artwork { width: 100%; border-radius: 18px; box-shadow: var(--shadow-artwork); }
+.room-now-playing .room-artwork-placeholder { font-size: 84px; }
+.room-now-metadata { min-width: 0; overflow-wrap: anywhere; }
+.room-now-metadata .eyebrow { color: var(--accent-bright); margin-bottom: 14px; }
+.room-now-title { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 3; margin: 0 0 12px; font-size: clamp(26px, 4vw, 40px); letter-spacing: -.045em; line-height: 1.12; }
+.room-now-artist { margin: 0 0 6px; font-size: 19px; line-height: 1.35; }
+.room-now-album { margin: 0; color: var(--foreground-muted); font-size: 14px; line-height: 1.5; }
+.room-queue-heading { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; margin: 28px 0 10px; }
+.room-queue-heading h2, .room-search h2 { margin: 0; font-size: 20px; letter-spacing: -.035em; }
+.room-queue-heading > span { color: var(--foreground-muted); font-size: 12px; }
+.room-queue { margin: 0; padding: 0; list-style: none; }
+.room-queue li, .room-next-preview { display: grid; grid-template-columns: 60px minmax(0, 1fr) auto; align-items: center; gap: 14px; padding: 12px 0; border-bottom: 1px solid var(--border); }
+.room-entry-detail { min-width: 0; overflow-wrap: anywhere; }
+.room-entry-title { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2; font-size: 14px; font-weight: 650; line-height: 1.4; }
+.room-entry-detail p { margin: 3px 0 0; color: var(--foreground-muted); font-size: 13px; line-height: 1.4; }
+.room-entry-artist { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.room-entry-meta { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; margin-top: 6px; }
+.room-entry-meta .request-lifecycle, .room-lock { display: inline-block; width: fit-content; margin: 0; border: 1px solid var(--border); border-radius: var(--radius-pill); padding: 2px 6px; background: var(--surface); color: var(--foreground-subtle); font-size: 10px; line-height: 1.5; font-weight: 550; }
+.room-entry-meta .request-lifecycle.ready { color: var(--success); }
+.room-lock { color: var(--accent-bright); background: var(--accent-glow); border-color: transparent; }
+.room-requester { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--foreground-muted); font-size: 11px; line-height: 1.5; }
+.room-entry-controls { display: flex; gap: 4px; }
+#room-root .room-entry-controls button { display: grid; place-items: center; width: 32px; height: 36px; padding: 0; border-color: transparent; background: transparent; font-size: 18px; }
+.room-entry-more { position: relative; }
+.room-entry-menu { position: absolute; z-index: 5; top: calc(100% + 4px); right: 0; width: 164px; padding: 4px; border: 1px solid var(--border-hover); border-radius: 8px; background: var(--background-elevated); box-shadow: var(--shadow-artwork); }
+#room-root .room-entry-controls .room-entry-menu button { justify-items: start; width: 100%; height: auto; padding: 9px 10px; font-size: 12px; text-align: left; }
+.room-connection, .room-empty { color: var(--foreground-muted); font-size: 12px; line-height: 1.6; }
+.room-connection { min-height: 16px; margin: 8px 0; }
+.room-warning { padding: 10px 12px; border-radius: 8px; background: var(--requested-surface); color: var(--foreground-subtle); font-size: 12px; line-height: 1.5; }
+.room-search-form { align-items: end; margin-top: 16px; }
+.room-search-form label { flex: 1; min-width: 140px; font-size: 12px; }
+.room-search-form input { width: 100%; }
+.room-search-result { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--border); }
+.room-search-result .room-entry-detail { flex: 1; min-width: 100px; }
+.room-join { max-width: 420px; display: grid; gap: 20px; }
+.room-device-picker fieldset { display: grid; gap: 14px; margin-block: 16px; border: 1px solid var(--border); }
+.room-device-picker label { display: flex; align-items: center; gap: 12px; overflow-wrap: anywhere; }
+.room-device-picker input { width: auto; flex: none; }
+.room-device-picker p { margin-block: 4px; }
+@media (max-width: 600px) {
+  body.room-guest main { padding-inline: 16px; }
+  .room-heading { gap: 8px; margin-bottom: 24px; }
+  .room-now-playing { grid-template-columns: minmax(0, 1fr); justify-items: center; gap: 24px; }
+  .room-now-playing > .room-artwork { max-width: 360px; }
+  .room-now-metadata { width: 100%; text-align: center; }
+  .room-now-title { font-size: 28px; }
+  .room-now-artist { font-size: 17px; }
+  .room-now-metadata .eyebrow { margin-bottom: 10px; font-size: 10px; }
+  .room-queue li, .room-next-preview { grid-template-columns: 52px minmax(0, 1fr) auto; gap: 8px; }
+  .room-queue .room-artwork, .room-next-preview .room-artwork { width: 52px; }
+  .room-entry-controls { gap: 0; }
+  #room-root .room-entry-controls button { width: 28px; height: 36px; }
+  .room-entry-title { font-size: 13px; }
+  .room-entry-detail p { font-size: 12px; }
+  .room-header-actions { gap: 4px; }
+}
+body:not(.authenticated) header, body:not(.authenticated):not(.room-guest) main, body:not(.authenticated) .tab-bar { display: none; }
 body.authenticated #auth { display: none; }
 .pull-to-refresh { position: fixed; top: calc(-44px + env(safe-area-inset-top, 0px)); left: 50%; z-index: 50; display: grid; width: 36px; height: 36px; place-items: center; border: 1px solid var(--border-hover); border-radius: 50%; background: var(--background-elevated); color: var(--foreground-muted); opacity: 0; pointer-events: none; transform: translate(-50%, calc(var(--pull-progress, 0) * 62px)) rotate(calc(var(--pull-progress, 0) * 180deg)); transition: opacity .15s var(--ease-out), color .15s var(--ease-out); }
 .pull-to-refresh.visible { opacity: 1; }
@@ -112,7 +206,7 @@ nav { display: flex; height: 100%; gap: 8px; }
 .tab-bar { display: none; }
 
 .auth-view { display: grid; min-height: 100vh; place-items: center; padding: 32px 24px; }
-.auth-card, .setup-card, .artist-card, .service-card, .artist-meta, .library-card, .discography-nav, .discography-similar-nav,
+.auth-card, .setup-card, .artist-card, .service-card, .artist-meta, .library-card, .discography-nav, .discography-similar-nav, .artist-biography-card,
 :where(#artist-anime) .release-anime-theme-link {
   position: relative; overflow: hidden; border: 1px solid var(--border); background: var(--surface-raised);
   box-shadow: var(--shadow-card), inset 0 1px rgba(255, 255, 255, .8);
@@ -212,13 +306,16 @@ h1 em { font-style: normal; }
 .recommendations-heading h2 { margin: 0; font-size: 27px; letter-spacing: -.04em; }
 .recommendation-row { min-width: 0; margin-top: 30px; content-visibility: auto; contain-intrinsic-size: auto 270px; }
 .recommendation-row h3 { margin: 0 0 12px; font-size: 17px; letter-spacing: -.02em; }
-.recommendation-carousel { display: flex; width: 100%; max-width: 100%; gap: 13px; overflow-x: auto; overflow-y: hidden; padding: 2px 2px 14px; scroll-snap-type: x proximity; scrollbar-color: var(--border-hover) transparent; -webkit-overflow-scrolling: touch; overscroll-behavior-x: contain; touch-action: pan-x pan-y pinch-zoom; }
+.recommendation-carousel { --recommendation-art-size: 154px; display: flex; width: 100%; max-width: 100%; gap: 13px; overflow-x: auto; overflow-y: hidden; padding: 2px 2px 14px; scroll-snap-type: x proximity; scrollbar-color: var(--border-hover) transparent; -webkit-overflow-scrolling: touch; overscroll-behavior-x: contain; touch-action: pan-x pan-y pinch-zoom; }
 .recommendation-carousel::-webkit-scrollbar { height: 7px; }
 .recommendation-carousel::-webkit-scrollbar-thumb { border-radius: 999px; background: var(--border-hover); }
-.recommendation-card { position: relative; display: grid; flex: 0 0 154px; gap: 8px; scroll-snap-align: start; cursor: pointer; outline: none; }
+.recommendation-card { position: relative; display: grid; flex: 0 0 var(--recommendation-art-size, 154px); gap: 8px; scroll-snap-align: start; cursor: pointer; outline: none; }
 .recommendation-open { display: grid; position: relative; min-width: 0; gap: 8px; border: 0; background: transparent; color: inherit; padding: 0; cursor: pointer; text-align: left; text-decoration: none; }
 .recommendation-open:focus-visible .recommendation-art { border-color: var(--accent-bright); box-shadow: 0 10px 25px rgba(68, 50, 38, .16), 0 0 0 2px rgba(168, 68, 45, .18); transform: translateY(-2px); }
-.recommendation-art { display: block; width: 154px; aspect-ratio: 1; border: 1px solid var(--border); border-radius: 12px; background: var(--background-elevated); object-fit: cover; transition: transform .2s var(--ease-out), border-color .2s var(--ease-out), box-shadow .2s var(--ease-out); }
+.recommendation-art, .skeleton-art { width: var(--recommendation-art-size, 154px); height: var(--recommendation-art-size, 154px); aspect-ratio: 1; overflow: hidden; border-radius: 12px; }
+.recommendation-art { position: relative; display: block; border: 1px solid var(--border); background: var(--background-elevated); transition: transform .2s var(--ease-out), border-color .2s var(--ease-out), box-shadow .2s var(--ease-out); }
+.recommendation-art > img, .recommendation-art > .recommendation-fallback { position: absolute; inset: 0; display: block; width: 100%; height: 100%; }
+.recommendation-art > img { object-fit: cover; }
 .recommendation-fallback { background: linear-gradient(135deg, #7f89ed, #252951 62%, #be6a9b); }
 .recommendation-source { display: flex; position: absolute; top: 8px; left: 8px; align-items: center; max-width: calc(100% - 16px); overflow: hidden; border: 1px solid rgba(255, 255, 255, .32); border-radius: 999px; background: rgba(55, 45, 39, .88); color: #fffaf4; padding: 3px 6px; white-space: nowrap; gap: 4px; font-size: 10px; font-weight: 700; }
 .recommendation-source > img { width: 13px; height: 13px; flex: none; object-fit: contain; }
@@ -232,6 +329,10 @@ h1 em { font-style: normal; }
 .artist-card { display: flex; align-items: center; gap: 15px; border-radius: var(--radius-card); padding: 13px 15px; transition: border-color var(--duration-standard) var(--ease-out), background var(--duration-standard) var(--ease-out), box-shadow var(--duration-standard) var(--ease-out), transform var(--duration-standard) var(--ease-out); }
 .artist-card.clickable { cursor: default; }
 .card-open { display: flex; min-width: 0; flex: 1; align-items: center; gap: 15px; border: 0; background: transparent; color: inherit; padding: 0; cursor: pointer; text-align: left; text-decoration: none; }
+.release-card-content { display: flex; min-width: 0; flex: 1; align-items: center; gap: 15px; }
+.release-card .avatar { border-radius: 10px; }
+.release-card .artist-info h2 { overflow-wrap: anywhere; }
+.release-card-state { display: inline-flex; align-items: center; justify-content: center; flex: none; min-height: 40px; min-width: 92px; color: var(--foreground-muted); font-size: 12px; line-height: 1.35; }
 .avatar { width: 44px; height: 44px; flex: none; border: 1px solid var(--border); border-radius: 50%; background: linear-gradient(135deg, #e3ad8f, #c97459 54%, #8375a8); }
 .cover-art { width: 44px; height: 44px; flex: none; border: 1px solid rgba(255, 255, 255, .1); border-radius: 10px; background: var(--background-elevated); object-fit: cover; }
 .artist-info { min-width: 0; flex: 1; }
@@ -278,6 +379,30 @@ h1 em { font-style: normal; }
 .discography-similar-nav { width: 100%; min-height: 58px; border-radius: 12px; color: var(--foreground-subtle); cursor: pointer; padding: 12px 17px; font: 600 13px/1.3 inherit; text-align: left; }
 .discography-similar-nav[aria-expanded="true"] { border-color: var(--accent); color: var(--foreground); }
 .discography-content { min-width: 0; }
+.artist-summary-view { min-width: 0; }
+.artist-summary-view > h2 { margin: 0 0 18px; }
+.artist-summary-view > .message:empty { display: none; }
+.artist-biography-card { border-radius: var(--radius-panel); padding: clamp(18px, 3vw, 24px); }
+.artist-biography-heading { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px 16px; }
+.artist-biography-heading h3 { margin: 0; font-size: 17px; letter-spacing: -.02em; }
+.artist-biography-source { display: inline-flex; align-items: center; gap: 6px; color: var(--foreground-muted); font-size: 12px; line-height: 1.4; }
+.wikipedia-mark { display: inline-block; flex: none; width: 19px; height: 19px; background: currentColor; mask: url("/icons/wikipedia.svg") center / contain no-repeat; }
+.artist-summary-bio { max-width: 68ch; margin: 16px 0 0; color: var(--foreground-subtle); font-size: 14px; line-height: 1.75; overflow-wrap: anywhere; white-space: normal; }
+.artist-biography-footer { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; margin-top: 16px; padding-top: 10px; border-top: 1px solid var(--border); }
+.artist-biography-footer:empty { display: none; }
+.artist-biography-toggle { min-height: 44px; border-color: transparent; background: transparent; color: var(--accent-bright); padding: 8px 0; box-shadow: none; }
+.artist-biography-footer a { display: inline-flex; align-items: center; gap: 4px; min-height: 44px; margin-left: auto; color: var(--foreground-muted); font-size: 12px; text-decoration: none; }
+.artist-biography-footer a:hover { color: var(--accent-bright); text-decoration: underline; }
+.artist-biography-footer :is(a, button):focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 3px; border-radius: var(--radius-control); }
+.artist-top-tracks { display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; }
+.artist-top-tracks li { min-width: 0; }
+.artist-top-tracks li::marker { content: ""; }
+.artist-summary-tracks h3 { margin: 28px 0 4px; }
+.artist-summary-tracks h3 + .field-help { margin: 0 0 14px; }
+@media (max-width: 700px) {
+  .discography-sidebar:has(.artist-summary-nav) { grid-template-columns: minmax(0, 1fr) auto; }
+  .artist-summary-nav { grid-row: 1; grid-column: 1 / -1; justify-self: start; }
+}
 .similar-artists-view { max-width: 100%; margin-top: 0; content-visibility: visible; }
 .similar-artists-status { margin: 6px 0 12px; }
 .similar-artists-list { display: grid; width: 100%; max-width: 100%; gap: 10px; }
@@ -420,7 +545,7 @@ h1 em { font-style: normal; }
 .skeleton::after { position: absolute; inset: 0; background: linear-gradient(90deg, transparent, rgba(255, 255, 255, .62) 50%, transparent); animation: skeleton-sweep 1.4s infinite; content: ""; }
 @keyframes skeleton-sweep { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
 .skeleton-card { height: 74px; }
-.skeleton-art { width: 154px; height: 154px; flex: 0 0 154px; border-radius: 12px; }
+.skeleton-art { flex: 0 0 var(--recommendation-art-size, 154px); border-radius: 12px; }
 
 .empty-state {
   display: grid;
@@ -823,8 +948,7 @@ details summary { margin-bottom: 17px; color: var(--accent-bright); cursor: poin
      page gutter, while their first card stays aligned with the heading. */
   .recommendations { width: 100%; margin-left: 0; transform: none; }
   .recommendation-carousel { margin: 0 -16px; padding-right: 16px; padding-left: 16px; scroll-padding-left: 16px; }
-  .recommendation-card { flex-basis: 132px; }
-  .recommendation-art, .skeleton-art { width: 132px; flex-basis: 132px; height: 132px; }
+  .recommendation-carousel { --recommendation-art-size: 132px; }
   .detail-heading { gap: 22px; }
   .detail-cover { width: min(280px, 100%); }
   .detail-cover.anime-cover { width: min(116px, 34vw); justify-self: start; border-radius: 12px; }
@@ -1092,6 +1216,7 @@ button,
 :root[data-theme="midnight"] .artist-card,
 :root[data-theme="midnight"] :where(#artist-anime) .release-anime-theme-link,
 :root[data-theme="midnight"] .artist-meta,
+:root[data-theme="midnight"] .artist-biography-card,
 :root[data-theme="midnight"] .library-card {
   background: var(--surface-raised);
   box-shadow: var(--shadow-card);
@@ -1256,6 +1381,16 @@ button,
   .theme-toggle { width: 44px; min-width: 44px; height: 44px; flex: 0 0 44px; padding: 0; }
 }
 
+@media (min-width: 701px) and (max-width: 900px) {
+  /* Leave room for all five links and account controls with wider system fonts. */
+  header { gap: 8px; padding-right: 12px; padding-left: 12px; }
+  .header-nav { gap: 0; }
+  .header-nav .nav-link { padding-right: 4px; padding-left: 4px; }
+  .logout { display: grid; flex: 0 0 44px; width: 44px; height: 44px; place-items: center; padding: 0; }
+  .logout-icon { display: block; }
+  .logout-label { position: absolute; width: 1px; height: 1px; overflow: hidden; margin: -1px; clip: rect(0 0 0 0); white-space: nowrap; }
+}
+
 @media (max-width: 700px) {
   header { padding-right: 14px; padding-left: 14px; }
 
@@ -1302,8 +1437,8 @@ button,
 }
 
 /* Personal recommendations give the reason and decision controls room to breathe. */
-.recommendation-card[data-personal-recommendation] { flex-basis: 210px; align-content: start; cursor: default; }
-.recommendation-card[data-personal-recommendation] .recommendation-art { width: 100%; }
+.recommendation-card[data-personal-recommendation], .recommendation-loading { --recommendation-art-size: 210px; }
+.recommendation-card[data-personal-recommendation] { align-content: start; cursor: default; }
 .recommendation-card[data-personal-recommendation] .recommendation-info strong,
 .recommendation-card[data-personal-recommendation] .recommendation-info span { white-space: normal; }
 .recommendation-reason { margin: 0; color: var(--foreground-muted); font-size: 12px; line-height: 1.5; min-height: 54px; }
@@ -1315,8 +1450,7 @@ button,
 .recommendation-browse, .recommendation-outcomes { margin-top: 28px; border-top: 1px solid var(--border); padding-top: 20px; }
 .recommendation-browse summary, .recommendation-outcomes summary { cursor: pointer; min-height: 44px; align-content: center; }
 @media (max-width: 700px) {
-  .recommendation-card[data-personal-recommendation] { flex-basis: 176px; }
-  .recommendation-card[data-personal-recommendation] .recommendation-art { height: 176px; }
+  .recommendation-card[data-personal-recommendation], .recommendation-loading { --recommendation-art-size: 176px; }
 }
 
 .popular-albums { margin-top: 32px; }
@@ -1401,10 +1535,11 @@ button,
 .artist-anime-sort select { width: auto; max-width: 100%; min-height: 44px; }
 
 .artist-info .release-group-metadata { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.artist-top-track .release-group-metadata { white-space: normal; overflow-wrap: anywhere; }
 
 /* Mobile discography: keep the action beside the title, with metadata below both. */
 @media (max-width: 700px) {
-  .artist-discography .artist-card[data-release-group-id] {
+  .artist-discography .release-card {
     display: grid;
     grid-template-columns: 44px minmax(0, 1fr) auto;
     grid-template-rows: auto auto;
@@ -1412,7 +1547,7 @@ button,
     row-gap: 3px;
     align-items: center;
   }
-  .artist-discography .artist-card[data-release-group-id] > .card-open {
+  .artist-discography .release-card > .release-card-content {
     display: grid;
     grid-column: 1 / -1;
     grid-row: 1 / 3;
@@ -1420,30 +1555,40 @@ button,
     grid-template-rows: subgrid;
     gap: inherit;
   }
-  .artist-discography .artist-card[data-release-group-id] .artist-info { display: contents; }
-  .artist-discography .artist-card[data-release-group-id] .card-open > :is(.avatar, .cover-art) {
+  .artist-discography .release-card .artist-info { display: contents; }
+  .artist-discography .release-card .release-card-content > :is(.avatar, .cover-art) {
     grid-column: 1;
     grid-row: 1 / 3;
     align-self: center;
   }
-  .artist-discography .artist-card[data-release-group-id] .artist-info h2 {
+  .artist-discography .release-card .artist-info h2 {
     grid-column: 2;
     grid-row: 1;
     min-width: 0;
     margin: 0;
     overflow-wrap: anywhere;
   }
-  .artist-discography .artist-card[data-release-group-id] .release-group-metadata {
+  .artist-discography .release-card .release-group-metadata {
     grid-column: 2 / -1;
     grid-row: 2;
     min-width: 0;
   }
-  .artist-discography .artist-card[data-release-group-id] > .release-group-request {
+  .artist-discography .release-card > :is(.release-group-request, .release-card-state) {
     grid-column: 3;
     grid-row: 1;
     z-index: 1;
     margin-left: 0;
     align-self: start;
+  }
+}
+
+/* At the narrowest widths, share the title column and place actions below it. */
+@media (max-width: 360px) {
+  .artist-discography .release-card { grid-template-columns: 44px minmax(0, 1fr); }
+  .artist-discography .release-card > :is(.release-group-request, .release-card-state) {
+    grid-column: 2;
+    grid-row: 3;
+    justify-self: end;
   }
 }
 

@@ -1,5 +1,6 @@
 """Disk-backed artwork caching, resizing, and eviction."""
 
+import logging
 import os
 import time
 from contextlib import contextmanager
@@ -9,7 +10,7 @@ from tempfile import NamedTemporaryFile
 from threading import Lock
 
 import requests
-from flask import current_app, redirect, send_file
+from flask import current_app, has_app_context, redirect, send_file
 from PIL import Image, UnidentifiedImageError
 
 if __package__:
@@ -51,6 +52,10 @@ _last_trim_at = None
 _cached_size_bytes = None
 
 
+def _logger():
+    return current_app.logger if has_app_context() else logging.getLogger(__name__)
+
+
 @contextmanager
 def _artwork_key_lock(cache_key):
     """Serialize cache misses for one image without retaining locks forever."""
@@ -88,9 +93,8 @@ def _scan_evictable_entries():
     try:
         with os.scandir(ARTWORK_CACHE_DIRECTORY) as directory:
             for entry in directory:
-                if (
-                    not entry.is_file(follow_symlinks=False)
-                    or not _evictable_filename(entry.name)
+                if not entry.is_file(follow_symlinks=False) or not _evictable_filename(
+                    entry.name
                 ):
                     continue
                 stat = entry.stat(follow_symlinks=False)
@@ -135,9 +139,8 @@ def _trim_artwork_misses_locked(now):
     try:
         with os.scandir(ARTWORK_CACHE_DIRECTORY) as directory:
             for entry in directory:
-                if (
-                    not entry.name.endswith(".miss")
-                    or not entry.is_file(follow_symlinks=False)
+                if not entry.name.endswith(".miss") or not entry.is_file(
+                    follow_symlinks=False
                 ):
                     continue
                 try:
@@ -261,23 +264,23 @@ def build_artwork_variant(original_path, cache_key, size):
             buffer = BytesIO()
             image.save(buffer, format="WEBP", quality=ARTWORK_WEBP_QUALITY, method=4)
     except (OSError, ValueError, UnidentifiedImageError) as exc:
-        current_app.logger.warning(
-            "Could not resize artwork %s to %s: %s", cache_key, size, exc
-        )
+        _logger().warning("Could not resize artwork %s to %s: %s", cache_key, size, exc)
         return None
 
     final_path = variant_cache_file(cache_key, size)
     temporary_path = None
     try:
         os.makedirs(ARTWORK_CACHE_DIRECTORY, exist_ok=True)
-        with NamedTemporaryFile("wb", dir=ARTWORK_CACHE_DIRECTORY, delete=False) as file:
+        with NamedTemporaryFile(
+            "wb", dir=ARTWORK_CACHE_DIRECTORY, delete=False
+        ) as file:
             temporary_path = file.name
             file.write(buffer.getvalue())
         _replace_cache_file(temporary_path, final_path)
         temporary_path = None
         return final_path
     except OSError as exc:
-        current_app.logger.warning("Could not store artwork variant %s: %s", cache_key, exc)
+        _logger().warning("Could not store artwork variant %s: %s", cache_key, exc)
         return None
     finally:
         if temporary_path and os.path.exists(temporary_path):
@@ -288,6 +291,12 @@ def plex_artist_artwork_key(server_id, rating_key, thumb=""):
     """Return a versioned, filesystem-safe key for a Plex artist thumbnail."""
     identity = f"{server_id}:{rating_key}:{thumb}".encode()
     return f"plex-artist-{sha256(identity).hexdigest()}"
+
+
+def plex_album_artwork_key(server_id, rating_key, thumb):
+    """Album revisions share the existing bounded disk cache and variants."""
+    identity = f"{server_id}:{rating_key}:{thumb}".encode()
+    return f"plex-album-{sha256(identity).hexdigest()}"
 
 
 def remove_stale_plex_artist_artwork(valid_keys):
@@ -329,7 +338,7 @@ def trim_artwork_cache():
     except OSError:
         with _size_lock:
             _cached_size_bytes = None
-        current_app.logger.warning("Could not trim artwork cache in %s", ARTWORK_CACHE_DIRECTORY)
+        _logger().warning("Could not trim artwork cache in %s", ARTWORK_CACHE_DIRECTORY)
 
 
 def maybe_trim_artwork_cache():
@@ -401,57 +410,98 @@ def clear_artwork_cache():
     return removed
 
 
-def _serve(path):
+def _serve(path, *, etag=True):
     try:
         os.utime(path, None)
     except OSError:
         pass
-    return send_file(path, max_age=ARTWORK_BROWSER_CACHE_TTL)
+    mime = {
+        ".jpg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+    }.get(os.path.splitext(path)[1].lower())
+    response = send_file(
+        path, mimetype=mime, etag=etag, max_age=ARTWORK_BROWSER_CACHE_TTL
+    )
+    if response.status_code == 304:
+        # Conditional responses have no body; release the original file handle
+        # immediately (also permits cache eviction on Windows).
+        response.close()
+    return response
 
 
-def _serve_at_size(original_path, cache_key, size):
+def _serve_at_size(original_path, cache_key, size, *, etag=True):
     """Serve the requested variant, falling back to the original image."""
     if not size:
-        return _serve(original_path)
+        return _serve(original_path, etag=etag)
     variant = artwork_cache_file(cache_key, size)
     if not variant:
         variant = build_artwork_variant(original_path, cache_key, size)
-    return _serve(variant or original_path)
+    return _serve(variant or original_path, etag=etag)
+
+
+def serve_cached_artwork(cache_key, *, size=None):
+    """Cache-only serving: a browser render must never contact PMS."""
+    size = normalized_size(size)
+    # These opaque Plex keys include the artwork revision. Access-time updates
+    # used by eviction must not change a browser's conditional cache identity.
+    etag = f"{cache_key}:{size or 'original'}"
+    variant = artwork_cache_file(cache_key, size) if size else None
+    if variant:
+        return _serve(variant, etag=etag)
+    original = artwork_cache_file(cache_key)
+    return (
+        _serve_at_size(original, cache_key, size, etag=etag) if original else ("", 404)
+    )
+
+
+def warm_artwork(cache_key, source_url, *, headers=None):
+    """Populate the shared cache from a worker, without a Flask request."""
+    return _cached_artwork(cache_key, source_url, headers=headers, warm=True)
 
 
 def cached_artwork(cache_key, source_url, *, headers=None, size=None):
+    return _cached_artwork(cache_key, source_url, headers=headers, size=size)
+
+
+def _cached_artwork(cache_key, source_url, *, headers=None, size=None, warm=False):
     """Serve a cached image, downloading a safe provider URL on a miss.
 
     The full-size download is always retained as the regeneration source, so
     adding or changing a variant size never re-requests the upstream provider.
     """
     size = normalized_size(size)
+
+    def serve(path):
+        return path if warm else _serve_at_size(path, cache_key, size)
+
     variant_file = artwork_cache_file(cache_key, size) if size else None
     if variant_file:
-        return _serve(variant_file)
+        return serve(variant_file)
 
     cached_file = artwork_cache_file(cache_key)
     if cached_file and not size:
-        return _serve(cached_file)
+        return serve(cached_file)
 
     with _artwork_key_lock(cache_key):
         # A request ahead of this one may have populated the original, the
         # requested variant, or the negative-cache marker while we waited.
         variant_file = artwork_cache_file(cache_key, size) if size else None
         if variant_file:
-            return _serve(variant_file)
+            return serve(variant_file)
 
         cached_file = artwork_cache_file(cache_key)
         if cached_file:
-            return _serve_at_size(cached_file, cache_key, size)
+            return serve(cached_file)
 
         miss_file = os.path.join(ARTWORK_CACHE_DIRECTORY, f"{cache_key}.miss")
         if _fresh_artwork_miss(miss_file):
-            return "", 404
+            return None if warm else ("", 404)
 
         resolved_source_url = source_url() if callable(source_url) else source_url
         if not resolved_source_url:
-            return "", 404
+            return None if warm else ("", 404)
 
         temporary_path = None
         provider_response = None
@@ -472,7 +522,7 @@ def cached_artwork(cache_key, source_url, *, headers=None, size=None):
             )
             if provider_response.status_code == 404:
                 _record_artwork_miss(miss_file)
-                return "", 404
+                return None if warm else ("", 404)
             provider_response.raise_for_status()
             content_type = (
                 provider_response.headers.get("Content-Type", "")
@@ -507,13 +557,13 @@ def cached_artwork(cache_key, source_url, *, headers=None, size=None):
             _replace_cache_file(temporary_path, final_path)
             temporary_path = None
             _remove_artwork_miss(miss_file)
-            served_response = _serve_at_size(final_path, cache_key, size)
+            served_response = serve(final_path)
             maybe_trim_artwork_cache()
             return served_response
         except (OSError, ValueError, requests.RequestException) as exc:
-            current_app.logger.warning(
-                "Could not cache artwork %s: %s", cache_key, exc
-            )
+            _logger().warning("Could not cache artwork %s: %s", cache_key, exc)
+            if warm:
+                return None
             if headers:
                 # A browser redirect cannot carry upstream authentication.
                 # Keep private providers behind the proxy and allow a retry.
@@ -525,7 +575,7 @@ def cached_artwork(cache_key, source_url, *, headers=None, size=None):
                 try:
                     close_response()
                 except OSError:
-                    current_app.logger.debug(
+                    _logger().debug(
                         "Could not close artwork response for %s",
                         cache_key,
                         exc_info=True,

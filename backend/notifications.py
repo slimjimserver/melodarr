@@ -413,8 +413,8 @@ def queue_admin_request(
             """SELECT p.*, u.plex_email, u.username FROM user_notification_preferences p
             JOIN users u ON u.id=p.user_id
             WHERE p.enabled=1 AND p.admin_request_notifications=1
-            AND u.role='admin' AND u.id<>?""",
-            (requester_id,),
+            AND u.role='admin' AND (? IS NULL OR u.id<>?)""",
+            (requester_id, requester_id),
         ).fetchall()
         if not preferences:
             return 0

@@ -131,11 +131,23 @@ def _public_status(mbid, state=None):
 
 def status(mbid):
     """Return the current or most recently persisted state for one artist."""
+    if musicbrainz.is_library_only_artist(mbid):
+        return _library_only_status()
     return _public_status(mbid)
+
+
+def _library_only_status():
+    return {
+        "status": "library-only", "polling": False,
+        "nextCheckAt": None, "lastCheckedAt": None, "lastRefreshAt": None,
+        "cachedCount": None, "observedCount": None,
+    }
 
 
 def discography_is_fresh(mbid):
     """Return whether a complete cached artist snapshot is within its check window."""
+    if musicbrainz.is_library_only_artist(mbid):
+        return True
     mbid = str(mbid or "").casefold()
     now = time.time()
     state = _read_state(mbid)
@@ -157,6 +169,8 @@ def discography_is_fresh(mbid):
 
 def request_revalidation(mbid):
     """Queue an eligible cached artist, coalescing duplicate click requests."""
+    if musicbrainz.is_library_only_artist(mbid):
+        return _library_only_status()
     mbid = mbid.casefold()
     state = _read_state(mbid)
     now = time.time()
@@ -217,6 +231,8 @@ def request_revalidation(mbid):
 
 def request_track_refresh(mbid):
     """Schedule a complete track rebuild after a manual discography refresh."""
+    if musicbrainz.is_library_only_artist(mbid):
+        return
     mbid = str(mbid or "").casefold()
     with queue_lock:
         forced_track_artist_ids.add(mbid)
@@ -387,6 +403,8 @@ def _stage_artist_refresh(mbid, priority, old_count):
 
 def refresh_artist_metadata(mbid, priority, *, cached_count=None):
     """Stage and atomically commit a complete artist and discography refresh."""
+    if musicbrainz.is_library_only_artist(mbid):
+        return {"libraryOnly": True}
     mbid = mbid.casefold()
     with _artist_refresh_lock(mbid):
         if cached_count is None:
@@ -441,6 +459,8 @@ def refresh_artist_metadata(mbid, priority, *, cached_count=None):
 
 def _refresh_artist_tracks(mbid, counts, priority="background"):
     """Stage every artist-credited release before replacing track rows."""
+    if musicbrainz.is_library_only_artist(mbid):
+        return 0
     old = track_search_index.artist_track_snapshot_info(mbid)
     try:
         old_keys = set(json.loads(old["cache_keys"])) if old else set()
@@ -551,6 +571,8 @@ def _record_failure(mbid):
 
 
 def _process_artist(mbid, *, force_tracks=False):
+    if musicbrainz.is_library_only_artist(mbid):
+        return
     state = _read_state(mbid)
     if not force_tracks and float(state.get("nextCheckAt") or 0) > time.time():
         return

@@ -12,6 +12,7 @@ node_modules/
 .pnpm-store/
 *.tsbuildinfo
 frontend/test-results/
+benchmark-results/
 
 # Generated frontend
 frontend/static/*.js
@@ -41,6 +42,7 @@ docs/*
 !docs/api.md
 !docs/openapi.yaml
 !docs/request-history-search.md
+!docs/rooms.md
 
 # Editors / OS
 .idea/

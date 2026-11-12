@@ -35,7 +35,7 @@ interface AppElement extends HTMLElement {
   fetchPriority: string;
 }
 type AccountPage = "profile" | "requests" | "general" | "linked-accounts" | "notifications" | "invitations";
-type AppView = "discover" | "detail" | "library" | "settings" | "account";
+type AppView = "discover" | "detail" | "library" | "settings" | "account" | "rooms";
 type SettingsPage = "services" | "notifications" | "requests" | "users" | "jobs";
 type ThemeName = "midnight" | "warm";
 
@@ -75,7 +75,8 @@ interface AdminUser extends AdminUserIdentity {
 }
 
 interface AdminRequest {
-  id: number;
+  id: number | string;
+  source: "user" | "automation";
   kind: "artist" | "release-group";
   mbid: string;
   name: string;
@@ -101,7 +102,11 @@ interface AdminRequest {
   song_id?: string | number;
   song_title?: string;
   animeThemes?: AnimeThemeLink[];
-  requester: AdminUserIdentity;
+  requester: AdminUserIdentity | {
+    id: null;
+    username: string;
+    userType: "automation";
+  };
 }
 
 function pushDeviceMetadata(): JsonObject {
@@ -250,7 +255,7 @@ let accountRenderAbort: AbortController | undefined;
 let sessionExpiryHandled = false;
 // Plex holdings tell a requester what is already available, so the library is
 // readable by every account. Settings remains administrator-only.
-const VIEWS_FOR_EVERY_USER = ["discover", "detail", "library", "account"];
+const VIEWS_FOR_EVERY_USER = ["discover", "detail", "library", "account", "rooms"];
 
 if ("scrollRestoration" in window.history) {
   window.history.scrollRestoration = "manual";
@@ -1132,6 +1137,12 @@ function setupNavigation() {
     if (updateHistory) {
       const path = view === "discover" ? "/" : `/${view}`;
       window.history.pushState({ view }, "", path);
+    }
+    window.dispatchEvent(new CustomEvent("melodarr-view-changed", { detail: view }));
+    if (view === "rooms") {
+      void import(document.body.dataset.roomsSrc || "/static/rooms.js").then((module) => {
+        if (document.querySelector("#rooms.active") && currentUser) module.showHostRooms(currentUser.csrfToken || "");
+      }).catch((error) => showToast(error.message, true));
     }
     resetPageScroll();
     focusMainContent();
@@ -2042,8 +2053,8 @@ function setupNavigation() {
   window.addEventListener("popstate", () => {
     // Fixed application routes take precedence over username routes, including
     // when authentication restores the current URL after a full page load.
-    if (["/", "/discover", "/library", "/library/"].includes(window.location.pathname)) {
-      showView(window.location.pathname.startsWith("/library") ? "library" : "discover", false);
+    if (["/", "/discover", "/library", "/library/", "/rooms"].includes(window.location.pathname)) {
+      showView(window.location.pathname === "/rooms" ? "rooms" : window.location.pathname.startsWith("/library") ? "library" : "discover", false);
       return;
     }
     if (["/settings", "/settings/notifications", "/settings/requests", "/settings/users", "/settings/jobs"].includes(window.location.pathname)) {
@@ -2083,12 +2094,12 @@ function setupNavigation() {
       return;
     }
     const view = window.location.pathname.slice(1) || "discover";
-    showView((["discover", "library", "settings"].includes(view) ? view : "discover") as AppView, false);
+    showView((["discover", "library", "settings", "rooms"].includes(view) ? view : "discover") as AppView, false);
   });
 
   const initialView = window.location.pathname.slice(1) || "discover";
   if (["settings/notifications", "settings/requests", "settings/users", "settings/jobs"].includes(initialView)) showView("settings", false);
-  else if (["library", "settings"].includes(initialView)) showView(initialView as AppView, false);
+  else if (["library", "settings", "rooms"].includes(initialView)) showView(initialView as AppView, false);
 
   document.querySelectorAll<HTMLAnchorElement>(".tab-bar .nav-link").forEach((link) => link.addEventListener("click", (event) => {
     if (event.defaultPrevented) {
@@ -2171,6 +2182,12 @@ function adminUserDisplayName(user: AdminUserIdentity) {
 /** Use the unique local identity for routes; Plex display names may collide. */
 function adminUserRouteUsername(user: AdminUserIdentity) {
   return user.localUsername || user.username;
+}
+
+function adminRequestDisplayName(item: AdminRequest) {
+  return item.requester.userType === "automation"
+    ? "Automation API"
+    : adminUserDisplayName(item.requester);
 }
 
 function createUserAvatar(user: AdminUserIdentity, large = false) {
@@ -2265,13 +2282,27 @@ function createAdminRequestItem(item: AdminRequest) {
   const requester = document.createElement("div");
   requester.className = "admin-request-requester";
   const requesterCopy = document.createElement("span");
-  const requesterName = document.createElement("a");
-  requesterName.className = "admin-request-requester-link";
-  requesterName.href = `/${encodeURIComponent(adminUserRouteUsername(item.requester))}`;
-  requesterName.textContent = adminUserDisplayName(item.requester);
+  let requesterName: HTMLElement;
+  let avatar: HTMLElement;
+  if (item.requester.userType === "automation") {
+    requesterName = document.createElement("strong");
+    avatar = document.createElement("span");
+    avatar.className = "user-avatar";
+    avatar.textContent = "A";
+    avatar.setAttribute("aria-hidden", "true");
+  } else {
+    const link = document.createElement("a");
+    link.className = "admin-request-requester-link";
+    link.href = `/${encodeURIComponent(adminUserRouteUsername(item.requester))}`;
+    requesterName = link;
+    avatar = createUserAvatar(item.requester);
+  }
+  requesterName.textContent = adminRequestDisplayName(item);
   const requesterMeta = document.createElement("small");
   const requestedAtDate = joinedDate(item.created_at);
-  const accountType = item.requester.userType === "plex" ? "Plex user" : "Local account";
+  const accountType = item.requester.userType === "automation"
+    ? "Automation"
+    : item.requester.userType === "plex" ? "Plex user" : "Local account";
   if (requestedAtDate) {
     const requestedAt = document.createElement("time");
     requestedAt.dateTime = requestedAtDate.toISOString();
@@ -2282,7 +2313,7 @@ function createAdminRequestItem(item: AdminRequest) {
     requesterMeta.textContent = accountType;
   }
   requesterCopy.append(requesterName, requesterMeta);
-  requester.append(createUserAvatar(item.requester), requesterCopy);
+  requester.append(avatar, requesterCopy);
 
   row.append(detail, requester);
   const plexBadge = createAdminRequestPlexBadge(item);
@@ -2323,9 +2354,9 @@ function renderAdminRequests() {
       item.artist_name,
       item.release_type,
       item.release_date,
-      adminUserDisplayName(item.requester),
-      item.requester.localUsername,
-      item.requester.plexEmail,
+      adminRequestDisplayName(item),
+      item.requester.userType !== "automation" ? item.requester.localUsername : "",
+      item.requester.userType !== "automation" ? item.requester.plexEmail : "",
     ].filter(Boolean).join(" ")).includes(query);
   });
   list.replaceChildren();
@@ -2335,7 +2366,7 @@ function renderAdminRequests() {
     empty.className = "message admin-request-empty";
     empty.textContent = adminRequests.length
       ? "No requests match the current filters."
-      : "No requests yet. Artist and release requests will appear here as users make them.";
+      : "No requests yet. Requests from users and automation will appear here.";
     list.append(empty);
   } else {
     visibleRequests.forEach((item) => list.append(createAdminRequestItem(item)));

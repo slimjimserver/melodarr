@@ -24,6 +24,18 @@ await build({
   target: "es2022",
 });
 
+await build({
+  entryPoints: ["src/rooms.ts"],
+  outdir: staticDirectory,
+  bundle: true,
+  format: "esm",
+  banner: { js: "/*! qrcode-generator 2.0.4 · Copyright (c) 2009 Kazuhiko Arase · MIT · /static/third-party-licenses.txt */" },
+  legalComments: "none",
+  minify: true,
+  sourcemap: false,
+  target: "es2022",
+});
+
 const initialFiles = await readdir(staticDirectory);
 await Promise.all(
   initialFiles

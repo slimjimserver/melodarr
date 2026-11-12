@@ -1,10 +1,13 @@
 openapi: 3.1.0
 info:
   title: Melodarr Automation API
-  version: 1.0.0
+  version: 1.1.0
   description: API endpoints available to trusted external automation.
 servers:
   - url: /
+security:
+  - ApiKeyAuth: []
+  - SessionAuth: []
 paths:
   /api/v1/animethemes/resolve:
     post:
@@ -13,9 +16,10 @@ paths:
       description: |
         Returns every unique AnimeThemes series linked to the supplied music.
         Release-group evidence takes priority over recording evidence for the
-        same series. The API key is currently scoped to this endpoint.
+        same series. API-key requests need no cookie or CSRF token.
       security:
         - ApiKeyAuth: []
+        - SessionAuth: []
       requestBody:
         required: true
         content:
@@ -57,13 +61,430 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+  /api/v1/music/recordings/{recordingMbid}/availability:
+    parameters:
+      - $ref: '#/components/parameters/RecordingMbid'
+    get:
+      operationId: recordingAvailability
+      summary: Get exact indexed Plex recording copies
+      description: |
+        Read-only local lookup, scoped to the configured Plex server and selected
+        library sections. Returns every playable indexed copy of the exact
+        recording MBID. Does not contact Plex live or initiate acquisition.
+      x-codeSamples:
+        - lang: Shell
+          source: |
+            curl 'https://melodarr.example/api/v1/music/recordings/89448197-91b7-4f39-80a6-95455ee1eed8/availability' -H "X-Api-Key: $MELODARR_API_KEY"
+      responses:
+        '200':
+          description: Exact recording availability. Cache-Control is no-store.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecordingAvailability'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /api/v1/music/recordings/{recordingMbid}/acquisition:
+    parameters:
+      - $ref: '#/components/parameters/RecordingMbid'
+    get:
+      operationId: recordingAcquisition
+      summary: Resolve exact recording acquisition targets
+      description: |
+        Reuses the browser acquisition resolver, including existing cached or
+        live MusicBrainz metadata resolution. Does not request media, scan Plex,
+        or query Lidarr live. Returns cached/resolved target diagnostics.
+      x-codeSamples:
+        - lang: Shell
+          source: |
+            curl 'https://melodarr.example/api/v1/music/recordings/89448197-91b7-4f39-80a6-95455ee1eed8/acquisition' -H "X-Api-Key: $MELODARR_API_KEY"
+      responses:
+        '200':
+          description: Resolution completed, including no_releases/no_release_groups. Cache-Control is no-store.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecordingAcquisition'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '502':
+          description: MusicBrainz resolution unavailable; no target is fabricated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecordingAcquisition'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /api/v1/music/recordings/{recordingMbid}/request:
+    parameters:
+      - $ref: '#/components/parameters/RecordingMbid'
+    get:
+      operationId: recordingRequestStatus
+      summary: Get current local recording request lifecycle
+      description: |
+        Uses the same batch lifecycle service as track search. Reads indexed
+        Plex data, persisted intent, pending jobs, and cached Lidarr snapshots.
+        Does not resolve targets, call providers, or mutate request state.
+      x-codeSamples:
+        - lang: Shell
+          source: |
+            curl 'https://melodarr.example/api/v1/music/recordings/89448197-91b7-4f39-80a6-95455ee1eed8/request' -H "X-Api-Key: $MELODARR_API_KEY"
+      responses:
+        '200':
+          description: Current lifecycle, including not_requested. Cache-Control is no-store.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecordingLifecycle'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    post:
+      operationId: requestRecording
+      summary: Initiate or reuse a global recording acquisition
+      description: |
+        No request body is required. Valid API-key calls need no session, cookie,
+        or CSRF token and use source=automation with user_id=null, including when
+        a session cookie is also present. Session-only callers need X-CSRF-Token
+        and retain their real user origin. No fake user/admin is assigned.
+        All origins reuse one locked recording acquisition and the same locked
+        release-group request service. Repeated/cross-origin attachments create
+        no duplicate Lidarr work or notifications. Initial automation work has
+        a separate durable release-group audit, no private user history, and
+        visibility in the administrator Requests view and admin request alerts
+        labeled Automation API. Personal request history remains user-only.
+        Already-READY calls write
+        no requester/audit rows. See docs/api.md for notification preferences.
+      parameters:
+        - name: X-CSRF-Token
+          in: header
+          required: false
+          description: Required only for session authentication without a valid API key.
+          schema:
+            type: string
+      x-codeSamples:
+        - lang: Shell
+          source: |
+            curl -X POST 'https://melodarr.example/api/v1/music/recordings/89448197-91b7-4f39-80a6-95455ee1eed8/request' -H 'Content-Type: application/json' -H "X-Api-Key: $MELODARR_API_KEY"
+      responses:
+        '200':
+          description: Existing acquisition or exact recording already READY. Cache-Control is no-store.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecordingLifecycle'
+        '202':
+          description: New acquisition accepted. Cache-Control is no-store.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecordingLifecycle'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Missing or invalid CSRF token for a session-only POST.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: No usable release group contains this exact recording.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '502':
+          $ref: '#/components/responses/UpstreamUnavailable'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /api/v1/search:
+    get:
+      operationId: searchMusic
+      summary: Search with compact exact-recording state on track cards
+      description: |
+        Same validation, result cards, ranking, ordering, limits, local/cache
+        behavior, and legitimate MusicBrainz search calls as browser search.
+        Track cards retain release-group id/name and add recordingMbid plus
+        recordingState when resolved. Alias-only/unresolved cards omit both.
+        Enrichment uses bounded local/cached batch reads and does not initiate
+        acquisition, resolve unrequested targets, query Plex/Lidarr live, scan,
+        enqueue work, or modify request history.
+      parameters:
+        - name: q
+          in: query
+          required: true
+          description: Plain title, title plus artist, ISRC, or version intent; at least two trimmed characters.
+          schema:
+            type: string
+            minLength: 2
+        - name: type
+          in: query
+          schema:
+            type: string
+            enum: [artist, album, track, anime]
+            default: artist
+        - name: musicbrainz
+          in: query
+          description: Set to 1 to bypass local short-circuiting for album/track search.
+          schema:
+            type: string
+            enum: ['1']
+      x-codeSamples:
+        - lang: Shell
+          source: |
+            curl --get 'https://melodarr.example/api/v1/search' -H "X-Api-Key: $MELODARR_API_KEY" --data-urlencode 'type=track' --data-urlencode 'q=Melatonin Tinashe'
+      responses:
+        '200':
+          description: Existing search result page with additive compact recording state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '502':
+          $ref: '#/components/responses/UpstreamUnavailable'
 components:
+  parameters:
+    RecordingMbid:
+      name: recordingMbid
+      in: path
+      required: true
+      description: Exact MusicBrainz recording UUID; never a MusicBrainz track or release-group MBID.
+      schema:
+        type: string
+        format: uuid
+  responses:
+    BadRequest:
+      description: Invalid query or MusicBrainz identifier.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: Missing/invalid API key and no authenticated session.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    UpstreamUnavailable:
+      description: Upstream resolution/request failed; error details are sanitized.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    ServiceUnavailable:
+      description: Local data/configuration unavailable or request initiation busy.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
   securitySchemes:
     ApiKeyAuth:
       type: apiKey
       in: header
       name: X-Api-Key
+    SessionAuth:
+      type: apiKey
+      in: cookie
+      name: session
+      description: Existing browser login; session-only POSTs also require X-CSRF-Token.
   schemas:
+    RecordingStatus:
+      type: string
+      enum: [not_requested, requested, queued, downloading, waiting_for_plex, ready]
+      description: |
+        Precedence is ready > waiting_for_plex > downloading > queued > requested
+        > not_requested. ready means the exact MusicBrainz recording MBID is
+        present in Melodarr's indexed Plex library. waiting_for_plex means the
+        selected persisted release group is fully available in cached Lidarr
+        state while the exact recording is absent from Plex.
+    RecordingTarget:
+      type: object
+      required: [releaseGroupMbid, title, artistName, primaryType]
+      properties:
+        releaseGroupMbid:
+          type: string
+          format: uuid
+        title:
+          type: string
+        artistName:
+          type: string
+        primaryType:
+          type: [string, 'null']
+    DownloadStatus:
+      type: object
+      description: Existing normalized cached client-safe projection; no credentials, paths, download IDs, or raw errors.
+      properties:
+        progress:
+          type: number
+          minimum: 0
+          maximum: 100
+        status:
+          type: string
+        trackedDownloadState:
+          type: string
+        trackedDownloadStatus:
+          type: string
+        timeLeft:
+          type: string
+        estimatedCompletionTime:
+          type: string
+    RecordingState:
+      type: object
+      required: [status, available, plexCopyCount, downloadStatus, target, retrying]
+      properties:
+        status:
+          $ref: '#/components/schemas/RecordingStatus'
+        available:
+          type: boolean
+          description: True only when the exact recording is READY in the selected Plex index.
+        plexCopyCount:
+          type: integer
+          minimum: 0
+          description: Distinct playable indexed Plex copies, unaffected by ISRC count.
+        downloadStatus:
+          oneOf:
+            - $ref: '#/components/schemas/DownloadStatus'
+            - type: 'null'
+        target:
+          description: Persisted local intent snapshot, null when unrequested; search never resolves it through MusicBrainz.
+          oneOf:
+            - $ref: '#/components/schemas/RecordingTarget'
+            - type: 'null'
+        retrying:
+          type: boolean
+          description: True only for a queued pending job with a stored error; raw errors are never exposed.
+    PlexTrack:
+      type: object
+      properties:
+        ratingKey:
+          type: string
+        key:
+          type: string
+        title:
+          type: string
+        trackArtist:
+          type: string
+        albumTitle:
+          type: string
+        musicbrainzRecordingId:
+          type: string
+          format: uuid
+      additionalProperties: true
+    RecordingAvailability:
+      type: object
+      required: [recordingMbid, available, tracks]
+      properties:
+        recordingMbid:
+          type: string
+          format: uuid
+        available:
+          type: boolean
+        tracks:
+          type: array
+          items:
+            $ref: '#/components/schemas/PlexTrack'
+    RecordingLifecycle:
+      allOf:
+        - $ref: '#/components/schemas/RecordingState'
+        - $ref: '#/components/schemas/RecordingAvailability'
+        - type: object
+          properties:
+            recordingTitle:
+              type: [string, 'null']
+            requestedAt:
+              type: [number, 'null']
+              description: Unix seconds of the first accepted recording acquisition.
+            alreadyAvailable:
+              type: boolean
+              description: POST only; the initial Plex check found the exact recording.
+            alreadyRequested:
+              type: boolean
+              description: POST only; an acquisition intent already existed.
+    AcquisitionTarget:
+      allOf:
+        - $ref: '#/components/schemas/RecordingTarget'
+        - type: object
+          properties:
+            availableInLidarr:
+              type: boolean
+            fullyAvailableInLidarr:
+              type: boolean
+            minimumTrackCount:
+              type: integer
+          additionalProperties: true
+    RecordingAcquisition:
+      type: object
+      required: [recordingMbid, state, available, needsAcquisition, target, alternatives]
+      properties:
+        recordingMbid:
+          type: string
+          format: uuid
+        recordingTitle:
+          type: string
+        state:
+          type: string
+          enum: [resolved, no_releases, no_release_groups, musicbrainz_unavailable]
+        available:
+          type: boolean
+        needsAcquisition:
+          type: boolean
+        target:
+          oneOf:
+            - $ref: '#/components/schemas/AcquisitionTarget'
+            - type: 'null'
+        alternatives:
+          type: array
+          items:
+            $ref: '#/components/schemas/AcquisitionTarget'
+        error:
+          type: string
+      additionalProperties: true
+    SearchResponse:
+      type: object
+      required: [results, type]
+      properties:
+        type:
+          type: string
+          enum: [artist, album, track, anime]
+        candidateCount:
+          type: integer
+        source:
+          type: string
+          enum: [local, musicbrainz]
+        results:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: [string, integer]
+                description: For track cards, the release-group MBID; existing other search types retain their IDs.
+              name:
+                type: string
+              matchedTrack:
+                type: string
+              recordingMbid:
+                type: string
+                format: uuid
+                description: Resolved exact recording MBID, omitted when no recording identity is known.
+              recordingState:
+                $ref: '#/components/schemas/RecordingState'
+            additionalProperties: true
     ResolveRequest:
       type: object
       properties:

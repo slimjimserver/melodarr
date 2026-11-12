@@ -130,7 +130,13 @@ def _get_user(connection, user_id):
 
 
 def _requester_payload(row):
-    """Return the public account identity associated with an admin request."""
+    """Describe a real account or the explicit automation origin."""
+    if row["source"] == "automation":
+        return {
+            "id": None,
+            "username": "Automation API",
+            "userType": "automation",
+        }
     is_plex_user = bool(row["plex_id"])
     return {
         "id": row["user_id"],
@@ -165,42 +171,45 @@ def users():
 @blueprint.get("/api/admin/requests")
 @admin_required
 def requests():
-    """Return one page of every user's request history to an administrator."""
+    """Return a combined page of user history and automation audit events."""
     page = _requested_page()
     if page is None:
         return api_error("Page must be a positive integer.")
 
     with db() as connection:
         total = connection.execute(
-            "SELECT COUNT(*) AS total FROM request_history"
+            "SELECT (SELECT COUNT(*) FROM request_history) + "
+            "(SELECT COUNT(*) FROM automation_request_history) AS total"
         ).fetchone()["total"]
         rows = connection.execute(
             """
+            WITH request_events AS (
+                SELECT
+                    id AS request_id, 'user' AS source, user_id,
+                    kind, mbid, name, artist_name, release_type, release_date,
+                    anime_slug, anime_name, theme_id, theme_label,
+                    song_id, song_title, created_at
+                FROM request_history
+                UNION ALL
+                SELECT
+                    id AS request_id, source, user_id,
+                    kind, mbid, name, artist_name, release_type, release_date,
+                    NULL, NULL, NULL, NULL, NULL, NULL, created_at
+                FROM automation_request_history
+            )
             SELECT
-                request_history.id AS request_id,
-                request_history.user_id,
-                request_history.kind,
-                request_history.mbid,
-                request_history.name,
-                request_history.artist_name,
-                request_history.release_type,
-                request_history.release_date,
-                request_history.anime_slug,
-                request_history.anime_name,
-                request_history.theme_id,
-                request_history.theme_label,
-                request_history.song_id,
-                request_history.song_title,
-                request_history.created_at,
+                request_events.*,
                 users.username AS local_username,
                 users.role,
                 users.plex_id,
                 users.plex_username,
                 users.plex_email,
                 users.plex_avatar
-            FROM request_history
-            JOIN users ON users.id = request_history.user_id
-            ORDER BY request_history.created_at DESC, request_history.id DESC
+            FROM request_events
+            LEFT JOIN users ON users.id = request_events.user_id
+            WHERE request_events.source = 'automation' OR users.id IS NOT NULL
+            ORDER BY request_events.created_at DESC,
+                     request_events.request_id DESC, request_events.source DESC
             LIMIT ? OFFSET ?
             """,
             (REQUESTS_PAGE_SIZE, (page - 1) * REQUESTS_PAGE_SIZE),
@@ -209,7 +218,14 @@ def requests():
     plex_index = _profile_plex_index()
     anime_link_cache = {}
     lifecycle_rows = [
-        {"id": row["request_id"], **{field: row[field] for field in REQUEST_HISTORY_FIELDS}}
+        {
+            "id": (
+                f"automation:{row['request_id']}"
+                if row["source"] == "automation" else row["request_id"]
+            ),
+            "source": row["source"],
+            **{field: row[field] for field in REQUEST_HISTORY_FIELDS},
+        }
         for row in rows
     ]
     apply_release_group_lifecycle(lifecycle_rows)

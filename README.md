@@ -4,6 +4,11 @@
 
 # Melodarr
 
+**Rooms:** Host a shared jukebox from `/rooms` after starting music in a compatible
+Plex player with another song in Up Next. Guests use a public Room link to search/request
+tracks. Melodarr manages the active PMS queue; remote Plex player queue changes
+appear naturally when playback advances. See [Rooms MVP](docs/rooms.md).
+
 Melodarr is a self-hosted music discovery and request app for Lidarr. It gives users a friendly place to find artists, explore albums, get personal recommendations, and request new music without needing access to Lidarr itself.
 
 ## Screenshots
@@ -36,6 +41,12 @@ Browse popular artists from Last.fm or check Apple Music's current Top 100 album
 
 Search AnimeThemes for openings and endings, see where each song appears in a series, and follow related anime. Melodarr matches those songs to MusicBrainz releases so they can be requested through Lidarr, with administrator review when a match needs a second look.
 
+Anime discovery uses the public GraphQL API at `https://graphql.animethemes.moe/`.
+No AnimeThemes API key or additional configuration is needed. Search results are
+cached for six hours, and anime, series, and artist details for 24 hours. Existing
+AnimeThemes IDs and saved song mappings continue to work after the migration
+from the deprecated JSON API.
+
 ### Know what is already in your library
 
 Connect Plex to browse the artists and albums you already own, open them directly in Plex, and keep duplicates out of recommendations and requests.
@@ -55,6 +66,25 @@ Authenticated clients can call `POST /api/v1/animethemes/resolve` with a MusicBr
 AnimeThemes does not assign every anime to a higher-level series. In that case, Melodarr returns the individual anime as an explicit fallback with `animeThemesSeriesId: null`, its `animeThemesAnimeId`, and `fallback: "anime"`; it never invents a series ID.
 
 See the [Melodarr API guide](docs/api.md) for authentication, request and response schemas, examples, errors, and the OpenAPI specification.
+
+The same key also authorizes `GET /api/v1/search` and recording availability,
+acquisition, and request lifecycle under `/api/v1/music/recordings/{recordingMbid}`.
+Recording request POSTs require no browser login, cookie, or CSRF token. They
+reuse the existing acquisition machinery with an explicit automation origin and
+no fake user account. Track search includes compact local recording state in
+one response; ordinary searches do not initiate acquisitions.
+
+## Building from source
+
+Local `docker build` commands use Docker Hub for the official Node and Python
+base images. The GitHub workflows use the same image tags from Docker's official
+repositories on Amazon ECR Public to avoid Docker Hub throttling on shared
+runners. They still publish Melodarr to Docker Hub after the image tests pass.
+To use that registry for a local build too:
+
+```sh
+docker build --build-arg BASE_IMAGE_REGISTRY=public.ecr.aws/docker/library --tag melodarr-local .
+```
 
 ## Environment variables
 

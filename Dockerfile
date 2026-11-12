@@ -1,4 +1,6 @@
-FROM node:24-alpine AS frontend-build
+# CI overrides the registry to use Docker's official images on ECR Public.
+ARG BASE_IMAGE_REGISTRY=docker.io/library
+FROM ${BASE_IMAGE_REGISTRY}/node:24-alpine AS frontend-build
 WORKDIR /app/frontend
 RUN corepack enable && corepack prepare pnpm@11.9.0 --activate
 COPY frontend/package.json frontend/pnpm-lock.yaml ./
@@ -10,7 +12,7 @@ COPY frontend/scripts ./scripts
 COPY frontend/static ./static
 RUN pnpm run build
 
-FROM python:3.13-slim
+FROM ${BASE_IMAGE_REGISTRY}/python:3.13-slim
 ARG MELODARR_VERSION=development
 WORKDIR /app
 COPY backend/requirements.txt .

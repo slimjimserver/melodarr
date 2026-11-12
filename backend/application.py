@@ -18,6 +18,7 @@ if __package__:
         load_session_secret,
     )
     from .instance_settings import ensure_instance_settings
+    from .logging_filters import protect_invite_logs
     from .responses import api_error
     from .routes.account import blueprint as account_blueprint
     from .routes.admin import blueprint as admin_blueprint
@@ -30,6 +31,7 @@ if __package__:
     from .routes.notifications import blueprint as notifications_blueprint
     from .routes.pages import blueprint as pages_blueprint
     from .routes.requests import blueprint as requests_blueprint
+    from .routes.rooms import blueprint as rooms_blueprint
     from .routes.settings import blueprint as settings_blueprint
     from .security import verify_csrf_token
     from .storage import init_db
@@ -43,6 +45,7 @@ else:  # Support the existing `python backend/app.py` entry point.
         load_session_secret,
     )
     from instance_settings import ensure_instance_settings
+    from logging_filters import protect_invite_logs
     from responses import api_error
     from routes.account import blueprint as account_blueprint
     from routes.admin import blueprint as admin_blueprint
@@ -55,6 +58,7 @@ else:  # Support the existing `python backend/app.py` entry point.
     from routes.notifications import blueprint as notifications_blueprint
     from routes.pages import blueprint as pages_blueprint
     from routes.requests import blueprint as requests_blueprint
+    from routes.rooms import blueprint as rooms_blueprint
     from routes.settings import blueprint as settings_blueprint
     from security import verify_csrf_token
     from storage import init_db
@@ -155,6 +159,7 @@ BLUEPRINTS = (
     library_blueprint,
     music_blueprint,
     requests_blueprint,
+    rooms_blueprint,
     settings_blueprint,
     notifications_blueprint,
     pages_blueprint,
@@ -167,6 +172,7 @@ def create_app(config=None):
         # This must precede load_session_secret, init_cache_db, and init_db: all
         # can write to paths captured when backend.config was first imported.
         assert_test_storage_isolation()
+    protect_invite_logs()
     app = Flask(
         __name__,
         static_folder=os.path.join(FRONTEND_ROOT, "static"),

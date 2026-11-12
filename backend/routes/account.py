@@ -230,15 +230,10 @@ def apply_release_group_lifecycle(items, *, snapshots=None):
         if item["kind"] != "release-group":
             continue
         mbid = str(item["mbid"])
-        download = lidarr.public_download_status(downloads.get(mbid.casefold()))
-        if _release_group_available(mbid, albums):
-            status, download = "available", None
-        elif download:
-            status = "downloading"
-        elif mbid.casefold() in pending:
-            status = "queued"
-        else:
-            status = "requested"
+        status, download = lidarr.release_group_lifecycle(
+            albums.get(mbid.casefold()), downloads.get(mbid.casefold()),
+            mbid.casefold() in pending,
+        )
         item["requestStatus"] = status
         item["downloadStatus"] = download
     return items

@@ -26,7 +26,20 @@ logger = logging.getLogger(__name__)
 # Lidarr, Plex, or MusicBrainz-search records.
 # Version 6 adds alternate track-title keys without changing canonical titles.
 # Version 7 adds independently replaceable, complete artist track snapshots.
-SCHEMA_VERSION = "7"
+# Version 8 adds Plex track availability and references into the shared MB cache.
+# Version 9 adds references into canonical ISRC/recording documents, not copies.
+SCHEMA_VERSION = "9"
+PLEX_TRACK_COLUMNS = {
+    "ratingKey": "rating_key", "key": "plex_key", "plexGuid": "plex_guid",
+    "title": "title", "trackArtist": "track_artist", "albumArtist": "album_artist",
+    "albumTitle": "album_title", "durationMs": "duration_ms",
+    "trackNumber": "track_number", "discNumber": "disc_number", "year": "year",
+    "librarySectionId": "section_id", "librarySectionTitle": "section_title",
+    "artistRatingKey": "artist_rating_key", "albumRatingKey": "album_rating_key",
+    "musicbrainzTrackId": "track_mbid", "musicbrainzRecordingId": "recording_mbid",
+    "musicbrainzReleaseId": "release_mbid", "musicbrainzReleaseGroupId": "release_group_mbid",
+    "mappingSource": "mapping_source", "mappingConfidence": "mapping_confidence",
+}
 SOURCE_MUSICBRAINZ = 1
 SOURCE_LIDARR = 2
 SOURCE_PLEX = 4
@@ -212,10 +225,51 @@ def initialize():
         row = connection.execute(
             "SELECT value FROM track_search_meta WHERE key = 'schema-version'"
         ).fetchone()
-    if row is not None and row["value"] in {"5", "6"}:
+        numeric = {"duration_ms", "track_number", "disc_number", "year"}
+        columns = ", ".join(
+            f"{column} {'INTEGER' if column in numeric else 'TEXT'}"
+            for column in PLEX_TRACK_COLUMNS.values()
+        )
+        connection.execute(
+            f"CREATE TABLE IF NOT EXISTS track_search_plex_tracks ("
+            f"server_id TEXT NOT NULL, {columns}, "
+            "PRIMARY KEY (server_id, rating_key)) WITHOUT ROWID"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_track_search_plex_recording "
+            "ON track_search_plex_tracks (server_id, recording_mbid)"
+        )
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS track_search_plex_isrcs (
+                server_id TEXT NOT NULL, rating_key TEXT NOT NULL, isrc TEXT NOT NULL,
+                PRIMARY KEY (server_id, rating_key, isrc)
+            ) WITHOUT ROWID
+        """)
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_track_search_plex_isrc "
+            "ON track_search_plex_isrcs (server_id, isrc, rating_key)"
+        )
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS track_search_release_refs (
+                release_mbid TEXT NOT NULL, cache_key TEXT NOT NULL,
+                PRIMARY KEY (release_mbid, cache_key)
+            ) WITHOUT ROWID
+        """)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS track_search_recording_refs (
+                isrc TEXT NOT NULL, recording_mbid TEXT NOT NULL, cache_key TEXT NOT NULL,
+                PRIMARY KEY (isrc, recording_mbid, cache_key)
+            ) WITHOUT ROWID
+        """)
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_track_search_recording_ref "
+            "ON track_search_recording_refs (recording_mbid)"
+        )
+    if row is not None and row["value"] in {"5", "6", "7", "8"}:
         with cache_db() as connection:
             if row["value"] == "5":
                 _backfill_title_keys(connection)
+            _backfill_plex_tracks_and_release_refs(connection)
             connection.execute(
                 "INSERT OR REPLACE INTO track_search_meta (key, value) "
                 "VALUES ('schema-version', ?)",
@@ -924,6 +978,11 @@ def rebuild_from_cache():
         connection.execute("DELETE FROM track_search_release_groups")
         connection.execute("DELETE FROM track_search_release_group_artists")
         connection.execute("DELETE FROM track_search_artist_discography_groups")
+        connection.execute("DELETE FROM track_search_plex_tracks")
+        connection.execute("DELETE FROM track_search_plex_isrcs")
+        connection.execute("DELETE FROM track_search_release_refs")
+        connection.execute("DELETE FROM track_search_recording_refs")
+        _backfill_plex_tracks_and_release_refs(connection)
         _upsert_rows(
             connection,
             artist_rows,
@@ -1157,6 +1216,8 @@ def index_release(release, cache_key):
         title_key_rows,
     )
     with cache_db() as connection:
+        _add_release_ref(connection, release, cache_key)
+        _add_recording_refs(connection, release, cache_key)
         _upsert_rows(
             connection,
             artist_rows,
@@ -1442,7 +1503,7 @@ def index_lidarr_artists(payload):
     index_lidarr_library(payload)
 
 
-def index_plex_library(payload):
+def index_plex_library(payload, *, server_id=None, track_inventory=None):
     if not _index_writable():
         return
     artist_rows = {}
@@ -1457,6 +1518,11 @@ def index_plex_library(payload):
         set(),
     )
     with cache_db() as connection:
+        _write_plex_tracks(
+            connection, server_id or payload.get("serverId") or "",
+            payload.get("tracks", []) if track_inventory is None else track_inventory,
+            replace=track_inventory is None,
+        )
         _clear_source(connection, SOURCE_PLEX)
         _upsert_rows(
             connection,
@@ -1466,6 +1532,304 @@ def index_plex_library(payload):
             release_group_rows,
             release_group_artist_rows,
         )
+
+
+def _add_release_ref(connection, release, cache_key):
+    if isinstance(release, dict) and _valid_mbid(release.get("id")) and "media" in release:
+        connection.execute(
+            "INSERT OR IGNORE INTO track_search_release_refs VALUES (?, ?)",
+            (release["id"].casefold(), cache_key),
+        )
+
+
+def _recording_entities(payload):
+    if not isinstance(payload, dict):
+        return []
+    recordings = list(payload.get("recordings") or [])
+    if "isrcs" in payload and _valid_mbid(payload.get("id")):
+        recordings.append(payload)
+    for release in [payload, *(payload.get("releases") or [])]:
+        for medium in release.get("media") or []:
+            for track in medium.get("tracks") or []:
+                recording = track.get("recording") or {}
+                recordings.append({
+                    **recording,
+                    "artist-credit": recording.get("artist-credit") or track.get("artist-credit") or [],
+                    "length": recording.get("length") or track.get("length"),
+                })
+    return [recording for recording in recordings if isinstance(recording, dict) and _valid_mbid(recording.get("id"))]
+
+
+def _add_recording_refs(connection, payload, key):
+    for recording in _recording_entities(payload):
+        codes = normalize_isrcs(recording.get("isrcs") or [payload.get("isrc")]) or [""]
+        connection.executemany(
+            "INSERT OR IGNORE INTO track_search_recording_refs VALUES (?, ?, ?)",
+            ((code, recording["id"].casefold(), key) for code in codes),
+        )
+
+
+def index_recording_document(payload, key):
+    """Reference ISRC lookups and recording documents in the shared metadata cache."""
+    if _index_writable():
+        with cache_db() as connection:
+            _add_recording_refs(connection, payload, key)
+
+
+def cached_recordings_by_isrc(isrc):
+    """Return local candidates and whether an exact ISRC lookup covers the full set.
+
+    A lone recording on a cached album is not evidence of ISRC uniqueness.
+    """
+    initialize()
+    with cache_db() as connection:
+        rows = connection.execute(
+            "SELECT DISTINCT c.value FROM track_search_recording_refs r JOIN api_cache c "
+            "ON c.cache_key = r.cache_key WHERE r.isrc = ? AND c.expires_at > ?",
+            (isrc, time.time()),
+        ).fetchall()
+    candidates, complete = {}, False
+    for row in rows:
+        try:
+            payload = json.loads(row["value"])
+        except (TypeError, ValueError):
+            continue
+        entities = _recording_entities(payload)
+        if payload.get("isrc") == isrc and payload.get("recording-count", len(entities)) == len(entities):
+            # Complete lookup takes precedence over partial album documents.
+            return entities, True
+        for recording in entities:
+            if isrc in normalize_isrcs(recording.get("isrcs")):
+                candidates[recording["id"]] = recording
+    return list(candidates.values()), complete
+
+
+def cached_recording_metadata(recording_mbid):
+    """Read full recording evidence from existing recording/release documents."""
+    initialize()
+    with cache_db() as connection:
+        rows = connection.execute(
+            "SELECT DISTINCT c.value FROM track_search_recording_refs r JOIN api_cache c "
+            "ON c.cache_key = r.cache_key WHERE r.recording_mbid = ? AND c.expires_at > ?",
+            (recording_mbid.casefold(), time.time()),
+        ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["value"])
+        except (TypeError, ValueError):
+            continue
+        for recording in _recording_entities(payload):
+            if recording["id"].casefold() == recording_mbid.casefold() and recording.get("artist-credit") and recording.get("length"):
+                return recording
+    return None
+
+
+def _backfill_plex_tracks_and_release_refs(connection):
+    """Additive v8 migration: preserve all existing search and snapshot rows."""
+    rows = connection.execute(
+        "SELECT cache_key, value FROM api_cache WHERE "
+        "cache_key LIKE 'musicbrainz-metadata:%' OR cache_key LIKE 'musicbrainz-search:%' OR cache_key LIKE 'plex-library:%'"
+    )
+    for row in rows:
+        try:
+            payload = json.loads(row["value"])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if row["cache_key"].startswith(("musicbrainz-metadata:", "musicbrainz-search:")):
+            _add_release_ref(connection, payload, row["cache_key"])
+            _add_recording_refs(connection, payload, row["cache_key"])
+        elif payload.get("serverId"):
+            _write_plex_tracks(connection, payload["serverId"], payload.get("tracks", []), replace=True)
+
+
+def cached_musicbrainz_release(release_mbid):
+    """Find a fresh, ISRC-capable release document regardless of include spelling."""
+    initialize()
+    with cache_db() as connection:
+        rows = connection.execute(
+            "SELECT c.value FROM track_search_release_refs r JOIN api_cache c "
+            "ON c.cache_key = r.cache_key WHERE r.release_mbid = ? AND c.expires_at > ? "
+            "ORDER BY c.expires_at DESC, c.cache_key",
+            (release_mbid.casefold(), time.time()),
+        )
+        for row in rows:
+            try:
+                payload = json.loads(row["value"])
+            except (TypeError, ValueError):
+                continue
+            recordings = [
+                track.get("recording") or {} for medium in payload.get("media", [])
+                for track in medium.get("tracks", [])
+            ]
+            if recordings and all("isrcs" in recording for recording in recordings):
+                return payload
+    return None
+
+
+def _write_plex_tracks(connection, server_id, tracks, *, replace=False):
+    if replace:
+        connection.execute("DELETE FROM track_search_plex_tracks WHERE server_id = ?", (server_id,))
+        connection.execute("DELETE FROM track_search_plex_isrcs WHERE server_id = ?", (server_id,))
+    columns = ", ".join(PLEX_TRACK_COLUMNS.values())
+    placeholders = ", ".join("?" for _ in range(len(PLEX_TRACK_COLUMNS) + 1))
+    rows = []
+    identities = []
+    isrc_rows = []
+    for track in tracks:
+        rating_key = str(track.get("ratingKey") or "")
+        if not rating_key:
+            continue
+        values = []
+        for field in PLEX_TRACK_COLUMNS:
+            value = track.get(field)
+            if field.startswith("musicbrainz"):
+                value = str(value).casefold() if _valid_mbid(value) else ""
+            elif field not in {"durationMs", "trackNumber", "discNumber", "year"}:
+                value = str(value or "")
+            values.append(value)
+        rows.append((server_id, *values))
+        identities.append((server_id, rating_key))
+        isrc_rows.extend((server_id, rating_key, isrc) for isrc in normalize_isrcs(track.get("isrcs")))
+    if not replace:
+        connection.executemany(
+            "DELETE FROM track_search_plex_isrcs WHERE server_id = ? AND rating_key = ?", identities,
+        )
+    connection.executemany(
+        f"INSERT OR REPLACE INTO track_search_plex_tracks (server_id, {columns}) VALUES ({placeholders})", rows,
+    )
+    connection.executemany("INSERT OR IGNORE INTO track_search_plex_isrcs VALUES (?, ?, ?)", isrc_rows)
+
+
+def normalize_isrcs(values):
+    if not isinstance(values, (list, tuple)):
+        return []
+    return sorted({str(value).strip().upper() for value in values if str(value or "").strip()})
+
+
+def plex_recording_tracks(server_id, recording_mbid, *, section_ids=None):
+    """Use the recording index; never parse the full snapshot on this hot path."""
+    return _plex_track_lookup(
+        server_id, "t.recording_mbid = ?", [recording_mbid.casefold()], section_ids,
+        recording_index=True,
+    )
+
+
+def plex_recording_mbids_by_rating_key(server_id, rating_keys):
+    """Resolve known queue tracks using their server-scoped primary keys."""
+    identities = list(dict.fromkeys(str(value) for value in rating_keys))
+    if not identities:
+        return {}
+    initialize()
+    result = {}
+    with cache_db() as connection:
+        for offset in range(0, len(identities), 500):
+            batch = identities[offset:offset + 500]
+            placeholders = ', '.join('?' for _ in batch)
+            rows = connection.execute(
+                "SELECT rating_key, recording_mbid FROM track_search_plex_tracks "
+                f"WHERE server_id = ? AND rating_key IN ({placeholders}) "
+                "AND recording_mbid != ''", [server_id, *batch],
+            )
+            result.update((row["rating_key"], row["recording_mbid"]) for row in rows)
+    return result
+
+
+def plex_tracks_by_rating_key(server_id, rating_keys):
+    """Resolve queue artwork identities locally, in bounded primary-key batches."""
+    identities = list(dict.fromkeys(str(value) for value in rating_keys if value))
+    result = {}
+    for offset in range(0, len(identities), 500):
+        batch = identities[offset : offset + 500]
+        tracks = _plex_track_lookup(
+            server_id,
+            f"t.rating_key IN ({', '.join('?' for _ in batch)})",
+            batch,
+            None,
+        )
+        result.update((track["ratingKey"], track) for track in tracks)
+    return result
+
+
+def plex_recording_copy_counts(server_id, recording_mbids, *, section_ids=None):
+    """Count playable exact recording copies without loading tracks or ISRCs."""
+    identities = list(dict.fromkeys(recording_mbids))
+    if not identities or (section_ids is not None and not section_ids):
+        return {}
+    initialize()
+    counts = {}
+    with cache_db() as connection:
+        for offset in range(0, len(identities), 500):
+            batch = identities[offset:offset + 500]
+            predicate = f"recording_mbid IN ({', '.join('?' for _ in batch)})"
+            parameters = [server_id, *batch]
+            if section_ids is not None:
+                predicate += f" AND section_id IN ({', '.join('?' for _ in section_ids)})"
+                parameters.extend(str(value) for value in section_ids)
+            rows = connection.execute(
+                "SELECT recording_mbid, COUNT(*) AS copies "
+                "FROM track_search_plex_tracks INDEXED BY idx_track_search_plex_recording "
+                f"WHERE server_id = ? AND {predicate} AND plex_key != '' "
+                "GROUP BY recording_mbid", parameters,
+            ).fetchall()
+            counts.update((row["recording_mbid"], row["copies"]) for row in rows)
+    return counts
+
+
+def plex_recording_tracks_batch(server_id, recording_mbids, *, section_ids=None):
+    """Load full copies in bounded batches for callers that need playback data."""
+    identities = list(dict.fromkeys(recording_mbids))
+    result = {}
+    for offset in range(0, len(identities), 500):
+        batch = identities[offset:offset + 500]
+        tracks = _plex_track_lookup(
+            server_id, f"t.recording_mbid IN ({', '.join('?' for _ in batch)})",
+            batch, section_ids, recording_index=True,
+        )
+        for track in tracks:
+            result.setdefault(track["musicbrainzRecordingId"], []).append(track)
+    return result
+
+
+def plex_isrc_tracks(server_id, isrc, *, section_ids=None):
+    return _plex_track_lookup(
+        server_id,
+        "t.recording_mbid IN (SELECT source.recording_mbid FROM track_search_plex_isrcs i "
+        "INDEXED BY idx_track_search_plex_isrc JOIN track_search_plex_tracks source "
+        "ON source.server_id = i.server_id AND source.rating_key = i.rating_key "
+        "WHERE i.server_id = ? AND i.isrc = ? AND source.recording_mbid != '')",
+        [server_id, str(isrc).strip().upper()], section_ids, recording_index=True,
+    )
+
+
+def _plex_track_lookup(server_id, predicate, identities, section_ids, *, recording_index=False):
+    initialize()
+    parameters = [server_id, *identities]
+    if section_ids is not None:
+        if not section_ids:
+            return []
+        predicate += f" AND t.section_id IN ({', '.join('?' for _ in section_ids)})"
+        parameters.extend(str(value) for value in section_ids)
+    with cache_db() as connection:
+        index = " INDEXED BY idx_track_search_plex_recording" if recording_index else ""
+        rows = connection.execute(
+            f"SELECT t.*, i.isrc FROM track_search_plex_tracks t{index} "
+            "LEFT JOIN track_search_plex_isrcs i "
+            "ON i.server_id = t.server_id AND i.rating_key = t.rating_key "
+            f"WHERE t.server_id = ? AND {predicate} "
+            "AND t.plex_key != '' ORDER BY t.rating_key, i.isrc", parameters,
+        ).fetchall()
+        result = {}
+        for row in rows:
+            if row["rating_key"] not in result:
+                result[row["rating_key"]] = {
+                    **{field: row[column] for field, column in PLEX_TRACK_COLUMNS.items()},
+                    "isrcs": [],
+                }
+            if row["isrc"]:
+                result[row["rating_key"]]["isrcs"].append(row["isrc"])
+        return list(result.values())
 
 
 def index_plex_artists(payload):
@@ -1833,6 +2197,15 @@ def stats():
         artist_discography_rows = connection.execute(
             "SELECT COUNT(*) FROM track_search_artist_discography_groups"
         ).fetchone()[0]
+        plex_track_rows = connection.execute(
+            "SELECT COUNT(*) FROM track_search_plex_tracks"
+        ).fetchone()[0]
+        plex_isrc_rows = connection.execute(
+            "SELECT COUNT(*) FROM track_search_plex_isrcs"
+        ).fetchone()[0]
+        release_ref_rows = connection.execute(
+            "SELECT COUNT(*) FROM track_search_release_refs"
+        ).fetchone()[0]
         index_bytes = None
         try:
             index_bytes = connection.execute("""
@@ -1849,6 +2222,9 @@ def stats():
         "releaseGroupRows": release_group_rows,
         "releaseGroupArtistRows": release_group_artist_rows,
         "artistDiscographyRows": artist_discography_rows,
+        "plexTrackRows": plex_track_rows,
+        "plexIsrcRows": plex_isrc_rows,
+        "releaseRefRows": release_ref_rows,
         "indexRows": (
             artist_rows
             + relation_rows
@@ -1856,6 +2232,9 @@ def stats():
             + release_group_rows
             + release_group_artist_rows
             + artist_discography_rows
+            + plex_track_rows
+            + plex_isrc_rows
+            + release_ref_rows
         ),
         "indexBytes": index_bytes,
         "databaseBytes": _database_bytes(),

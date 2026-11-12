@@ -385,7 +385,7 @@ test.describe("mobile touch and high-density artwork", () => {
     await page.locator("#login-form").getByLabel("Username").fill("ada");
     await page.locator("#login-form").getByLabel("Password").fill("fixture-password");
     await page.getByRole("button", { name: "Sign in", exact: true }).click();
-    const art = page.locator('[data-item-id="retina-album"] img.recommendation-art');
+    const art = page.locator('[data-item-id="retina-album"] .recommendation-art > img');
     await art.scrollIntoViewIfNeeded();
     await expect(art).toHaveAttribute("src", /size=large/);
     await expect(page.getByRole("link", { name: /Listen|Find listening options/ })).toHaveCount(0);

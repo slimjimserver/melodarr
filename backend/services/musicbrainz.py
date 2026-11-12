@@ -7,6 +7,7 @@ import unicodedata
 from contextlib import contextmanager
 from threading import Lock, local
 from urllib.parse import quote, urlsplit, urlunsplit
+from uuid import UUID
 from xml.etree import ElementTree
 
 import requests
@@ -15,7 +16,7 @@ from pykakasi import kakasi
 logger = logging.getLogger(__name__)
 
 if __package__ == "backend.services":
-    from ..api_cache import cache_key, cached_json_get
+    from ..api_cache import _fresh_cache_value, cache_key, cached_json_get
     from ..config import (
         COVER_ART_ARCHIVE_URL,
         MUSICBRAINZ_METADATA_CACHE_TTL,
@@ -26,7 +27,7 @@ if __package__ == "backend.services":
     )
     from ..storage import get_service
 else:  # Support the existing `python backend/app.py` entry point.
-    from api_cache import cache_key, cached_json_get
+    from api_cache import _fresh_cache_value, cache_key, cached_json_get
     from config import (
         COVER_ART_ARCHIVE_URL,
         MUSICBRAINZ_METADATA_CACHE_TTL,
@@ -39,6 +40,9 @@ else:  # Support the existing `python backend/app.py` entry point.
 
 
 TEST_RECORDING_ID = "5f396c8b-ae2e-48de-afbc-904f4f0d66fc"
+VARIOUS_ARTISTS_ID = "89ad4ac3-39f7-470e-963a-56509c546377"
+RELEASE_TRACK_INCLUDES = "recordings+artist-credits+release-groups+isrcs"
+RECORDING_RELEASE_INCLUDES = "recordings+release-groups+artist-credits+media"
 SEARCH_UNAVAILABLE_MESSAGE = (
     "MusicBrainz search is unavailable. If this is a self-hosted server, "
     "check that its search/Solr service is running and reachable from the "
@@ -51,6 +55,8 @@ _interactive_waiters = 0
 _prefetch_waiters = 0
 _critical_streak = 0
 _critical_operations = 0
+_critical_operation_deadlines = {}
+_CRITICAL_OPERATION_PAUSE_SECONDS = 30.0
 _CRITICAL_BURST_LIMIT = 2
 _BACKGROUND_COOLDOWN_INITIAL_SECONDS = 30.0
 _BACKGROUND_COOLDOWN_MAX_SECONDS = 60.0
@@ -59,6 +65,11 @@ _background_failure_streak = 0
 _background_resume_at = 0.0
 _session_state = local()
 _romanizer = kakasi()
+
+
+def is_library_only_artist(mbid):
+    """Apply the local-library exception to this one special artist identity."""
+    return str(mbid or "").casefold() == VARIOUS_ARTISTS_ID
 
 
 class ConfigurationError(ValueError):
@@ -229,10 +240,17 @@ def _priority_is_blocked(priority):
         return bool(
             _critical_waiters and _critical_streak < _CRITICAL_BURST_LIMIT
         )
+    # A very large catalogue (especially Various Artists) can take hours to
+    # assemble. Reserve the first few pages, then let enrichment make progress
+    # while the operation continues to use critical priority for live slots.
+    critical_operation_paused = bool(_critical_operations) and any(
+        deadline > time.monotonic()
+        for deadline in tuple(_critical_operation_deadlines.values())
+    )
     if priority == "prefetch":
-        return bool(_critical_operations or _critical_waiters or _interactive_waiters)
+        return bool(critical_operation_paused or _critical_waiters or _interactive_waiters)
     return bool(
-        _critical_operations
+        critical_operation_paused
         or _critical_waiters
         or _interactive_waiters
         or _prefetch_waiters
@@ -285,15 +303,20 @@ def _wait_for_request_slot(priority="interactive", request_interval_seconds=None
 
 @contextmanager
 def critical_operation():
-    """Keep speculative work paused without starving other user actions."""
+    """Briefly reserve artist-page slots without indefinitely pausing workers."""
     global _critical_operations
+    token = object()
     with _request_lock:
         _critical_operations += 1
+        _critical_operation_deadlines[token] = (
+            time.monotonic() + _CRITICAL_OPERATION_PAUSE_SECONDS
+        )
     try:
         yield
     finally:
         with _request_lock:
             _critical_operations -= 1
+            del _critical_operation_deadlines[token]
 
 
 def _cached_get(
@@ -325,6 +348,10 @@ def _cached_get(
             request_timeout=20 if priority == "critical" else 15,
             request_get=_http_get,
             after_response=after_response,
+            # A critical operation pauses speculative requests. Sharing their
+            # miss lock would deadlock if a paused owner held this cache key.
+            # The response cache remains shared, and is rechecked after pacing.
+            coalescing_scope=priority,
             **kwargs,
         )
     except (requests.Timeout, requests.ConnectionError) as exc:
@@ -400,6 +427,12 @@ def get(
     **extra,
 ):
     """Load one metadata resource or collection from MusicBrainz."""
+    if is_library_only_artist(extra.get("artist")) and path.rstrip("/") in {
+        "/release-group", "/release", "/recording",
+    }:
+        if cache_only:
+            return (None, False) if include_cache_status else None
+        raise requests.RequestException("Various Artists uses only the local library catalogue.")
     params = {"fmt": "json", **extra}
     if inc:
         params["inc"] = inc
@@ -417,6 +450,122 @@ def get(
         cache_only=cache_only,
         cache_response=cache_response,
     )
+
+
+def browse_releases_by_recording(
+    recording_id, *, priority="interactive", cache_ttl=None, force_refresh=False,
+    include_url_relations=False, cache_only=False,
+):
+    """Read every directly linked release, rejecting incomplete page sets.
+
+    MusicBrainz can return fewer than limit releases because of its track
+    budget. Only the actual number returned advances the offset.
+    Cache-only reads return None unless every page is already available.
+    """
+    recording_id = str(UUID(str(recording_id)))
+    releases, seen, offset, expected_total = [], set(), 0, None
+    while True:
+        page = get(
+            "/release", RECORDING_RELEASE_INCLUDES + ("+url-rels" if include_url_relations else ""), priority=priority,
+            recording=recording_id, limit=100, offset=offset,
+            cache_ttl=cache_ttl, force_refresh=force_refresh,
+            **({"cache_only": True} if cache_only else {}),
+        )
+        if page is None and cache_only:
+            return None
+        try:
+            total = page["release-count"]
+            actual_offset = page.get("release-offset", offset)
+            batch = page["releases"]
+            if (
+                isinstance(total, bool) or not isinstance(total, int) or total < 0
+                or isinstance(actual_offset, bool) or not isinstance(actual_offset, int)
+                or actual_offset != offset
+                or not isinstance(batch, list) or offset + len(batch) > total
+                or (not batch and offset < total)
+                or (expected_total is not None and total != expected_total)
+            ):
+                raise ValueError
+            ids = [str(UUID(str(release["id"]))) for release in batch]
+            if len(set(ids)) != len(ids) or seen.intersection(ids):
+                raise ValueError
+        except (TypeError, KeyError, ValueError, AttributeError) as exc:
+            raise requests.RequestException(
+                "MusicBrainz returned an incomplete recording release collection."
+            ) from exc
+        expected_total = total
+        releases.extend(batch)
+        seen.update(ids)
+        offset += len(batch)
+        if offset == total:
+            return releases
+
+
+def release_track_metadata(release_id, *, priority="background"):
+    """Reuse release documents in the shared cache, upgrading old includes once."""
+    if __package__ == "backend.services":
+        from .. import track_search_index
+    else:
+        import track_search_index
+    cached = track_search_index.cached_musicbrainz_release(release_id)
+    if cached is not None:
+        return cached
+    path = f"/release/{quote(release_id)}"
+    metadata = get(path, RELEASE_TRACK_INCLUDES, priority=priority)
+    track_search_index.index_release(metadata, metadata_cache_key(path, RELEASE_TRACK_INCLUDES))
+    return metadata
+
+
+def recordings_by_track_ids(track_ids, *, priority="background"):
+    """Batch exact tid searches; reject ambiguous or truncated results."""
+    track_ids = sorted(set(track_ids))
+    if not 1 <= len(track_ids) <= 25:
+        raise ValueError("Track-ID search requires between 1 and 25 IDs")
+    query = " OR ".join(f"tid:{track_id}" for track_id in track_ids)
+    response = search(query, "recording", priority=priority, limit=100)
+    recordings = response.get("recordings", [])
+    if int(response.get("recording-count", len(recordings))) > len(recordings):
+        return {}
+    candidates = {track_id: {} for track_id in track_ids}
+    for recording in recordings:
+        recording_id = recording.get("id")
+        if not recording_id:
+            continue
+        matched_ids = {
+            track.get("id") for release in recording.get("releases", [])
+            for medium in release.get("media", [])
+            for track in (medium.get("tracks") or medium.get("track") or [])
+        }
+        # A single exact tid search can uniquely identify a recording even
+        # when the search server omits the nested release track list.
+        if len(track_ids) == 1 and len(recordings) == 1:
+            matched_ids.add(track_ids[0])
+        for track_id in matched_ids & candidates.keys():
+            candidates[track_id][recording_id] = recording
+    mappings = {}
+    recording_metadata = {}
+    if len(track_ids) > 1 and recordings:
+        # Some search servers omit nested track IDs from recording results.
+        # Exact single-ID queries disambiguate only those unattributed IDs;
+        # the worker still bounds and paces the entire fallback pass.
+        for track_id, matches in candidates.items():
+            if not matches:
+                resolved = recordings_by_track_ids([track_id], priority=priority)
+                if track_id in resolved:
+                    recording = resolved[track_id]
+                    matches[recording["id"]] = recording
+    for track_id, matches in candidates.items():
+        if len(matches) != 1:
+            continue
+        recording_id, recording = next(iter(matches.items()))
+        if "isrcs" not in recording:
+            if recording_id not in recording_metadata:
+                recording_metadata[recording_id] = get(
+                    f"/recording/{quote(recording_id)}", "isrcs", priority=priority,
+                )
+            recording = {**recording, **recording_metadata[recording_id]}
+        mappings[track_id] = recording
+    return mappings
 
 
 def artist_entity_counts(mbid, priority="background"):
@@ -508,6 +657,11 @@ def metadata_cache_key(path, inc, **extra):
     """Return the persistent key used by a MusicBrainz metadata request."""
     record = metadata_cache_record(path, inc, None, **extra)
     return cache_key(record["namespace"], record["url"], record["params"])
+
+
+def cached_artist_metadata(artist_mbid):
+    """Peek at the normal artist-detail relationship document without a request."""
+    return _fresh_cache_value(metadata_cache_key(f"/artist/{quote(artist_mbid)}", "aliases+url-rels+genres"))
 
 
 def test_connection(values):

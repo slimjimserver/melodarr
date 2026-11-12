@@ -113,7 +113,7 @@ def _cache_operation(operation, *, locked_default=_RAISE_ON_LOCK, description="a
             time.sleep(delay)
 
 
-def _cached_value(key, row):
+def _cached_value(key, row, *, discard_invalid=True):
     """Decode one row, discarding corruption from the disposable cache."""
     if row is None:
         return None
@@ -121,9 +121,11 @@ def _cached_value(key, row):
         return json.loads(row["value"])
     except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         logger.warning(
-            "Discarding invalid metadata cache entry (%s)",
+            "Invalid metadata cache entry (%s)",
             _safe_error_label(exc),
         )
+        if not discard_invalid:
+            return None
 
         def delete_invalid(connection):
             connection.execute(
@@ -253,8 +255,15 @@ def document_cache_key(namespace, document_id):
     return f"{namespace}:{digest}"
 
 
-def get_cache_document(namespace, document_id, *, allow_expired=False):
-    """Read a non-HTTP cache document used by a background scan."""
+@contextmanager
+def cache_document_lock(namespace, document_id):
+    """Coalesce concurrent builders of the same locally assembled document."""
+    with _request_lock(document_cache_key(namespace, document_id)):
+        yield
+
+
+def get_cache_document(namespace, document_id, *, allow_expired=False, read_only=False):
+    """Read a worker document; read-only callers also leave corrupt rows alone."""
     key = document_cache_key(namespace, document_id)
 
     def read(connection):
@@ -271,7 +280,7 @@ def get_cache_document(namespace, document_id, *, allow_expired=False):
         locked_default=None,
         description=f"read the {namespace} document",
     )
-    return _cached_value(key, row)
+    return _cached_value(key, row, discard_invalid=not read_only)
 
 
 def set_cache_document(namespace, document_id, value, ttl):
@@ -437,8 +446,14 @@ def cached_json_get(
     reject_redirects=False,
     request_get=None,
     after_response=None,
+    coalescing_scope=None,
 ):
-    """Fetch JSON; cache_params can omit credentials sent in request params."""
+    """Fetch JSON; optionally isolate cache-miss owners by scheduling scope.
+
+    Scopes share cached values but never wait for each other's live requests.
+    This keeps higher-priority work from waiting on a paused cache owner.
+    cache_params can omit credentials sent in request params.
+    """
     key = cache_key(namespace, url, params if cache_params is None else cache_params)
     if not force_refresh:
         value = _fresh_cache_value(key)
@@ -447,7 +462,8 @@ def cached_json_get(
     if cache_only:
         return (None, False) if include_cache_status else None
 
-    coalescing_lock = _request_lock(key) if not force_refresh else nullcontext()
+    lock_key = key if coalescing_scope is None else (key, coalescing_scope)
+    coalescing_lock = _request_lock(lock_key) if not force_refresh else nullcontext()
     with coalescing_lock:
         # Another request may have filled the cache while this one waited. This
         # happens before provider pacing, so followers consume no upstream slot.
@@ -598,6 +614,12 @@ def delete_cache_namespace(namespace):
         cursor = connection.execute(
             "DELETE FROM api_cache WHERE cache_key LIKE ?", (f"{namespace}:%",)
         )
+        if namespace == "plex-library":
+            for table in ("track_search_plex_tracks", "track_search_plex_isrcs"):
+                if connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,),
+                ).fetchone():
+                    connection.execute(f"DELETE FROM {table}")
         return cursor.rowcount
 
     return _cache_operation(

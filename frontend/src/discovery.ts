@@ -844,7 +844,7 @@
     return url.href;
   }
 
-  function addExternalLinks(container: Element, kind: DetailKind, id: string, spotify?: string, plexUrl = "", plexampUrl = "") {
+  function addExternalLinks(container: Element, kind: DetailKind, id: string, spotify?: string, deezerUrl = "", plexUrl = "", plexampUrl = "") {
     const links = document.createElement("div");
     links.className = "external-icons";
     const destinations = [
@@ -862,6 +862,14 @@
         mobile ? "Open in Spotify" : "Open on Spotify",
         "external-link-spotify",
         !mobile,
+      ));
+    }
+    if (kind === "artist" && deezerUrl) {
+      links.append(createServiceIconLink(
+        deezerUrl,
+        "/icons/deezer.svg",
+        "Open on Deezer",
+        "external-link-deezer",
       ));
     }
     if (plexUrl) {
@@ -949,6 +957,7 @@
       kind,
       data.id,
       data.spotify,
+      data.deezer,
       plexLinks.url,
       plexLinks.plexampUrl,
     );
@@ -968,6 +977,7 @@
       ...groups,
       ...(data.animeReleaseGroups || []),
       ...(data.trackSearchGroups || []),
+      ...(data.summaryReleaseGroups || []),
     ]
       .map((group: JsonObject) => [String(group.id), group])).values()];
   }
@@ -1332,6 +1342,12 @@
     const action = captureDetailActionContext();
     const button = releaseGroup.button;
     const previousLabel = button.textContent;
+    const peerButtons = [...$("#detail-results").querySelectorAll<HTMLElement>("[data-release-group-id]")]
+      .filter(card => card.dataset.releaseGroupId === releaseGroup.id)
+      .map(card => card.querySelector<HTMLButtonElement>(".release-group-request"))
+      .filter((peer): peer is HTMLButtonElement => Boolean(peer && peer !== button));
+    const previousPeers = peerButtons.map(peer => ({ peer, label: peer.textContent, disabled: peer.disabled }));
+    peerButtons.forEach(peer => { peer.disabled = true; peer.textContent = "Sending to Lidarr…"; });
     button.disabled = true;
     button.textContent = "Sending to Lidarr…";
     try {
@@ -1382,6 +1398,7 @@
       showToast(error.message, true);
       button.textContent = previousLabel;
       button.disabled = false;
+      previousPeers.forEach(({ peer, label, disabled }) => { peer.textContent = label; peer.disabled = disabled; });
     }
   }
 
@@ -1431,12 +1448,12 @@
   ) {
     const card = document.createElement("article");
     card.className = "recommendation-card";
+    const artwork = document.createElement("div");
+    artwork.className = "recommendation-art";
     const fallback = document.createElement("div");
-    fallback.className = "recommendation-art recommendation-fallback";
-    let artwork: HTMLElement = fallback;
+    fallback.className = "recommendation-fallback";
     if (item.coverArt) {
       const image = document.createElement("img");
-      image.className = "recommendation-art";
       image.alt = "";
       image.loading = "lazy";
       image.decoding = "async";
@@ -1448,7 +1465,9 @@
         artworkUrl.searchParams.set("size", window.devicePixelRatio >= 2 ? "large" : "card");
       }
       loadArtworkWhenNear(image, artworkUrl.href, fallback);
-      artwork = image;
+      artwork.append(image);
+    } else {
+      artwork.append(fallback);
     }
     const personalized = Boolean(item.personalized);
     if (personalized) {
@@ -2109,8 +2128,29 @@
     return group;
   }
 
+  function createReleaseCard(...args: Parameters<typeof createCard>) {
+    const card = createCard(...args);
+    card.classList.add("release-card");
+    let content = card.querySelector<HTMLElement>(".card-open");
+    if (!content) {
+      content = document.createElement("div");
+      content.append(...Array.from(card.childNodes));
+      card.append(content);
+    }
+    content.classList.add("release-card-content");
+    card.querySelector(".artist-info p")!.classList.add("release-group-metadata");
+    return card;
+  }
+
   function createReleaseGroupCard(group: JsonObject) {
-    const card = createCard(
+    if (group.localOnly) {
+      const card = createCard(releaseGroupDisplayTitle(group), String(group.date || ""));
+      if (group.plexUrl) {
+        card.append(createServiceIconLink(group.plexUrl, "/icons/plex.svg", "Open in Plex"));
+      }
+      return card;
+    }
+    const card = createReleaseCard(
       releaseGroupDisplayTitle(group),
       [group.date, ...(group.animeNames || []), ...(group.secondaryTypes || []), group.disambiguation]
         .filter(Boolean)
@@ -2143,6 +2183,221 @@
     card.append(groupRequest);
     card.dataset.releaseGroupId = String(group.id);
     return card;
+  }
+
+  function createBiographyCard(bio: JsonObject, artistId: string) {
+    const card = document.createElement("section");
+    card.className = "artist-biography-card";
+    const header = document.createElement("div");
+    header.className = "artist-biography-heading";
+    const title = document.createElement("h3");
+    title.id = `artist-biography-heading-${artistId}`;
+    title.textContent = "Biography";
+    card.setAttribute("aria-labelledby", title.id);
+    const attribution = document.createElement("span");
+    attribution.className = "artist-biography-source";
+    const mark = document.createElement("span");
+    mark.className = "wikipedia-mark";
+    mark.setAttribute("aria-hidden", "true");
+    attribution.append(mark, "From Wikipedia");
+    header.append(title, attribution);
+
+    const rawText = String(bio.text);
+    let text = rawText.trim().replace(/\s+/g, " ");
+    // The current API caps its extract at 1,000 code points. A capped final
+    // token may be incomplete; keep the original payload and display a clean
+    // excerpt instead. Wikipedia remains the source for the full biography.
+    const capped = Array.from(rawText).length === 1000 && !/[.!?…][\p{Pe}\p{Pf}"']*$/u.test(text);
+    if (capped) text = text.replace(/(?:\s+|^)\S*$/, "").replace(/[\s,;:–—-]+$/, "") + "…";
+    const words = text.split(/\s+/);
+    let preview = "";
+    for (const word of words) {
+      if (preview && preview.length + word.length + 1 > 380) break;
+      preview += (preview ? " " : "") + word;
+    }
+    const expandable = preview.length < text.length;
+    if (expandable) preview = preview.replace(/[\s,;:.…–—-]+$/, "") + "…";
+    const paragraph = document.createElement("p");
+    paragraph.id = `artist-biography-text-${artistId}`;
+    paragraph.className = "artist-summary-bio";
+    paragraph.textContent = expandable ? preview : text;
+    const footer = document.createElement("div");
+    footer.className = "artist-biography-footer";
+    if (expandable) {
+      const toggle = document.createElement("button");
+      toggle.type = "button";
+      toggle.className = "secondary-action artist-biography-toggle";
+      toggle.textContent = "Show more";
+      toggle.setAttribute("aria-expanded", "false");
+      toggle.setAttribute("aria-controls", paragraph.id);
+      toggle.addEventListener("click", () => {
+        const expanded = toggle.getAttribute("aria-expanded") !== "true";
+        toggle.setAttribute("aria-expanded", String(expanded));
+        toggle.textContent = expanded ? "Show less" : "Show more";
+        paragraph.textContent = expanded ? text : preview;
+      });
+      footer.append(toggle);
+    }
+    if (/^https:\/\/[a-z0-9-]+\.wikipedia\.org\/wiki\//.test(String(bio.sourceUrl || ""))) {
+      const source = document.createElement("a");
+      source.href = String(bio.sourceUrl);
+      source.textContent = "Wikipedia";
+      source.target = "_blank";
+      source.rel = "noopener noreferrer";
+      source.title = "Read the full biography on Wikipedia";
+      const external = document.createElement("span");
+      external.setAttribute("aria-hidden", "true");
+      external.textContent = " ↗";
+      source.append(external);
+      footer.append(source);
+    }
+    card.append(header, paragraph, footer);
+    return card;
+  }
+
+  function artistSummaryView(data: JsonObject) {
+    const element = document.createElement("section");
+    element.id = "artist-summary-view";
+    element.className = "artist-summary-view";
+    element.hidden = true;
+    const heading = document.createElement("h2");
+    heading.textContent = "Summary";
+    const status = document.createElement("p");
+    status.className = "message";
+    status.setAttribute("role", "status");
+    const body = document.createElement("div");
+    element.append(heading, status, body);
+    const biography = document.createElement("div");
+    const trackSection = document.createElement("div");
+    trackSection.className = "artist-summary-tracks";
+    const list = document.createElement("ol");
+    list.className = "artist-top-tracks";
+    list.setAttribute("role", "list");
+    list.setAttribute("aria-label", "Top Tracks from Deezer");
+    const rows = new Map<string, { element: HTMLLIElement; signature: string }>();
+    let biographySignature = "";
+    let loaded = false;
+    let loading = false;
+    let pending = false;
+    let polls = 0;
+    let pollDelay = 350;
+    let progressSignature = "";
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const action = captureDetailActionContext();
+
+    async function load() {
+      if (loading || (loaded && !pending) || element.hidden) return;
+      clearTimeout(timer);
+      loading = true;
+      status.textContent = biography.childElementCount || rows.size ? "" : "Loading summary…";
+      try {
+        const summary = await getJson(`/api/music/artist/${encodeURIComponent(String(data.id))}/summary`, 30_000, detailSessionAbort.signal);
+        if (!element.isConnected || !isCurrentDetailAction(action)) return;
+        loaded = true;
+        pending = Boolean(summary.pending)
+          || (Object.values(summary.sources || {}) as JsonObject[]).some(source => source.pending)
+          || (summary.topTracks || []).some((track: JsonObject) => track.pending);
+        const nextProgress = JSON.stringify([summary.bio, summary.sources, (summary.topTracks || []).map((track: JsonObject) => [
+          track.position, track.deezer_track_id, track.title, track.pending, track.details_pending,
+          track.recording_mbid, track.release_group_mbid,
+        ])]);
+        if (nextProgress !== progressSignature) pollDelay = 350;
+        progressSignature = nextProgress;
+        const canonical = new Map(artistReleaseGroups(data).map(group => [String(group.id), group]));
+        data.summaryReleaseGroups = (Object.values(summary.releaseGroups || {}) as JsonObject[]).map((incoming) => {
+          const existing = canonical.get(String(incoming.id));
+          if (existing) {
+            existing.coverArt ||= incoming.coverArt;
+            existing.title ||= incoming.title;
+            return existing;
+          }
+          canonical.set(String(incoming.id), incoming);
+          return incoming;
+        });
+        const nextBiography = JSON.stringify(summary.bio || null);
+        if (nextBiography !== biographySignature) {
+          biographySignature = nextBiography;
+          biography.replaceChildren();
+          if (summary.bio?.text) {
+            biography.append(createBiographyCard(summary.bio, String(data.id)));
+          }
+        }
+        if (biography.childElementCount && !biography.isConnected) body.prepend(biography);
+        if (summary.topTracks?.length) {
+          if (!trackSection.childElementCount) {
+            const title = document.createElement("h3");
+            title.textContent = "Top Tracks";
+            const attribution = document.createElement("p");
+            attribution.className = "field-help";
+            attribution.textContent = "From Deezer";
+            trackSection.append(title, attribution, list);
+            body.append(trackSection);
+          }
+          const activeKeys = new Set<string>();
+          summary.topTracks.forEach((track: JsonObject, index: number) => {
+            const key = `${track.position || index + 1}:${track.deezer_track_id ?? index}`;
+            activeKeys.add(key);
+            const existing = rows.get(key);
+            const row = existing?.element || document.createElement("li");
+            row.value = Number(track.position || index + 1);
+            const group = track.pending ? undefined : canonical.get(String(track.release_group_mbid));
+            const signature = JSON.stringify([track.title, track.title_short, track.album?.title, track.artist?.name,
+              Boolean(track.pending), group?.id, group?.title, group?.coverArt || track.coverArt]);
+            if (signature !== existing?.signature) {
+              const card = group ? createReleaseGroupCard(group)
+                : createReleaseCard(String(track.title || "Untitled"), String(track.album?.title || ""), undefined, track.coverArt || "");
+              card.classList.add("artist-top-track");
+              card.dataset.summaryPending = String(Boolean(track.pending));
+              card.querySelector("h2")!.textContent = String(track.title || track.title_short || "Untitled");
+              const context = card.querySelector<HTMLParagraphElement>(".artist-info p")!;
+              context.textContent = track.pending
+                ? [track.artist?.name, track.album?.title].filter(Boolean).join(" · ")
+                : String(group?.title || track.album?.title || "");
+              context.title = context.textContent;
+              const request = card.querySelector<HTMLButtonElement>(".release-group-request");
+              if (request?.textContent === "Request") request.textContent = "Request Album";
+              if (track.pending) {
+                const matching = document.createElement("span");
+                matching.className = "release-card-state artist-top-track-status";
+                matching.textContent = "Finding album…";
+                card.append(matching);
+              }
+              row.replaceChildren(card);
+              rows.set(key, { element: row, signature });
+            }
+            // Move only when needed; stable rows keep artwork and focused buttons.
+            if (list.children[index] !== row) list.insertBefore(row, list.children[index] || null);
+          });
+          for (const [key, row] of rows) {
+            if (!activeKeys.has(key)) { row.element.remove(); rows.delete(key); }
+          }
+        } else {
+          rows.clear();
+          list.replaceChildren();
+          trackSection.replaceChildren();
+          trackSection.remove();
+        }
+        applyArtistReleaseGroupAvailability(data, summary.releaseGroups || {});
+        if (incompleteArtistReleaseGroups(data).length) startDetailAvailability("artist", data);
+        status.replaceChildren();
+        if (!biography.childElementCount && !rows.size) status.textContent = pending ? "Loading summary…" : "No summary available yet.";
+        if (pending && !element.hidden && polls++ < 90) {
+          timer = setTimeout(() => void load(), pollDelay);
+          pollDelay = Math.min(2_000, Math.round(pollDelay * 1.5));
+        }
+      } catch (error) {
+        if (!element.isConnected || !isCurrentDetailAction(action) || detailSessionAbort.signal.aborted) return;
+        status.textContent = biography.childElementCount || rows.size ? "" : "Summary is unavailable right now. ";
+        const retry = document.createElement("button");
+        retry.className = "secondary-action";
+        retry.textContent = "Retry";
+        retry.addEventListener("click", () => { loaded = false; polls = 0; pollDelay = 350; void load(); });
+        status.append(retry);
+      } finally {
+        loading = false;
+      }
+    }
+    return { element, load, hide: () => { element.hidden = true; clearTimeout(timer); } };
   }
 
   /**
@@ -2241,6 +2496,7 @@
     releaseContent.id = "discography-release-view";
     releaseContent.className = "discography-release-view";
     const similar = similarArtistsView(String(data.id));
+    const artistSummary = artistSummaryView(data);
     similar.element.id = "similar-artists-view";
     const sections: Array<{
       element: HTMLDetailsElement;
@@ -2319,6 +2575,7 @@
         tools.hidden = false;
         releaseContent.hidden = false;
         similar.element.hidden = true;
+        artistSummary.hide();
         section.open = true;
         section.scrollIntoView({ behavior: "smooth", block: "start" });
       });
@@ -2453,6 +2710,7 @@
       tools.hidden = false;
       releaseContent.hidden = false;
       similar.element.hidden = true;
+      artistSummary.hide();
       animeSection.open = true;
       animeSection.scrollIntoView({ behavior: "smooth", block: "start" });
     });
@@ -2579,6 +2837,7 @@
     similarButton.setAttribute("aria-controls", similar.element.id);
     similarButton.setAttribute("aria-expanded", "false");
     similarButton.addEventListener("click", () => {
+      artistSummary.hide();
       tools.hidden = true;
       releaseContent.hidden = true;
       similar.element.hidden = false;
@@ -2591,8 +2850,26 @@
         similarButton.setAttribute("aria-expanded", "false");
       });
     });
-    sidebar.append(index, similarButton);
-    content.append(releaseContent, similar.element);
+    const summaryButton = document.createElement("button");
+    summaryButton.className = "discography-similar-nav artist-summary-nav";
+    summaryButton.type = "button";
+    summaryButton.textContent = "Summary";
+    summaryButton.setAttribute("aria-controls", artistSummary.element.id);
+    summaryButton.setAttribute("aria-expanded", "false");
+    summaryButton.addEventListener("click", () => {
+      tools.hidden = true;
+      releaseContent.hidden = true;
+      similar.element.hidden = true;
+      similarButton.setAttribute("aria-expanded", "false");
+      artistSummary.element.hidden = false;
+      summaryButton.setAttribute("aria-expanded", "true");
+      void artistSummary.load();
+    });
+    [...index.querySelectorAll("a"), similarButton].forEach(link => {
+      link.addEventListener("click", () => summaryButton.setAttribute("aria-expanded", "false"));
+    });
+    sidebar.append(summaryButton, index, similarButton);
+    content.append(releaseContent, similar.element, artistSummary.element);
     layout.append(sidebar, content);
     container.append(tools, layout);
     refreshSections();
@@ -4002,7 +4279,9 @@
       } else {
         resetDetailCover();
       }
-      $("#detail-subtitle").textContent = [data.country, data.disambiguation].filter(Boolean).join(" · ");
+      $("#detail-subtitle").textContent = data.libraryOnly
+        ? "Albums in your libraries"
+        : [data.country, data.disambiguation].filter(Boolean).join(" · ");
       const meta = createMeta("artist", data);
       addMuteButton(requiredDescendant<HTMLElement>(meta, ".external-icons"), "artist", String(data.id));
       const facts = [data.type, data.gender, data.area, data.lifeSpan?.begin].filter(Boolean).join(" · ");
@@ -4021,11 +4300,14 @@
       const refreshButton = document.createElement("button");
       refreshButton.className = "secondary-action refresh-discography";
       refreshButton.type = "button";
-      refreshButton.textContent = "Refresh discography";
+      const refreshLabel = data.libraryOnly ? "Refresh library albums" : "Refresh discography";
+      refreshButton.textContent = refreshLabel;
       refreshButton.addEventListener("click", async () => {
         refreshButton.disabled = true;
         refreshButton.textContent = "Refreshing…";
-        $("#detail-message").textContent = "Refreshing the complete discography from MusicBrainz…";
+        $("#detail-message").textContent = data.libraryOnly
+          ? "Refreshing albums from your libraries…"
+          : "Refreshing the complete discography from MusicBrainz…";
         const action = captureDetailActionContext();
         try {
           const refreshed = await postJson(
@@ -4037,18 +4319,21 @@
           if (!isCurrentDetailAction(action)) return;
           if (currentDetail?.kind === "artist" && currentDetail?.id === data.id) {
             renderDetail("artist", refreshed);
-            $("#detail-message").textContent = "Discography refreshed from MusicBrainz.";
+            $("#detail-message").textContent = refreshed.libraryOnly
+              ? "Library albums refreshed."
+              : "Discography refreshed from MusicBrainz.";
           }
         } catch (error) {
           if (!isCurrentDetailAction(action) || error.name === "AbortError") return;
           $("#detail-message").textContent = error.message;
           refreshButton.disabled = false;
-          refreshButton.textContent = "Refresh discography";
+          refreshButton.textContent = refreshLabel;
         }
       });
       const actions = document.createElement("div");
       actions.className = "detail-actions";
-      actions.append(requestButton, refreshButton);
+      if (!data.libraryOnly) actions.append(requestButton);
+      actions.append(refreshButton);
       results.append(actions);
 
       results.append(renderDiscography(data));
@@ -4384,7 +4669,7 @@
     button.disabled = true;
     results.setAttribute("aria-busy", "true");
     const placeholder = document.createElement("div");
-    placeholder.className = "recommendation-carousel";
+    placeholder.className = "recommendation-carousel recommendation-loading";
     placeholder.append(skeletonBlock("skeleton-art", 8));
     results.replaceChildren(placeholder);
     message.textContent = "Gathering a few recommendations for you…";

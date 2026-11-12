@@ -25,7 +25,7 @@ async function expectRequestsActive(page: Page) {
 }
 
 for (const theme of ["midnight", "warm"]) {
-  for (const width of [1440, 768, 390, 320]) {
+  for (const width of [1440, 900, 768, 701, 390, 320]) {
     test(`primary Requests navigation works in ${theme} at ${width}px`, async ({ page }, testInfo) => {
       await page.setViewportSize({ width, height: 900 });
       await page.addInitScript(theme => localStorage.setItem("melodarr-theme", theme), theme);
@@ -33,8 +33,8 @@ for (const theme of ["midnight", "warm"]) {
       await expect(page.locator("#library")).toBeVisible();
       const desktop = page.locator(".header-nav");
       const mobile = page.locator(".tab-bar");
-      await expect(desktop.locator("a")).toHaveText(["Discover", "Your library", "Requests", "Settings"]);
-      await expect(mobile.locator("a")).toHaveText(["Discover", "Library", "Requests", "Settings"]);
+      await expect(desktop.locator("a")).toHaveText(["Discover", "Your library", "Requests", "Rooms", "Settings"]);
+      await expect(mobile.locator("a")).toHaveText(["Discover", "Library", "Requests", "Rooms", "Settings"]);
       await expect(desktop.locator('[data-primary-account="requests"]')).toHaveAttribute("href", "/ada/requests");
       const musicIcon = mobile.locator('[data-primary-account="requests"] .tab-icon');
       await expect(musicIcon).toHaveAttribute("aria-hidden", "true");
@@ -73,12 +73,12 @@ for (const theme of ["midnight", "warm"]) {
             }),
           };
         });
-        expect(metrics.items).toHaveLength(4);
+        expect(metrics.items).toHaveLength(5);
         expect(metrics.scroll).toBeLessThanOrEqual(metrics.viewport);
         expect(metrics.bottom).toBe(900);
         expect(metrics.padding).toBe("24px");
         for (const item of metrics.items) {
-          expect(item.width).toBeCloseTo(metrics.viewport / 4, 1);
+          expect(item.width).toBeCloseTo(metrics.viewport / 5, 1);
           expect(item.left).toBeGreaterThanOrEqual(0);
           expect(item.right).toBeLessThanOrEqual(metrics.viewport);
           expect(item.labelLeft).toBeGreaterThanOrEqual(item.left);
@@ -86,10 +86,37 @@ for (const theme of ["midnight", "warm"]) {
           expect(item.bottom).toBeLessThanOrEqual(item.contentBottom);
         }
       } else {
-        const metrics = await desktop.evaluate(nav => ({ right: nav.getBoundingClientRect().right,
-          scroll: document.documentElement.scrollWidth, viewport: document.documentElement.clientWidth }));
-        expect(metrics.right).toBeLessThanOrEqual(width);
-        expect(metrics.scroll).toBeLessThanOrEqual(metrics.viewport);
+        // System font widths differ between Windows and Linux. Verdana also
+        // exercises wider tablet labels on Windows, where both fallbacks fit.
+        const fonts = ["system-ui, sans-serif", "sans-serif"];
+        if (width <= 900) fonts.push("Verdana, sans-serif");
+        for (const font of fonts) {
+          await page.evaluate(font => { document.body.style.fontFamily = font; }, font);
+          const metrics = await desktop.evaluate(nav => {
+            const header = nav.parentElement!;
+            const bounds = header.getBoundingClientRect();
+            const style = getComputedStyle(header);
+            return { right: nav.getBoundingClientRect().right,
+              scroll: document.documentElement.scrollWidth, viewport: document.documentElement.clientWidth,
+              contentLeft: bounds.left + parseFloat(style.paddingLeft),
+              contentRight: bounds.right - parseFloat(style.paddingRight),
+              controls: [...header.querySelectorAll<HTMLElement>(":scope > *")]
+                .filter(item => getComputedStyle(item).display !== "none")
+                .map(item => ({ name: item.id || item.className, left: item.getBoundingClientRect().left,
+                  right: item.getBoundingClientRect().right })),
+            };
+          });
+          expect(metrics.right).toBeLessThanOrEqual(width);
+          expect(metrics.scroll, `${font}: ${JSON.stringify(metrics.controls)}`).toBeLessThanOrEqual(metrics.viewport);
+          for (const control of metrics.controls) {
+            expect(control.left, `${font}: ${control.name}`).toBeGreaterThanOrEqual(metrics.contentLeft - .5);
+            expect(control.right, `${font}: ${control.name}`).toBeLessThanOrEqual(metrics.contentRight + .5);
+          }
+          for (let i = 1; i < metrics.controls.length; i++) {
+            expect(metrics.controls[i].left).toBeGreaterThanOrEqual(metrics.controls[i - 1].right);
+          }
+        }
+        await page.evaluate(() => { document.body.style.fontFamily = ""; });
       }
       await page.screenshot({ path: testInfo.outputPath("primary-requests.png") });
       await page.locator('[data-account-route="profile"]').click();
@@ -160,16 +187,30 @@ test("primary Requests href follows the authenticated identity after switching a
   await expect(page).toHaveURL(/\/bea\/requests$/);
 });
 
-test("primary Requests is available to regular users and encodes their username", async ({ page }) => {
+test("primary Requests is available to regular users and encodes their username", async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 320, height: 900 });
   await page.route("**/api/auth/me", route => route.fulfill({ json: {
     id: 3, username: "Music Listener", role: "user", csrfToken: "csrf-listener",
   } }));
   await page.goto("/library");
-  const requests = page.locator(".tab-bar").getByRole("link", { name: "Requests", exact: true });
+  const mobile = page.locator(".tab-bar");
+  const links = mobile.locator("a:visible");
+  await expect(links).toHaveText(["Discover", "Library", "Requests", "Rooms"]);
+  await expect(mobile.getByRole("link", { name: "Settings", exact: true })).toBeHidden();
+  const bounds = await links.evaluateAll(items => items.map(item => {
+    const rect = item.getBoundingClientRect();
+    return { width: rect.width, left: rect.left, right: rect.right };
+  }));
+  for (const [index, rect] of bounds.entries()) {
+    expect(rect.width).toBeCloseTo(80, 1);
+    expect(rect.left).toBeCloseTo(index * 80, 1);
+    expect(rect.right).toBeLessThanOrEqual(320);
+  }
+  const requests = mobile.getByRole("link", { name: "Requests", exact: true });
   await expect(requests).toBeVisible();
   await expect(requests).toHaveAttribute("href", "/Music%20Listener/requests");
   await requests.click();
   await expect(page).toHaveURL(/\/Music%20Listener\/requests$/);
   await expectRequestsActive(page);
+  await page.screenshot({ path: testInfo.outputPath("primary-requests-user.png") });
 });

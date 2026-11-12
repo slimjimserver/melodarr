@@ -114,7 +114,7 @@ SERIES_RESPONSE = {
 
 
 class AnimeThemesServiceTests(unittest.TestCase):
-    @patch("backend.services.animethemes.cached_json_get")
+    @patch("backend.services.animethemes.graphql.search")
     def test_search_returns_normalized_anime_summaries(self, cached_get):
         cached_get.return_value = {
             "search": {
@@ -146,19 +146,9 @@ class AnimeThemesServiceTests(unittest.TestCase):
             "synopsis": "A ninja story.",
             "coverArt": "",
         }])
-        cached_get.assert_called_once_with(
-            "https://api.animethemes.moe/search",
-            params={
-                "q": "Naruto",
-                "limit": 10,
-                "include[anime]": "images",
-            },
-            headers={"User-Agent": animethemes.USER_AGENT},
-            namespace="animethemes-search",
-            ttl=animethemes._SEARCH_CACHE_TTL,
-        )
+        cached_get.assert_called_once_with("Naruto", 10, ttl=animethemes._SEARCH_CACHE_TTL)
 
-    @patch("backend.services.animethemes.cached_json_get")
+    @patch("backend.services.animethemes.graphql.detail")
     def test_detail_normalizes_themes_artists_entries_and_relations(self, cached_get):
         cached_get.return_value = ANIME_RESPONSE
 
@@ -200,20 +190,14 @@ class AnimeThemesServiceTests(unittest.TestCase):
                 "notes": ["Version one", "Version two"],
             }],
         })
-        cached_get.assert_called_once_with(
-            "https://api.animethemes.moe/anime/naruto",
-            params={"include": animethemes._DETAIL_INCLUDE},
-            headers={"User-Agent": animethemes.USER_AGENT},
-            namespace="animethemes-detail",
-            ttl=animethemes._DETAIL_CACHE_TTL,
-        )
+        cached_get.assert_called_once_with("naruto", ttl=animethemes._DETAIL_CACHE_TTL)
 
-    @patch("backend.services.animethemes.cached_json_get")
+    @patch("backend.services.animethemes.graphql.detail")
     def test_detail_returns_none_when_upstream_has_no_anime(self, cached_get):
         cached_get.return_value = {"anime": None}
         self.assertIsNone(animethemes.detail("not_here"))
 
-    @patch("backend.services.animethemes.cached_json_get")
+    @patch("backend.services.animethemes.graphql.series_detail")
     def test_series_detail_normalizes_and_orders_related_anime(self, cached_get):
         cached_get.return_value = SERIES_RESPONSE
 
@@ -235,19 +219,15 @@ class AnimeThemesServiceTests(unittest.TestCase):
         )
         self.assertEqual(result["anime"][0]["coverArt"], "https://img/original.avif")
         cached_get.assert_called_once_with(
-            "https://api.animethemes.moe/series/boku_no_kokoro_no_yabai_yatsu",
-            params={"include": animethemes._SERIES_INCLUDE},
-            headers={"User-Agent": animethemes.USER_AGENT},
-            namespace="animethemes-series",
-            ttl=animethemes._SERIES_CACHE_TTL,
+            "boku_no_kokoro_no_yabai_yatsu", ttl=animethemes._SERIES_CACHE_TTL,
         )
 
-    @patch("backend.services.animethemes.cached_json_get")
+    @patch("backend.services.animethemes.graphql.series_detail")
     def test_series_detail_returns_none_without_a_series(self, cached_get):
         cached_get.return_value = {"series": None}
         self.assertIsNone(animethemes.series_detail("not_here"))
 
-    @patch("backend.services.animethemes.cached_json_get")
+    @patch("backend.services.animethemes.graphql.search")
     def test_search_enforces_the_requested_limit_locally(self, cached_get):
         cached_get.return_value = {"search": {"anime": [
             {"id": index, "name": f"Anime {index}", "slug": f"anime_{index}"}
@@ -258,7 +238,7 @@ class AnimeThemesServiceTests(unittest.TestCase):
 
         self.assertEqual([result["id"] for result in results], [0, 1])
 
-    @patch("backend.services.animethemes.cached_json_get")
+    @patch("backend.services.animethemes.graphql._graphql")
     def test_inputs_are_validated_before_an_external_request(self, cached_get):
         invalid_calls = (
             lambda: animethemes.search("x"),

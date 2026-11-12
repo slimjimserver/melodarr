@@ -227,8 +227,15 @@ def record_request(
     song_title="",
     search_metadata=(),
 ):
-    """Record an artist or release-group request for one user."""
+    """Record private user history or an explicit automation audit event."""
     with db() as connection:
+        if user_id is None:
+            _record_automation_request(connection, kind, mbid, name, artist_name, release_type, release_date)
+            connection.execute(
+                "INSERT OR IGNORE INTO pending_lidarr_search_requesters (job_id, user_id, source) "
+                "SELECT id, NULL, 'automation' FROM pending_lidarr_searches WHERE mbid = ?", (mbid,),
+            )
+            return
         history_cursor = connection.execute(
             "INSERT INTO request_history "
             "(user_id, kind, mbid, name, artist_name, release_type, "
@@ -262,6 +269,16 @@ def record_request(
             )
 
     _wake_recommendations()
+
+
+def _record_automation_request(connection, kind, mbid, name, artist_name, release_type, release_date):
+    """Machine audit is durable and never belongs to a user's private history."""
+    connection.execute(
+        "INSERT OR IGNORE INTO automation_request_history "
+        "(source, user_id, kind, mbid, name, artist_name, release_type, release_date, created_at) "
+        "VALUES ('automation', NULL, ?, ?, ?, ?, ?, ?, ?)",
+        (kind, mbid, name, artist_name or None, release_type or None, release_date or None, time.time()),
+    )
 
 
 def enqueue_lidarr_search(
@@ -299,9 +316,12 @@ def enqueue_lidarr_search(
         ).fetchone()["id"]
         connection.execute(
             "INSERT OR IGNORE INTO pending_lidarr_search_requesters "
-            "(job_id, user_id) VALUES (?, ?)",
-            (job_id, user_id),
+            "(job_id, user_id, source) VALUES (?, ?, ?)",
+            (job_id, user_id, "automation" if user_id is None else "user"),
         )
+        if user_id is None:
+            _record_automation_request(connection, "release-group", mbid, name, artist_name, release_type, release_date)
+            return bool(cursor.rowcount)
         # The queue is shared across users by release-group MBID, while
         # request history is private per user. Even when another request
         # already created the shared job, retain this user's action.
@@ -338,6 +358,88 @@ def pending_lidarr_search(mbid):
         return connection.execute(
             "SELECT * FROM pending_lidarr_searches WHERE mbid = ?", (mbid,)
         ).fetchone()
+
+
+def recording_acquisition(recording_mbid):
+    """Read the immutable acquisition target with one primary-key lookup."""
+    with db() as connection:
+        row = connection.execute(
+            "SELECT * FROM recording_acquisitions WHERE recording_mbid = ?",
+            (recording_mbid,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def recording_acquisitions(recording_mbids):
+    """Batch immutable targets and pending jobs through their MBID indexes.
+
+    One SELECT/connection for a search page; chunk larger callers to stay below
+    SQLite's bind limit. Pending error text is internal and must not be exposed.
+    """
+    identities = list(dict.fromkeys(recording_mbids))
+    if not identities:
+        return {}
+    result = {}
+    with db() as connection:
+        for offset in range(0, len(identities), 500):
+            batch = identities[offset:offset + 500]
+            placeholders = ", ".join("?" for _ in batch)
+            rows = connection.execute(
+                "SELECT intent.*, pending.mbid AS pending_mbid, "
+                "pending.last_error AS pending_last_error "
+                "FROM recording_acquisitions intent "
+                "LEFT JOIN pending_lidarr_searches pending "
+                "ON pending.mbid = intent.release_group_mbid "
+                f"WHERE intent.recording_mbid IN ({placeholders})", batch,
+            ).fetchall()
+            result.update((row["recording_mbid"], dict(row)) for row in rows)
+    return result
+
+
+def save_recording_acquisition(recording_mbid, target, recording_title, user_id):
+    """Persist accepted work and its initial requester in one short transaction.
+
+    The caller holds the recording initiation lock. Conflict handling also
+    protects the chosen target from replacement by future callers.
+    """
+    now = time.time()
+    with db() as connection:
+        connection.execute(
+            "INSERT OR IGNORE INTO recording_acquisitions "
+            "(recording_mbid, release_group_mbid, recording_title, target_title, "
+            "artist_name, primary_type, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (recording_mbid, target["releaseGroupMbid"], recording_title,
+             target.get("title") or "", target.get("artistName") or "",
+             target.get("primaryType"), now, now),
+        )
+        _add_recording_requester(connection, recording_mbid, user_id, now)
+
+
+def _add_recording_requester(connection, recording_mbid, user_id, now):
+    inserted = connection.execute(
+        "INSERT OR IGNORE INTO recording_acquisition_requesters "
+        "(recording_mbid, user_id, requested_at, source) VALUES (?, ?, ?, ?)",
+        (recording_mbid, user_id, now, "automation" if user_id is None else "user"),
+    ).rowcount
+    if inserted:
+        connection.execute(
+            "UPDATE recording_acquisitions SET updated_at = ? WHERE recording_mbid = ?",
+            (now, recording_mbid),
+        )
+    # Keep a shared pending job associated with every interested user even if
+    # its first requester deletes their account. This does not create work,
+    # history rows, or duplicate notifications on repeated recording requests.
+    connection.execute(
+        "INSERT OR IGNORE INTO pending_lidarr_search_requesters (job_id, user_id, source) "
+        "SELECT id, ?, ? FROM pending_lidarr_searches WHERE mbid = "
+        "(SELECT release_group_mbid FROM recording_acquisitions WHERE recording_mbid = ?)",
+        (user_id, "automation" if user_id is None else "user", recording_mbid),
+    )
+
+
+def add_recording_acquisition_requester(recording_mbid, user_id):
+    with db() as connection:
+        _add_recording_requester(connection, recording_mbid, user_id, time.time())
 
 
 def pending_lidarr_search_mbids(mbids):
@@ -592,6 +694,41 @@ def _create_pending_lidarr_searches_table(connection):
     """)
 
 
+def _migrate_requester_sources(connection, table, identity, reference, *, timestamp=False):
+    """Upgrade user-only associations while preserving their FKs/timestamps.
+
+    Names are internal schema constants. User associations retain their composite
+    PK. A partial unique index makes the NULL-user automation origin idempotent.
+    """
+    columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+    legacy = None
+    if columns and "source" not in columns:
+        legacy = f"{table}_user_legacy"
+        connection.execute(f"ALTER TABLE {table} RENAME TO {legacy}")
+    connection.execute(
+        f"CREATE TABLE IF NOT EXISTS {table} ("
+        f"{identity} {'TEXT' if timestamp else 'INTEGER'} NOT NULL REFERENCES {reference} ON DELETE CASCADE, "
+        "user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, "
+        + ("requested_at REAL NOT NULL, " if timestamp else "")
+        + "source TEXT NOT NULL DEFAULT 'user' "
+        "CHECK ((source = 'user' AND user_id IS NOT NULL) OR (source = 'automation' AND user_id IS NULL)), "
+        f"PRIMARY KEY({identity}, user_id))"
+    )
+    if legacy:
+        copied = f"{identity}, user_id" + (", requested_at" if timestamp else "")
+        parent, parent_key = reference.rstrip(")").split("(")
+        connection.execute(
+            f"INSERT INTO {table} ({copied}) SELECT {copied} FROM {legacy} "
+            "WHERE user_id IN (SELECT id FROM users) "
+            f"AND {identity} IN (SELECT {parent_key} FROM {parent})"
+        )
+        connection.execute(f"DROP TABLE {legacy}")
+    connection.execute(
+        f"CREATE UNIQUE INDEX IF NOT EXISTS {table}_automation "
+        f"ON {table}({identity}) WHERE source = 'automation'"
+    )
+
+
 def _migrate_pending_lidarr_searches(connection):
     """Separate shared queue work from the users who requested it."""
     exists = connection.execute(
@@ -631,15 +768,9 @@ def _migrate_pending_lidarr_searches(connection):
     else:
         _create_pending_lidarr_searches_table(connection)
 
-    connection.execute("""
-        CREATE TABLE IF NOT EXISTS pending_lidarr_search_requesters (
-            job_id INTEGER NOT NULL
-                REFERENCES pending_lidarr_searches(id) ON DELETE CASCADE,
-            user_id INTEGER NOT NULL
-                REFERENCES users(id) ON DELETE CASCADE,
-            PRIMARY KEY(job_id, user_id)
-        )
-    """)
+    _migrate_requester_sources(
+        connection, "pending_lidarr_search_requesters", "job_id", "pending_lidarr_searches(id)",
+    )
     if legacy_table:
         connection.execute(
             "INSERT OR IGNORE INTO pending_lidarr_search_requesters "
@@ -683,8 +814,8 @@ def _delete_legacy_orphans(connection):
         )
     connection.execute(
         "DELETE FROM pending_lidarr_search_requesters "
-        "WHERE NOT EXISTS (SELECT 1 FROM users "
-        "WHERE users.id = pending_lidarr_search_requesters.user_id) "
+        "WHERE (user_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM users "
+        "WHERE users.id = pending_lidarr_search_requesters.user_id)) "
         "OR NOT EXISTS (SELECT 1 FROM pending_lidarr_searches "
         "WHERE pending_lidarr_searches.id = "
         "pending_lidarr_search_requesters.job_id)"
@@ -804,6 +935,11 @@ def init_db():
     legacy_settings = {}
     legacy_lastfm_api_key = ""
     with db() as connection:
+        if __package__:
+            from .room_storage import prepare_code_migration
+        else:
+            from room_storage import prepare_code_migration
+        prepare_code_migration(connection)
         # WAL lets request threads read account and queue state while a
         # background worker commits unrelated updates.
         connection.execute("PRAGMA journal_mode = WAL")
@@ -885,6 +1021,11 @@ def init_db():
             "CREATE UNIQUE INDEX IF NOT EXISTS users_plex_id_unique "
             "ON users(plex_id) WHERE plex_id IS NOT NULL"
         )
+        if __package__:
+            from .room_storage import migrate as migrate_rooms
+        else:
+            from room_storage import migrate as migrate_rooms
+        migrate_rooms(connection)
         plex_flow_schema = connection.execute(
             "SELECT sql FROM sqlite_master "
             "WHERE type = 'table' AND name = 'plex_auth_flows'"
@@ -939,6 +1080,21 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS request_history_recent "
             "ON request_history(created_at DESC, id DESC)"
         )
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS automation_request_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL CHECK(source = 'automation'),
+                user_id INTEGER CHECK(user_id IS NULL),
+                kind TEXT NOT NULL CHECK(kind IN ('artist', 'release-group')),
+                mbid TEXT NOT NULL,
+                name TEXT NOT NULL,
+                artist_name TEXT,
+                release_type TEXT,
+                release_date TEXT,
+                created_at REAL NOT NULL,
+                UNIQUE(kind, mbid)
+            )
+        """)
         connection.execute("""
             CREATE TABLE IF NOT EXISTS recommendation_preferences (
                 user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -1330,6 +1486,30 @@ def init_db():
             "ON anime_artist_links(artist_mbid)"
         )
         _migrate_pending_lidarr_searches(connection)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS recording_acquisitions (
+                recording_mbid TEXT NOT NULL PRIMARY KEY,
+                release_group_mbid TEXT NOT NULL,
+                recording_title TEXT NOT NULL DEFAULT '',
+                target_title TEXT NOT NULL DEFAULT '',
+                artist_name TEXT NOT NULL DEFAULT '',
+                primary_type TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+        """)
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS recording_acquisitions_release_group "
+            "ON recording_acquisitions(release_group_mbid)"
+        )
+        _migrate_requester_sources(
+            connection, "recording_acquisition_requesters", "recording_mbid",
+            "recording_acquisitions(recording_mbid)", timestamp=True,
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS recording_acquisition_requesters_user "
+            "ON recording_acquisition_requesters(user_id, recording_mbid)"
+        )
         # Release-group requests always use RefreshAlbum. Convert work queued
         # by versions that conditionally selected RefreshArtist as well.
         connection.execute(
